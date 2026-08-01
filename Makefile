@@ -9,7 +9,7 @@
 # Required variables:
 #   PLATFORM        - Target SoC:
 #                       Ingenic   - T10, T20, T21, T23, T30, T31, T32, T33, T40, T41
-#                       SigmaStar - INFINITY6E
+#                       SigmaStar - INFINITY6E, INFINITY6B0
 #   CROSS_COMPILE   - Cross-compiler prefix (e.g. mipsel-linux-)
 #
 # Optional variables:
@@ -24,7 +24,7 @@ $(error PLATFORM not set. Use: make PLATFORM=T31)
 endif
 
 # Validate platform
-VALID_PLATFORMS := T10 T20 T21 T23 T30 T31 T32 T33 T40 T41 INFINITY6E
+VALID_PLATFORMS := T10 T20 T21 T23 T30 T31 T32 T33 T40 T41 INFINITY6E INFINITY6B0
 ifeq ($(filter $(PLATFORM),$(VALID_PLATFORMS)),)
 $(error Invalid PLATFORM=$(PLATFORM). Valid: $(VALID_PLATFORMS))
 endif
@@ -34,7 +34,7 @@ endif # clean guard
 # Ingenic parts use the single-library IMP SDK; SigmaStar parts use the
 # per-module MI SDK. Set unconditionally (not inside the clean guard) so
 # `make clean` still resolves the right object paths.
-SIGMASTAR_PLATFORMS := INFINITY6E
+SIGMASTAR_PLATFORMS := INFINITY6E INFINITY6B0
 ifneq ($(filter $(PLATFORM),$(SIGMASTAR_PLATFORMS)),)
 VENDOR := sigmastar
 else

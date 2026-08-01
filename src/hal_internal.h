@@ -53,6 +53,8 @@
 #define HAL_PLATFORM_NAME "A1"
 #elif defined(PLATFORM_INFINITY6E)
 #define HAL_PLATFORM_NAME "INFINITY6E"
+#elif defined(PLATFORM_INFINITY6B0)
+#define HAL_PLATFORM_NAME "INFINITY6B0"
 #else
 #error "No PLATFORM_* defined"
 #endif
@@ -60,13 +62,20 @@
 /*
  * Vendor selection.
  *
- * Everything above INFINITY6E is an Ingenic T-series/A1 part sharing the IMP
- * SDK; the derived HAL_OLD_SDK/HAL_NEW_SDK/HAL_IMPVI_SDK macros below only
- * distinguish IMP *generations* and are meaningless for other vendors.
- * HAL_INGENIC_SDK / HAL_SIGMASTAR_SDK sit one level above them and select
- * which vendor SDK is in play at all.
+ * Everything above the INFINITY* entries is an Ingenic T-series/A1 part
+ * sharing the IMP SDK; the derived HAL_OLD_SDK/HAL_NEW_SDK/HAL_IMPVI_SDK
+ * macros below only distinguish IMP *generations* and are meaningless for
+ * other vendors. HAL_INGENIC_SDK / HAL_SIGMASTAR_SDK sit one level above them
+ * and select which vendor SDK is in play at all.
+ *
+ * Every SigmaStar platform shares one backend. src/star/ is written against
+ * the MI ABI as vendored in src/star/i6_*.h, and that ABI spans the Infinity6
+ * family: divinus drives infinity6, infinity6e and infinity6b0 through the
+ * same i6 HAL, switching implementations only at infinity6c and mercury6.
+ * So a new family in this list needs no backend code -- only its own
+ * capability block in hal_caps.c.
  */
-#if defined(PLATFORM_INFINITY6E)
+#if defined(PLATFORM_INFINITY6E) || defined(PLATFORM_INFINITY6B0)
 #define HAL_SIGMASTAR_SDK
 #else
 #define HAL_INGENIC_SDK

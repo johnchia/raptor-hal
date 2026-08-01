@@ -6,7 +6,8 @@
  * corresponding capability block is compiled and all others are excluded.
  *
  * Values are derived from the SDK difference analysis across all 10
- * supported Ingenic SoCs (T10, T20, T21, T23, T30, T31, T32, T33, T40, T41).
+ * supported Ingenic SoCs (T10, T20, T21, T23, T30, T31, T32, T33, T40, T41),
+ * plus the SigmaStar Infinity6 families at the end of the chain.
  */
 
 #include "hal_internal.h"
@@ -809,6 +810,13 @@ const rss_hal_caps_t g_hal_caps = {
 
 /* ═══════════════════════════════════════════════════════════════════════
  * INFINITY6E (SigmaStar SSC30KQ / SSC338Q)
+ * INFINITY6B0 (SigmaStar SSC333 / SSC335 / SSC337)
+ *
+ * One block for both families. src/star/ is written against the MI ABI
+ * vendored in src/star/i6_*.h, which spans the Infinity6 series -- divinus
+ * drives infinity6, infinity6e and infinity6b0 through that same i6 HAL and
+ * only switches implementation at infinity6c. So the two share every
+ * capability here except where marked.
  *
  * Two kinds of false appear below, and the distinction matters:
  *
@@ -825,10 +833,10 @@ const rss_hal_caps_t g_hal_caps = {
  * or a permanent-false explanation are listed; the rest default to
  * false/0 via designated initialization.
  * ═══════════════════════════════════════════════════════════════════════ */
-#elif defined(PLATFORM_INFINITY6E)
+#elif defined(PLATFORM_INFINITY6E) || defined(PLATFORM_INFINITY6B0)
 const rss_hal_caps_t g_hal_caps = {
     /* System info */
-    .soc_name = "INFINITY6E",
+    .soc_name = HAL_PLATFORM_NAME,
     /* Real value comes from MI_SYS_GetVersion() at runtime (phase 2);
      * this is only the compile-time fallback string. */
     .sdk_version = "MI",
@@ -871,12 +879,38 @@ const rss_hal_caps_t g_hal_caps = {
      * backlight_comp (WDR curve descriptors), and switch_bin -- a tuning
      * binary *is* loaded during hal_init, but Ingenic's runtime
      * bin-switching op has no MI counterpart.
+     *
+     * INFINITY6B0 leaves all five false, and this is the one place the two
+     * families genuinely diverge. Every scalar knob is reached by poking a
+     * field at a hardcoded (payload size, manual offset) pair in an opaque
+     * MI IQ struct -- see g_iq in src/star/hal_isp.c. Those numbers were
+     * read out of an INFINITY6E libmi_isp.so with objdump, and they are
+     * properties of that library build, not of the MI API. Nothing else
+     * here carries that risk: the rest of the backend calls typed entry
+     * points whose ABI divinus already exercises on infinity6b0, whereas
+     * the IQ pokes are raptor's alone and divinus has no equivalent to
+     * corroborate.
+     *
+     * A wrong offset does not fail. Access is read-modify-write, so it
+     * lands a plausible value in the wrong field of a struct nobody has
+     * fully described, and the image quietly degrades with nothing naming
+     * the cause. False here means isp_set_* returns RSS_ERR_NOTSUP and rvd
+     * leaves the tuning binary in charge -- which is the correct image
+     * either way, just not an adjustable one.
+     *
+     * Deriving them needs no board, only the library:
+     *   arm-linux-gnueabihf-objdump -d \
+     *       --disassemble=MI_ISP_IQ_GetBrightness libmi_isp.so
+     * prints the payload size into the size slot. If the five offsets
+     * match INFINITY6E's, this becomes a shared block again.
      */
+#if defined(PLATFORM_INFINITY6E)
     .has_defog = true,
     .has_sinter = true,
     .has_temper = true,
     .has_ae_comp = true,
     .has_max_gain = true,
+#endif
 
     /*
      * Audio — every audio cap stays false, and phase 4 does not change
@@ -919,10 +953,11 @@ const rss_hal_caps_t g_hal_caps = {
     .uses_new_sdk = false,
     .uses_impvi = false,
 
-    /* Limits — Infinity6E exposes 9 addressable VENC channels
+    /* Limits — the Infinity6 family exposes 9 addressable VENC channels
      * (I6_VENC_CHN_NUM in both divinus's i6_venc.h and waybeam's
      * sigmastar_types.h; divinus allocates channel state for all 9 and
-     * iterates them). An earlier 3 here came from misreading
+     * iterates them, for every family it drives through the i6 HAL).
+     * An earlier 3 here came from misreading
      * MI_VENC_MAX_CHN_NUM_PER_DC, which is the per-device-group limit and
      * not the total. Capped at RSS_MAX_ENC_CHANNELS (8) since that is
      * raptor's array bound, so 8 is the most this field can honestly
@@ -944,7 +979,8 @@ const rss_hal_caps_t g_hal_caps = {
      * output port (src/star/hal_framesource.c) and a VPE channel has four
      * of them: divinus's teardown disables ports 0..3 (i6_hal.c:365) and
      * waybeam uses 0 and 1. Measured on an SSC30KQ: all four ports accept
-     * MI_VPE_SetPortMode at 640x360 NV12. */
+     * MI_VPE_SetPortMode at 640x360 NV12. The port count is a VPE property
+     * rather than a per-family one, so INFINITY6B0 inherits it unmeasured. */
     .max_enc_channels = 8,
     .max_fs_channels = 4,
     /* Keep in step with STAR_OSD_REGION_MAX in src/star/star_state.h.
@@ -955,5 +991,5 @@ const rss_hal_caps_t g_hal_caps = {
 };
 
 #else
-#error "No PLATFORM_* defined. Set one of: PLATFORM_T10 T20 T21 T23 T30 T31 T32 T33 T40 T41 INFINITY6E"
+#error "No PLATFORM_* defined. Set one of: PLATFORM_T10 T20 T21 T23 T30 T31 T32 T33 T40 T41 INFINITY6E INFINITY6B0"
 #endif
