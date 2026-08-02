@@ -500,8 +500,10 @@ typedef struct {
      * per-sensor tuning file rather than by scalar controls, and without
      * the right one the vendor 3A falls back to a generic table and the
      * image comes out miscoloured. The backend derives the usual path
-     * from the sensor name (/etc/sensors/<name>.bin on OpenIPC), so this
-     * only needs setting for a tuning file kept somewhere else.
+     * from the sensor name, searching the directories the distributions
+     * ship these in (/etc/sensors on OpenIPC, /usr/share/sensor on
+     * thingino), so this only needs setting for a tuning file kept
+     * somewhere else.
      *
      * Ingenic backends ignore it: there the equivalent tuning is
      * compiled into the sensor driver.

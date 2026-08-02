@@ -1493,6 +1493,98 @@ static void test_the_tuning_is_reloaded_when_the_isp_resets(void)
     CHECK(st.iq_reloads == 5, "the counter must stop at 5, got %d", st.iq_reloads);
 }
 
+static void touch_file(const char *dir, const char *leaf)
+{
+    char path[256];
+    FILE *f;
+
+    snprintf(path, sizeof(path), "%s/%s", dir, leaf);
+    f = fopen(path, "w");
+    assert(f);
+    fclose(f);
+}
+
+/*
+ * The tuning file is found by searching, and the order is the contract:
+ * a rootfs carrying both layouts must resolve to the first directory, and
+ * one carrying only the second must still resolve. Retargeting the search
+ * at temporary directories is the only way to assert either, since the
+ * real paths are absolute and not writable by a test.
+ */
+static void test_iq_file_search_order(void)
+{
+    char dir_a[] = "/tmp/raptor-iq-a-XXXXXX";
+    char dir_b[] = "/tmp/raptor-iq-b-XXXXXX";
+    const char *saved_a = star_iq_dirs[0];
+    const char *saved_b = star_iq_dirs[1];
+    rss_sensor_config_t cfg;
+    star_state_t st;
+    char out[128];
+    char expect[128];
+    char explicit_path[64];
+
+    /*
+     * The directories themselves, before they are retargeted. Asserting
+     * the search order alone would not notice these being reordered or
+     * renamed, which is the half of the contract the distributions see.
+     */
+    CHECK(sizeof(star_iq_dirs) / sizeof(star_iq_dirs[0]) == 2, "expected two search directories");
+    CHECK(strcmp(saved_a, "/etc/sensors") == 0, "first directory must be /etc/sensors, got %s",
+          saved_a);
+    CHECK(strcmp(saved_b, "/usr/share/sensor") == 0,
+          "second directory must be /usr/share/sensor, got %s", saved_b);
+
+    assert(mkdtemp(dir_a));
+    assert(mkdtemp(dir_b));
+    star_iq_dirs[0] = dir_a;
+    star_iq_dirs[1] = dir_b;
+
+    memset(&st, 0, sizeof(st));
+    memset(&cfg, 0, sizeof(cfg));
+    /* Upper case on purpose: MI reports "GC4653", the file is gc4653.bin. */
+    snprintf(cfg.name, sizeof(cfg.name), "GC4653");
+
+    CHECK(!star_isp_resolve_iq(&st, &cfg, out, sizeof(out)),
+          "no tuning file anywhere must not resolve");
+    CHECK(out[0] == '\0', "a failed resolve must leave the path empty");
+
+    /* Only the second directory has it: the fallback has to be reached. */
+    touch_file(dir_b, "gc4653.bin");
+    snprintf(expect, sizeof(expect), "%s/gc4653.bin", dir_b);
+    CHECK(star_isp_resolve_iq(&st, &cfg, out, sizeof(out)), "second directory must resolve");
+    CHECK(strcmp(out, expect) == 0, "expected %s, got %s", expect, out);
+
+    /* Both have it: the first wins. */
+    touch_file(dir_a, "gc4653.bin");
+    snprintf(expect, sizeof(expect), "%s/gc4653.bin", dir_a);
+    CHECK(star_isp_resolve_iq(&st, &cfg, out, sizeof(out)), "first directory must resolve");
+    CHECK(strcmp(out, expect) == 0, "search order broken: expected %s, got %s", expect, out);
+
+    /* An explicit iq_file outranks the search. */
+    touch_file(dir_b, "custom.bin");
+    snprintf(explicit_path, sizeof(explicit_path), "%s/custom.bin", dir_b);
+    snprintf(cfg.iq_file, sizeof(cfg.iq_file), "%s", explicit_path);
+    CHECK(star_isp_resolve_iq(&st, &cfg, out, sizeof(out)), "explicit iq_file must resolve");
+    CHECK(strcmp(out, explicit_path) == 0, "explicit iq_file must win, got %s", out);
+
+    /* An unreadable iq_file falls back to the search rather than failing. */
+    snprintf(cfg.iq_file, sizeof(cfg.iq_file), "%s/absent.bin", dir_b);
+    snprintf(expect, sizeof(expect), "%s/gc4653.bin", dir_a);
+    CHECK(star_isp_resolve_iq(&st, &cfg, out, sizeof(out)),
+          "an unreadable iq_file must fall back to the search");
+    CHECK(strcmp(out, expect) == 0, "expected fallback to %s, got %s", expect, out);
+
+    snprintf(expect, sizeof(expect), "%s/gc4653.bin", dir_a);
+    remove(expect);
+    snprintf(expect, sizeof(expect), "%s/gc4653.bin", dir_b);
+    remove(expect);
+    remove(explicit_path);
+    rmdir(dir_a);
+    rmdir(dir_b);
+    star_iq_dirs[0] = saved_a;
+    star_iq_dirs[1] = saved_b;
+}
+
 int main(void)
 {
     test_table_bounds();
@@ -1521,6 +1613,7 @@ int main(void)
     test_max_exposure_can_raise_a_conservative_ceiling();
     test_limits_are_reasserted_when_configured();
     test_the_tuning_is_reloaded_when_the_isp_resets();
+    test_iq_file_search_order();
 
     if (failures) {
         printf("\n%d check(s) failed\n", failures);

@@ -737,14 +737,29 @@ static int star_isp_wait_ready(star_state_t *st, unsigned int timeout_ms, bool v
 }
 
 /*
+ * Directories that ship one tuning binary per sensor, searched in order.
+ *
+ * The file is named after the sensor's driver module
+ * (sensor_gc4653_mipi.ko -> gc4653.bin), which is the same string 2e's
+ * sensor_detect already produces, so on a stock image the right file is
+ * found with nothing declared anywhere. Distributions disagree on the
+ * directory -- OpenIPC installs into /etc/sensors, thingino keeps them in
+ * /usr/share/sensor -- and the same binary is expected to boot on either
+ * rootfs, so both are searched rather than one being fixed at build time.
+ *
+ * Element type is pointer-to-const rather than a const array: the tests
+ * retarget these at temporary directories to exercise the search order.
+ */
+static const char *star_iq_dirs[] = {
+    "/etc/sensors",
+    "/usr/share/sensor",
+};
+
+/*
  * Work out which tuning binary to load.
  *
- * An explicit [sensor] iq_file wins. Otherwise the sensor's own name
- * gives it away: OpenIPC installs one binary per sensor as
- * /etc/sensors/<name>.bin, named exactly as the kernel module is
- * (sensor_gc4653_mipi.ko -> gc4653.bin), which is the same string 2e's
- * sensor_detect already produces. So on a stock OpenIPC image the
- * correct tuning file is found with nothing declared anywhere.
+ * An explicit [sensor] iq_file wins; failing that the sensor's own name
+ * picks the file out of the directories above.
  *
  * Returns true and fills out[] when a readable file was found.
  */
@@ -753,7 +768,8 @@ static bool star_isp_resolve_iq(star_state_t *st, const rss_sensor_config_t *cfg
 {
     const char *name = NULL;
     char lower[64];
-    size_t i;
+    char tried[192] = "";
+    size_t i, d, off = 0;
 
     out[0] = '\0';
 
@@ -787,15 +803,22 @@ static bool star_isp_resolve_iq(star_state_t *st, const rss_sensor_config_t *cfg
         lower[i] = (char)tolower((unsigned char)name[i]);
     lower[i] = '\0';
 
-    snprintf(out, len, "/etc/sensors/%s.bin", lower);
-    if (access(out, R_OK) == 0) {
-        HAL_LOG_DBG("isp: tuning file %s (from sensor name)", out);
-        return true;
+    for (d = 0; d < sizeof(star_iq_dirs) / sizeof(star_iq_dirs[0]); d++) {
+        snprintf(out, len, "%s/%s.bin", star_iq_dirs[d], lower);
+        if (access(out, R_OK) == 0) {
+            HAL_LOG_DBG("isp: tuning file %s (from sensor name)", out);
+            return true;
+        }
+        if (off < sizeof(tried)) {
+            int n = snprintf(tried + off, sizeof(tried) - off, "%s%s", off ? " " : "", out);
+            if (n > 0)
+                off += (size_t)n;
+        }
     }
 
-    HAL_LOG_WARN("isp: no tuning file at %s; the generic vendor tuning stays loaded "
-                 "and colour will be off",
-                 out);
+    HAL_LOG_WARN("isp: no tuning file for %s (tried %s); the generic vendor tuning stays "
+                 "loaded and colour will be off",
+                 lower, tried);
     out[0] = '\0';
     return false;
 }
