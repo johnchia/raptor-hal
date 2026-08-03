@@ -854,11 +854,9 @@ const rss_hal_caps_t g_hal_caps = {
     .max_sensors = 1,
     /* Permanent false: T23-specific IMP_ISP_MultiCamera_* API. */
     .has_t23_multicam_api = false,
-    /* The sensor is fixed when sensor_<name>_mipi.ko is insmod'd and MI
-     * addresses it by index, so the HAL names it from /proc/modules and never
-     * needs an I2C address. [sensor] name/i2c_addr are overrides here, not
-     * requirements. */
-    .has_sensor_detect = true,
+    /* MI binds the sensor when its driver loads and addresses it by index,
+     * so the backend resolves its identity and needs no I2C address. */
+    .sdk_owns_sensor = true,
 
     /*
      * ISP tuning — phase 3. True only where MI has a control that

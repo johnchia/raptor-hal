@@ -740,9 +740,9 @@ static int star_isp_wait_ready(star_state_t *st, unsigned int timeout_ms, bool v
  * Directories that ship one tuning binary per sensor, searched in order.
  *
  * The file is named after the sensor's driver module
- * (sensor_gc4653_mipi.ko -> gc4653.bin), which is the same string 2e's
- * sensor_detect already produces, so on a stock image the right file is
- * found with nothing declared anywhere. Distributions disagree on the
+ * (sensor_gc4653_mipi.ko -> gc4653.bin), which is the string the backend
+ * reads from /proc/modules during bring-up, so on a stock image the right
+ * file is found with nothing declared anywhere. Distributions disagree on the
  * directory -- OpenIPC installs into /etc/sensors, thingino keeps them in
  * /usr/share/sensor -- and the same binary is expected to boot on either
  * rootfs, so both are searched rather than one being fixed at build time.
@@ -756,10 +756,8 @@ static const char *star_iq_dirs[] = {
 };
 
 /*
- * Work out which tuning binary to load.
- *
- * An explicit [sensor] iq_file wins; failing that the sensor's own name
- * picks the file out of the directories above.
+ * Work out which tuning binary to load: the sensor's own name picks the file
+ * out of the directories above.
  *
  * Returns true and fills out[] when a readable file was found.
  */
@@ -773,29 +771,22 @@ static bool star_isp_resolve_iq(star_state_t *st, const rss_sensor_config_t *cfg
 
     out[0] = '\0';
 
-    if (cfg && cfg->iq_file[0]) {
-        if (access(cfg->iq_file, R_OK) == 0) {
-            snprintf(out, len, "%s", cfg->iq_file);
-            HAL_LOG_DBG("isp: tuning file %s (from config)", out);
-            return true;
-        }
-        HAL_LOG_WARN("isp: configured tuning file %s is not readable; trying the sensor default",
-                     cfg->iq_file);
-    }
-
     /*
-     * cfg->name is preferred over MI's plane.sensName because the file
-     * is named after the driver module, which is what cfg->name came
-     * from. plane.sensName is the same identity as MI reports it
-     * ("GC4653"), and is the fallback when nothing named the sensor.
+     * The module name resolves the file, so the backend's own reading of it
+     * comes first among the two that carry that spelling; an operator's
+     * [sensor] name overrides it, since naming it explicitly is a deliberate
+     * act. plane.sensName is the same identity spelled MI's way and is the
+     * last resort, for a board whose module is named unusually.
      */
     if (cfg && cfg->name[0])
         name = cfg->name;
+    else if (st->sensor_name[0])
+        name = st->sensor_name;
     else if (st->snr_enabled && st->plane.sensName[0])
         name = st->plane.sensName;
 
     if (!name) {
-        HAL_LOG_WARN("isp: no sensor name and no iq_file; the generic vendor tuning stays loaded");
+        HAL_LOG_WARN("isp: no sensor name; the generic vendor tuning stays loaded");
         return false;
     }
 

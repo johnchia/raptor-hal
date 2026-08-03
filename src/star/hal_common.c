@@ -176,10 +176,9 @@ static bool star_sensor_name_matches(const char *cfg_name, const char *drv_name)
  * star_sensor_detect -- name the loaded sensor driver without touching MI.
  *
  * MI reports the sensor name in i6_snr_plane.sensName, but only after
- * MI_SNR_Enable, and a daemon needs the name earlier than that: it builds the
- * config it hands to hal_init, and on Ingenic that config is what tells IMP
- * which sensor to talk to. So this reads what the kernel has already published
- * instead, and is the one op valid before init.
+ * MI_SNR_Enable, and spelled MI's way. The tuning binary is named after the
+ * driver module, so that spelling is the one that resolves it -- and it is
+ * readable from the kernel before MI can answer at all.
  *
  * On SigmaStar the sensor is a kernel module, insmod'd as sensor_<name>_mipi
  * (or _dvp), so /proc/modules already carries the answer:
@@ -254,17 +253,6 @@ static int star_sensor_detect_from(const char *path, char *buf, size_t len)
     /* Both names, so a mis-trimmed module is obvious from the log alone. */
     HAL_LOG_INFO("sensor detect: \"%s\" (module %s in %s)", buf, module, path);
     return RSS_OK;
-}
-
-static int hal_sensor_detect(void *ctx, char *buf, size_t len)
-{
-    /*
-     * Deliberately does not go through star_state(): this op is legal before
-     * init, when there is no MI state to consult, and it needs none.
-     */
-    if (!ctx)
-        return RSS_ERR_INVAL;
-    return star_sensor_detect_from("/proc/modules", buf, len);
 }
 
 /*
@@ -429,6 +417,14 @@ static int star_sensor_bringup(star_state_t *st, const rss_sensor_config_t *cfg,
     ret = st->snr.fnSetOrientation(STAR_SNR_INDEX, mirror ? 1 : 0, flip ? 1 : 0);
     if (ret)
         HAL_LOG_WARN("MI_SNR_SetOrien(%d,%d) failed: %d", mirror, flip, ret);
+
+    /*
+     * Read the driver module's name before Enable. It needs no MI call, and
+     * the ISP wants it when hal_init loads the tuning binary.
+     */
+    if (star_sensor_detect_from("/proc/modules", st->sensor_name, sizeof(st->sensor_name)) !=
+        RSS_OK)
+        st->sensor_name[0] = '\0';
 
     ret = st->snr.fnEnable(STAR_SNR_INDEX);
     if (ret) {
@@ -1226,7 +1222,6 @@ static const rss_hal_ops_t g_ops = {
     .init = hal_init,
     .deinit = hal_deinit,
     .get_caps = hal_get_caps,
-    .sensor_detect = hal_sensor_detect,
 
     /* System utilities */
     .sys_get_version = hal_sys_get_version,

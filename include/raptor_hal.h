@@ -493,22 +493,6 @@ typedef struct {
     uint16_t height;
     uint32_t fps;
 
-    /*
-     * Optional ISP tuning binary, empty to let the backend find its own.
-     *
-     * Only the SigmaStar backend reads this. Its ISP is driven by a
-     * per-sensor tuning file rather than by scalar controls, and without
-     * the right one the vendor 3A falls back to a generic table and the
-     * image comes out miscoloured. The backend derives the usual path
-     * from the sensor name, searching the directories the distributions
-     * ship these in (/etc/sensors on OpenIPC, /usr/share/sensor on
-     * thingino), so this only needs setting for a tuning file kept
-     * somewhere else.
-     *
-     * Ingenic backends ignore it: there the equivalent tuning is
-     * compiled into the sensor driver.
-     */
-    char iq_file[128];
 
     /*
      * Mirror and flip, as requested by the config.
@@ -701,14 +685,12 @@ typedef struct {
     int max_sensors;           /* 1 for T20-T31, 3 for T23-1.3.0/T32/T40/T41 */
     bool has_t23_multicam_api; /* T23 1.3.0 IMP_ISP_MultiCamera_* functions */
     /*
-     * The HAL can name the attached sensor itself, via the sensor_detect op,
-     * and does not need an I2C address to reach it. True on SDKs that bind the
-     * sensor at driver-load time and address it by index afterwards, so a
-     * daemon should treat [sensor] name/i2c_addr as an override rather than
-     * as required configuration. False on Ingenic, where IMP is told the
-     * sensor's name and address explicitly.
+     * The SDK binds the sensor when its driver loads and addresses it by
+     * index, so the HAL resolves the sensor's identity itself and neither a
+     * name nor an I2C address is required configuration. Either may still be
+     * given, and is then advisory. False on Ingenic, which is told both.
      */
-    bool has_sensor_detect;
+    bool sdk_owns_sensor;
     bool has_defog;
     bool has_dpc;
     bool has_drc;
@@ -766,18 +748,6 @@ typedef struct rss_hal_ops {
     int (*init)(void *ctx, const rss_multi_sensor_config_t *multi_cfg);
     int (*deinit)(void *ctx);
     const rss_hal_caps_t *(*get_caps)(void *ctx);
-    /*
-     * Name the attached sensor. Unlike every other op here this one is valid
-     * *before* init -- it has to be, because a daemon needs the name in order
-     * to build the config it passes to init. Implementations must therefore
-     * answer without touching the vendor SDK; reading what the kernel already
-     * published about the loaded driver is the intended shape.
-     *
-     * Writes a NUL-terminated lowercase driver name ("gc4653") to buf and
-     * returns RSS_OK, or RSS_ERR_NOENT if no sensor driver is loaded. Callers
-     * gate on caps.has_sensor_detect.
-     */
-    int (*sensor_detect)(void *ctx, char *buf, size_t len);
     int (*bind)(void *ctx, const rss_cell_t *src, const rss_cell_t *dst);
     int (*unbind)(void *ctx, const rss_cell_t *src, const rss_cell_t *dst);
 

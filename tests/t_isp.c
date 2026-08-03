@@ -1521,7 +1521,6 @@ static void test_iq_file_search_order(void)
     star_state_t st;
     char out[128];
     char expect[128];
-    char explicit_path[64];
 
     /*
      * The directories themselves, before they are retargeted. Asserting
@@ -1560,25 +1559,32 @@ static void test_iq_file_search_order(void)
     CHECK(star_isp_resolve_iq(&st, &cfg, out, sizeof(out)), "first directory must resolve");
     CHECK(strcmp(out, expect) == 0, "search order broken: expected %s, got %s", expect, out);
 
-    /* An explicit iq_file outranks the search. */
-    touch_file(dir_b, "custom.bin");
-    snprintf(explicit_path, sizeof(explicit_path), "%s/custom.bin", dir_b);
-    snprintf(cfg.iq_file, sizeof(cfg.iq_file), "%s", explicit_path);
-    CHECK(star_isp_resolve_iq(&st, &cfg, out, sizeof(out)), "explicit iq_file must resolve");
-    CHECK(strcmp(out, explicit_path) == 0, "explicit iq_file must win, got %s", out);
-
-    /* An unreadable iq_file falls back to the search rather than failing. */
-    snprintf(cfg.iq_file, sizeof(cfg.iq_file), "%s/absent.bin", dir_b);
+    /*
+     * With no [sensor] name, the module name the backend read during
+     * bring-up is what resolves the file. This is the path a stock image
+     * takes, since no board config names the sensor.
+     */
+    cfg.name[0] = '\0';
+    snprintf(st.sensor_name, sizeof(st.sensor_name), "gc4653");
     snprintf(expect, sizeof(expect), "%s/gc4653.bin", dir_a);
     CHECK(star_isp_resolve_iq(&st, &cfg, out, sizeof(out)),
-          "an unreadable iq_file must fall back to the search");
-    CHECK(strcmp(out, expect) == 0, "expected fallback to %s, got %s", expect, out);
+          "the detected module name must resolve the file");
+    CHECK(strcmp(out, expect) == 0, "expected %s, got %s", expect, out);
+
+    /* MI's own spelling is the last resort, and is spelled its way. */
+    st.sensor_name[0] = '\0';
+    st.snr_enabled = true;
+    snprintf(st.plane.sensName, sizeof(st.plane.sensName), "GC4653");
+    CHECK(star_isp_resolve_iq(&st, &cfg, out, sizeof(out)),
+          "MI's sensor name must resolve the file when nothing else names it");
+    CHECK(strcmp(out, expect) == 0, "expected %s, got %s", expect, out);
+    st.snr_enabled = false;
+    st.plane.sensName[0] = '\0';
 
     snprintf(expect, sizeof(expect), "%s/gc4653.bin", dir_a);
     remove(expect);
     snprintf(expect, sizeof(expect), "%s/gc4653.bin", dir_b);
     remove(expect);
-    remove(explicit_path);
     rmdir(dir_a);
     rmdir(dir_b);
     star_iq_dirs[0] = saved_a;

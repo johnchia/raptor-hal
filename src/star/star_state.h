@@ -592,6 +592,14 @@ typedef struct {
     int aud_nobuf_recover[STAR_AUD_CHN_MAX];
     int aud_ok_run[STAR_AUD_CHN_MAX];
 
+    /*
+     * The loaded sensor driver's own name, read from /proc/modules during
+     * bring-up. The tuning binary is named after the driver module, so this
+     * is what resolves it; MI's plane.sensName is the same sensor spelled
+     * MI's way and only exists after Enable.
+     */
+    char sensor_name[64];
+
     /* Unwind flags -- each set only once its step has succeeded, so
      * teardown undoes exactly what was done and no more. */
     bool sys_inited;
