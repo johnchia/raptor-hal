@@ -1717,44 +1717,19 @@ static uint32_t star_ae_total_gain(const i6_isp_ae_status *ae)
 }
 
 /*
- * Thresholds for the one-shot lane-identification line below. A lane mean
- * this close to the 255 ceiling is a clipped frame carrying no colour
- * information; fewer than this many counts between the brightest and
- * dimmest colour lane is a scene too neutral to tell any lane order from
- * another. The Y tolerance is generous on purpose -- the AE grid is
- * subsampled and its weights are the vendor's, so the check is meant to
- * separate "lane 3 is luma" from "lane 3 is a colour channel", not to
- * validate a colour matrix.
- */
-#define STAR_AE_LANE_CLIP 240u
-
-/*
- * How far the runner-up order has to sit behind the winner, averaged over
- * the cells scored, before the win means anything. One count per cell is
- * inside integer-division rounding; two is not.
- */
-#define STAR_AE_LANE_MARGIN 2u
-
-/* Enough cells that the sums are a population, not a sample. */
-#define STAR_AE_LANE_MIN_CELLS 64u
-
-/* At file scope rather than inside the function so the host suite can
- * clear it between cases; a one-shot latch is otherwise untestable except
- * in whichever test happens to run first. */
-static bool star_ae_lanes_identified;
-static bool star_ae_lanes_ambiguous;
-
-/*
- * Mean of the AE grid's Y lane, or 0 if the layout cannot be confirmed.
+ * Mean of the AE grid's Y lane, or 0 if the grid cannot be trusted.
  *
- * The confirmation is the point. i6_isp.h derives a 128x90 grid of
- * 4-byte cells from two wrappers' payload sizes but cannot place the
- * eight spare bytes, so this reads the grid dimensions from the AE status
- * (which has its own field offsets) and looks for them at both ends of
- * the stats block. A match places the cells; no match means the layout
- * guess is wrong, and then the honest answer is no luma -- averaging the
- * wrong offset produces a number that looks like a reading and moves the
- * IR-cut filter.
+ * The layout is MI_ISP_AE_HW_STATISTICS_t: the grid dimensions lead and
+ * the cells are r,g,b,y with luma at lane 3 (see i6_isp.h). What still has
+ * to happen at runtime is reading the dimensions -- the buffer is sized
+ * for the 128x90 maximum and this sensor reports 32x32, so averaging the
+ * whole buffer would average 11,000 cells of zeros into the answer.
+ *
+ * The dimensions are checked against the AE status' own copy before
+ * anything is averaged. It is the same witness the layout search used to
+ * choose between two candidate placements, kept because a grid that
+ * disagrees with itself is a reason to report no luma rather than a
+ * plausible-looking number that will move the IR-cut filter.
  */
 static uint32_t star_ae_luma(star_state_t *st, const i6_isp_ae_status *ae)
 {
@@ -1799,28 +1774,18 @@ static uint32_t star_ae_luma(star_state_t *st, const i6_isp_ae_status *ae)
         return 0;
     }
 
-    if (stats->lead.blkX == blk_x && stats->lead.blkY == blk_y) {
-        cell = stats->lead.cell;
-    } else if (stats->trail.blkX == blk_x && stats->trail.blkY == blk_y) {
-        cell = stats->trail.cell;
-    } else {
-        /*
-         * Both ends disagree with the AE status. One log line with the
-         * eight candidate bytes is enough to place them from a board
-         * log, which is the only place the answer exists.
-         */
+    if (stats->blkX != blk_x || stats->blkY != blk_y) {
         if (!layout_warned) {
-            HAL_LOG_WARN("isp: AE stats layout unconfirmed for a %ux%u grid "
-                         "(lead %u,%u trail %u,%u) -- no scene luma, day/night "
-                         "falls back to gain only",
-                         blk_x, blk_y, stats->lead.blkX, stats->lead.blkY, stats->trail.blkX,
-                         stats->trail.blkY);
+            HAL_LOG_WARN("isp: AE stats report a %ux%u grid where the AE status says %ux%u -- "
+                         "no scene luma, day/night falls back to gain only",
+                         stats->blkX, stats->blkY, blk_x, blk_y);
             layout_warned = true;
         }
         free(stats);
         return 0;
     }
 
+    cell = stats->cell;
     cells = blk_x * blk_y;
     for (unsigned int i = 0; i < cells; i++)
         for (unsigned int lane = 0; lane < I6_ISP_AE_CELL_SZ; lane++)
@@ -1829,10 +1794,10 @@ static uint32_t star_ae_luma(star_state_t *st, const i6_isp_ae_status *ae)
     luma = (uint32_t)(sum[I6_ISP_AE_CELL_Y] / cells);
 
     /*
-     * Where the cells sit, once. Any frame with data in it settles that, so
-     * the only guard needed is against an all-zero sample -- not
-     * hypothetical, since an ISP freshly reset to its defaults reports
-     * exactly that.
+     * The grid and its lane means, once. Guarded against an all-zero
+     * sample -- not hypothetical, since an ISP freshly reset to its
+     * defaults reports exactly that, and a line of zeros would be read as
+     * the layout having been confirmed against a black frame.
      *
      * The lane means are computed in the argument list rather than into an
      * array, because HAL_LOG_DBG compiles away entirely without HAL_DEBUG
@@ -1840,107 +1805,10 @@ static uint32_t star_ae_luma(star_state_t *st, const i6_isp_ae_status *ae)
      * release build.
      */
     if (!layout_logged && (sum[0] || sum[1] || sum[2] || sum[3])) {
-        HAL_LOG_DBG("isp: AE grid %ux%u, cells at offset %u, lane means "
-                    "r=%u g=%u b=%u y=%u (y is the one used)",
-                    blk_x, blk_y, cell == stats->lead.cell ? 8u : 0u,
-                    (unsigned int)(sum[0] / cells), (unsigned int)(sum[1] / cells),
+        HAL_LOG_DBG("isp: AE grid %ux%u, lane means r=%u g=%u b=%u y=%u (y is the one used)",
+                    blk_x, blk_y, (unsigned int)(sum[0] / cells), (unsigned int)(sum[1] / cells),
                     (unsigned int)(sum[2] / cells), (unsigned int)(sum[3] / cells));
         layout_logged = true;
-    }
-
-    /*
-     * WHICH lane is which is a separate question, and the placement line
-     * cannot answer it. Two things make it harder than it looks.
-     *
-     * Spread between the lanes is necessary but nowhere near sufficient.
-     * What separates two orders is the weight difference across the lanes
-     * they exchange, so an r/g swap moves the prediction by only
-     * 0.288 * |r - g| -- r=40 g=36 b=24 y=36 has 16 counts of spread and
-     * all six orders land within tolerance of that y.
-     *
-     * And the grid mean cannot supply the colour anyway, because AWB is
-     * built to remove it: point the camera at a saturated blue and the
-     * frame mean comes back r=55 g=38 b=43, red highest, blue corrected
-     * away. Waiting for a colourful mean is waiting for the thing AWB
-     * exists to prevent.
-     *
-     * So score the cells, not the mean. AWB neutralises the average over
-     * the frame; it does not make every cell grey, and a 32x32 grid gives
-     * a thousand of them. Summing each order's error across all cells
-     * turns a per-cell difference too small to see into a total that
-     * separates, and the correct order wins by more the more colour is
-     * anywhere in the scene.
-     */
-    if (!star_ae_lanes_identified) {
-        /* Every way r,g,b could sit in lanes 0..2; the first is waybeam's. */
-        static const unsigned char perm[6][3] = {{0, 1, 2}, {0, 2, 1}, {1, 0, 2},
-                                                 {1, 2, 0}, {2, 0, 1}, {2, 1, 0}};
-        uint64_t err_sum[6] = {0};
-        unsigned int scored = 0;
-        unsigned int best = 0, rival = 0;
-
-        for (unsigned int i = 0; i < cells; i++) {
-            const unsigned char *c = &cell[i * I6_ISP_AE_CELL_SZ];
-            unsigned int y = c[I6_ISP_AE_CELL_Y];
-
-            /* A clipped cell has lost the ratios this depends on. */
-            if (c[0] >= STAR_AE_LANE_CLIP || c[1] >= STAR_AE_LANE_CLIP ||
-                c[2] >= STAR_AE_LANE_CLIP)
-                continue;
-
-            for (unsigned int p = 0; p < 6; p++) {
-                unsigned int pred =
-                    (299u * c[perm[p][0]] + 587u * c[perm[p][1]] + 114u * c[perm[p][2]]) / 1000u;
-
-                err_sum[p] += pred > y ? pred - y : y - pred;
-            }
-            scored++;
-        }
-
-        for (unsigned int p = 1; p < 6; p++)
-            if (err_sum[p] < err_sum[best])
-                best = p;
-
-        /* The closest order that is not the assumed one. */
-        rival = 1;
-        for (unsigned int p = 2; p < 6; p++)
-            if (err_sum[p] < err_sum[rival])
-                rival = p;
-
-        /*
-         * Require a margin per scored cell rather than a bare ordering:
-         * across a thousand cells the sums separate on rounding alone,
-         * and a lead of a fraction of a count each is not evidence.
-         */
-        if (scored >= STAR_AE_LANE_MIN_CELLS &&
-            (best == 0 ? err_sum[rival] - err_sum[0] : err_sum[0] - err_sum[best]) >=
-                (uint64_t)scored * STAR_AE_LANE_MARGIN) {
-            /*
-             * The assumed order confirming is the expected outcome and tells
-             * an operator nothing. Another order fitting better means every
-             * luma this file reports is built from the wrong bytes, and
-             * day/night follows that luma -- worth a warning.
-             */
-            if (best == 0)
-                HAL_LOG_DBG("isp: AE lanes over %u cells: r,g,b,y is off luma by %llu/cell, "
-                            "the nearest other order by %llu/cell -- the order is confirmed",
-                            scored, (unsigned long long)(err_sum[0] / scored),
-                            (unsigned long long)(err_sum[rival] / scored));
-            else
-                HAL_LOG_WARN("isp: AE lanes over %u cells: r,g,b,y is off luma by %llu/cell but "
-                             "another order fits better at %llu/cell -- scene luma is being read "
-                             "from the wrong bytes",
-                             scored, (unsigned long long)(err_sum[0] / scored),
-                             (unsigned long long)(err_sum[best] / scored));
-            star_ae_lanes_identified = true;
-        } else if (!star_ae_lanes_ambiguous && scored >= STAR_AE_LANE_MIN_CELLS) {
-            HAL_LOG_DBG("isp: AE lanes over %u cells do not separate yet (r,g,b,y off luma "
-                        "by %llu/cell, nearest other order %llu/cell); needs colour somewhere "
-                        "in frame, which AWB works against",
-                        scored, (unsigned long long)(err_sum[0] / scored),
-                        (unsigned long long)(err_sum[rival] / scored));
-            star_ae_lanes_ambiguous = true;
-        }
     }
 
     free(stats);

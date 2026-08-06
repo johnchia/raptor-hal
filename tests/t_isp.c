@@ -19,7 +19,6 @@
 #include "star/hal_isp.c"
 
 #include <assert.h>
-#include <stdarg.h>
 #include <stdio.h>
 
 /*
@@ -43,37 +42,6 @@ static void quiet_log(int level, const char *file, int line, const char *fmt, ..
     (void)file;
     (void)line;
     (void)fmt;
-}
-
-/*
- * Some behaviour of this backend IS a log line -- the AE lane
- * identification exists only to be read off a board log -- so one test
- * needs to see what was written rather than just that nothing crashed.
- */
-static char g_log[8][256];
-static unsigned int g_log_lines;
-
-static void capture_log(int level, const char *file, int line, const char *fmt, ...)
-{
-    va_list ap;
-
-    (void)level;
-    (void)file;
-    (void)line;
-    if (g_log_lines >= 8)
-        return;
-    va_start(ap, fmt);
-    vsnprintf(g_log[g_log_lines], sizeof(g_log[0]), fmt, ap);
-    va_end(ap);
-    g_log_lines++;
-}
-
-static const char *log_containing(const char *needle)
-{
-    for (unsigned int i = 0; i < g_log_lines; i++)
-        if (strstr(g_log[i], needle))
-            return g_log[i];
-    return NULL;
 }
 
 rss_hal_log_func_t rss_hal_log_fn = quiet_log;
@@ -958,13 +926,12 @@ static void test_tuning_waits_for_the_ae(void)
 /*
  * ── isp_get_exposure ──────────────────────────────────────────────────
  *
- * The AE grid layout is derived, not documented: i6_isp.h gets the cell
- * width from two wrappers' payload sizes and cannot place the eight spare
- * bytes, so hal_isp.c decides at runtime by matching the grid dimensions
- * from the AE status against both ends of the block. These tests cover
- * both placements, the case where neither matches (which must yield no
- * luma rather than a number from the wrong offset), and the fixed-point
- * gain arithmetic.
+ * The AE grid's layout is the vendor's MI_ISP_AE_HW_STATISTICS_t, so what
+ * is left to test is what still happens at runtime: the buffer is sized
+ * for a 128x90 grid and the sensor reports 32x32, so the live dimensions
+ * decide how much of it is averaged, and a buffer whose dimensions
+ * disagree with the AE status must produce no luma rather than a number
+ * from the wrong cells. Plus the fixed-point gain arithmetic.
  */
 
 static i6_isp_ae_status g_ae_status;
@@ -1101,7 +1068,7 @@ static void test_exposure_gain_is_x1024_fixed_point(void)
     CHECK(hal_isp_get_exposure(&ctx, &exp) == RSS_ERR_IO, "a failed AE status must report io");
 }
 
-static void test_exposure_luma_from_either_layout(void)
+static void test_exposure_luma_covers_only_the_live_grid(void)
 {
     rss_hal_ctx_t ctx;
     star_state_t st;
@@ -1111,145 +1078,24 @@ static void test_exposure_luma_from_either_layout(void)
     g_ae_stats = malloc(sizeof(*g_ae_stats));
     assert(g_ae_stats);
 
-    /* Cells after the two dimension words. */
+    /*
+     * fill_grid puts a known ramp in the first 8 cells and a value the
+     * mean must not pick up in every cell after them -- so this fails if
+     * the average runs past the 4x2 grid the AE status reports into the
+     * rest of the 128x90 buffer.
+     */
     exposure_setup(&ctx, &st);
-    want = fill_grid(g_ae_stats->lead.cell, 8);
-    g_ae_stats->lead.blkX = 4;
-    g_ae_stats->lead.blkY = 2;
-    CHECK(hal_isp_get_exposure(&ctx, &exp) == RSS_OK, "a lead-placed grid must read");
-    CHECK(exp.ae_luma == want, "lead layout luma is %u, got %u", want, exp.ae_luma);
-
-    /* Cells first, dimensions after. */
-    exposure_setup(&ctx, &st);
-    want = fill_grid(g_ae_stats->trail.cell, 8);
-    g_ae_stats->trail.blkX = 4;
-    g_ae_stats->trail.blkY = 2;
-    CHECK(hal_isp_get_exposure(&ctx, &exp) == RSS_OK, "a trail-placed grid must read");
-    CHECK(exp.ae_luma == want, "trail layout luma is %u, got %u", want, exp.ae_luma);
+    want = fill_grid(g_ae_stats->cell, 8);
+    g_ae_stats->blkX = 4;
+    g_ae_stats->blkY = 2;
+    CHECK(hal_isp_get_exposure(&ctx, &exp) == RSS_OK, "the grid must read");
+    CHECK(exp.ae_luma == want, "luma is %u, got %u", want, exp.ae_luma);
 
     free(g_ae_stats);
     g_ae_stats = NULL;
 }
 
-/*
- * The AE lane-identification line must not be spent on a frame that
- * cannot answer the question it exists to ask.
- *
- * This has now cost two board runs. The first logged r=0 g=0 b=0 y=0 from
- * an ISP that had just been reset to its defaults; the guard added for
- * that only rejected all-zero, so the second logged
- * r=253 g=252 b=253 y=253 -- a daylight scene clipped against the untuned
- * 300us shutter floor. Neither distinguishes any lane order from any
- * other, and both consumed the one shot for the process.
- *
- * The line is only worth writing on a frame with colour in it, and then
- * it should state a verdict rather than four numbers for someone to
- * weigh up by eye: with a genuine r,g,b,y layout, lane 3 is the BT.601
- * sum of the first three.
- */
-static void fill_lanes(unsigned char *cell, unsigned int cells, unsigned char r, unsigned char g,
-                       unsigned char b, unsigned char y)
-{
-    memset(g_ae_stats, 0xEE, sizeof(*g_ae_stats));
-
-    for (unsigned int i = 0; i < cells; i++) {
-        cell[i * I6_ISP_AE_CELL_SZ + 0] = r;
-        cell[i * I6_ISP_AE_CELL_SZ + 1] = g;
-        cell[i * I6_ISP_AE_CELL_SZ + 2] = b;
-        cell[i * I6_ISP_AE_CELL_SZ + I6_ISP_AE_CELL_Y] = y;
-    }
-}
-
-/* The grid the board reports. It has to be this big: the check scores
- * cells and declines to answer on fewer than STAR_AE_LANE_MIN_CELLS. */
-#define LANE_PROBE_BLK_X 32
-#define LANE_PROBE_BLK_Y 32
-
-static void lane_probe(unsigned char r, unsigned char g, unsigned char b, unsigned char y)
-{
-    rss_hal_ctx_t ctx;
-    star_state_t st;
-    rss_exposure_t exp;
-
-    exposure_setup(&ctx, &st);
-
-    /* The AE status is what says how big the grid is; the stats buffer has
-     * to agree with it or the layout is treated as unconfirmed. */
-    g_ae_status.avgBlkX = LANE_PROBE_BLK_X;
-    g_ae_status.avgBlkY = LANE_PROBE_BLK_Y;
-    fill_lanes(g_ae_stats->lead.cell, LANE_PROBE_BLK_X * LANE_PROBE_BLK_Y, r, g, b, y);
-    g_ae_stats->lead.blkX = LANE_PROBE_BLK_X;
-    g_ae_stats->lead.blkY = LANE_PROBE_BLK_Y;
-
-    /* The "still ambiguous" note is once per process, so clear it between
-     * probes -- each frame's own verdict is what is under test. */
-    star_ae_lanes_ambiguous = false;
-
-    g_log_lines = 0;
-    rss_hal_log_fn = capture_log;
-    CHECK(hal_isp_get_exposure(&ctx, &exp) == RSS_OK, "the probe frame must read");
-    rss_hal_log_fn = quiet_log;
-}
-
-static void test_ae_lane_identification_waits_for_a_frame_that_answers(void)
-{
-    g_ae_stats = malloc(sizeof(*g_ae_stats));
-    assert(g_ae_stats);
-    star_ae_lanes_identified = false;
-
-    /*
-     * The two frames that actually happened. Neither may confirm anything:
-     * every order predicts an all-zero cell perfectly, and a clipped cell
-     * is skipped outright, so the clipped frame scores none at all.
-     */
-    lane_probe(0, 0, 0, 0);
-    CHECK(!log_containing("order is confirmed"), "an all-zero frame identifies nothing");
-    lane_probe(253, 252, 253, 253);
-    CHECK(!log_containing("AE lanes"), "a clipped frame scores no cells and says nothing");
-
-    /* And the one that was reported as "should be good enough": a neutral
-     * scene is unclipped and still cannot separate the lanes. r and g equal
-     * means the orders that swap them predict identically. */
-    lane_probe(46, 46, 44, 46);
-    CHECK(!log_containing("order is confirmed"), "a neutral frame identifies nothing");
-    CHECK(!star_ae_lanes_identified, "none of those may consume the one shot");
-
-    /*
-     * A coloured frame whose lane 3 really is BT.601 luma:
-     * (299*180 + 587*90 + 114*40) / 1000 = 111, so r,g,b,y is off by 0 a cell
-     * and the nearest rival (b,r,g) by 16.
-     *
-     * Asserted on the state rather than the log, because confirming the
-     * assumed order is the uninteresting outcome and says so at debug level,
-     * which compiles out without HAL_DEBUG. The state is what the rest of
-     * the file depends on.
-     */
-    lane_probe(180, 90, 40, 111);
-    CHECK(star_ae_lanes_identified, "a coloured frame must settle the order");
-    CHECK(!log_containing("wrong bytes"), "and must not call the assumed order wrong");
-
-    /* One shot: the answer does not change, so nothing is scored again. */
-    lane_probe(180, 90, 40, 111);
-    CHECK(!log_containing("AE lanes"), "the question is asked once per process");
-
-    /*
-     * A lane 3 that is not luma is the outcome that matters, so it warns
-     * rather than being read as a confirmation. y = 40 is the b lane, so
-     * g,b,r,y fits far better.
-     */
-    star_ae_lanes_identified = false;
-    lane_probe(180, 90, 40, 40);
-    CHECK(log_containing("another order fits better") != NULL,
-          "a non-luma lane 3 must be called out: %s",
-          log_containing("AE lanes") ? log_containing("AE lanes") : "(nothing logged)");
-    CHECK(star_ae_lanes_identified, "and must still consume the one shot");
-
-    free(g_ae_stats);
-    g_ae_stats = NULL;
-    star_ae_lanes_identified = false;
-}
-
-static void test_exposure_refuses_an_unconfirmed_layout(void)
+static void test_exposure_refuses_a_grid_that_disagrees(void)
 {
     rss_hal_ctx_t ctx;
     star_state_t st;
@@ -1258,16 +1104,15 @@ static void test_exposure_refuses_an_unconfirmed_layout(void)
     g_ae_stats = malloc(sizeof(*g_ae_stats));
     assert(g_ae_stats);
 
-    /* Dimensions at neither end: the layout guess is wrong, so there is
-     * no luma to report. Averaging offset 0 regardless is what this test
-     * exists to prevent -- it would look like a reading and move the
-     * IR-cut filter. */
+    /* The stats buffer's own dimensions contradict the AE status'. Reading
+     * the cells anyway is what this test exists to prevent: the number
+     * would look like a reading and move the IR-cut filter. */
     exposure_setup(&ctx, &st);
-    fill_grid(g_ae_stats->trail.cell, 8);
-    g_ae_stats->trail.blkX = 999;
-    g_ae_stats->trail.blkY = 999;
+    fill_grid(g_ae_stats->cell, 8);
+    g_ae_stats->blkX = 999;
+    g_ae_stats->blkY = 999;
     CHECK(hal_isp_get_exposure(&ctx, &exp) == RSS_OK, "the gain half must still be reported");
-    CHECK(exp.ae_luma == 0, "an unconfirmed layout must yield no luma, got %u", exp.ae_luma);
+    CHECK(exp.ae_luma == 0, "a disagreeing grid must yield no luma, got %u", exp.ae_luma);
     CHECK(exp.total_gain == 2048, "gain must survive a luma failure, got %u", exp.total_gain);
 
     /* Dimensions the grid cannot hold are rejected before the stats call:
@@ -1708,9 +1553,8 @@ int main(void)
     test_tuning_waits_for_the_ae();
     test_exposure_waits_for_the_isp();
     test_exposure_gain_is_x1024_fixed_point();
-    test_exposure_luma_from_either_layout();
-    test_ae_lane_identification_waits_for_a_frame_that_answers();
-    test_exposure_refuses_an_unconfirmed_layout();
+    test_exposure_luma_covers_only_the_live_grid();
+    test_exposure_refuses_a_grid_that_disagrees();
     test_bin_limits_snapshot_records_the_tuning();
     test_gain_ceiling_refuses_ingenic_units();
     test_gain_ceiling_clamps_to_the_tuning();
