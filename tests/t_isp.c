@@ -9,13 +9,6 @@
 #define PLATFORM_INFINITY6E 1
 #define HAL_MODULE_VIDEO 1
 
-/* The AE gate's real budgets are 2000/400 ms of polling. Shortened here so
- * the timeout paths are exercised in milliseconds rather than seconds --
- * what is under test is which branch a timeout takes, not how long it is
- * willing to wait. */
-#define STAR_ISP_AE_TIMEOUT_MS 30
-#define STAR_ISP_AE_QUICK_MS 20
-
 #include "star/hal_isp.c"
 
 #include <assert.h>
@@ -810,120 +803,6 @@ static void test_tuning_load_leaves_3a_alone(void)
 }
 
 /*
- * The load has to wait for CUS3A's AE, not just for the IQ parameter
- * store.
- *
- * The AE's own init reads the generic iqfile from disk and takes its
- * limits from it, and that init is deferred to the first ISP frame
- * interrupt -- strictly after the readiness flag this used to be gated on.
- * So a load placed on the flag alone is always overwritten, which is the
- * whole reason the reload loop existed.
- *
- * What has to hold: an early attempt that finds no exposure yet must leave
- * the latch clear so a later call retries, and it must not have loaded --
- * a load that is going to be wiped is worse than no load, because it sets
- * the latch. A late attempt that still finds nothing loads anyway, because
- * an unexplained AE is not a reason to ship an untuned image.
- */
-static unsigned int g_gate_shutter;
-static unsigned int g_gate_calls;
-static int g_gate_ret;
-
-static int fake_gate_ae_status(int channel, i6_isp_ae_status *out)
-{
-    (void)channel;
-    g_gate_calls++;
-    if (g_gate_ret)
-        return g_gate_ret;
-    memset(out, 0, sizeof(*out));
-    out->shutterUs = g_gate_shutter;
-    return 0;
-}
-
-static void gate_setup(star_state_t *st)
-{
-    memset(st, 0, sizeof(*st));
-    st->isp_loaded = true;
-    st->pend_max_again = -1;
-    st->pend_max_dgain = -1;
-    st->fps = 30;
-    snprintf(st->iq_file, sizeof(st->iq_file), "/etc/sensors/gc4653.bin");
-    st->isp.fnGetParaInitStatus = fake_parainit_ready;
-    st->isp.fnLoadChannelConfig = fake_loadcfg;
-    st->isp.fnGetAeStatus = fake_gate_ae_status;
-
-    loadcfg_calls = 0;
-    g_gate_calls = 0;
-    g_gate_ret = 0;
-}
-
-static void test_tuning_waits_for_the_ae(void)
-{
-    star_state_t st;
-    size_t i;
-
-    for (i = 0; i < IQ_PARAM_COUNT; i++)
-        g_iq[i].has_pending = false;
-
-    /* The witness itself: zero shutter is "not initialised", any exposure
-     * at all is "running". */
-    gate_setup(&st);
-    g_gate_shutter = 0;
-    CHECK(star_isp_wait_ae_running(&st, 30, false) == RSS_ERR_TIMEOUT,
-          "a zero shutter must not satisfy the gate");
-    g_gate_shutter = 1;
-    CHECK(star_isp_wait_ae_running(&st, 30, false) == RSS_OK,
-          "any exposure at all satisfies it");
-
-    /* A failing call is not a running AE either -- it is the "sensor have
-     * NOT been initialized" case, which is exactly when the load must not
-     * go yet. */
-    g_gate_ret = -1;
-    CHECK(star_isp_wait_ae_running(&st, 30, false) == RSS_ERR_TIMEOUT,
-          "a failing GetAeStatus must not satisfy the gate");
-    g_gate_ret = 0;
-
-    /* Returns as soon as the answer arrives rather than spending the
-     * budget: 30 ms of budget is three polls, and one answer ends it. */
-    g_gate_calls = 0;
-    g_gate_shutter = 5000;
-    CHECK(star_isp_wait_ae_running(&st, 30, false) == RSS_OK, "must succeed");
-    CHECK(g_gate_calls == 1, "must stop at the first answer, polled %u times", g_gate_calls);
-
-    /* The early attempt: no exposure yet, so nothing is loaded and nothing
-     * is latched. */
-    gate_setup(&st);
-    g_gate_shutter = 0;
-    star_isp_tune_when_ready(&st, false);
-    CHECK(loadcfg_calls == 0, "an early attempt must not load before the AE runs, got %u",
-          loadcfg_calls);
-    CHECK(!st.isp_tuned, "and must leave the latch clear so a later call retries");
-
-    /* Same state, AE now running: the retry loads. */
-    g_gate_shutter = 8000;
-    star_isp_tune_when_ready(&st, false);
-    CHECK(loadcfg_calls == 1, "the retry must load, got %u calls", loadcfg_calls);
-    CHECK(st.isp_tuned, "and latch");
-
-    /* The late attempt with the AE still silent loads regardless. */
-    gate_setup(&st);
-    g_gate_shutter = 0;
-    star_isp_tune_when_ready(&st, true);
-    CHECK(loadcfg_calls == 1, "a late attempt must load anyway, got %u calls", loadcfg_calls);
-    CHECK(st.isp_tuned, "and latch");
-
-    /* No AE-status symbol is not a reason to refuse to tune. */
-    gate_setup(&st);
-    st.isp.fnGetAeStatus = NULL;
-    star_isp_tune_when_ready(&st, false);
-    CHECK(loadcfg_calls == 1, "an unbound witness must not block the load, got %u calls",
-          loadcfg_calls);
-
-    for (i = 0; i < IQ_PARAM_COUNT; i++)
-        g_iq[i].has_pending = false;
-}
-
-/*
  * ── isp_get_exposure ──────────────────────────────────────────────────
  *
  * The AE grid's layout is the vendor's MI_ISP_AE_HW_STATISTICS_t, so what
@@ -1550,7 +1429,6 @@ int main(void)
     test_sensor_fps_clamps_to_the_mode();
     test_recorded_values_survive_a_reload();
     test_tuning_load_leaves_3a_alone();
-    test_tuning_waits_for_the_ae();
     test_exposure_waits_for_the_isp();
     test_exposure_gain_is_x1024_fixed_point();
     test_exposure_luma_covers_only_the_live_grid();

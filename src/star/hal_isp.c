@@ -192,24 +192,6 @@
  */
 #define STAR_ISP_READY_QUICK_MS 400
 
-/*
- * Second wait, for CUS3A's AE rather than for the IQ parameter store --
- * see the comment above star_isp_wait_ae_running for why one does not
- * imply the other. Bounded by a frame period rather than by the ISP's
- * bring-up, because what it is waiting for is the first ISP frame
- * interrupt: 400 ms is a dozen frames at 30 fps and two at the slowest
- * mode the sensor offers.
- */
-/* Overridable so the host suite can reach the timeout paths without
- * spending the budget on the wall clock -- same reason star_iq_dirs is
- * not const. */
-#ifndef STAR_ISP_AE_TIMEOUT_MS
-#define STAR_ISP_AE_TIMEOUT_MS 2000
-#endif
-#ifndef STAR_ISP_AE_QUICK_MS
-#define STAR_ISP_AE_QUICK_MS 400
-#endif
-
 /* Largest payload the table below touches (NR3D, 1776). Sized generously
  * so a future entry does not silently overflow -- star_iq_call refuses
  * anything that does not fit rather than truncating. */
@@ -769,69 +751,6 @@ static int star_isp_wait_ready(star_state_t *st, unsigned int timeout_ms, bool v
 }
 
 /*
- * Wait for CUS3A's AE to have initialised itself, which is a different
- * event from the IQ parameter store coming ready and has to be waited for
- * separately.
- *
- * There are two tuning files in two formats and only one of them is the
- * ISP's source of truth. raptor's is an API bin, applied with
- * MI_ISP_API_CmdLoadBinFile. CUS3A's is `iqfile<n>.bin`, read from disk by
- * the algorithm library itself -- and it is read from inside SigmaAeInit,
- * which is where the AE's gain and shutter limits come from.
- *
- * That AE init is deferred to the frame thread: CUS3A's AE registration
- * sets its init-done flag false and leaves the immediate init compiled
- * out, so the init runs on the first ISP frame interrupt. The IQ store's
- * ready flag reports IQ-API readiness, which happens earlier. So a load
- * gated only on that flag is always followed by a read of the generic
- * iqfile, and everything it established is replaced -- the gain ceiling,
- * and the shutter cap with it.
- *
- * Hence this gate. A non-zero shutter out of MI_ISP_CUS3A_GetAeStatus is
- * proof the AE is running, therefore that it has initialised, therefore
- * that a load will survive. It is also the cheapest available witness:
- * already bound, already polled for day/night.
- *
- * This is what divinus gets right by construction -- it loads at the end
- * of sdk_init with its encoder thread already running, so its load lands
- * after the same interrupt, on the same board and the same bin.
- */
-static int star_isp_wait_ae_running(star_state_t *st, unsigned int timeout_ms, bool verbose)
-{
-    unsigned int waited = 0;
-    int last_ret = 0;
-
-    if (!st->isp.fnGetAeStatus)
-        return RSS_ERR_NOTSUP;
-
-    while (waited < timeout_ms) {
-        i6_isp_ae_status ae;
-        int ret;
-
-        memset(&ae, 0, sizeof(ae));
-        ret = st->isp.fnGetAeStatus(STAR_ISP_CHN, &ae);
-        if (ret == 0 && ae.shutterUs) {
-            HAL_LOG_DBG("isp: AE running after %u ms (shutter %u us)", waited, ae.shutterUs);
-            return RSS_OK;
-        }
-        last_ret = ret;
-
-        star_isp_sleep_ms(STAR_ISP_READY_POLL_MS);
-        waited += STAR_ISP_READY_POLL_MS;
-    }
-
-    if (!verbose)
-        HAL_LOG_DBG("isp: AE not running yet after %u ms (last return %d)", timeout_ms, last_ret);
-    else
-        HAL_LOG_WARN("isp: AE still reports no exposure after %u ms (last return %d); loading the "
-                     "tuning anyway, and the reload check will repair it if CUS3A initialises "
-                     "later",
-                     timeout_ms, last_ret);
-
-    return RSS_ERR_TIMEOUT;
-}
-
-/*
  * Directories that ship one tuning binary per sensor, searched in order.
  *
  * The file is named after the sensor's driver module
@@ -1057,12 +976,22 @@ int star_isp_cap_exposure(star_state_t *st, unsigned int fps)
     }
 
     /*
-     * SetExposureLimit constrains the AE algorithm; it does not touch
-     * the shutter register the sensor is already running with. If the
-     * tuning binary brought the sensor up with an exposure longer than
-     * the frame period, the sensor stays slow until something makes its
-     * driver recompute timing -- and MI_SNR_SetFps is that something.
-     * waybeam calls this the cold-boot fix (star6e_pipeline.c:2094).
+     * The SetFps below, not the write above, is what makes this function
+     * worth calling.
+     *
+     * SetExposureLimit writes MI's mirror of the AE state and the running
+     * CUS3A algorithm does not consult it: measured on the board, a
+     * maxShutterUs of 2000 reads back as 2000 while the AE goes on running
+     * 7689, and a 64x sensor-gain *floor* is ignored the same way. So the
+     * cap is bookkeeping -- it is what the reload check reads, and it is
+     * what get-isp reports -- and a tuning binary asking for a longer
+     * shutter than the frame period still gets one. That costs frame rate
+     * in a dark scene and can only be fixed in the binary.
+     *
+     * MI_SNR_SetFps does work. It does not touch the AE at all: it makes
+     * the sensor driver recompute its timing, which is what recovers a
+     * sensor brought up slow by the tuning. waybeam calls this the
+     * cold-boot fix (star6e_pipeline.c:2094).
      */
     if (st->snr.fnSetFramerate && st->snr.fnSetFramerate(STAR_SNR_INDEX, star_snr_fps_arg(st, fps)))
         HAL_LOG_WARN("isp: MI_SNR_SetFps(%u) after the exposure fit failed", fps);
@@ -1179,22 +1108,7 @@ void star_isp_tune_when_ready(star_state_t *st, bool verbose)
                             verbose) != RSS_OK)
         return;
 
-    /*
-     * Both conditions, in order. The parameter store has to be up for the
-     * load to be answered at all, and CUS3A's AE has to have initialised
-     * or the load will be undone by the iqfile read inside that init.
-     *
-     * An early opportunistic attempt that finds the AE not running yet
-     * gives up and leaves isp_tuned clear, so the call at encoder start
-     * retries with the full budget. A timeout on *that* attempt loads
-     * anyway: an early load is worth more than no load, and the reload
-     * check below is what covers it having been early.
-     */
-    if (star_isp_wait_ae_running(st, verbose ? STAR_ISP_AE_TIMEOUT_MS : STAR_ISP_AE_QUICK_MS,
-                                 verbose) == RSS_ERR_TIMEOUT && !verbose)
-        return;
-
-    /* Both waits are one-way transitions, so one attempt from here on. */
+    /* Ready is a one-way transition, so one attempt from here on. */
     st->isp_tuned = true;
 
     if (st->iq_file[0]) {
@@ -1896,14 +1810,29 @@ static void star_isp_reassert_limits(star_state_t *st)
  * here, deleting the bin changing nothing, and white balance being wrong
  * under artificial light.
  *
- * What wipes it is CUS3A's own deferred AE init reading the generic
- * iqfile, which star_isp_wait_ae_running now waits for -- so this is no
- * longer the mechanism, and on a normal bring-up it should find nothing to
- * do. It stays as insurance, because the AE init leaves its flag clear
- * whenever the sensor is not initialised yet and retries on every later
- * frame interrupt: a sensor re-init can therefore re-read the iqfile long
- * after bring-up, and any *other* step a future SDK build resets the ISP
- * from would look the same from here.
+ * What wipes it is CUS3A's own AE init. That init reads the generic
+ * `iqfile<n>.bin` from disk and takes the AE's limits from it, and CUS3A
+ * defers it to its frame thread -- so it runs about three seconds into
+ * bring-up, after any point at which this code could sensibly load. It is
+ * not a step of raptor's that can be reordered: gating the load on the AE
+ * reporting an exposure was tried and the wipe still followed it, because
+ * a running shutter predates the init that establishes the limits. Waiting
+ * for it is also not worth a fixed delay -- three seconds of untuned colour
+ * to save one reload.
+ *
+ * So detect and repair, which also covers the other cases: CUS3A leaves
+ * its init flag clear whenever the sensor is not up yet and retries on
+ * every later frame interrupt, so a sensor re-init can re-read the iqfile
+ * long after bring-up.
+ *
+ * One thing this comment used to imply and should not: the limits it
+ * compares are MI's mirror of the AE state, and with CUS3A running the
+ * algorithm does not consult that mirror -- writing it changes nothing
+ * (measured: a 2000 us shutter cap and a 64x gain floor both read back and
+ * both ignored). That does not weaken the witness, because what is being
+ * detected is the mirror being *reset*, which is CUS3A's init happening.
+ * It does mean the repair has to be the bin reload, which is the only
+ * channel to the algorithm, and never a re-write of the limits.
  *
  * The limits are a reliable witness because the tuning's own values were
  * snapshotted before anything could overwrite them, and because the only
@@ -1917,11 +1846,6 @@ static void star_isp_reassert_limits(star_state_t *st)
  * because a reload that does not stick must not turn into a loop -- and
  * if the bound is reached, the log says so, which is a better failure
  * than silence.
- *
- * The detection is worth keeping as it stands. It was reading a real
- * signal all along, and its documented blind spot -- a max_again equal to
- * the untuned default -- only cost anything while this was the mechanism
- * rather than the backstop.
  */
 #define STAR_IQ_RELOAD_MAX 5
 
@@ -1986,8 +1910,8 @@ static void star_isp_reload_if_reset(star_state_t *st, bool force)
     }
 
     st->iq_reloads++;
-    HAL_LOG_INFO("isp: AE is on sensor gain ..%u but the tuning has ..%u -- CUS3A re-read its own "
-                 "iqfile after the load; reloading %s (attempt %d)",
+    HAL_LOG_INFO("isp: AE limits are back on sensor gain ..%u where the tuning has ..%u -- CUS3A "
+                 "re-read its own iqfile after the load; reloading %s (attempt %d)",
                  limit.maxSensorGain, st->bin_max_sensor_gain, st->iq_file, st->iq_reloads);
 
     if (st->isp.fnLoadChannelConfig(STAR_ISP_CHN, st->iq_file, STAR_IQ_LOAD_KEY)) {
