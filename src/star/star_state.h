@@ -456,9 +456,10 @@ typedef struct {
      * redundant loads for exactly that reason
      * (star6e_pipeline.c:2073-2077).
      *
-     * gray and the flip pair exist because MI has no getter for either:
+     * gray exists because MI has no getter for it:
      * MI_ISP_IQ_GetColorToGray reads the IQ struct rather than a
-     * day/night mode, and MI_SNR_SetOrien has no counterpart at all.
+     * day/night mode. Orientation needs no such shadow -- it lives in the
+     * VPE channel param, which reads back.
      */
     char iq_file[128];
     bool isp_loaded;
@@ -524,8 +525,6 @@ typedef struct {
     int iq_reloads;
 
     bool gray;
-    bool hflip;
-    bool vflip;
 
     star_vpe_port_t port[STAR_VPE_PORT_NUM];
     star_venc_chn_t enc[I6_VENC_CHN_NUM];

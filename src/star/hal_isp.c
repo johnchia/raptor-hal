@@ -1059,7 +1059,6 @@ void star_isp_bringup(star_state_t *st, const rss_sensor_config_t *cfg)
  * that the second one is about to make untrue.
  */
 static void star_isp_flush_pending(star_state_t *st);
-static int star_isp_set_orien(star_state_t *st);
 static void star_isp_reload_if_reset(star_state_t *st, bool force);
 
 /*
@@ -1404,25 +1403,13 @@ void star_isp_tune_when_ready(star_state_t *st, bool verbose)
     star_isp_cap_exposure(st, st->fps);
 
     /*
-     * Orientation goes on last, and only when something was asked for.
-     *
-     * MI_SNR_SetOrien does not write the sensor's mirror register. The
-     * driver stores the value, marks it dirty, and writes it on the next
-     * frame notification from AE -- pCus_SetOrien and
-     * pCus_AEStatusNotify(CUS_FRAME_ACTIVE) in the vendor
-     * sensor_<name>_mipi.c. Anything between bring-up and here that
-     * reprograms sensor timing or restarts 3A can therefore lose that
-     * pending write, and both the tuning load and the MI_SNR_SetFps
-     * inside star_isp_cap_exposure are candidates. waybeam hit exactly
-     * this after a live bin reload and fixed it by re-issuing SetOrien
-     * once afterwards; this is the same repair at the same point in the
-     * sequence.
-     *
-     * No re-apply is needed when nothing was asked for, because anything
-     * that resets orientation resets it to unmirrored.
+     * Orientation needs no re-apply here. It lives in the VPE channel
+     * param, which this code is the only writer of, and the channel is
+     * created once in star_vpe_bringup and destroyed once in teardown --
+     * so nothing a tuning load does can lose it. The sensor register this
+     * replaced did need one, because MI_SNR_SetOrien leaves the write
+     * pending on an AE frame notification that a reload can swallow.
      */
-    if (st->hflip || st->vflip)
-        star_isp_set_orien(st);
 }
 
 /*
@@ -2534,90 +2521,123 @@ int hal_isp_get_running_mode(void *ctx, rss_isp_mode_t *mode)
 /*
  * Mirror and flip.
  *
- * Done in the sensor, not the ISP. MI_SNR_SetOrien takes both axes at
- * once, so each op has to supply the one it is not changing from tracked
- * state; the starting values come from the sensor config, applied before
- * MI_SNR_Enable in star_sensor_bringup.
+ * The VPE channel's own mirror/flip, which is the same stage Ingenic's ISP
+ * flip acts at: digital, downstream of the sensor, and settable whenever.
+ * The vendor's stated reason for the fields existing is to cover sensors
+ * that cannot flip themselves, so using them for every sensor costs
+ * nothing and makes one path do the work.
  *
- * That bring-up path is the one both references use and the one to trust.
- * A runtime change is best-effort by comparison, because of how the
- * vendor sensor driver implements it: SetOrien only stores the value and
- * sets a dirty flag, and the register is written by
- * pCus_AEStatusNotify(CUS_FRAME_ACTIVE) -- so it lands on the next AE
- * frame notification if 3A is running, and sits pending if it is not.
- * MI_SNR_GetOrien is no help in telling which happened: the vendor
- * driver reads it back from its static default table rather than the live
- * value, so it reports unmirrored however the image actually looks (which
- * matches waybeam's note that GetOrien "reads 0 while the image is
- * plainly held"). Hence the tracked state here, and hence the re-apply at
- * the end of star_isp_tune_when_ready.
+ * Not the sensor's MI_SNR_SetOrien, which was the earlier mechanism and is
+ * best-effort by comparison: it only stores the value and sets a dirty
+ * flag, leaving pCus_AEStatusNotify(CUS_FRAME_ACTIVE) to write the
+ * register, so it lands on the next AE frame notification if 3A is running
+ * and sits pending if it is not -- and MI_SNR_GetOrien cannot say which,
+ * because the vendor driver answers it from its static default table
+ * rather than the live value. A channel param has no pending state and
+ * reads back what it is doing.
+ *
+ * Not the per-port DMA mirror either. That one is applied after the OSD,
+ * so it would flip the timestamp along with the picture.
+ *
+ * Get-then-set, as the vendor requires: the SDK mutates what it is given
+ * (3DNR level is clamped to the per-chip maximum internally), so a blind
+ * write would put whatever this file last guessed back over it.
  */
-static int star_isp_set_orien(star_state_t *st)
+static int star_isp_apply_orien(star_state_t *st, int mirror, int flip)
 {
+    i6e_vpe_para para;
     int ret;
 
-    if (!st->snr.fnSetOrientation)
+    if (!st->vpe.fnGetChannelParam || !st->vpe.fnSetChannelParam)
         return RSS_ERR_NOTSUP;
+    if (!st->vpe_chn_created)
+        return RSS_ERR_NOENT;
 
-    ret = st->snr.fnSetOrientation(STAR_SNR_INDEX, st->hflip ? 1 : 0, st->vflip ? 1 : 0);
+    memset(&para, 0, sizeof(para));
+    ret = st->vpe.fnGetChannelParam(STAR_VPE_CHN, (i6_vpe_para *)&para);
     if (ret) {
-        HAL_LOG_WARN("isp: MI_SNR_SetOrien(mirror=%d, flip=%d) failed: %d", st->hflip, st->vflip,
-                     ret);
+        HAL_LOG_WARN("isp: MI_VPE_GetChannelParam failed: %d", ret);
         return RSS_ERR_IO;
     }
 
-    HAL_LOG_DBG("isp: orientation mirror=%d flip=%d", st->hflip, st->vflip);
+    if (para.mirror == (mirror ? 1 : 0) && para.flip == (flip ? 1 : 0))
+        return RSS_OK;
+
+    para.mirror = mirror ? 1 : 0;
+    para.flip = flip ? 1 : 0;
+
+    ret = st->vpe.fnSetChannelParam(STAR_VPE_CHN, (i6_vpe_para *)&para);
+    if (ret) {
+        HAL_LOG_WARN("isp: MI_VPE_SetChannelParam(mirror=%d, flip=%d) failed: %d", para.mirror,
+                     para.flip, ret);
+        return RSS_ERR_IO;
+    }
+
+    HAL_LOG_DBG("isp: orientation mirror=%d flip=%d", para.mirror, para.flip);
     return RSS_OK;
 }
 
 int hal_isp_set_hflip(void *ctx, int enable)
 {
+    rss_hal_ctx_t *c = (rss_hal_ctx_t *)ctx;
     star_state_t *st = star_state(ctx);
-    bool prev;
+    int prev;
     int ret;
 
     if (!st)
         return RSS_ERR_INVAL;
 
-    prev = st->hflip;
-    st->hflip = enable ? true : false;
-    ret = star_isp_set_orien(st);
+    prev = c->hflip_state[0];
+    c->hflip_state[0] = enable ? 1 : 0;
+    ret = star_isp_apply_orien(st, c->hflip_state[0], c->vflip_state[0]);
     if (ret != RSS_OK)
-        st->hflip = prev;
+        c->hflip_state[0] = prev;
 
     return ret;
 }
 
 int hal_isp_set_vflip(void *ctx, int enable)
 {
+    rss_hal_ctx_t *c = (rss_hal_ctx_t *)ctx;
     star_state_t *st = star_state(ctx);
-    bool prev;
+    int prev;
     int ret;
 
     if (!st)
         return RSS_ERR_INVAL;
 
-    prev = st->vflip;
-    st->vflip = enable ? true : false;
-    ret = star_isp_set_orien(st);
+    prev = c->vflip_state[0];
+    c->vflip_state[0] = enable ? 1 : 0;
+    ret = star_isp_apply_orien(st, c->hflip_state[0], c->vflip_state[0]);
     if (ret != RSS_OK)
-        st->vflip = prev;
+        c->vflip_state[0] = prev;
 
     return ret;
 }
 
 int hal_isp_get_hvflip(void *ctx, int *hflip, int *vflip)
 {
+    rss_hal_ctx_t *c = (rss_hal_ctx_t *)ctx;
     star_state_t *st = star_state(ctx);
+    i6e_vpe_para para;
 
     if (!st)
         return RSS_ERR_INVAL;
 
-    /* Tracked rather than queried -- MI_SNR_SetOrien has no getter. */
+    /* Hardware first, cache only as the fallback: the point of moving off
+     * the sensor register is that this can now be asked rather than
+     * remembered. */
+    memset(&para, 0, sizeof(para));
+    if (st->vpe_chn_created && st->vpe.fnGetChannelParam &&
+        !st->vpe.fnGetChannelParam(STAR_VPE_CHN, (i6_vpe_para *)&para)) {
+        c->hflip_state[0] = para.mirror ? 1 : 0;
+        c->vflip_state[0] = para.flip ? 1 : 0;
+    }
+
     if (hflip)
-        *hflip = st->hflip ? 1 : 0;
+        *hflip = c->hflip_state[0];
     if (vflip)
-        *vflip = st->vflip ? 1 : 0;
+        *vflip = c->vflip_state[0];
 
     return RSS_OK;
 }

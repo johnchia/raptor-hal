@@ -320,7 +320,8 @@ static unsigned char star_sensor_pick_mode(star_state_t *st, const rss_sensor_co
  * star_sensor_bringup -- select a mode, start the sensor, read back what it is.
  *
  * Sequence follows both references: SetPlaneMode -> QueryResCount ->
- * SetRes -> SetFps -> SetOrien -> Enable.
+ * SetRes -> SetFps -> Enable. Orientation is not part of it -- it belongs
+ * to the VPE channel, see star_vpe_bringup.
  *
  * Two deliberate choices:
  *
@@ -338,8 +339,7 @@ static unsigned char star_sensor_pick_mode(star_state_t *st, const rss_sensor_co
  * because the single field it uses from intfAttr, mipi.input, is 0 for this
  * sensor anyway. waybeam queries after Enable (sensor_select.c:485); so do we.
  */
-static int star_sensor_bringup(star_state_t *st, const rss_sensor_config_t *cfg, int mirror,
-                               int flip)
+static int star_sensor_bringup(star_state_t *st, const rss_sensor_config_t *cfg)
 {
     unsigned int count = 0;
     int ret;
@@ -409,15 +409,23 @@ static int star_sensor_bringup(star_state_t *st, const rss_sensor_config_t *cfg,
         }
     }
 
-    /* Orientation before Enable, so the driver's init picks it up.
-     * Recorded because MI_SNR_SetOrien has no getter and it takes both
-     * axes at once, so a later isp_set_hflip has to supply the flip it
-     * is not changing. */
-    st->hflip = mirror ? true : false;
-    st->vflip = flip ? true : false;
-    ret = st->snr.fnSetOrientation(STAR_SNR_INDEX, mirror ? 1 : 0, flip ? 1 : 0);
+    /*
+     * Pin the sensor to unrotated before Enable, so that orientation is the
+     * VPE channel's business alone.
+     *
+     * Not a no-op, and not skippable: a sensor driver's default orientation
+     * is whatever its own table says, and it need not be identity. The
+     * GC4653 on this board comes up rotated 180 degrees -- measured, by
+     * removing this call and watching the picture turn over -- so leaving
+     * the register alone means inheriting a per-sensor orientation that
+     * nothing in the config can see or explain. Before Enable, because that
+     * is when the driver's init reads it.
+     */
+    ret = st->snr.fnSetOrientation(STAR_SNR_INDEX, 0, 0);
     if (ret)
-        HAL_LOG_WARN("MI_SNR_SetOrien(%d,%d) failed: %d", mirror, flip, ret);
+        HAL_LOG_WARN("MI_SNR_SetOrien(0,0) failed: %d -- the sensor keeps its driver's "
+                     "default orientation, which may not be unrotated",
+                     ret);
 
     /*
      * Read the driver module's name before Enable. It needs no MI call, and
@@ -583,7 +591,7 @@ static int star_vif_bringup(star_state_t *st)
  * "IspApiGet channel not created" (waybeam star6e_pipeline.c:172-200).
  * hal_isp.c does that polling; see star_isp_wait_ready.
  */
-static int star_vpe_bringup(star_state_t *st)
+static int star_vpe_bringup(star_state_t *st, int mirror, int flip)
 {
     i6e_vpe_chn channel;
     i6e_vpe_para param;
@@ -622,10 +630,22 @@ static int star_vpe_bringup(star_state_t *st)
     /* 3DNR level 1, as both references default it. The range is 0-7;
      * raptor's own temper knob goes through MI_ISP_IQ_SetNR3D instead. */
     param.level3DNR = 1;
-    /* Digital mirror/flip stay off; orientation is a sensor register.
-     * See the note in hal_framesource.c's star_fs_configure. */
-    param.mirror = 0;
-    param.flip = 0;
+    /*
+     * Orientation, applied before StartChannel so the first frame is
+     * already the right way up. Channel level, not per-port: the channel's
+     * mirror/flip sit ahead of each port's crop, scaler and OSD, so the
+     * timestamp stays readable and in its corner while the scene turns
+     * over. The per-port DMA mirror in i6_vpe_port is after the OSD and
+     * would flip the text with it.
+     *
+     * The write is not read-modify-write here only because the channel was
+     * created two calls ago and nothing else has touched it -- the ops in
+     * hal_isp.c do read first, as the vendor asks. reserved[16] is
+     * MI_VPE_PqParam_t, marked "only dvr use", so leaving it zero is what
+     * it is for.
+     */
+    param.mirror = mirror ? 1 : 0;
+    param.flip = flip ? 1 : 0;
     param.lensAdjOn = 0;
 
     ret = st->vpe.fnSetChannelParam(STAR_VPE_CHN, (i6_vpe_para *)&param);
@@ -772,17 +792,17 @@ static int hal_init(void *ctx, const rss_multi_sensor_config_t *cfg)
     st->sys_inited = true;
 
     /*
-     * Orientation comes from the sensor config, not from hflip_state[].
-     * That array is where the generic ISP layer records what an op last
-     * set, and no op can have run yet -- it is unavoidably still zero
-     * here, so reading it was the same as hardcoding "no flip" and the
-     * config's request never reached the sensor. It is set from the
-     * config so a later read of it agrees with the hardware.
+     * Seed the orientation cache from the sensor config. hflip_state[] is
+     * where the generic ISP layer records what an op last set, and no op
+     * can have run yet, so it is unavoidably still zero here -- reading it
+     * without this would be the same as hardcoding "no flip" and the
+     * config's request would never reach the hardware. The ops in
+     * hal_isp.c own it from here on; there is no second copy.
      */
     c->hflip_state[0] = c->sensors[0].hflip ? 1 : 0;
     c->vflip_state[0] = c->sensors[0].vflip ? 1 : 0;
 
-    ret = star_sensor_bringup(st, &c->sensors[0], c->hflip_state[0], c->vflip_state[0]);
+    ret = star_sensor_bringup(st, &c->sensors[0]);
     if (ret)
         goto err_teardown;
 
@@ -790,7 +810,7 @@ static int hal_init(void *ctx, const rss_multi_sensor_config_t *cfg)
     if (ret)
         goto err_teardown;
 
-    ret = star_vpe_bringup(st);
+    ret = star_vpe_bringup(st, c->hflip_state[0], c->vflip_state[0]);
     if (ret)
         goto err_teardown;
 

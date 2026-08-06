@@ -271,11 +271,10 @@ static int star_fs_configure(star_state_t *st, int chn, star_vpe_port_t *port,
     attr.output.width = width;
     attr.output.height = height;
     /*
-     * Digital mirror/flip stay off here. Orientation is applied at the
-     * sensor (MI_SNR_SetOrien), which is what both references do --
-     * waybeam explicitly keeps the VPE mirror/flip fields at 0 because
-     * they are "unreliable on several sensor combos"
-     * (star6e_pipeline.c:547).
+     * Mirror/flip stay off *here*. Orientation is the VPE channel's, one
+     * stage upstream, because a port's mirror is applied after the OSD and
+     * would flip the timestamp with the picture; the channel's is applied
+     * before it. See star_vpe_bringup and hal_isp.c's star_isp_apply_orien.
      */
     attr.mirror = 0;
     attr.flip = 0;
@@ -510,8 +509,8 @@ int star_fs_clone_port(star_state_t *st, int src, int dst)
     memset(&attr, 0, sizeof(attr));
     attr.output.width = s->width;
     attr.output.height = s->height;
-    /* Orientation is applied at the sensor, so both ports already see a
-     * correctly oriented picture -- see star_fs_configure. */
+    /* Orientation is the channel's, so both ports already see a correctly
+     * oriented picture -- see star_fs_configure. */
     attr.mirror = 0;
     attr.flip = 0;
     attr.pixFmt = s->pixFmt;

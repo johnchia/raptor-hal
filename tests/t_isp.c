@@ -605,22 +605,36 @@ static void test_pending_queue(void)
 }
 
 /*
- * Orientation. MI_SNR_SetOrien takes both axes at once, so setting one has
- * to carry the other over from tracked state -- get that wrong and enabling
+ * Orientation. The VPE channel param carries both axes in one struct, so
+ * setting one has to carry the other over -- get that wrong and enabling
  * vflip silently cancels an hflip that is already in effect. The whole path
  * is function pointers, so it tests without hardware.
+ *
+ * The mock answers a read with whatever the last write left, because the
+ * op is a read-modify-write and the thing worth testing is that it does not
+ * flatten the fields it is not there to change.
  */
-static unsigned int orien_calls;
-static unsigned char orien_last_mirror, orien_last_flip;
-static int orien_ret;
+static unsigned int vpe_para_set_calls;
+static i6e_vpe_para g_vpe_para;
+static int vpe_para_get_ret, vpe_para_set_ret;
 
-static int fake_set_orien(unsigned int sensor, unsigned char mirror, unsigned char flip)
+static int fake_get_chn_param(int chn, i6_vpe_para *param)
 {
-    (void)sensor;
-    orien_calls++;
-    orien_last_mirror = mirror;
-    orien_last_flip = flip;
-    return orien_ret;
+    (void)chn;
+    if (vpe_para_get_ret)
+        return vpe_para_get_ret;
+    memcpy(param, &g_vpe_para, sizeof(g_vpe_para));
+    return 0;
+}
+
+static int fake_set_chn_param(int chn, i6_vpe_para *param)
+{
+    (void)chn;
+    if (vpe_para_set_ret)
+        return vpe_para_set_ret;
+    vpe_para_set_calls++;
+    memcpy(&g_vpe_para, param, sizeof(g_vpe_para));
+    return 0;
 }
 
 static void test_orientation_carries_both_axes(void)
@@ -632,20 +646,27 @@ static void test_orientation_carries_both_axes(void)
 
     memset(&ctx, 0, sizeof(ctx));
     memset(&st, 0, sizeof(st));
+    memset(&g_vpe_para, 0, sizeof(g_vpe_para));
     ctx.platform = &st;
-    st.snr.fnSetOrientation = fake_set_orien;
-    orien_calls = 0;
-    orien_ret = 0;
+    st.vpe.fnGetChannelParam = fake_get_chn_param;
+    st.vpe.fnSetChannelParam = fake_set_chn_param;
+    st.vpe_chn_created = true;
+    /* What star_vpe_bringup left behind, and what must still be there after. */
+    g_vpe_para.level3DNR = 1;
+    vpe_para_set_calls = 0;
+    vpe_para_get_ret = vpe_para_set_ret = 0;
 
     CHECK(hal_isp_set_hflip(c, 1) == RSS_OK, "set_hflip succeeds");
-    CHECK(orien_calls == 1, "set_hflip issues one SetOrien, got %u", orien_calls);
-    CHECK(orien_last_mirror == 1 && orien_last_flip == 0, "hflip alone -> (1,0), got (%u,%u)",
-          orien_last_mirror, orien_last_flip);
+    CHECK(vpe_para_set_calls == 1, "set_hflip issues one write, got %u", vpe_para_set_calls);
+    CHECK(g_vpe_para.mirror == 1 && g_vpe_para.flip == 0, "hflip alone -> (1,0), got (%d,%d)",
+          g_vpe_para.mirror, g_vpe_para.flip);
+    CHECK(g_vpe_para.level3DNR == 1, "the rest of the param must survive the write, 3DNR got %d",
+          g_vpe_para.level3DNR);
 
     /* The one that would regress: vflip must not drop the live hflip. */
     CHECK(hal_isp_set_vflip(c, 1) == RSS_OK, "set_vflip succeeds");
-    CHECK(orien_last_mirror == 1 && orien_last_flip == 1, "vflip must keep hflip -> (1,1), "
-          "got (%u,%u)", orien_last_mirror, orien_last_flip);
+    CHECK(g_vpe_para.mirror == 1 && g_vpe_para.flip == 1, "vflip must keep hflip -> (1,1), "
+          "got (%d,%d)", g_vpe_para.mirror, g_vpe_para.flip);
 
     hf = vf = -1;
     CHECK(hal_isp_get_hvflip(c, &hf, &vf) == RSS_OK, "get_hvflip succeeds");
@@ -653,21 +674,32 @@ static void test_orientation_carries_both_axes(void)
 
     /* Clearing one leaves the other alone. */
     CHECK(hal_isp_set_hflip(c, 0) == RSS_OK, "clearing hflip succeeds");
-    CHECK(orien_last_mirror == 0 && orien_last_flip == 1, "clearing hflip keeps vflip -> (0,1), "
-          "got (%u,%u)", orien_last_mirror, orien_last_flip);
+    CHECK(g_vpe_para.mirror == 0 && g_vpe_para.flip == 1, "clearing hflip keeps vflip -> (0,1), "
+          "got (%d,%d)", g_vpe_para.mirror, g_vpe_para.flip);
 
-    /* A failed SetOrien must not leave the tracked state claiming a change
-     * that never reached the sensor, or the next set would carry a lie. */
-    orien_ret = -1;
-    CHECK(hal_isp_set_hflip(c, 1) != RSS_OK, "a failing SetOrien is reported");
+    /* Asking for what is already set costs no write. The SDK mutates a param
+     * it is handed, so a redundant one is not free. */
+    vpe_para_set_calls = 0;
+    CHECK(hal_isp_set_vflip(c, 1) == RSS_OK, "a redundant set succeeds");
+    CHECK(vpe_para_set_calls == 0, "a redundant set must not write, got %u", vpe_para_set_calls);
+
+    /* A failed write must not leave the cache claiming a change that never
+     * reached the hardware, or the next set would carry a lie. */
+    vpe_para_set_ret = -1;
+    CHECK(hal_isp_set_hflip(c, 1) != RSS_OK, "a failing write is reported");
     hf = -1;
     CHECK(hal_isp_get_hvflip(c, &hf, NULL) == RSS_OK, "get_hvflip still succeeds");
     CHECK(hf == 0, "a failed set must not be recorded, got %d", hf);
 
-    /* No MI_SNR resolved at all is NOTSUP, not a crash. */
-    orien_ret = 0;
-    st.snr.fnSetOrientation = NULL;
-    CHECK(hal_isp_set_hflip(c, 1) == RSS_ERR_NOTSUP, "missing SetOrien symbol is NOTSUP");
+    /* Before the channel exists there is nothing to write to, and that is a
+     * different answer from a missing symbol. */
+    vpe_para_set_ret = 0;
+    st.vpe_chn_created = false;
+    CHECK(hal_isp_set_hflip(c, 1) == RSS_ERR_NOENT, "no channel yet is NOENT");
+
+    st.vpe_chn_created = true;
+    st.vpe.fnSetChannelParam = NULL;
+    CHECK(hal_isp_set_hflip(c, 1) == RSS_ERR_NOTSUP, "a missing symbol is NOTSUP");
 }
 
 /*

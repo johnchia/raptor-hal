@@ -42,6 +42,7 @@ typedef struct {
     int (*fnCreateChannel)(int channel, i6_vpe_chn *config);
     int (*fnDestroyChannel)(int channel);
     int (*fnSetChannelConfig)(int channel, i6_vpe_chn *config);
+    int (*fnGetChannelParam)(int channel, i6_vpe_para *config);
     int (*fnSetChannelParam)(int channel, i6_vpe_para *config);
     int (*fnStartChannel)(int channel);
     int (*fnStopChannel)(int channel);
@@ -118,6 +119,10 @@ static inline int i6_vpe_load(i6_vpe_impl *vpe_lib)
 
     if (!(vpe_lib->fnSetChannelConfig = (int(*)(int channel, i6_vpe_chn *config))
         hal_symbol_load("i6_vpe", vpe_lib->handle, "MI_VPE_SetChannelAttr")))
+        return RSS_ERR_NOTSUP;
+
+    if (!(vpe_lib->fnGetChannelParam = (int(*)(int channel, i6_vpe_para *config))
+        hal_symbol_load("i6_vpe", vpe_lib->handle, "MI_VPE_GetChannelParam")))
         return RSS_ERR_NOTSUP;
 
     if (!(vpe_lib->fnSetChannelParam = (int(*)(int channel, i6_vpe_para *config))
