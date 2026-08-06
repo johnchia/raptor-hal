@@ -62,7 +62,34 @@ DEPS = $(wildcard ../src/star/*.c ../src/star/*.h ../src/*.c ../src/*.h \
 t_%: t_%.c $(DEPS)
 	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
 
+# ABI conformance against SigmaStar's own headers. Opt-in: the vendor
+# headers are not redistributable and are not in the repo, so this is
+# skipped rather than failed when SIGMASTAR_SDK is unset.
+#
+# SIGMASTAR_SDK points at the SDK's release include directory -- the one
+# holding mi_common_datatype.h. `pudding` is the Infinity6E ISP header
+# set; the other families sit beside it and are worth compiling against
+# deliberately when asking whether a struct moved between SoCs.
+#
+# Cross-compiled, and that is not incidental: this is the one thing here
+# that is *about* layout, so it has to be the target's ABI, with the
+# _Static_asserts left in place rather than defined away. Compile-only,
+# so no sysroot beyond the toolchain's own headers is needed.
+SIGMASTAR_SDK ?=
+ABI_CC = $(CROSS_COMPILE)gcc
+ABI_CFLAGS = -Wall -Wextra -std=c11 -DPLATFORM_INFINITY6E=1 \
+	     -I$(SIGMASTAR_HEADERS)/infinity6e \
+	     -I$(SIGMASTAR_SDK) -I$(SIGMASTAR_SDK)/isp/pudding
+
+abi-check:
+ifeq ($(SIGMASTAR_SDK),)
+	@echo "abi-check: skipped, set SIGMASTAR_SDK=/path/to/project/release/include"
+else
+	$(ABI_CC) $(ABI_CFLAGS) -c -o /dev/null abi_iq.c
+	@echo "abi-check: IQ table matches the vendor headers"
+endif
+
 clean:
 	rm -f $(BINS)
 
-.PHONY: test clean $(addprefix test-,$(SUITES))
+.PHONY: test clean abi-check $(addprefix test-,$(SUITES))

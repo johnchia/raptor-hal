@@ -105,11 +105,35 @@ static void test_table_bounds(void)
         CHECK(p->mi_unity <= p->mi_max, "%s: unity %u above max %u", p->name, p->mi_unity,
               p->mi_max);
 
-        /* An auto/manual entry must leave room for bEnable+enOpType. */
-        if (p->shape == IQ_AUTOMAN)
+        /*
+         * An auto/manual entry must leave room for bEnable+enOpType, and
+         * its two numbers have to agree with each other. The payload is
+         * 8 + 16 auto blocks + one manual block of the same size, padded
+         * out to the struct's 4-byte alignment -- so a manual offset fixes
+         * the block size, and the block size fixes the payload. Both
+         * numbers are functions of one, and a row where they disagree is
+         * writing its level into stAuto.
+         *
+         * Worth having even though tests/abi_iq.c checks the same rows
+         * against the vendor structs: this needs no SDK, and it is what
+         * catches the arithmetic mistake rather than the transcription one.
+         * temper's old 1288 implies an 80-byte block, which implies a
+         * 1368-byte payload beside the 1776 the row also claimed.
+         */
+        if (p->shape == IQ_AUTOMAN) {
+            unsigned int block = (p->manual_off - 8) / 16;
+            unsigned int implied = (8 + 17 * block + 3) & ~3u;
+
             CHECK(p->manual_off >= 8, "%s: AUTOMAN manual offset %u below the 8-byte header",
                   p->name, p->manual_off);
-        else
+            CHECK((p->manual_off - 8) % 16 == 0,
+                  "%s: manual offset %u is not 8 plus 16 whole auto blocks", p->name,
+                  p->manual_off);
+            CHECK(p->payload == implied,
+                  "%s: a manual offset of %u implies a %u-byte block and a %u-byte payload, "
+                  "not %u",
+                  p->name, p->manual_off, block, implied, p->payload);
+        } else
             CHECK(p->manual_off == 0, "%s: FLAT/BOOL must live at offset 0, not %u", p->name,
                   p->manual_off);
     }
@@ -117,7 +141,8 @@ static void test_table_bounds(void)
 
 /* The documented payload sizes, restated here so a typo in the table is a
  * test failure rather than a silently wrong ioctl. Values from
- * disassembling libmi_isp.so. */
+ * disassembling libmi_isp.so; tests/abi_iq.c checks the same rows against
+ * the vendor structs when the SDK is available, which this cannot. */
 static void test_table_matches_disassembly(void)
 {
     CHECK(g_iq[IQ_BRIGHTNESS].payload == 76 && g_iq[IQ_BRIGHTNESS].manual_off == 72, "brightness");
@@ -126,7 +151,7 @@ static void test_table_matches_disassembly(void)
           "saturation");
     CHECK(g_iq[IQ_SHARPNESS].payload == 1268 && g_iq[IQ_SHARPNESS].manual_off == 1192, "sharpness");
     CHECK(g_iq[IQ_SINTER].payload == 112 && g_iq[IQ_SINTER].manual_off == 104, "sinter");
-    CHECK(g_iq[IQ_TEMPER].payload == 1776 && g_iq[IQ_TEMPER].manual_off == 1288, "temper");
+    CHECK(g_iq[IQ_TEMPER].payload == 1776 && g_iq[IQ_TEMPER].manual_off == 1672, "temper");
     CHECK(g_iq[IQ_DEFOG].payload == 28, "defog");
     CHECK(g_iq[IQ_GRAY].payload == 4, "gray");
     CHECK(g_iq[IQ_EVCOMP].payload == 8, "evcomp");
@@ -362,6 +387,74 @@ static void test_evcomp_neutral_comes_from_the_tuning(void)
     g_iq[IQ_EVCOMP] = saved;
 }
 
+/*
+ * Anti-flicker is the one knob where raptor's enum and MI's differ in
+ * order rather than in range: MI is DISABLE, 60HZ, 50HZ, AUTO. Passing the
+ * value through therefore configures the other mains frequency, and does
+ * it symmetrically -- the getter reads back the same swap, so a
+ * round-trip through the control API looks correct while the picture bands
+ * under 50 Hz lighting. This test is the round-trip that is not
+ * self-consistent by construction: it names MI's numbers on both sides.
+ */
+static uint32_t g_flicker_raw;
+static int flicker_get(int chn, void *buf)
+{
+    (void)chn;
+    memcpy(buf, &g_flicker_raw, sizeof(g_flicker_raw));
+    return 0;
+}
+
+static int flicker_set(int chn, void *buf)
+{
+    (void)chn;
+    memcpy(&g_flicker_raw, buf, sizeof(g_flicker_raw));
+    return 0;
+}
+
+static void test_antiflicker_translates_the_mains_frequency(void)
+{
+    star_iq_param_t saved = g_iq[IQ_FLICKER];
+    rss_hal_ctx_t ctx;
+    star_state_t st;
+    void *c = &ctx;
+    rss_antiflicker_t mode;
+
+    memset(&ctx, 0, sizeof(ctx));
+    memset(&st, 0, sizeof(st));
+    ctx.platform = &st;
+    st.isp_loaded = true;
+    st.isp_tuned = true;
+
+    g_iq[IQ_FLICKER].fn_get = flicker_get;
+    g_iq[IQ_FLICKER].fn_set = flicker_set;
+
+    CHECK(hal_isp_set_antiflicker(c, RSS_ANTIFLICKER_50HZ) == RSS_OK, "50 Hz must apply");
+    CHECK(g_flicker_raw == 2, "50 Hz must reach MI as 2, got %u", g_flicker_raw);
+    CHECK(hal_isp_set_antiflicker(c, RSS_ANTIFLICKER_60HZ) == RSS_OK, "60 Hz must apply");
+    CHECK(g_flicker_raw == 1, "60 Hz must reach MI as 1, got %u", g_flicker_raw);
+    CHECK(hal_isp_set_antiflicker(c, RSS_ANTIFLICKER_OFF) == RSS_OK, "off must apply");
+    CHECK(g_flicker_raw == 0, "off must reach MI as 0, got %u", g_flicker_raw);
+
+    /* And back, read from MI's numbers rather than from what was set. */
+    g_flicker_raw = 2;
+    CHECK(hal_isp_get_antiflicker(c, &mode) == RSS_OK, "get must succeed");
+    CHECK(mode == RSS_ANTIFLICKER_50HZ, "MI's 2 is 50 Hz, got %d", (int)mode);
+    g_flicker_raw = 1;
+    CHECK(hal_isp_get_antiflicker(c, &mode) == RSS_OK, "get must succeed");
+    CHECK(mode == RSS_ANTIFLICKER_60HZ, "MI's 1 is 60 Hz, got %d", (int)mode);
+
+    /* MI's AUTO has no raptor enumerator, so it reads as off rather than
+     * as a value raptor cannot hand back to its own setter. */
+    g_flicker_raw = 3;
+    CHECK(hal_isp_get_antiflicker(c, &mode) == RSS_OK, "get must succeed on AUTO");
+    CHECK(mode == RSS_ANTIFLICKER_OFF, "MI's AUTO reads as off, got %d", (int)mode);
+
+    CHECK(hal_isp_set_antiflicker(c, (rss_antiflicker_t)7) == RSS_ERR_INVAL,
+          "an out-of-range mode is refused");
+
+    g_iq[IQ_FLICKER] = saved;
+}
+
 static void test_pending_queue(void)
 {
     rss_hal_ctx_t ctx;
@@ -396,11 +489,12 @@ static void test_pending_queue(void)
     CHECK(hal_isp_get_brightness(c, &v8) == RSS_OK, "get_brightness should succeed");
     CHECK(v8 == STAR_ISP_NEUTRAL, "untouched brightness should read neutral, got %u", v8);
 
-    /* Raw-valued params take the raw path. */
+    /* Raw-valued params take the raw path. MI orders 60 Hz before 50 Hz,
+     * so what gets queued is the translated value, not raptor's. */
     CHECK(hal_isp_set_antiflicker(c, RSS_ANTIFLICKER_50HZ) == RSS_OK, "set_antiflicker queues");
     CHECK(g_iq[IQ_FLICKER].has_pending && g_iq[IQ_FLICKER].pending_is_raw,
           "antiflicker queues as raw");
-    CHECK(g_iq[IQ_FLICKER].pending == RSS_ANTIFLICKER_50HZ, "queued flicker value");
+    CHECK(g_iq[IQ_FLICKER].pending == STAR_FLICKER_50HZ, "queued flicker value should be MI's 2");
 
     CHECK(hal_isp_set_defog(c, 1) == RSS_OK, "set_defog queues");
     CHECK(g_iq[IQ_DEFOG].has_pending && g_iq[IQ_DEFOG].pending == 1, "defog queued as 1");
@@ -1484,6 +1578,7 @@ int main(void)
     test_unscale_round_trip();
     test_scale_degenerate_inputs();
     test_evcomp_neutral_comes_from_the_tuning();
+    test_antiflicker_translates_the_mains_frequency();
     test_pending_queue();
     test_orientation_carries_both_axes();
     test_sensor_fps_clamps_to_the_mode();
