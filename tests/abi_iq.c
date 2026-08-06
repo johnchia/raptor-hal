@@ -88,6 +88,15 @@ _Static_assert(offsetof(MI_ISP_AE_HW_STATISTICS_t, nAvg) == 8,
 _Static_assert(offsetof(MI_ISP_AE_AVGS, uAvgY) == I6_ISP_AE_CELL_Y,
                "AE cell luma lane");
 _Static_assert(sizeof(MI_ISP_AE_AVGS) == I6_ISP_AE_CELL_SZ, "AE cell size");
+_Static_assert(sizeof(CusAEInfo_t) == 65, "CusAEInfo_t is the 65 bytes the wrapper copies");
+_Static_assert(sizeof(i6_isp_ae_status) >= sizeof(CusAEInfo_t),
+               "AE status must hold all of CusAEInfo_t");
+_Static_assert(offsetof(CusAEInfo_t, Shutter) == offsetof(i6_isp_ae_status, shutterUs),
+               "AE status shutter offset");
+_Static_assert(offsetof(CusAEInfo_t, AvgBlkX) == offsetof(i6_isp_ae_status, avgBlkX),
+               "AE status grid dimension offset");
+_Static_assert(offsetof(CusAEInfo_t, PreAvgY) == offsetof(i6_isp_ae_status, preAvgY),
+               "AE status PreAvgY offset");
 _Static_assert(sizeof(MI_ISP_AE_EXPO_LIMIT_TYPE_t) == sizeof(i6_isp_exp),
                "AE exposure limit size");
 _Static_assert(offsetof(MI_ISP_AE_EXPO_LIMIT_TYPE_t, u32MaxShutterUS)

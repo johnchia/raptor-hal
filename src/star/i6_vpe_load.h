@@ -150,14 +150,19 @@ static inline int i6_vpe_load(i6_vpe_impl *vpe_lib)
         return RSS_ERR_NOTSUP;
 
     /*
-     * MI_VPE_GetPortMode and MI_VPE_SetPortCrop are deliberately not
-     * bound. Both were tried against this SDK and neither behaved as its
-     * signature suggests: the crop came back reading a rectangle it was
-     * never passed, and calling the getter left the port it was asked
-     * about with no geometry at all. i6_vpe_port is reconstructed, not
-     * vendor-supplied, so a size mismatch here writes past the caller's
-     * frame. Nothing on a working path may depend on an MI struct layout
-     * this port has not verified.
+     * MI_VPE_GetPortMode and MI_VPE_SetPortCrop are not bound, but the
+     * reason has narrowed. It used to be that i6_vpe_port was
+     * reconstructed rather than vendor-supplied, so a size mismatch could
+     * write past the caller's frame; it matches MI_VPE_PortMode_t exactly,
+     * 16 bytes, field for field, so that objection is gone.
+     *
+     * What stands is that both were tried and neither behaved as its
+     * signature suggests: calling the getter left the port it was asked
+     * about with no geometry at all, and the crop came back reading a
+     * rectangle it was never passed -- which the headers explain, because
+     * MI_VPE_SetPortCrop takes an MI_SYS_WindowRect_t (four u16, 8 bytes)
+     * and not a port mode. Nothing on a working path needs either, so the
+     * experiment is worth repeating only when a caller wants runtime crop.
      */
 
     return RSS_OK;
