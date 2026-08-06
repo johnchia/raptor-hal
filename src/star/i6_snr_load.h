@@ -33,6 +33,7 @@ typedef struct {
     int (*fnDisable)(unsigned int sensor);
     int (*fnEnable)(unsigned int sensor);
 
+    int (*fnGetFramerate)(unsigned int sensor, unsigned int *framerate);
     int (*fnSetFramerate)(unsigned int sensor, unsigned int framerate);
     int (*fnSetOrientation)(unsigned int sensor, unsigned char mirror, unsigned char flip);
 
@@ -62,6 +63,10 @@ static inline int i6_snr_load(i6_snr_impl *snr_lib)
 
     if (!(snr_lib->fnEnable = (int(*)(unsigned int sensor))
         hal_symbol_load("i6_snr", snr_lib->handle, "MI_SNR_Enable")))
+        return RSS_ERR_NOTSUP;
+
+    if (!(snr_lib->fnGetFramerate = (int(*)(unsigned int sensor, unsigned int *framerate))
+        hal_symbol_load("i6_snr", snr_lib->handle, "MI_SNR_GetFps")))
         return RSS_ERR_NOTSUP;
 
     if (!(snr_lib->fnSetFramerate = (int(*)(unsigned int sensor, unsigned int framerate))

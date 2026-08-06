@@ -671,6 +671,91 @@ static void test_orientation_carries_both_axes(void)
 }
 
 /*
+ * Sensor framerate. The mode's range is the sensor's, not the config's, so a
+ * request outside it is clamped rather than refused -- and the unit MI takes
+ * depends on whether the request is a whole number of frames.
+ */
+static unsigned int g_fps_programmed;
+static unsigned int g_fps_reported;
+static int g_fps_set_ret, g_fps_get_ret;
+
+static int fake_set_fps(unsigned int sensor, unsigned int fps)
+{
+    (void)sensor;
+    if (g_fps_set_ret)
+        return g_fps_set_ret;
+    g_fps_programmed = fps;
+    g_fps_reported = fps;
+    return 0;
+}
+
+static int fake_get_fps(unsigned int sensor, unsigned int *fps)
+{
+    (void)sensor;
+    if (g_fps_get_ret)
+        return g_fps_get_ret;
+    *fps = g_fps_reported;
+    return 0;
+}
+
+static void test_sensor_fps_clamps_to_the_mode(void)
+{
+    rss_hal_ctx_t ctx;
+    star_state_t st;
+    void *c = &ctx;
+    uint32_t num, den;
+
+    memset(&ctx, 0, sizeof(ctx));
+    memset(&st, 0, sizeof(st));
+    ctx.platform = &st;
+    st.snr.fnSetFramerate = fake_set_fps;
+    st.snr.fnGetFramerate = fake_get_fps;
+    st.res.minFps = 5;
+    st.res.maxFps = 30;
+    g_fps_programmed = g_fps_reported = 0;
+    g_fps_set_ret = g_fps_get_ret = 0;
+
+    CHECK(hal_isp_set_sensor_fps(c, 15, 1) == RSS_OK, "an in-range rate must succeed");
+    CHECK(g_fps_programmed == 15, "15 fps must reach MI as 15, got %u", g_fps_programmed);
+    CHECK(st.fps == 15, "st.fps must follow, got %u", st.fps);
+
+    /* Above and below the mode's range, clamped rather than refused. */
+    CHECK(hal_isp_set_sensor_fps(c, 60, 1) == RSS_OK, "an over-range rate must still succeed");
+    CHECK(g_fps_programmed == 30, "60 must clamp to the mode's 30, got %u", g_fps_programmed);
+    CHECK(hal_isp_set_sensor_fps(c, 1, 1) == RSS_OK, "an under-range rate must still succeed");
+    CHECK(g_fps_programmed == 5, "1 must clamp to the mode's 5, got %u", g_fps_programmed);
+
+    /* A fractional rate goes as milli-frames, which is MI's other unit. */
+    CHECK(hal_isp_set_sensor_fps(c, 30000, 1001) == RSS_OK, "29.97 must succeed");
+    CHECK(g_fps_programmed == 29970, "29.97 must reach MI as 29970, got %u", g_fps_programmed);
+    CHECK(st.fps == 30, "st.fps rounds for the frame period, got %u", st.fps);
+
+    /* The getter reads hardware, and tells the two units apart by the
+     * mode's own ceiling. */
+    num = den = 0;
+    CHECK(hal_isp_get_sensor_fps(c, &num, &den) == RSS_OK, "get must succeed");
+    CHECK(num == 29970 && den == 1000, "a milli reading must report /1000, got %u/%u", num, den);
+    g_fps_reported = 20;
+    CHECK(hal_isp_get_sensor_fps(c, &num, &den) == RSS_OK, "get must succeed");
+    CHECK(num == 20 && den == 1, "a whole reading must report /1, got %u/%u", num, den);
+
+    /* No getter falls back to what was programmed rather than failing. */
+    st.snr.fnGetFramerate = NULL;
+    CHECK(hal_isp_get_sensor_fps(c, &num, &den) == RSS_OK, "get must fall back");
+    CHECK(num == 30 && den == 1, "the fallback is the recorded rate, got %u/%u", num, den);
+
+    /* A zero denominator is a caller error, not a division. */
+    CHECK(hal_isp_set_sensor_fps(c, 30, 0) == RSS_ERR_INVAL, "a zero denominator is INVAL");
+    CHECK(hal_isp_set_sensor_fps(c, 0, 1) == RSS_ERR_INVAL, "a zero rate is INVAL");
+
+    /* A failing MI call is reported, and no symbol at all is NOTSUP. */
+    g_fps_set_ret = -1;
+    CHECK(hal_isp_set_sensor_fps(c, 15, 1) == RSS_ERR_IO, "a failing SetFps is io");
+    st.snr.fnSetFramerate = NULL;
+    CHECK(hal_isp_set_sensor_fps(c, 15, 1) == RSS_ERR_NOTSUP, "a missing symbol is NOTSUP");
+}
+
+/*
  * A tuning reload must be able to put the knobs back, so the recorded
  * values have to survive the flush that applies them.
  *
@@ -1605,6 +1690,7 @@ int main(void)
     test_ae_target_scales_the_tuning_curve();
     test_pending_queue();
     test_orientation_carries_both_axes();
+    test_sensor_fps_clamps_to_the_mode();
     test_recorded_values_survive_a_reload();
     test_tuning_load_leaves_3a_alone();
     test_exposure_waits_for_the_isp();

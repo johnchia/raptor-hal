@@ -877,6 +877,7 @@ static void star_isp_snapshot_bin_limits(star_state_t *st)
     st->bin_max_sensor_gain = limit.maxSensorGain;
     st->bin_min_isp_gain = limit.minIspGain;
     st->bin_max_isp_gain = limit.maxIspGain;
+    st->bin_max_shutter_us = limit.maxShutterUs;
 
     /*
      * INFO because this is the line every night-mode threshold gets
@@ -893,10 +894,23 @@ static void star_isp_snapshot_bin_limits(star_state_t *st)
                          (limit.maxIspGain ? limit.maxIspGain : 1024u) / 1024u);
 }
 
+/*
+ * The rate to hand MI_SNR_SetFps: whole frames, unless a fractional rate
+ * was programmed, in which case the milli-frames it was programmed with.
+ * Re-issuing a fractional rate as a rounded one would quietly retune the
+ * sensor a fraction of a frame away from what was asked for.
+ */
+static unsigned int star_snr_fps_arg(const star_state_t *st, unsigned int fps)
+{
+    if (st->fps_milli && st->fps_milli % 1000u)
+        return st->fps_milli;
+    return fps;
+}
+
 int star_isp_cap_exposure(star_state_t *st, unsigned int fps)
 {
     i6_isp_exp limit;
-    unsigned int frame_us;
+    unsigned int frame_us, want;
     int ret;
 
     if (!st || !st->isp_loaded || !fps)
@@ -905,9 +919,9 @@ int star_isp_cap_exposure(star_state_t *st, unsigned int fps)
         return RSS_ERR_NOTSUP;
 
     /*
-     * An explicit max_exposure_us owns the ceiling. Without this the
-     * framerate clamp below would immediately undo it, and a config key
-     * that silently does nothing is worse than no key.
+     * An explicit max_exposure_us owns the ceiling. Without this the fit
+     * below would immediately undo it, and a config key that silently does
+     * nothing is worse than no key.
      */
     if (st->pend_ae_it_max > 0) {
         HAL_LOG_DBG("isp: max shutter left at the configured %d us", st->pend_ae_it_max);
@@ -929,15 +943,27 @@ int star_isp_cap_exposure(star_state_t *st, unsigned int fps)
     }
 
     frame_us = 1000000u / fps;
-    if (limit.maxShutterUs <= frame_us) {
-        HAL_LOG_DBG("isp: AE max shutter %u us already within the %u us frame period",
-                    limit.maxShutterUs, frame_us);
+
+    /*
+     * The frame period is the ceiling's upper bound, and the tuning's own
+     * ceiling is its target. Fitting to both means a rate change moves the
+     * ceiling either way: up to what the tuning asked for when the frame
+     * period allows it, down to the frame period when it does not. Neither
+     * direction ever exceeds the calibration.
+     */
+    want = st->bin_max_shutter_us ? st->bin_max_shutter_us : limit.maxShutterUs;
+    if (want > frame_us)
+        want = frame_us;
+
+    if (limit.maxShutterUs == want) {
+        HAL_LOG_DBG("isp: AE max shutter already %u us for the %u us frame period", want, frame_us);
         return RSS_OK;
     }
 
-    HAL_LOG_INFO("isp: capping AE max shutter %u -> %u us to hold %u fps", limit.maxShutterUs,
-                 frame_us, fps);
-    limit.maxShutterUs = frame_us;
+    HAL_LOG_INFO("isp: AE max shutter %u -> %u us for %u fps", limit.maxShutterUs, want, fps);
+    limit.maxShutterUs = want;
+    if (limit.minShutterUs > want)
+        limit.minShutterUs = want;
 
     ret = st->isp.fnSetExposureLimit(STAR_ISP_CHN, &limit);
     if (ret) {
@@ -953,8 +979,8 @@ int star_isp_cap_exposure(star_state_t *st, unsigned int fps)
      * driver recompute timing -- and MI_SNR_SetFps is that something.
      * waybeam calls this the cold-boot fix (star6e_pipeline.c:2094).
      */
-    if (st->snr.fnSetFramerate && st->snr.fnSetFramerate(STAR_SNR_INDEX, fps))
-        HAL_LOG_WARN("isp: MI_SNR_SetFps(%u) after the exposure cap failed", fps);
+    if (st->snr.fnSetFramerate && st->snr.fnSetFramerate(STAR_SNR_INDEX, star_snr_fps_arg(st, fps)))
+        HAL_LOG_WARN("isp: MI_SNR_SetFps(%u) after the exposure fit failed", fps);
 
     return RSS_OK;
 }
@@ -1763,8 +1789,9 @@ static void star_isp_flush_pending(star_state_t *st)
     if (st->pend_max_dgain >= 0)
         (void)star_isp_apply_gain_limit(st, false, st->pend_max_dgain);
 
-    /* Before star_isp_cap_exposure, which only lowers, so a request at or
-     * under the frame period survives it untouched. */
+    /* Order does not matter for correctness -- star_isp_cap_exposure yields
+     * outright to an explicit request -- but keeping it first means the log
+     * reads in the order the values were decided. */
     if (st->pend_ae_it_max > 0)
         (void)star_isp_apply_ae_it_max(st, (unsigned int)st->pend_ae_it_max);
 
@@ -1782,15 +1809,16 @@ static void star_isp_flush_pending(star_state_t *st)
  * Ingenic's own isp_set_ae_it_max is a different quantity on a different
  * scale; nothing converts between them.
  *
- * Why this op exists at all: star_isp_cap_exposure only ever *lowers* the
- * ceiling, to hold the requested framerate, and both references do the
- * same -- waybeam clamps with `want_shutter <= cur_limit.maxShutterUs`
- * and divinus never calls SetExposureLimit at all (i6_sensor_exposure is
- * defined with no caller). So a tuning file that publishes a conservative
- * shutter ceiling is the ceiling, and on a sensor whose gain ceiling is
- * also low -- gc4653.bin allows 8x sensor and no ISP gain at all -- there
- * is no lever left for a dark scene. This is that lever, opt-in, because
- * trading motion blur for light is a decision this code cannot make.
+ * Why this op exists at all: star_isp_cap_exposure never lets the ceiling
+ * *exceed* the tuning's own, since it fits the frame period against that
+ * value rather than above it, and both references are stricter still --
+ * waybeam clamps with `want_shutter <= cur_limit.maxShutterUs` and divinus
+ * never calls SetExposureLimit at all (i6_sensor_exposure is defined with
+ * no caller). So a tuning file that publishes a conservative shutter
+ * ceiling is the ceiling, and on a sensor whose gain ceiling is also low
+ * -- gc4653.bin allows 8x sensor and no ISP gain at all -- there is no
+ * lever left for a dark scene. This is that lever, opt-in, because trading
+ * motion blur for light is a decision this code cannot make.
  *
  * Still bounded by the frame period: a longer exposure than the frame
  * period cannot be honoured without dropping framerate, which is a
@@ -2591,5 +2619,110 @@ int hal_isp_get_hvflip(void *ctx, int *hflip, int *vflip)
     if (vflip)
         *vflip = st->vflip ? 1 : 0;
 
+    return RSS_OK;
+}
+
+/*
+ * Sensor frame rate.
+ *
+ * MI_SNR_SetFps works on an enabled, streaming sensor -- measured, both
+ * directions, with MI_SNR_GetFps reporting the new rate immediately and
+ * the delivered stream following it. So this is a runtime attribute here
+ * as it is on Ingenic, not a bring-up-only setting.
+ *
+ * Two things the vendor notes add. The valid range belongs to the mode
+ * selected by MI_SNR_SetRes, not to the sensor, so a request is clamped to
+ * the mode raptor picked rather than refused. And fps is accepted either
+ * as whole frames or as milli-frames (min*1000 to max*1000), which is what
+ * makes a rational like 30000/1001 expressible.
+ *
+ * What does not need doing: no rebind. MI_SYS_BindChnPort2's source and
+ * destination rates are fixed at bind time and cannot be re-set without
+ * unbinding, but they are not a ratio -- a port bound to a lower
+ * destination rate holds that rate as an absolute target across a sensor
+ * change, and a port bound pass-through delivers whatever arrives. The
+ * only limit is that nothing can deliver more than the sensor produces.
+ */
+int hal_isp_set_sensor_fps(void *ctx, uint32_t fps_num, uint32_t fps_den)
+{
+    star_state_t *st = star_state(ctx);
+    unsigned int milli, min_milli, max_milli;
+    int ret;
+
+    if (!st || !fps_num || !fps_den)
+        return RSS_ERR_INVAL;
+    if (!st->snr.fnSetFramerate)
+        return RSS_ERR_NOTSUP;
+
+    milli = (unsigned int)(((uint64_t)fps_num * 1000u) / fps_den);
+    if (!milli)
+        return RSS_ERR_INVAL;
+
+    min_milli = st->res.minFps * 1000u;
+    max_milli = st->res.maxFps * 1000u;
+    if (max_milli && milli > max_milli) {
+        HAL_LOG_WARN("isp: %u.%03u fps is above the mode's %u fps maximum; using %u", milli / 1000,
+                     milli % 1000, st->res.maxFps, st->res.maxFps);
+        milli = max_milli;
+    } else if (min_milli && milli < min_milli) {
+        HAL_LOG_WARN("isp: %u.%03u fps is below the mode's %u fps minimum; using %u", milli / 1000,
+                     milli % 1000, st->res.minFps, st->res.minFps);
+        milli = min_milli;
+    }
+
+    /* Whole frames when the request is one, milli-frames when it is not:
+     * MI takes both, and the whole number is what every reference passes. */
+    ret = st->snr.fnSetFramerate(STAR_SNR_INDEX, milli % 1000 ? milli : milli / 1000);
+    if (ret) {
+        HAL_LOG_WARN("isp: MI_SNR_SetFps(%u.%03u) failed: %d", milli / 1000, milli % 1000, ret);
+        return RSS_ERR_IO;
+    }
+
+    st->fps_milli = milli;
+    st->fps = (milli + 500) / 1000;
+    HAL_LOG_INFO("isp: sensor fps %u.%03u", milli / 1000, milli % 1000);
+
+    /*
+     * The shutter ceiling is a function of the frame period, so it moves
+     * with the rate -- otherwise a drop to 15 fps would keep a 33 ms
+     * ceiling it no longer needs, and a rise to 30 would leave a 66 ms one
+     * the sensor cannot honour without slowing straight back down.
+     */
+    (void)star_isp_cap_exposure(st, st->fps);
+
+    return RSS_OK;
+}
+
+int hal_isp_get_sensor_fps(void *ctx, uint32_t *fps_num, uint32_t *fps_den)
+{
+    star_state_t *st = star_state(ctx);
+    unsigned int fps = 0;
+
+    if (!st || !fps_num || !fps_den)
+        return RSS_ERR_INVAL;
+
+    if (st->snr.fnGetFramerate && !st->snr.fnGetFramerate(STAR_SNR_INDEX, &fps) && fps) {
+        /*
+         * MI answers in whatever unit it was set in. A value past the
+         * mode's maximum is therefore milli-frames rather than an
+         * impossible rate -- there is no other way to tell them apart, and
+         * the mode's own ceiling is the only boundary either side of which
+         * the reading makes sense.
+         */
+        if (st->res.maxFps && fps > st->res.maxFps) {
+            *fps_num = fps;
+            *fps_den = 1000;
+        } else {
+            *fps_num = fps;
+            *fps_den = 1;
+        }
+        return RSS_OK;
+    }
+
+    if (!st->fps)
+        return RSS_ERR_NOTSUP;
+
+    *fps_num = st->fps;
+    *fps_den = 1;
     return RSS_OK;
 }

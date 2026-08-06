@@ -436,8 +436,14 @@ typedef struct {
     unsigned char res_index;
 
     /* Sensor frame rate, as programmed. Used for the VIF->VPE bind and
-     * as the source rate for 2d's VPE->VENC bind. */
+     * as the source rate for 2d's VPE->VENC bind.
+     *
+     * fps_milli carries the same rate to three decimal places, which is
+     * the other unit MI_SNR_SetFps accepts. It exists so a fractional rate
+     * can be re-issued exactly -- the AE fit re-programs the sensor, and
+     * rounding there would move a 29.97 request to 30. */
     unsigned int fps;
+    unsigned int fps_milli;
 
     /*
      * ISP state.
@@ -501,6 +507,16 @@ typedef struct {
     unsigned int bin_max_sensor_gain;
     unsigned int bin_min_isp_gain;
     unsigned int bin_max_isp_gain;
+
+    /*
+     * The tuning's shutter ceiling, kept for the same reason and read at
+     * the same time. It is the upper bound star_isp_cap_exposure fits the
+     * frame period against: lowering the framerate widens the ceiling back
+     * toward this and no further, because a tuning that asks for less
+     * exposure than the frame period allows is stating a calibration, not
+     * leaving room.
+     */
+    unsigned int bin_max_shutter_us;
 
     /* How many times the tuning binary has been reloaded after finding the
      * ISP back on its defaults. Bounded: a reload that does not stick must
@@ -728,7 +744,7 @@ void star_isp_untune(star_state_t *st);
 void star_isp_teardown(star_state_t *st);
 
 /*
- * Clamp the AE's maximum shutter to one frame period.
+ * Fit the AE's maximum shutter to one frame period.
  *
  * Called from star_isp_bringup after the tuning binary is loaded, since
  * the binary carries its own AE limits and they are not required to
@@ -736,6 +752,11 @@ void star_isp_teardown(star_state_t *st);
  * on an exposure longer than the frame period in dim light, and the
  * sensor answers by dropping its own rate -- a 30 fps request silently
  * delivering 12 fps, with nothing in any log to say why.
+ *
+ * Called again whenever the framerate changes, which is why it fits
+ * rather than only lowers: a drop to 15 fps has twice the frame period to
+ * spend, and refusing to give it back would leave the picture darker than
+ * the tuning intended for no reason the caller could see.
  */
 int star_isp_cap_exposure(star_state_t *st, unsigned int fps);
 
@@ -758,6 +779,8 @@ int hal_isp_set_max_dgain(void *ctx, int gain);
 int hal_isp_set_running_mode(void *ctx, rss_isp_mode_t mode);
 int hal_isp_set_hflip(void *ctx, int enable);
 int hal_isp_set_vflip(void *ctx, int enable);
+int hal_isp_set_sensor_fps(void *ctx, uint32_t fps_num, uint32_t fps_den);
+int hal_isp_get_sensor_fps(void *ctx, uint32_t *fps_num, uint32_t *fps_den);
 
 int hal_isp_get_brightness(void *ctx, uint8_t *val);
 int hal_isp_get_contrast(void *ctx, uint8_t *val);

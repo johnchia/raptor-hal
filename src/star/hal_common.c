@@ -375,11 +375,10 @@ static int star_sensor_bringup(star_state_t *st, const rss_sensor_config_t *cfg,
      * Frame rate: honour the config's request within the mode's range, else
      * run the mode as fast as it goes.
      *
-     * `[sensor] fps` reaches Ingenic through isp_set_sensor_fps, which MI has
-     * no equivalent of -- MI_SNR_SetFps is part of sensor bring-up and is
-     * called once, here, before Enable. So this is where that setting has to
-     * be applied on this backend, and without it the key would silently do
-     * nothing.
+     * Done here as well as through isp_set_sensor_fps because the first frame
+     * should already be at the requested rate -- MI_SNR_SetFps is settable at
+     * any time (see hal_isp_set_sensor_fps), but nothing can call an op before
+     * hal_init returns.
      *
      * A request outside [minFps, maxFps] is clamped rather than refused, and
      * says so: the range belongs to the selected mode, and dropping to a
@@ -387,8 +386,8 @@ static int star_sensor_bringup(star_state_t *st, const rss_sensor_config_t *cfg,
      *
      * The rate is recorded as well as programmed because MI_SYS_BindChnPort2
      * takes source and destination frame rates -- both the VIF->VPE bind below
-     * and the VPE->VENC bind need it -- and MI offers no way to read back what
-     * the sensor is actually running at.
+     * and the VPE->VENC bind need it -- and because the AE shutter ceiling is
+     * fitted to the frame period.
      */
     if (st->res.maxFps) {
         unsigned int want = cfg->fps ? cfg->fps : st->res.maxFps;
@@ -402,10 +401,12 @@ static int star_sensor_bringup(star_state_t *st, const rss_sensor_config_t *cfg,
         }
 
         ret = st->snr.fnSetFramerate(STAR_SNR_INDEX, want);
-        if (ret)
+        if (ret) {
             HAL_LOG_WARN("MI_SNR_SetFps(%u) failed: %d", want, ret);
-        else
+        } else {
             st->fps = want;
+            st->fps_milli = want * 1000u;
+        }
     }
 
     /* Orientation before Enable, so the driver's init picks it up.
@@ -1261,6 +1262,7 @@ static const rss_hal_ops_t g_ops = {
     .isp_set_running_mode = hal_isp_set_running_mode,
     .isp_set_hflip = hal_isp_set_hflip,
     .isp_set_vflip = hal_isp_set_vflip,
+    .isp_set_sensor_fps = hal_isp_set_sensor_fps,
 
     .isp_get_brightness = hal_isp_get_brightness,
     .isp_get_contrast = hal_isp_get_contrast,
@@ -1276,6 +1278,7 @@ static const rss_hal_ops_t g_ops = {
     .isp_get_max_dgain = hal_isp_get_max_dgain,
     .isp_get_running_mode = hal_isp_get_running_mode,
     .isp_get_hvflip = hal_isp_get_hvflip,
+    .isp_get_sensor_fps = hal_isp_get_sensor_fps,
     .isp_get_exposure = hal_isp_get_exposure,
 
     /* Framesource -- VPE output ports (src/star/hal_framesource.c).
