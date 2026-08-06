@@ -25,9 +25,16 @@
 CC ?= gcc
 SAN ?= address
 
+# SIGMASTAR_HEADERS mirrors the top-level Makefile's variable, so a checkout
+# with the submodule elsewhere can point both at the same place. The MI
+# declarations are host-compiled here with the size assertions defined away:
+# they describe an ARM ABI, and the suites test logic rather than layout.
+SIGMASTAR_HEADERS ?= ../sigmastar-headers
+
 CFLAGS = -Wall -Wextra -std=c11 -D_GNU_SOURCE -g -fsanitize=$(SAN) \
 	 -D'_Static_assert(c,m)=' -DPLATFORM_INFINITY6E=1 \
-	 -I../src -I../include -I../../raptor-common/include
+	 -I../src -I../include -I../../raptor-common/include \
+	 -I$(SIGMASTAR_HEADERS)/infinity6e
 LDFLAGS = -fsanitize=$(SAN) -lpthread
 
 # gpio is the odd one out: src/hal_gpio.c is platform-independent sysfs
