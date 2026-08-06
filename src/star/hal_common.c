@@ -256,67 +256,6 @@ static int star_sensor_detect_from(const char *path, char *buf, size_t len)
 }
 
 /*
- * star_sensor_pick_mode -- choose among the modes the sensor driver enumerates.
- *
- * Index 0 is the native mode and the default. A config that asks for a
- * specific geometry gets an exact match on the mode's output dimensions; fps
- * only breaks ties, because MI_SNR_SetFps programs the rate separately within
- * a mode's [minFps, maxFps] range, so a mode whose range merely contains the
- * requested rate is a perfectly good answer.
- *
- * An unmatched request warns and falls back to native. The mode list belongs
- * to the sensor driver, and refusing to start because raptor.conf names a
- * resolution this sensor lacks would be a worse outcome than starting at its
- * native one and saying so plainly.
- */
-static unsigned char star_sensor_pick_mode(star_state_t *st, const rss_sensor_config_t *cfg,
-                                           unsigned int count)
-{
-    unsigned int want_w = cfg->width;
-    unsigned int want_h = cfg->height;
-    unsigned char best = 0;
-    bool have_best = false;
-    unsigned int i;
-
-    /* fps alone does not select a mode -- it is programmed within whatever
-     * mode is chosen, further down in star_sensor_bringup. */
-    if (!want_w || !want_h)
-        return 0;
-
-    /* MI indexes modes with an unsigned char; nothing real comes close. */
-    if (count > 255)
-        count = 255;
-
-    for (i = 0; i < count; i++) {
-        i6_snr_res res;
-
-        if (st->snr.fnGetResolution(STAR_SNR_INDEX, (unsigned char)i, &res))
-            continue;
-        if (res.output.width != want_w || res.output.height != want_h)
-            continue;
-
-        /* Exact geometry. Prefer a mode that can also run the wanted rate. */
-        if (!have_best) {
-            best = (unsigned char)i;
-            have_best = true;
-        }
-        if (cfg->fps && cfg->fps >= res.minFps && cfg->fps <= res.maxFps) {
-            best = (unsigned char)i;
-            break;
-        }
-    }
-
-    if (!have_best) {
-        HAL_LOG_WARN("sensor: no mode matches the requested %ux%u; using native mode 0",
-                     want_w, want_h);
-        return 0;
-    }
-
-    HAL_LOG_DBG("sensor: mode %u matches the requested %ux%u", best, want_w, want_h);
-    return best;
-}
-
-/*
  * star_sensor_bringup -- select a mode, start the sensor, read back what it is.
  *
  * Sequence follows both references: SetPlaneMode -> QueryResCount ->
@@ -358,7 +297,14 @@ static int star_sensor_bringup(star_state_t *st, const rss_sensor_config_t *cfg)
         return RSS_ERR_NOENT;
     }
 
-    st->res_index = star_sensor_pick_mode(st, cfg, count);
+    /*
+     * Mode 0, the driver's native one. The mode list is enumerated above to
+     * confirm the driver answered at all, not to choose from: nothing in the
+     * config selects a mode, so a sensor with several runs the first. A board
+     * that ever needs another one wants the choice made where the sensor is
+     * known, not through a field every platform has to carry.
+     */
+    st->res_index = 0;
     ret = st->snr.fnGetResolution(STAR_SNR_INDEX, st->res_index, &st->res);
     if (ret) {
         HAL_LOG_ERR("MI_SNR_GetRes(%u) failed: %d", st->res_index, ret);
@@ -372,17 +318,11 @@ static int star_sensor_bringup(star_state_t *st, const rss_sensor_config_t *cfg)
     }
 
     /*
-     * Frame rate: honour the config's request within the mode's range, else
-     * run the mode as fast as it goes.
-     *
-     * Done here as well as through isp_set_sensor_fps because the first frame
-     * should already be at the requested rate -- MI_SNR_SetFps is settable at
-     * any time (see hal_isp_set_sensor_fps), but nothing can call an op before
-     * hal_init returns.
-     *
-     * A request outside [minFps, maxFps] is clamped rather than refused, and
-     * says so: the range belongs to the selected mode, and dropping to a
-     * working rate beats failing to start.
+     * Start the sensor at the mode's own maximum. `[sensor] fps` arrives
+     * through isp_set_sensor_fps once rvd is applying its ISP settings, which
+     * is before any output port is enabled, so the rate a stream sees is
+     * still the configured one -- and starting at the ceiling means the bind
+     * below declares a source rate no later change can exceed.
      *
      * The rate is recorded as well as programmed because MI_SYS_BindChnPort2
      * takes source and destination frame rates -- both the VIF->VPE bind below
@@ -390,22 +330,12 @@ static int star_sensor_bringup(star_state_t *st, const rss_sensor_config_t *cfg)
      * fitted to the frame period.
      */
     if (st->res.maxFps) {
-        unsigned int want = cfg->fps ? cfg->fps : st->res.maxFps;
-
-        if (want > st->res.maxFps || (st->res.minFps && want < st->res.minFps)) {
-            unsigned int clamped = want > st->res.maxFps ? st->res.maxFps : st->res.minFps;
-            HAL_LOG_WARN("sensor: requested %u fps is outside the mode's %u-%u range; "
-                         "using %u",
-                         want, st->res.minFps, st->res.maxFps, clamped);
-            want = clamped;
-        }
-
-        ret = st->snr.fnSetFramerate(STAR_SNR_INDEX, want);
+        ret = st->snr.fnSetFramerate(STAR_SNR_INDEX, st->res.maxFps);
         if (ret) {
-            HAL_LOG_WARN("MI_SNR_SetFps(%u) failed: %d", want, ret);
+            HAL_LOG_WARN("MI_SNR_SetFps(%u) failed: %d", st->res.maxFps, ret);
         } else {
-            st->fps = want;
-            st->fps_milli = want * 1000u;
+            st->fps = st->res.maxFps;
+            st->fps_milli = st->res.maxFps * 1000u;
         }
     }
 

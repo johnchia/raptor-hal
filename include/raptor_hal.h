@@ -476,24 +476,6 @@ typedef struct {
     int pwdn_gpio;
     int power_gpio;
 
-    /*
-     * Optional mode request. Zero means "whatever the sensor calls native",
-     * which is what every Ingenic backend does unconditionally -- there the
-     * mode is a property of the loaded driver, so these are ignored.
-     *
-     * SigmaStar sensors enumerate their modes at runtime (MI_SNR_QueryResCount)
-     * and one has to be selected before MI_SNR_Enable, so these give a config
-     * file a way to ask for a mode other than the first. A request that matches
-     * nothing is a warning and falls back to native rather than an error: the
-     * mode list is the sensor driver's, and refusing to start because a config
-     * names a resolution this particular sensor lacks would be worse than
-     * starting at its native one and saying so.
-     */
-    uint16_t width;
-    uint16_t height;
-    uint32_t fps;
-
-
 } rss_sensor_config_t;
 
 /* Maximum number of sensors supported (IMPVI_MAIN, SEC, THR) */
