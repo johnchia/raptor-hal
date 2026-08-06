@@ -323,6 +323,20 @@ static star_iq_param_t g_iq[IQ_PARAM_COUNT] = {
      * value is undocumented -- 100 is the midpoint of the range, which is
      * not the same thing. Anything written here pins the AE's target luma,
      * so guessing the neutral wrong shifts every default image.
+     *
+     * Two things measured about it that these numbers get wrong, both worth
+     * fixing together and neither fixed here:
+     *
+     * The lower half is dead. The tuning leaves s32EV at 0, so the learned
+     * neutral is 0, so star_iq_scale maps raptor's 0..127 onto MI's 0..0 --
+     * ae_comp 0 and 64 are indistinguishable from 128 on the board. That is
+     * this mapping, not the hardware: MI_ISP_AE_EV_COMP_TYPE_t.s32EV is
+     * *signed* (asserted in tests/abi_iq.c), so the lower half should map to
+     * negative EV rather than compress into nothing.
+     *
+     * And the 200 is too generous: ae_comp 192 and 255 produce identical
+     * exposure, gain and luma, so the AE's real ceiling is reached before
+     * raptor's 192 and a third of the range does nothing.
      */
     [IQ_EVCOMP] = { "ae_comp", "MI_ISP_AE_GetEVComp", "MI_ISP_AE_SetEVComp",
                     I6_ISP_AE_EVCOMP_PAYLOAD, 0, 4, IQ_FLAT, 200, 100, true, NULL, NULL },
@@ -976,22 +990,18 @@ int star_isp_cap_exposure(star_state_t *st, unsigned int fps)
     }
 
     /*
-     * Whether the cap above reaches the AE algorithm is unsettled, and the
-     * one measurement in hand says it does not: with the limit reading
-     * 22..33333 the AE was seen running a 50000 us shutter, which is the
-     * tuning binary's own ceiling and exactly the 20 fps the board
-     * delivered when asked for 30. That was on a run where the binary had
-     * been loaded too early and re-read from disk underneath us, so it is
-     * consistent with the AE taking its limits at init and never looking
-     * again -- which would make this write bookkeeping for get-isp and for
-     * the reload check.
+     * The cap above does reach the algorithm, which is worth stating because
+     * the evidence takes a detour. Driving ae_comp to 192 makes the AE
+     * demand every photon it can: shutter 9089 -> 30000 us, gain 1024 ->
+     * 1083, scene luma 42 -> 123, the picture on its way to blown out. And
+     * it stops there -- below this 33333, rather than reaching for the
+     * 50000 the tuning binary asks for.
      *
-     * Not concluded, because the obvious follow-up cannot be done from
-     * outside the process: MI's per-module AE calls dispatch through a
-     * handler table that CUS3A registers in the *owning* process, so a
-     * second process writing them proves nothing about what the algorithm
-     * sees. Settling it means instrumenting this file, in a dark enough
-     * scene for the AE to want the whole frame period.
+     * Which places the 20 fps that was once measured at a requested 30: the
+     * AE was running 50000 because the binary had been loaded too early and
+     * re-read from disk underneath us, taking this cap with it. Not the cap
+     * failing -- the cap being erased. See the comment above
+     * star_isp_reload_if_reset.
      *
      * The SetFps below is independent of all that, and it is measured
      * working. It does not touch the AE: it makes the sensor driver
