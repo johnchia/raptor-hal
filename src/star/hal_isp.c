@@ -35,18 +35,26 @@
  * toggle-only module is just bEnable.
  *
  * So one field is reachable with (payload size, manual offset, width) and
- * no struct at all. Both numbers are verifiable without vendor headers:
- * each wrapper hardcodes its payload size, so
+ * no struct at all. The payload size is verifiable without vendor
+ * headers, because each wrapper hardcodes it:
  *
  *     arm-openipc-linux-gnueabihf-objdump -d \
  *         --disassemble=MI_ISP_IQ_GetBrightness libmi_isp.so
  *
- * prints `mov.w r3, #76` into the size slot. Every entry in the table
- * below was checked that way, and the check is sharper than it sounds:
- * brightness is a u32 at manual offset 72 in a 76-byte payload, so the
- * manual value is provably the last four bytes and the convention is
- * confirmed rather than assumed. Saturation (392 in 416), sharpness
- * (1192 in 1268), NRLuma (104 in 112) and NR3D (1288 in 1776) all agree.
+ * prints `mov.w r3, #76` into the size slot. That is where the numbers in
+ * i6_isp.h come from, and it is the size that governs how much the
+ * library copies into the staging buffer.
+ *
+ * The manual offset does not follow from the payload size alone, and
+ * assuming it did is how one row came to be wrong for as long as the
+ * table existed. The auto array holds 16 blocks and the manual block is a
+ * seventeenth of the same size, so a payload of 1776 implies a block of
+ * (1776 - 8) / 17 = 104 and a manual offset of 8 + 16 * 104 = 1672 -- not
+ * the 1288 that was there, which implies an 80-byte block and contradicts
+ * the 1776 it sits beside. Brightness is the case where the arithmetic is
+ * unambiguous (a u32 at 72 in 76 is provably the last four bytes); the
+ * larger modules are not, so tests/abi_iq.c now checks every row against
+ * the vendor structs instead.
  *
  * Every access is read-modify-write. That is what makes poking one field
  * of a struct we have not fully described safe: whatever else the
@@ -269,11 +277,11 @@ enum {
 };
 
 /*
- * Payload sizes are from disassembling the board's libmi_isp.so; manual
- * offsets are waybeam's, cross-checked against those sizes (see the
- * header comment). mi_unity is the MI value corresponding to raptor's
- * neutral 128, which is what keeps a default config from shifting the
- * image:
+ * Payload sizes and manual-block offsets live in i6_isp.h, where the
+ * vendor ABI belongs and where tests/abi_iq.c asserts every one of them
+ * against the vendor headers. mi_unity is the MI value corresponding to
+ * raptor's neutral 128, which is what keeps a default config from
+ * shifting the image:
  *
  *   brightness/contrast  0..100, midpoint 50
  *   saturation           0..127 where 32 is unity gain (1X), *not* the
@@ -285,24 +293,30 @@ enum {
  *                        -- see unity_from_tuning
  */
 static star_iq_param_t g_iq[IQ_PARAM_COUNT] = {
-    [IQ_BRIGHTNESS] = { "brightness", "MI_ISP_IQ_GetBrightness", "MI_ISP_IQ_SetBrightness", 76, 72,
+    [IQ_BRIGHTNESS] = { "brightness", "MI_ISP_IQ_GetBrightness", "MI_ISP_IQ_SetBrightness",
+                        I6_ISP_IQ_BRIGHTNESS_PAYLOAD, I6_ISP_IQ_BRIGHTNESS_MANUAL,
                         4, IQ_AUTOMAN, 100, 50, false, NULL, NULL },
-    [IQ_CONTRAST] = { "contrast", "MI_ISP_IQ_GetContrast", "MI_ISP_IQ_SetContrast", 76, 72, 4,
+    [IQ_CONTRAST] = { "contrast", "MI_ISP_IQ_GetContrast", "MI_ISP_IQ_SetContrast",
+                      I6_ISP_IQ_CONTRAST_PAYLOAD, I6_ISP_IQ_CONTRAST_MANUAL, 4,
                       IQ_AUTOMAN, 100, 50, false, NULL, NULL },
-    [IQ_SATURATION] = { "saturation", "MI_ISP_IQ_GetSaturation", "MI_ISP_IQ_SetSaturation", 416, 392,
+    [IQ_SATURATION] = { "saturation", "MI_ISP_IQ_GetSaturation", "MI_ISP_IQ_SetSaturation",
+                        I6_ISP_IQ_SATURATION_PAYLOAD, I6_ISP_IQ_SATURATION_MANUAL,
                         1, IQ_AUTOMAN, 127, 32, false, NULL, NULL },
-    [IQ_SHARPNESS] = { "sharpness", "MI_ISP_IQ_GetSharpness", "MI_ISP_IQ_SetSharpness", 1268, 1192,
+    [IQ_SHARPNESS] = { "sharpness", "MI_ISP_IQ_GetSharpness", "MI_ISP_IQ_SetSharpness",
+                       I6_ISP_IQ_SHARPNESS_PAYLOAD, I6_ISP_IQ_SHARPNESS_MANUAL,
                        1, IQ_AUTOMAN, 255, 128, false, NULL, NULL },
     /* Spatial (per-frame) luma noise reduction is raptor's "sinter". */
-    [IQ_SINTER] = { "sinter", "MI_ISP_IQ_GetNRLuma", "MI_ISP_IQ_SetNRLuma", 112, 104, 1, IQ_AUTOMAN,
+    [IQ_SINTER] = { "sinter", "MI_ISP_IQ_GetNRLuma", "MI_ISP_IQ_SetNRLuma",
+                    I6_ISP_IQ_NRLUMA_PAYLOAD, I6_ISP_IQ_NRLUMA_MANUAL, 1, IQ_AUTOMAN,
                     255, 128, false, NULL, NULL },
     /* Temporal noise reduction is raptor's "temper" -- MI calls it 3D NR. */
-    [IQ_TEMPER] = { "temper", "MI_ISP_IQ_GetNR3D", "MI_ISP_IQ_SetNR3D", 1776, 1288, 1, IQ_AUTOMAN,
+    [IQ_TEMPER] = { "temper", "MI_ISP_IQ_GetNR3D", "MI_ISP_IQ_SetNR3D",
+                    I6_ISP_IQ_NR3D_PAYLOAD, I6_ISP_IQ_NR3D_MANUAL, 1, IQ_AUTOMAN,
                     255, 128, false, NULL, NULL },
-    [IQ_DEFOG] = { "defog", "MI_ISP_IQ_GetDefog", "MI_ISP_IQ_SetDefog", 28, 0, 4, IQ_BOOL, 1, 0,
-                   false, NULL, NULL },
-    [IQ_GRAY] = { "gray", "MI_ISP_IQ_GetColorToGray", "MI_ISP_IQ_SetColorToGray", 4, 0, 4, IQ_BOOL,
-                  1, 0, false, NULL, NULL },
+    [IQ_DEFOG] = { "defog", "MI_ISP_IQ_GetDefog", "MI_ISP_IQ_SetDefog",
+                   I6_ISP_IQ_DEFOG_PAYLOAD, 0, 4, IQ_BOOL, 1, 0, false, NULL, NULL },
+    [IQ_GRAY] = { "gray", "MI_ISP_IQ_GetColorToGray", "MI_ISP_IQ_SetColorToGray",
+                  I6_ISP_IQ_GRAY_PAYLOAD, 0, 4, IQ_BOOL, 1, 0, false, NULL, NULL },
     /*
      * The only knob whose neutral has to be learned. It is IQ_FLAT, so
      * there is no auto mode to hand it back to, and MI's own no-compensation
@@ -310,10 +324,10 @@ static star_iq_param_t g_iq[IQ_PARAM_COUNT] = {
      * not the same thing. Anything written here pins the AE's target luma,
      * so guessing the neutral wrong shifts every default image.
      */
-    [IQ_EVCOMP] = { "ae_comp", "MI_ISP_AE_GetEVComp", "MI_ISP_AE_SetEVComp", 8, 0, 4, IQ_FLAT, 200,
-                    100, true, NULL, NULL },
-    [IQ_FLICKER] = { "antiflicker", "MI_ISP_AE_GetFlicker", "MI_ISP_AE_SetFlicker", 4, 0, 4, IQ_FLAT,
-                     3, 0, false, NULL, NULL },
+    [IQ_EVCOMP] = { "ae_comp", "MI_ISP_AE_GetEVComp", "MI_ISP_AE_SetEVComp",
+                    I6_ISP_AE_EVCOMP_PAYLOAD, 0, 4, IQ_FLAT, 200, 100, true, NULL, NULL },
+    [IQ_FLICKER] = { "antiflicker", "MI_ISP_AE_GetFlicker", "MI_ISP_AE_SetFlicker",
+                     I6_ISP_AE_FLICKER_PAYLOAD, 0, 4, IQ_FLAT, 3, 0, false, NULL, NULL },
 };
 
 /* ================================================================
@@ -1281,23 +1295,39 @@ int hal_isp_get_ae_comp(void *ctx, int *val)
 }
 
 /*
- * Anti-flicker. raptor's OFF/50HZ/60HZ are 0/1/2 and MI's flicker enum
- * is bounded at 3, so the two line up position for position. Passed
- * through rather than translated, with the range checked so a future
- * raptor value cannot land on an MI mode by accident.
+ * Anti-flicker. The two enums are the same width and both bounded at 3,
+ * but MI orders 60 Hz before 50 Hz, so they have to be translated rather
+ * than passed through: DISABLE 0, 60HZ 1, 50HZ 2, AUTO 3. raptor has no
+ * enumerator for AUTO, so nothing selects it and a read of it reports OFF.
  *
  * Applied unconditionally, unlike the tuning scalars: mains frequency
  * is a property of where the camera is installed, which a tuning file
  * shipped with a sensor cannot know.
  */
+#define STAR_FLICKER_DISABLE 0
+#define STAR_FLICKER_60HZ    1
+#define STAR_FLICKER_50HZ    2
+
 int hal_isp_set_antiflicker(void *ctx, rss_antiflicker_t mode)
 {
-    if ((unsigned int)mode > RSS_ANTIFLICKER_60HZ) {
+    uint32_t raw;
+
+    switch (mode) {
+    case RSS_ANTIFLICKER_OFF:
+        raw = STAR_FLICKER_DISABLE;
+        break;
+    case RSS_ANTIFLICKER_50HZ:
+        raw = STAR_FLICKER_50HZ;
+        break;
+    case RSS_ANTIFLICKER_60HZ:
+        raw = STAR_FLICKER_60HZ;
+        break;
+    default:
         HAL_LOG_WARN("isp: antiflicker mode %d out of range", (int)mode);
         return RSS_ERR_INVAL;
     }
 
-    return star_iq_set_raw(ctx, IQ_FLICKER, (uint32_t)mode);
+    return star_iq_set_raw(ctx, IQ_FLICKER, raw);
 }
 
 int hal_isp_get_antiflicker(void *ctx, rss_antiflicker_t *mode)
@@ -1309,8 +1339,20 @@ int hal_isp_get_antiflicker(void *ctx, rss_antiflicker_t *mode)
         return RSS_ERR_INVAL;
 
     ret = star_iq_get_raw(ctx, IQ_FLICKER, &raw);
-    if (ret == RSS_OK)
-        *mode = (rss_antiflicker_t)(raw > RSS_ANTIFLICKER_60HZ ? RSS_ANTIFLICKER_OFF : raw);
+    if (ret != RSS_OK)
+        return ret;
+
+    switch (raw) {
+    case STAR_FLICKER_50HZ:
+        *mode = RSS_ANTIFLICKER_50HZ;
+        break;
+    case STAR_FLICKER_60HZ:
+        *mode = RSS_ANTIFLICKER_60HZ;
+        break;
+    default:
+        *mode = RSS_ANTIFLICKER_OFF;
+        break;
+    }
 
     return ret;
 }
