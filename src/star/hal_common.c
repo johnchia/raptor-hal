@@ -219,7 +219,11 @@ static int star_sensor_detect_from(const char *path, char *buf, size_t len)
 
         if (strncmp(name, "sensor_", 7) != 0)
             continue;
-        snprintf(module, sizeof(module), "%s", name); /* keep for the log */
+        /* Kept for the log. The precision is what the truncation is: a
+         * module name longer than this buffer is not one we can match
+         * anyway, and without it -O0 raises format-truncation as an error
+         * while -Os does not, so DEBUG=1 fails to build. */
+        snprintf(module, sizeof(module), "%.*s", (int)sizeof(module) - 1, name);
         name += 7;
         if (!*name)
             continue;

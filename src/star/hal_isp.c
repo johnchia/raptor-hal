@@ -976,22 +976,28 @@ int star_isp_cap_exposure(star_state_t *st, unsigned int fps)
     }
 
     /*
-     * The SetFps below, not the write above, is what makes this function
-     * worth calling.
+     * Whether the cap above reaches the AE algorithm is unsettled, and the
+     * one measurement in hand says it does not: with the limit reading
+     * 22..33333 the AE was seen running a 50000 us shutter, which is the
+     * tuning binary's own ceiling and exactly the 20 fps the board
+     * delivered when asked for 30. That was on a run where the binary had
+     * been loaded too early and re-read from disk underneath us, so it is
+     * consistent with the AE taking its limits at init and never looking
+     * again -- which would make this write bookkeeping for get-isp and for
+     * the reload check.
      *
-     * SetExposureLimit writes MI's mirror of the AE state and the running
-     * CUS3A algorithm does not consult it: measured on the board, a
-     * maxShutterUs of 2000 reads back as 2000 while the AE goes on running
-     * 7689, and a 64x sensor-gain *floor* is ignored the same way. So the
-     * cap is bookkeeping -- it is what the reload check reads, and it is
-     * what get-isp reports -- and a tuning binary asking for a longer
-     * shutter than the frame period still gets one. That costs frame rate
-     * in a dark scene and can only be fixed in the binary.
+     * Not concluded, because the obvious follow-up cannot be done from
+     * outside the process: MI's per-module AE calls dispatch through a
+     * handler table that CUS3A registers in the *owning* process, so a
+     * second process writing them proves nothing about what the algorithm
+     * sees. Settling it means instrumenting this file, in a dark enough
+     * scene for the AE to want the whole frame period.
      *
-     * MI_SNR_SetFps does work. It does not touch the AE at all: it makes
-     * the sensor driver recompute its timing, which is what recovers a
-     * sensor brought up slow by the tuning. waybeam calls this the
-     * cold-boot fix (star6e_pipeline.c:2094).
+     * The SetFps below is independent of all that, and it is measured
+     * working. It does not touch the AE: it makes the sensor driver
+     * recompute its timing, which is what recovers a sensor the tuning
+     * brought up slow. waybeam calls this the cold-boot fix
+     * (star6e_pipeline.c:2094).
      */
     if (st->snr.fnSetFramerate && st->snr.fnSetFramerate(STAR_SNR_INDEX, star_snr_fps_arg(st, fps)))
         HAL_LOG_WARN("isp: MI_SNR_SetFps(%u) after the exposure fit failed", fps);
@@ -1810,29 +1816,29 @@ static void star_isp_reassert_limits(star_state_t *st)
  * here, deleting the bin changing nothing, and white balance being wrong
  * under artificial light.
  *
- * What wipes it is CUS3A's own AE init. That init reads the generic
- * `iqfile<n>.bin` from disk and takes the AE's limits from it, and CUS3A
- * defers it to its frame thread -- so it runs about three seconds into
- * bring-up, after any point at which this code could sensibly load. It is
- * not a step of raptor's that can be reordered: gating the load on the AE
- * reporting an exposure was tried and the wipe still followed it, because
- * a running shutter predates the init that establishes the limits. Waiting
- * for it is also not worth a fixed delay -- three seconds of untuned colour
- * to save one reload.
+ * What wipes it is CUS3A's own AE init, which reads the generic
+ * `iqfile<n>.bin` from disk and takes the AE's limits from it. CUS3A defers
+ * that init to its frame thread, so it lands *after* this file's load --
+ * which happens at the first framesource enable, before the encoder threads
+ * are even started, let alone a frame delivered.
  *
- * So detect and repair, which also covers the other cases: CUS3A leaves
+ * Ordering does fix it, and the evidence is accidental: a -O0 build of this
+ * file brings the pipeline up slowly enough that the load falls on the
+ * other side of the AE init, and then it survives -- zero reloads, tuning
+ * limits still in place. A load issued from a second process minutes into a
+ * run is likewise stable for as long as it is watched. So the load is not
+ * doomed; it is early.
+ *
+ * What has been ruled out as a gate is a non-zero shutter from
+ * MI_ISP_CUS3A_GetAeStatus: the sensor is already exposing before the init
+ * that sets the limits, so it fires too soon and the wipe still follows.
+ * The trigger that would work is the first frame actually delivered, which
+ * is a signal the pipeline has and this file is not currently told about.
+ *
+ * Until it is, detect and repair -- which is needed anyway: CUS3A leaves
  * its init flag clear whenever the sensor is not up yet and retries on
  * every later frame interrupt, so a sensor re-init can re-read the iqfile
  * long after bring-up.
- *
- * One thing this comment used to imply and should not: the limits it
- * compares are MI's mirror of the AE state, and with CUS3A running the
- * algorithm does not consult that mirror -- writing it changes nothing
- * (measured: a 2000 us shutter cap and a 64x gain floor both read back and
- * both ignored). That does not weaken the witness, because what is being
- * detected is the mirror being *reset*, which is CUS3A's init happening.
- * It does mean the repair has to be the bin reload, which is the only
- * channel to the algorithm, and never a re-write of the limits.
  *
  * The limits are a reliable witness because the tuning's own values were
  * snapshotted before anything could overwrite them, and because the only
