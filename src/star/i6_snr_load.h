@@ -1,92 +1,31 @@
 /*
- * star/i6_snr.h -- MI_SNR bindings, Infinity6E
+ * star/i6_snr_load.h -- dlopen loader and function table for MI_SNR
  *
- * Vendored from OpenIPC divinus, src/hal/star/i6_snr.h. See i6_common.h for
- * why these headers are vendored and for the four adaptations applied.
+ * The ABI declarations this binds to are in sigmastar-headers; only the
+ * dlopen/dlsym half lives here, because it reports through raptor's logger
+ * and error codes. Adaptations from divinus's src/hal/star/i6_snr.h:
  *
- * Note that MI_SNR is entirely index-based: resolutions are queried by count
- * and index, and no call anywhere in this API names a sensor. The sensor
- * identity is fixed when sensor_<name>_mipi.ko is insmod'd, so raptor's
- * sensor "discovery" is a module check plus the geometry queries below --
- * not the probing the Ingenic backend does.
+ *   1. HAL_ERROR(mod, ...) becomes HAL_LOG_ERR(...) plus an explicit return,
+ *      since HAL_ERROR's hidden `return EXIT_FAILURE` is not a convention
+ *      raptor uses.
+ *   2. EXIT_SUCCESS/EXIT_FAILURE become RSS_OK/RSS_ERR_*: RSS_ERR_NOENT when
+ *      a library is absent, RSS_ERR_NOTSUP when a library is present but
+ *      lacks a symbol. Callers can then tell "SDK not installed" from "SDK
+ *      too old" without parsing logs.
+ *   3. The loaders are `static inline`, not `static`. raptor-hal builds with
+ *      -Werror, and an unused `static` function in a header is a
+ *      -Wunused-function error; `static inline` is exempt.
  *
  * Copyright (c) 2024 OpenIPC
  * SPDX-License-Identifier: MIT
  */
 
-#ifndef STAR_I6_SNR_H
-#define STAR_I6_SNR_H
+#ifndef STAR_I6_SNR_LOAD_H
+#define STAR_I6_SNR_LOAD_H
 
-#include "i6_common.h"
+#include <i6_snr.h>
 
-typedef enum {
-    I6_SNR_HWHDR_NONE,
-    I6_SNR_HWHDR_SONY_DOL,
-    I6_SNR_HWHDR_DCG,
-    I6_SNR_HWHDR_EMBED_RAW8,
-    I6_SNR_HWHDR_EMBED_RAW10,
-    I6_SNR_HWHDR_EMBED_RAW12,
-    I6_SNR_HWHDR_EMBED_RAW16
-} i6_snr_hwhdr;
-
-typedef struct {
-    unsigned int laneCnt;
-    unsigned int rgbFmtOn;
-    i6_common_input input;
-    unsigned int hsyncMode;
-    unsigned int sampDelay;
-    i6_snr_hwhdr hwHdr;
-    unsigned int virtChn;
-    unsigned int packType[2];
-} i6_snr_mipi;
-
-typedef struct {
-    unsigned int multplxNum;
-    i6_common_sync sync;
-    i6_common_edge edge;
-    int bitswap;
-} i6_snr_bt656;
-
-typedef struct {
-    i6_common_sync sync;
-} i6_snr_par;
-
-typedef union {
-    i6_snr_par parallel;
-    i6_snr_mipi mipi;
-    i6_snr_bt656 bt656;
-} i6_snr_intfattr;
-
-typedef struct {
-    unsigned int planeCnt;
-    i6_common_intf intf;
-    i6_common_hdr hdr;
-    i6_snr_intfattr intfAttr;
-    char earlyInit;
-} i6_snr_pad;
-
-typedef struct {
-    unsigned int planeId;
-    char sensName[32];
-    i6_common_rect capt;
-    i6_common_bayer bayer;
-    i6_common_prec precision;
-    int hdrSrc;
-    // Value in microseconds
-    unsigned int shutter;
-    // Value multiplied by 1024
-    unsigned int sensGain;
-    unsigned int compGain;
-    i6_common_pixfmt pixFmt;
-} i6_snr_plane;
-
-typedef struct {
-    i6_common_rect crop;
-    i6_common_dim output;
-    unsigned int maxFps;
-    unsigned int minFps;
-    char desc[32];
-} __attribute__((packed, aligned(4))) i6_snr_res;
+#include "i6_symbols.h"
 
 typedef struct {
     void *handle;
@@ -181,4 +120,4 @@ static inline void i6_snr_unload(i6_snr_impl *snr_lib)
     memset(snr_lib, 0, sizeof(*snr_lib));
 }
 
-#endif /* STAR_I6_SNR_H */
+#endif /* STAR_I6_SNR_LOAD_H */

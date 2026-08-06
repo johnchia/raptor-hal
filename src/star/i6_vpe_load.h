@@ -1,171 +1,31 @@
 /*
- * star/i6_vpe.h -- MI_VPE bindings, Infinity6E
+ * star/i6_vpe_load.h -- dlopen loader and function table for MI_VPE
  *
- * Vendored from OpenIPC divinus, src/hal/star/i6_vpe.h. See i6_common.h for
- * why these headers are vendored and for the four adaptations applied.
+ * The ABI declarations this binds to are in sigmastar-headers; only the
+ * dlopen/dlsym half lives here, because it reports through raptor's logger
+ * and error codes. Adaptations from divinus's src/hal/star/i6_vpe.h:
  *
- * IMPORTANT -- two channel/param layouts, and Infinity6E uses the i6e_ ones.
- * MI_VPE_CreateChannel and MI_VPE_SetChannelParam take a longer struct on
- * Infinity6E (i6e_vpe_chn / i6e_vpe_para, with the lens-distortion-correction
- * members) than on the original Infinity6 (i6_vpe_chn / i6_vpe_para).
- * divinus picks by SoC series at runtime and casts to the shorter type, since
- * that is what the function pointers are declared with -- see i6_hal.c:302-345,
- * `if (series == 0xF1)`. Our target is 0xF1 only, so the backend always
- * populates the i6e_ variants; the shorter ones are kept solely because the
- * function-pointer signatures name them and because keeping the file diffable
- * against upstream is worth more than trimming two structs.
- *
- * One divergence from divinus beyond the four common adaptations: the
- * loader below also opens libispalgo.so, libcus3a.so and libmi_isp.so.
- * divinus opens those in its i6_isp.h loader, which it happens to run
- * before its VPE loader; here the dependency lives with the module that
- * needs it. The reason it is mandatory rather than tidy is in i6_vpe_load.
+ *   1. HAL_ERROR(mod, ...) becomes HAL_LOG_ERR(...) plus an explicit return,
+ *      since HAL_ERROR's hidden `return EXIT_FAILURE` is not a convention
+ *      raptor uses.
+ *   2. EXIT_SUCCESS/EXIT_FAILURE become RSS_OK/RSS_ERR_*: RSS_ERR_NOENT when
+ *      a library is absent, RSS_ERR_NOTSUP when a library is present but
+ *      lacks a symbol. Callers can then tell "SDK not installed" from "SDK
+ *      too old" without parsing logs.
+ *   3. The loaders are `static inline`, not `static`. raptor-hal builds with
+ *      -Werror, and an unused `static` function in a header is a
+ *      -Wunused-function error; `static inline` is exempt.
  *
  * Copyright (c) 2024 OpenIPC
  * SPDX-License-Identifier: MIT
  */
 
-#ifndef STAR_I6_VPE_H
-#define STAR_I6_VPE_H
+#ifndef STAR_I6_VPE_LOAD_H
+#define STAR_I6_VPE_LOAD_H
 
-#include "i6_common.h"
+#include <i6_vpe.h>
 
-typedef enum {
-    I6_VPE_MODE_INVALID,
-    I6_VPE_MODE_DVR = 0x1,
-    I6_VPE_MODE_CAM_TOP = 0x2,
-    I6_VPE_MODE_CAM_BOTTOM = 0x4,
-    I6_VPE_MODE_CAM = I6_VPE_MODE_CAM_TOP | I6_VPE_MODE_CAM_BOTTOM,
-    I6_VPE_MODE_REALTIME_TOP = 0x8,
-    I6_VPE_MODE_REALTIME_BOTTOM = 0x10,
-    I6_VPE_MODE_REALTIME = I6_VPE_MODE_REALTIME_TOP | I6_VPE_MODE_REALTIME_BOTTOM,
-    I6_VPE_MODE_END
-} i6_vpe_mode;
-
-typedef enum {
-    I6_VPE_SENS_INVALID,
-    I6_VPE_SENS_ID0,
-    I6_VPE_SENS_ID1,
-    I6_VPE_SENS_ID2,
-    I6_VPE_SENS_ID3,
-    I6_VPE_SENS_END,
-} i6_vpe_sens;
-
-typedef struct {
-    unsigned int rev;
-    unsigned int size;
-    unsigned char data[64];
-} i6_vpe_iqver;
-
-typedef struct {
-    int mode;
-    char bypassOn;
-    char proj3x3On;
-    int proj3x3[9];
-    unsigned short userSliceNum;
-    unsigned int focalLengthX;
-    unsigned int focalLengthY;
-    void *configAddr;
-    unsigned int configSize;
-    int mapType;
-    union {
-        struct {
-            void *xMapAddr, *yMapAddr;
-            unsigned int xMapSize, yMapSize;
-        } dispInfo;
-        struct {
-            void *calibPolyBinAddr;
-            unsigned int calibPolyBinSize;
-        } calibInfo;
-    };
-    char lensAdjOn;
-} i6e_vpe_ildc;
-
-typedef struct {
-    char bypassOn;
-    char proj3x3On;
-    int proj3x3[9];
-    unsigned int focalLengthX;
-    unsigned int focalLengthY;
-    void *configAddr;
-    unsigned int configSize;
-    union {
-        struct {
-            void *xMapAddr, *yMapAddr;
-            unsigned int xMapSize, yMapSize;
-        } dispInfo;
-        struct {
-            void *calibPolyBinAddr;
-            unsigned int calibPolyBinSize;
-        } calibInfo;
-    };
-} i6e_vpe_ldc;
-
-typedef struct {
-    i6_common_dim capt;
-    i6_common_pixfmt pixFmt;
-    i6_common_hdr hdr;
-    i6_vpe_sens sensor;
-    char noiseRedOn;
-    char edgeOn;
-    char edgeSmoothOn;
-    char contrastOn;
-    char invertOn;
-    char rotateOn;
-    i6_vpe_mode mode;
-    i6_vpe_iqver iqparam;
-    i6e_vpe_ildc lensInit;
-    char lensAdjOn;
-    unsigned int chnPort;
-} i6e_vpe_chn;
-
-typedef struct {
-    i6_common_dim capt;
-    i6_common_pixfmt pixFmt;
-    i6_common_hdr hdr;
-    i6_vpe_sens sensor;
-    char noiseRedOn;
-    char edgeOn;
-    char edgeSmoothOn;
-    char contrastOn;
-    char invertOn;
-    char rotateOn;
-    i6_vpe_mode mode;
-    i6_vpe_iqver iqparam;
-    char lensAdjOn;
-    unsigned int chnPort;
-} i6_vpe_chn;
-
-typedef struct {
-    char reserved[16];
-    i6e_vpe_ldc lensAdj;
-    i6_common_hdr hdr;
-    // Accepts values from 0-7
-    int level3DNR;
-    char mirror;
-    char flip;
-    char reserved2;
-    char lensAdjOn;
-} i6e_vpe_para;
-
-typedef struct {
-    char reserved[16];
-    i6_common_hdr hdr;
-    // Accepts values from 0-7
-    int level3DNR;
-    char mirror;
-    char flip;
-    char reserved2;
-    char lensAdjOn;
-} i6_vpe_para;
-
-typedef struct {
-    i6_common_dim output;
-    char mirror;
-    char flip;
-    i6_common_pixfmt pixFmt;
-    i6_common_compr compress;
-} i6_vpe_port;
+#include "i6_symbols.h"
 
 typedef struct {
     void *handle;
@@ -316,4 +176,4 @@ static inline void i6_vpe_unload(i6_vpe_impl *vpe_lib)
     memset(vpe_lib, 0, sizeof(*vpe_lib));
 }
 
-#endif /* STAR_I6_VPE_H */
+#endif /* STAR_I6_VPE_LOAD_H */

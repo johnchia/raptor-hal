@@ -21,14 +21,14 @@
 
 #include "hal_internal.h"
 
-#include "i6_aud.h"
-#include "i6_isp.h"
-#include "i6_rgn.h"
-#include "i6_snr.h"
-#include "i6_sys.h"
-#include "i6_venc.h"
-#include "i6_vif.h"
-#include "i6_vpe.h"
+#include "i6_aud_load.h"
+#include "i6_isp_load.h"
+#include "i6_rgn_load.h"
+#include "i6_snr_load.h"
+#include "i6_sys_load.h"
+#include "i6_venc_load.h"
+#include "i6_vif_load.h"
+#include "i6_vpe_load.h"
 
 /* ================================================================
  * FIXED TOPOLOGY

@@ -69,14 +69,19 @@ HEADER_VER  := $(HEADER_VER_$(PLATFORM))
 HEADER_LANG := $(HEADER_LANG_$(PLATFORM))
 
 # Paths
-INGENIC_HEADERS ?= ingenic-headers
-INGENIC_LIB     ?= ../ingenic-lib
+INGENIC_HEADERS   ?= ingenic-headers
+INGENIC_LIB       ?= ../ingenic-lib
+SIGMASTAR_HEADERS ?= sigmastar-headers
 
-# SigmaStar needs no SDK path: the MI ABI declarations and their dlopen
-# loaders live in src/star/i6_*.h, so there are no vendor headers to point at
-# and no MI libraries to link. SDK_INCLUDE stays empty for that vendor.
+# SigmaStar keys on the chip family rather than an SDK version, because these
+# declarations are reconstructions rather than vendor drops and the submodule
+# commit is what pins them. Still no MI libraries to link: the loaders in
+# src/star/i6_*_load.h reach MI through dlopen.
+HEADER_FAMILY_INFINITY6E  := infinity6e
+HEADER_FAMILY_INFINITY6B0 := infinity6e
+
 ifeq ($(VENDOR),sigmastar)
-SDK_INCLUDE     :=
+SDK_INCLUDE     := $(SIGMASTAR_HEADERS)/$(HEADER_FAMILY_$(PLATFORM))
 else
 SDK_INCLUDE     := $(INGENIC_HEADERS)/$(PLATFORM)/$(HEADER_VER)/$(HEADER_LANG)
 endif
@@ -96,11 +101,10 @@ CFLAGS  += -std=c11
 CFLAGS  += -ffunction-sections -fdata-sections -flto
 CFLAGS  += -fno-asynchronous-unwind-tables -fmerge-all-constants -fno-ident
 CFLAGS  += -DPLATFORM_$(PLATFORM)
-ifneq ($(SDK_INCLUDE),)
 CFLAGS  += -I$(SDK_INCLUDE)
 # IMP headers live in an imp/ subdir and are included as <imp/imp_system.h>.
-# Guarded on SDK_INCLUDE being non-empty rather than on the vendor: a bare
-# -I would swallow the following flag as its argument.
+# sigmastar-headers is flat, so this one is Ingenic-only.
+ifeq ($(VENDOR),ingenic)
 CFLAGS  += -I$(SDK_INCLUDE)/imp
 endif
 CFLAGS  += -Iinclude

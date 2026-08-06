@@ -136,7 +136,7 @@ static i6_venc_ratemode star_enc_ratemode(rss_codec_t codec, rss_rc_mode_t mode)
         case RSS_RC_CBR:
             return I6_VENC_RATEMODE_MJPGCBR;
         case RSS_RC_FIXQP:
-            return I6_VENC_RATEMODE_MJPGQP;
+            return I6_VENC_RATEMODE_MJPGFIXQP;
         default:
             return I6_VENC_RATEMODE_END;
         }
@@ -144,7 +144,7 @@ static i6_venc_ratemode star_enc_ratemode(rss_codec_t codec, rss_rc_mode_t mode)
 
     switch (mode) {
     case RSS_RC_FIXQP:
-        return h265 ? I6_VENC_RATEMODE_H265QP : I6_VENC_RATEMODE_H264QP;
+        return h265 ? I6_VENC_RATEMODE_H265FIXQP : I6_VENC_RATEMODE_H264FIXQP;
     case RSS_RC_CBR:
         return h265 ? I6_VENC_RATEMODE_H265CBR : I6_VENC_RATEMODE_H264CBR;
     case RSS_RC_VBR:
@@ -208,7 +208,11 @@ static int star_enc_fill_rate(i6_venc_rate *rate, rss_codec_t codec,
      * declares h264Cbr and h265Cbr as the same type (and likewise Vbr,
      * Avbr and Qp), so they are the same bytes of the same union, and
      * `mode` is what tells the encoder which codec it is configuring.
-     * Only ABR is genuinely H.264-only, and it has its own arm.
+     *
+     * AVBR shares the VBR arm for the same reason: MI_VENC_AttrH264Avbr_t,
+     * Ubr_t and Vbr_t are all seven u32s in the same order. The UBR modes
+     * are declared but unreachable -- star_enc_ratemode maps nothing to
+     * them, since no rss_rc_mode_t asks for an unconstrained bitrate.
      */
     switch (mode) {
     case I6_VENC_RATEMODE_MJPGCBR:
@@ -216,7 +220,7 @@ static int star_enc_fill_rate(i6_venc_rate *rate, rss_codec_t codec,
         rate->mjpgCbr.fpsNum = fps_num;
         rate->mjpgCbr.fpsDen = fps_den;
         break;
-    case I6_VENC_RATEMODE_MJPGQP:
+    case I6_VENC_RATEMODE_MJPGFIXQP:
         rate->mjpgQp.fpsNum = fps_num;
         rate->mjpgQp.fpsDen = fps_den;
         rate->mjpgQp.quality = max_qp;
@@ -244,8 +248,8 @@ static int star_enc_fill_rate(i6_venc_rate *rate, rss_codec_t codec,
         rate->h264Vbr.maxQual = max_qp;
         rate->h264Vbr.minQual = min_qp;
         break;
-    case I6_VENC_RATEMODE_H264QP:
-    case I6_VENC_RATEMODE_H265QP:
+    case I6_VENC_RATEMODE_H264FIXQP:
+    case I6_VENC_RATEMODE_H265FIXQP:
         /* interQual is the I-frame QP, predQual the P-frame QP. init_qp
          * applies to both when the caller gave one. */
         rate->h264Qp.gop = gop;
@@ -253,14 +257,6 @@ static int star_enc_fill_rate(i6_venc_rate *rate, rss_codec_t codec,
         rate->h264Qp.fpsDen = fps_den;
         rate->h264Qp.interQual = star_enc_qp(cfg->init_qp, max_qp);
         rate->h264Qp.predQual = star_enc_qp(cfg->init_qp, min_qp);
-        break;
-    case I6_VENC_RATEMODE_H264ABR:
-        rate->h264Abr.gop = gop;
-        rate->h264Abr.statTime = 1;
-        rate->h264Abr.fpsNum = fps_num;
-        rate->h264Abr.fpsDen = fps_den;
-        rate->h264Abr.avgBitrate = cfg->bitrate;
-        rate->h264Abr.maxBitrate = max_bitrate;
         break;
     default:
         return RSS_ERR_NOTSUP;

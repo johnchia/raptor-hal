@@ -25,10 +25,15 @@ signatures, ring buffer semantics) are handled internally via compile-time
 
 ## Build
 
-Produces a static library `libraptor_hal.a`. Requires the
-[ingenic-headers](https://github.com/thingino/ingenic-headers) repo.
+Produces a static library `libraptor_hal.a`. SDK declarations come from a
+headers submodule, one per vendor:
+[ingenic-headers](https://github.com/thingino/ingenic-headers) for the Ingenic
+platforms and
+[sigmastar-headers](https://github.com/johnchia/sigmastar-headers) for the
+SigmaStar ones.
 
 ```
+git submodule update --init
 make PLATFORM=T31 CROSS_COMPILE=mipsel-linux-
 ```
 
@@ -36,9 +41,10 @@ make PLATFORM=T31 CROSS_COMPILE=mipsel-linux-
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
-| `PLATFORM` | yes | -- | Target SoC: T20, T21, T23, T30, T31, T32, T33, T40, T41 |
+| `PLATFORM` | yes | -- | Target SoC: T20, T21, T23, T30, T31, T32, T33, T40, T41, INFINITY6E, INFINITY6B0 |
 | `CROSS_COMPILE` | yes | -- | Toolchain prefix (e.g. `mipsel-linux-`) |
-| `INGENIC_HEADERS` | no | `../ingenic-headers` | Path to SDK header repo |
+| `INGENIC_HEADERS` | no | `ingenic-headers` | Path to Ingenic SDK header repo |
+| `SIGMASTAR_HEADERS` | no | `sigmastar-headers` | Path to SigmaStar MI header repo |
 | `INGENIC_LIB` | no | `../ingenic-lib` | Path to SDK library repo |
 | `DEBUG` | no | 0 | Set to 1 for `-O0 -g` and `HAL_DEBUG` logging |
 | `V` | no | 0 | Set to 1 for verbose build output |
