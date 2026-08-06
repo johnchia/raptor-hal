@@ -474,6 +474,14 @@ typedef struct {
      */
     bool isp_tuned;
 
+    /*
+     * Set by the first encoded frame to reach the application, and cleared
+     * whenever the VPE channel stops. It gates the tuning load: CUS3A's AE
+     * init reads its own iqfile on a frame interrupt and would read back
+     * over anything loaded before that. See star_isp_note_frame.
+     */
+    bool isp_frame_seen;
+
     /* Gain ceilings requested before the ISP would accept them; -1 for
      * "nothing asked". Not in the IQ table because MI keeps both in the
      * AE exposure-limit struct rather than in a per-module payload. */
@@ -712,12 +720,20 @@ void star_isp_bringup(star_state_t *st, const rss_sensor_config_t *cfg);
 
 /*
  * Load the tuning binary and flush any queued control values, once the
- * ISP is answering. Idempotent, and a no-op until then, so the enable
- * and start paths can both call it and the first one to find the ISP up
- * wins. verbose=false for early opportunistic attempts, true for the
- * one whose failure is worth a warning.
+ * ISP is answering *and* a frame has been delivered. Idempotent, and a
+ * no-op until both hold, so the enable and start paths can both call it
+ * and whichever finds the conditions met wins. verbose=false for early
+ * opportunistic attempts, true for the one whose failure is worth a
+ * warning.
  */
 void star_isp_tune_when_ready(star_state_t *st, bool verbose);
+
+/*
+ * Tell the ISP a frame reached the application, which is what releases the
+ * tuning load. Called per frame from the encoder checkout path; free after
+ * the first. See the definition for why nothing earlier is safe.
+ */
+void star_isp_note_frame(star_state_t *st);
 
 /*
  * Mark the tuning as lost, so the next star_isp_tune_when_ready re-applies

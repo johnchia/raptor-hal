@@ -357,9 +357,10 @@ int hal_fs_enable_channel(void *ctx, int chn)
     /*
      * Enabling a port is what finally makes the VPE channel run, and the
      * ISP is served by that channel -- so this is the earliest moment the
-     * ISP can answer anything, and the earliest the sensor's tuning
-     * binary can be loaded. Opportunistic and quiet: frames need a moment
-     * to start, and hal_enc_start tries again straight afterwards.
+     * ISP can answer anything. Not the earliest the tuning can be loaded,
+     * though: that waits for a frame (star_isp_note_frame), so this call
+     * only queues. Kept because it is also the retry path after a hot
+     * restart, and quiet because there is nothing to warn about yet.
      */
     star_isp_tune_when_ready(st, false);
 

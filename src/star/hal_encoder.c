@@ -1077,11 +1077,11 @@ int hal_enc_start(void *ctx, int chn)
     enc->receiving = true;
 
     /*
-     * Last and best chance to load the sensor's tuning binary: the whole
-     * chain is live by now, so an ISP that will not answer here is not
-     * going to. Verbose for that reason -- the framesource enable already
-     * tried quietly a moment ago. Idempotent, so a second stream's start
-     * costs nothing.
+     * The whole chain is live by now, so an ISP that will not answer here
+     * is not going to -- verbose for that reason, where the framesource
+     * enable a moment ago was quiet. It still will not load: that waits
+     * for the first frame this channel checks out. Idempotent, so a second
+     * stream's start costs nothing.
      */
     star_isp_tune_when_ready(st, true);
 
@@ -1247,6 +1247,14 @@ int hal_enc_get_frame(void *ctx, int chn, rss_frame_t *frame)
     frame->timestamp = enc->strm.count ? (int64_t)enc->strm.packet[0].timestamp : 0;
     star_enc_fill_nals(enc, frame);
     frame->_priv = enc;
+
+    /*
+     * The tuning load waits for this. A frame here means the ISP has run at
+     * least one, which means CUS3A has had the frame interrupt its AE init
+     * is deferred to -- the earliest point at which a tuning binary can be
+     * loaded without being read back over. Free after the first frame.
+     */
+    star_isp_note_frame(st);
 
     return RSS_OK;
 }

@@ -766,7 +766,7 @@ static int fake_parainit_ready(int channel, i6_isp_parainit *status)
     return 0;
 }
 
-static void tune_once(star_state_t *st)
+static void tune_setup(star_state_t *st)
 {
     memset(st, 0, sizeof(*st));
     st->isp_loaded = true;
@@ -779,6 +779,14 @@ static void tune_once(star_state_t *st)
     st->isp.fnLoadChannelConfig = fake_loadcfg;
 
     loadcfg_calls = 0;
+}
+
+static void tune_once(star_state_t *st)
+{
+    tune_setup(st);
+    /* The load is gated on a delivered frame; this test is about what the
+     * load itself does, so grant it. */
+    st->isp_frame_seen = true;
     star_isp_tune_when_ready(st, false);
 }
 
@@ -797,6 +805,65 @@ static void test_tuning_load_leaves_3a_alone(void)
     /* The hatch is gone, so neither symbol is bound any more. The test
      * that it cannot be reached is that i6_isp_impl has nowhere to put
      * one: this file would not compile if the fields came back unused. */
+
+    for (i = 0; i < IQ_PARAM_COUNT; i++)
+        g_iq[i].has_pending = false;
+}
+
+/*
+ * The load waits for a delivered frame, and nothing sooner.
+ *
+ * CUS3A's AE init reads its own iqfile from disk and takes the AE's limits
+ * from it, and CUS3A defers that init to its frame thread. So a load issued
+ * on IQ-API readiness -- which is what this used to do -- is read back over
+ * every time, and the gain ceiling and shutter cap go with it, costing a
+ * third of the frame rate in a dark scene. A frame reaching the application
+ * is strictly after the ISP frame interrupt that runs the init.
+ *
+ * The failure this pins is the load happening at all before that: an early
+ * load is worse than no load, because it sets the latch that stops anything
+ * later from trying.
+ */
+static void test_tuning_waits_for_the_first_frame(void)
+{
+    star_state_t st;
+    size_t i;
+
+    for (i = 0; i < IQ_PARAM_COUNT; i++)
+        g_iq[i].has_pending = false;
+
+    /* Every bring-up call before the first frame must decline, quietly and
+     * without latching, however many times it is made. */
+    tune_setup(&st);
+    star_isp_tune_when_ready(&st, false);
+    star_isp_tune_when_ready(&st, true);
+    CHECK(loadcfg_calls == 0, "nothing may load before a frame, got %u calls", loadcfg_calls);
+    CHECK(!st.isp_tuned, "and nothing may latch");
+
+    /* The frame is the trigger, and it loads exactly once. */
+    star_isp_note_frame(&st);
+    CHECK(st.isp_frame_seen, "the frame is recorded");
+    CHECK(loadcfg_calls == 1, "the first frame loads, got %u calls", loadcfg_calls);
+    CHECK(st.isp_tuned, "and latches");
+
+    star_isp_note_frame(&st);
+    star_isp_note_frame(&st);
+    CHECK(loadcfg_calls == 1, "later frames must not reload, got %u calls", loadcfg_calls);
+
+    /*
+     * Losing the VPE channel has to take the frame back as well as the
+     * latch. The channel restarting re-registers CUS3A, which re-reads the
+     * iqfile on its next frame interrupt -- so a reload issued on the
+     * strength of a frame from before the restart would be lost exactly as
+     * the first load was.
+     */
+    star_isp_untune(&st);
+    CHECK(!st.isp_frame_seen, "untune must take the frame back, not just the latch");
+    star_isp_tune_when_ready(&st, true);
+    CHECK(loadcfg_calls == 1, "and the restart must not reload before a new frame, got %u",
+          loadcfg_calls);
+    star_isp_note_frame(&st);
+    CHECK(loadcfg_calls == 2, "the first frame after the restart reloads, got %u", loadcfg_calls);
 
     for (i = 0; i < IQ_PARAM_COUNT; i++)
         g_iq[i].has_pending = false;
@@ -1429,6 +1496,7 @@ int main(void)
     test_sensor_fps_clamps_to_the_mode();
     test_recorded_values_survive_a_reload();
     test_tuning_load_leaves_3a_alone();
+    test_tuning_waits_for_the_first_frame();
     test_exposure_waits_for_the_isp();
     test_exposure_gain_is_x1024_fixed_point();
     test_exposure_luma_covers_only_the_live_grid();

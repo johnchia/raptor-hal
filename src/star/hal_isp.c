@@ -1041,8 +1041,13 @@ int star_isp_cap_exposure(star_state_t *st, unsigned int fps)
  * explanation: divinus loads its IQ file at the very end of sdk_init,
  * after the encoding thread is already running (media.c:827), and
  * waybeam loads after its output and video stages are up. So the load
- * moves to star_isp_tune_when_ready, which the framesource and encoder
- * start paths call once frames can actually flow.
+ * moves to star_isp_tune_when_ready.
+ *
+ * "Once the ISP can answer" turned out to be necessary but not
+ * sufficient, and the second condition is the reason this file has a
+ * frame notification in it: see star_isp_note_frame. The framesource and
+ * encoder start paths still call tune_when_ready, but by then they only
+ * queue -- what loads is the first frame out of VENC.
  *
  * What stays here is only what is safe before the pipeline runs: binding
  * the library and working out which file to load. Neither touches MI.
@@ -1117,6 +1122,25 @@ void star_isp_tune_when_ready(star_state_t *st, bool verbose)
      */
     if (st->isp_tuned) {
         star_isp_reload_if_reset(st, true);
+        return;
+    }
+
+    /*
+     * Not before a frame has come out of the pipeline. CUS3A's AE init
+     * reads its own iqfile from disk and takes the AE's limits from it, and
+     * that init is deferred to CUS3A's frame thread -- so a load issued any
+     * earlier is read back over, taking the gain ceiling and the shutter
+     * cap with it. A delivered frame is strictly after the ISP frame
+     * interrupt that runs the init, which is what makes it the right
+     * witness where "the ISP is answering" and "the AE reports an exposure"
+     * are both too early.
+     *
+     * Callers on the bring-up path reach here before that and simply queue;
+     * star_isp_note_frame issues the call that loads.
+     */
+    if (!st->isp_frame_seen) {
+        HAL_LOG_DBG("isp: tuning deferred until the first frame -- a load before CUS3A's "
+                    "AE init would be read back over");
         return;
     }
 
@@ -1206,7 +1230,47 @@ void star_isp_untune(star_state_t *st)
         return;
 
     st->isp_tuned = false;
-    HAL_LOG_DBG("isp: VPE channel stopped; tuning will be re-applied when it restarts");
+    /* And the frame that gated the load has to be earned again: the channel
+     * coming back re-registers CUS3A, which re-reads the iqfile on its next
+     * frame interrupt, so a reload issued before then would be lost the
+     * same way the first load was. Cleared atomically because the encoder
+     * threads are reading it -- see star_isp_note_frame. */
+    __atomic_clear(&st->isp_frame_seen, __ATOMIC_RELEASE);
+    HAL_LOG_DBG("isp: VPE channel stopped; tuning will be re-applied on the first frame "
+                "after it restarts");
+}
+
+/*
+ * A frame reached the application. Called from the encoder's checkout path,
+ * so it runs once per frame on every channel and has to cost nothing after
+ * the first.
+ *
+ * This is the tuning load's trigger -- see star_isp_tune_when_ready for why
+ * nothing earlier will do. Deliberately the *encoded* frame rather than
+ * anything closer to the sensor: it is the latest of the available signals
+ * and therefore the safest, and it is what divinus effectively waits for by
+ * loading at the end of sdk_init with its encoder thread already running.
+ *
+ * The test-and-set is not decoration. rvd runs one encoder thread per
+ * channel and there are four of them, so this is the first thing in this
+ * file to be called from more than one thread at once -- everything else
+ * arrives on the pipeline setup path or the ctrl thread. A plain
+ * check-then-set would let two threads whose first frames land together
+ * both run the load, and the load is a bin read plus a flush over the
+ * shared knob table. Exactly one caller gets through; the rest return on
+ * the unsynchronised read above, which is safe because it only ever goes
+ * false -> true.
+ */
+void star_isp_note_frame(star_state_t *st)
+{
+    if (!st || st->isp_frame_seen)
+        return;
+
+    if (__atomic_test_and_set(&st->isp_frame_seen, __ATOMIC_ACQ_REL))
+        return;
+
+    HAL_LOG_DBG("isp: first frame delivered; loading the tuning now");
+    star_isp_tune_when_ready(st, true);
 }
 
 void star_isp_teardown(star_state_t *st)
@@ -1228,6 +1292,7 @@ void star_isp_teardown(star_state_t *st)
     i6_isp_unload(&st->isp);
     st->isp_loaded = false;
     st->isp_tuned = false;
+    st->isp_frame_seen = false;
     st->iq_file[0] = '\0';
 }
 
@@ -1832,23 +1897,26 @@ static void star_isp_reassert_limits(star_state_t *st)
  * which happens at the first framesource enable, before the encoder threads
  * are even started, let alone a frame delivered.
  *
- * Ordering does fix it, and the evidence is accidental: a -O0 build of this
- * file brings the pipeline up slowly enough that the load falls on the
- * other side of the AE init, and then it survives -- zero reloads, tuning
- * limits still in place. A load issued from a second process minutes into a
- * run is likewise stable for as long as it is watched. So the load is not
- * doomed; it is early.
+ * Ordering fixes it, and star_isp_note_frame is that fix: the load now
+ * waits for a delivered frame, which is strictly after the interrupt the
+ * AE init runs on. The evidence that late is enough arrived by accident --
+ * a -O0 build of this file brings the pipeline up slowly enough that the
+ * load falls on the far side of the init, and then it survives with zero
+ * reloads -- and a load issued from a second process minutes into a run is
+ * stable for as long as it is watched.
  *
- * What has been ruled out as a gate is a non-zero shutter from
- * MI_ISP_CUS3A_GetAeStatus: the sensor is already exposing before the init
- * that sets the limits, so it fires too soon and the wipe still follows.
- * The trigger that would work is the first frame actually delivered, which
- * is a signal the pipeline has and this file is not currently told about.
+ * What was ruled out as a gate along the way: a non-zero shutter from
+ * MI_ISP_CUS3A_GetAeStatus, because the sensor is already exposing before
+ * the init that sets the limits, so it fires too soon and the wipe still
+ * follows.
  *
- * Until it is, detect and repair -- which is needed anyway: CUS3A leaves
- * its init flag clear whenever the sensor is not up yet and retries on
- * every later frame interrupt, so a sensor re-init can re-read the iqfile
- * long after bring-up.
+ * This stays as the backstop, because the gate cannot cover everything:
+ * CUS3A leaves its init flag clear whenever the sensor is not up yet and
+ * retries on every later frame interrupt, so a sensor re-init can re-read
+ * the iqfile long after bring-up and long after the frame that released the
+ * load. With the gate in place this should find nothing to do on a normal
+ * bring-up, and a reload in the log is now a signal worth reading rather
+ * than the expected first-boot noise.
  *
  * The limits are a reliable witness because the tuning's own values were
  * snapshotted before anything could overwrite them, and because the only
