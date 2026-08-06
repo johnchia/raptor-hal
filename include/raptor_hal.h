@@ -494,21 +494,6 @@ typedef struct {
     uint32_t fps;
 
 
-    /*
-     * Mirror and flip, as requested by the config.
-     *
-     * These decide what the *first* frame looks like, which the ops
-     * cannot: a backend brings its pipeline up inside hal_init, before any
-     * caller can reach isp_set_hflip. A camera is mounted one way round
-     * and stays there, so starting the wrong way up and correcting a frame
-     * later is a visible fault rather than a detail.
-     *
-     * The ops own it from then on, and on every backend they are a
-     * runtime attribute settable at any time. Ingenic backends ignore
-     * these fields and take orientation from the ops alone.
-     */
-    int hflip;
-    int vflip;
 } rss_sensor_config_t;
 
 /* Maximum number of sensors supported (IMPVI_MAIN, SEC, THR) */
