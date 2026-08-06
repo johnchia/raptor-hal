@@ -220,8 +220,16 @@ typedef struct {
     uint16_t manual_off; /* where the value lives (0 for FLAT/BOOL) */
     uint8_t width;       /* 1, 2 or 4 bytes */
     uint8_t shape;       /* star_iq_shape_t */
-    uint32_t mi_max;   /* MI's maximum for the field */
-    uint32_t mi_unity; /* MI value that means the same as raptor's 128 */
+    int32_t mi_max;   /* MI's maximum for the field */
+    int32_t mi_unity; /* MI value that means the same as raptor's 128 */
+    /*
+     * MI's *minimum*, which is 0 for every module whose field is unsigned
+     * and negative for the one that is not. It is what lets raptor's
+     * sub-neutral half reach somewhere: with a floor of 0 and a baseline of
+     * 0 -- ae_comp's case before this existed -- 0..127 has nowhere to go
+     * and the whole lower half of the knob is inert.
+     */
+    int32_t mi_floor;
     /*
      * Set for a parameter whose MI neutral is not a constant this port can
      * know: the baseline is whatever the tuning binary left in the field,
@@ -289,59 +297,74 @@ enum {
  *                        a linear 0..255 -> 0..127 map would silently
  *                        double saturation at raptor's neutral
  *   sharpness, NR        0..255, midpoint 128
- *   EV compensation      0..200, unity unknown and learned from the tuning
- *                        -- see unity_from_tuning
+ *   EV compensation      signed, +/-STAR_AE_EV_SPAN about the tuning's own
+ *                        value -- see unity_from_tuning and mi_floor
  */
+
+/*
+ * How far ae_comp moves the AE's target, each way, in MI's EV units.
+ *
+ * Measured, because both numbers this replaced were guesses and both were
+ * wrong. Sweeping ae_comp through raptor's own ctrl path and reading the AE
+ * back: from a baseline of 41 the scene luma rises to 56 at EV 3, 83 at 9,
+ * 105 at 14, and 123 at 20 -- and then stops. EV 25, 39, 75, 100 and 200
+ * all give exactly luma 123, shutter 30000 us and gain 1111. So the AE's
+ * target clips a little under EV 20, and the old maximum of 200 spent nine
+ * tenths of raptor's upper half on values the algorithm ignores. Thirteen
+ * of the 255 steps did anything at all.
+ *
+ * 20 puts saturation at the end of the range instead, where a user asking
+ * for maximum gets it and every step in between moves the picture. The
+ * clip is a property of the AE's target curve rather than of the scene, so
+ * this does not want to be per-sensor: the tuning's curve is what
+ * ae_target reports, and shifting it by a fixed EV span is what this knob
+ * is for.
+ *
+ * The floor is the negative of it. MI_ISP_AE_EV_COMP_TYPE_t.s32EV is signed
+ * (asserted in tests/abi_iq.c), and with the tuning's baseline at 0 an
+ * unsigned range is what made raptor's whole lower half inert.
+ */
+#define STAR_AE_EV_SPAN 20
 static star_iq_param_t g_iq[IQ_PARAM_COUNT] = {
     [IQ_BRIGHTNESS] = { "brightness", "MI_ISP_IQ_GetBrightness", "MI_ISP_IQ_SetBrightness",
                         I6_ISP_IQ_BRIGHTNESS_PAYLOAD, I6_ISP_IQ_BRIGHTNESS_MANUAL,
-                        4, IQ_AUTOMAN, 100, 50, false, NULL, NULL },
+                        4, IQ_AUTOMAN, 100, 50, 0, false, NULL, NULL },
     [IQ_CONTRAST] = { "contrast", "MI_ISP_IQ_GetContrast", "MI_ISP_IQ_SetContrast",
                       I6_ISP_IQ_CONTRAST_PAYLOAD, I6_ISP_IQ_CONTRAST_MANUAL, 4,
-                      IQ_AUTOMAN, 100, 50, false, NULL, NULL },
+                      IQ_AUTOMAN, 100, 50, 0, false, NULL, NULL },
     [IQ_SATURATION] = { "saturation", "MI_ISP_IQ_GetSaturation", "MI_ISP_IQ_SetSaturation",
                         I6_ISP_IQ_SATURATION_PAYLOAD, I6_ISP_IQ_SATURATION_MANUAL,
-                        1, IQ_AUTOMAN, 127, 32, false, NULL, NULL },
+                        1, IQ_AUTOMAN, 127, 32, 0, false, NULL, NULL },
     [IQ_SHARPNESS] = { "sharpness", "MI_ISP_IQ_GetSharpness", "MI_ISP_IQ_SetSharpness",
                        I6_ISP_IQ_SHARPNESS_PAYLOAD, I6_ISP_IQ_SHARPNESS_MANUAL,
-                       1, IQ_AUTOMAN, 255, 128, false, NULL, NULL },
+                       1, IQ_AUTOMAN, 255, 128, 0, false, NULL, NULL },
     /* Spatial (per-frame) luma noise reduction is raptor's "sinter". */
     [IQ_SINTER] = { "sinter", "MI_ISP_IQ_GetNRLuma", "MI_ISP_IQ_SetNRLuma",
                     I6_ISP_IQ_NRLUMA_PAYLOAD, I6_ISP_IQ_NRLUMA_MANUAL, 1, IQ_AUTOMAN,
-                    255, 128, false, NULL, NULL },
+                    255, 128, 0, false, NULL, NULL },
     /* Temporal noise reduction is raptor's "temper" -- MI calls it 3D NR. */
     [IQ_TEMPER] = { "temper", "MI_ISP_IQ_GetNR3D", "MI_ISP_IQ_SetNR3D",
                     I6_ISP_IQ_NR3D_PAYLOAD, I6_ISP_IQ_NR3D_MANUAL, 1, IQ_AUTOMAN,
-                    255, 128, false, NULL, NULL },
+                    255, 128, 0, false, NULL, NULL },
     [IQ_DEFOG] = { "defog", "MI_ISP_IQ_GetDefog", "MI_ISP_IQ_SetDefog",
-                   I6_ISP_IQ_DEFOG_PAYLOAD, 0, 4, IQ_BOOL, 1, 0, false, NULL, NULL },
+                   I6_ISP_IQ_DEFOG_PAYLOAD, 0, 4, IQ_BOOL, 1, 0, 0, false, NULL, NULL },
     [IQ_GRAY] = { "gray", "MI_ISP_IQ_GetColorToGray", "MI_ISP_IQ_SetColorToGray",
-                  I6_ISP_IQ_GRAY_PAYLOAD, 0, 4, IQ_BOOL, 1, 0, false, NULL, NULL },
+                  I6_ISP_IQ_GRAY_PAYLOAD, 0, 4, IQ_BOOL, 1, 0, 0, false, NULL, NULL },
     /*
-     * The only knob whose neutral has to be learned. It is IQ_FLAT, so
-     * there is no auto mode to hand it back to, and MI's own no-compensation
-     * value is undocumented -- 100 is the midpoint of the range, which is
-     * not the same thing. Anything written here pins the AE's target luma,
-     * so guessing the neutral wrong shifts every default image.
+     * The only knob whose neutral has to be learned, and the only one whose
+     * MI field is signed. It is IQ_FLAT, so there is no auto mode to hand it
+     * back to; what it does is shift the AE's target luma, so a neutral
+     * guessed wrong shifts every default image.
      *
-     * Two things measured about it that these numbers get wrong, both worth
-     * fixing together and neither fixed here:
-     *
-     * The lower half is dead. The tuning leaves s32EV at 0, so the learned
-     * neutral is 0, so star_iq_scale maps raptor's 0..127 onto MI's 0..0 --
-     * ae_comp 0 and 64 are indistinguishable from 128 on the board. That is
-     * this mapping, not the hardware: MI_ISP_AE_EV_COMP_TYPE_t.s32EV is
-     * *signed* (asserted in tests/abi_iq.c), so the lower half should map to
-     * negative EV rather than compress into nothing.
-     *
-     * And the 200 is too generous: ae_comp 192 and 255 produce identical
-     * exposure, gain and luma, so the AE's real ceiling is reached before
-     * raptor's 192 and a third of the range does nothing.
+     * Both of its numbers were wrong, and both were measured -- see
+     * STAR_AE_EV_SPAN. The range is symmetric about whatever the tuning
+     * left in the field, which is 0 on the sensor binaries we ship.
      */
     [IQ_EVCOMP] = { "ae_comp", "MI_ISP_AE_GetEVComp", "MI_ISP_AE_SetEVComp",
-                    I6_ISP_AE_EVCOMP_PAYLOAD, 0, 4, IQ_FLAT, 200, 100, true, NULL, NULL },
+                    I6_ISP_AE_EVCOMP_PAYLOAD, 0, 4, IQ_FLAT, STAR_AE_EV_SPAN, 0,
+                    -STAR_AE_EV_SPAN, true, NULL, NULL },
     [IQ_FLICKER] = { "antiflicker", "MI_ISP_AE_GetFlicker", "MI_ISP_AE_SetFlicker",
-                     I6_ISP_AE_FLICKER_PAYLOAD, 0, 4, IQ_FLAT, 3, 0, false, NULL, NULL },
+                     I6_ISP_AE_FLICKER_PAYLOAD, 0, 4, IQ_FLAT, 3, 0, 0, false, NULL, NULL },
 };
 
 /* ================================================================
@@ -431,29 +454,42 @@ static int star_iq_resolve(star_state_t *st, star_iq_param_t *p)
  * below that, so a default config brightened the picture and every value
  * under 128 was spent climbing back down to where the tuning already was.
  */
+/*
+ * Read the field as MI declares it, signed where MI's is.
+ *
+ * The cast is the whole of the sign extension, which holds because every
+ * signed field here is four bytes wide -- ae_comp's is the only one, and
+ * the host suite asserts that a row with a negative floor is a u32-width
+ * row. A narrower signed field would need a shift and there is none.
+ */
+static int32_t star_iq_read_field(const star_iq_param_t *p, const uint8_t *buf)
+{
+    return (int32_t)star_iq_read(buf, p->manual_off, p->width);
+}
+
 static void star_iq_learn_unity(star_iq_param_t *p, const uint8_t *buf)
 {
-    uint32_t base;
+    int32_t base;
 
     if (!p->unity_from_tuning || !p->unity_stale)
         return;
 
-    base = star_iq_read(buf, p->manual_off, p->width);
-    if (base > p->mi_max) {
+    base = star_iq_read_field(p, buf);
+    if (base > p->mi_max || base < p->mi_floor) {
         /* Out of range means the offset or width is wrong, and a baseline
          * adopted from a misread field would be invisible afterwards. */
-        HAL_LOG_WARN("isp: %s reads MI %u, above its %u maximum -- not adopting it as the "
-                     "neutral, keeping %u",
-                     p->name, base, p->mi_max, p->mi_unity);
+        HAL_LOG_WARN("isp: %s reads MI %d, outside its %d..%d range -- not adopting it as the "
+                     "neutral, keeping %d",
+                     p->name, base, p->mi_floor, p->mi_max, p->mi_unity);
         p->unity_stale = false;
         return;
     }
 
     p->mi_unity = base;
     p->unity_stale = false;
-    HAL_LOG_INFO("isp: %s baseline from the tuning is MI %u/%u -- raptor 128 maps here, "
-                 "so 0..127 darkens by up to %u and 129..255 brightens by up to %u",
-                 p->name, base, p->mi_max, base, p->mi_max - base);
+    HAL_LOG_INFO("isp: %s baseline from the tuning is MI %d in %d..%d -- raptor 128 maps here, "
+                 "so 0..127 reaches down to %d and 129..255 up to %d",
+                 p->name, base, p->mi_floor, p->mi_max, p->mi_floor, p->mi_max);
 }
 
 /* Re-arm every baseline that is read out of the tuning rather than assumed.
@@ -506,44 +542,51 @@ static int star_iq_store(star_state_t *st, int idx, uint8_t *buf)
  * saturation's unity at 32 of 127, linear scaling puts raptor's neutral
  * at 64 -- twice unity gain -- and every default config would boost
  * colour.
+ *
+ * The two halves are separately linear between floor..unity and
+ * unity..max. For the unsigned modules floor is 0, which is what it has
+ * always been, and the arithmetic below reduces to what it was.
  */
-static uint32_t star_iq_scale(int val, uint32_t unity, uint32_t max)
+static int32_t star_iq_scale(int val, int32_t unity, int32_t floor, int32_t max)
 {
     if (val <= 0)
-        return 0;
+        return floor;
     if (val >= 255)
         return max;
-    /* A unity of 0 is legitimate for a learned baseline and needs no guard:
-     * the divisors below are constants, and the sub-neutral half correctly
-     * collapses onto 0 because there is nowhere below it to go. */
     if (val == STAR_ISP_NEUTRAL || unity >= max)
         return unity;
 
     if (val < STAR_ISP_NEUTRAL)
-        return (uint32_t)(((uint64_t)val * unity) / STAR_ISP_NEUTRAL);
+        return floor + (int32_t)(((int64_t)val * (unity - floor)) / STAR_ISP_NEUTRAL);
 
-    return unity + (uint32_t)(((uint64_t)(val - STAR_ISP_NEUTRAL) * (max - unity)) /
-                              (255 - STAR_ISP_NEUTRAL));
+    return unity + (int32_t)(((int64_t)(val - STAR_ISP_NEUTRAL) * (max - unity)) /
+                             (255 - STAR_ISP_NEUTRAL));
 }
 
 /* Inverse of star_iq_scale, for the getters. */
-static uint8_t star_iq_unscale(uint32_t mi, uint32_t unity, uint32_t max)
+static uint8_t star_iq_unscale(int32_t mi, int32_t unity, int32_t floor, int32_t max)
 {
-    if (max == 0 || mi >= max)
+    if (max == floor || mi >= max)
         return 255;
     if (unity >= max)
         return STAR_ISP_NEUTRAL;
-    /* Tested before the mi == 0 case, which it subsumes: with a baseline of
-     * 0, MI 0 is neutral rather than the bottom of the scale. */
+    /*
+     * Ahead of the floor test, which would otherwise swallow it: when the
+     * learned baseline sits on the floor -- an unsigned row whose tuning
+     * left the field at 0 -- MI 0 is neutral, not the bottom of the scale.
+     */
     if (mi == unity)
         return STAR_ISP_NEUTRAL;
+    if (mi <= floor)
+        return 0;
 
-    /* unity is necessarily non-zero on this branch, so the divide is safe. */
+    /* unity is necessarily above floor on this branch, so both divides are
+     * safe. */
     if (mi < unity)
-        return (uint8_t)(((uint64_t)mi * STAR_ISP_NEUTRAL) / unity);
+        return (uint8_t)(((int64_t)(mi - floor) * STAR_ISP_NEUTRAL) / (unity - floor));
 
     return (uint8_t)(STAR_ISP_NEUTRAL +
-                     ((uint64_t)(mi - unity) * (255 - STAR_ISP_NEUTRAL)) / (max - unity));
+                     ((int64_t)(mi - unity) * (255 - STAR_ISP_NEUTRAL)) / (max - unity));
 }
 
 /*
@@ -558,7 +601,7 @@ static int star_iq_apply_scalar(star_state_t *st, int idx, int val)
 {
     star_iq_param_t *p = &g_iq[idx];
     uint8_t buf[STAR_IQ_PAYLOAD_MAX];
-    uint32_t mi_val;
+    int32_t mi_val;
     int ret;
 
     ret = star_iq_fetch(st, idx, buf);
@@ -574,12 +617,15 @@ static int star_iq_apply_scalar(star_state_t *st, int idx, int val)
         star_iq_write(buf, STAR_ISP_OPTYPE_OFF, 4, STAR_ISP_OP_MANUAL);
     }
 
-    mi_val = star_iq_scale(val, p->mi_unity, p->mi_max);
-    star_iq_write(buf, p->manual_off, p->width, mi_val);
+    mi_val = star_iq_scale(val, p->mi_unity, p->mi_floor, p->mi_max);
+    /* The cast is the two's-complement bit pattern MI wants for a negative
+     * field, and a no-op for every other row. */
+    star_iq_write(buf, p->manual_off, p->width, (uint32_t)mi_val);
 
     ret = star_iq_store(st, idx, buf);
     if (ret == RSS_OK)
-        HAL_LOG_DBG("isp: %s = %d (MI %u/%u)", p->name, val, mi_val, p->mi_max);
+        HAL_LOG_DBG("isp: %s = %d (MI %d in %d..%d)", p->name, val, mi_val, p->mi_floor,
+                    p->mi_max);
 
     return ret;
 }
@@ -644,7 +690,7 @@ static int star_iq_get_scalar(void *ctx, int idx, uint8_t *out)
         return RSS_OK;
     }
 
-    *out = star_iq_unscale(star_iq_read(buf, p->manual_off, p->width), p->mi_unity, p->mi_max);
+    *out = star_iq_unscale(star_iq_read_field(p, buf), p->mi_unity, p->mi_floor, p->mi_max);
     return RSS_OK;
 }
 

@@ -70,8 +70,17 @@ static void test_table_bounds(void)
               "%s: field at %u+%u overruns the %u-byte payload", p->name, p->manual_off, p->width,
               p->payload);
         CHECK(p->mi_max > 0, "%s: mi_max is zero", p->name);
-        CHECK(p->mi_unity <= p->mi_max, "%s: unity %u above max %u", p->name, p->mi_unity,
+        CHECK(p->mi_unity <= p->mi_max, "%s: unity %d above max %d", p->name, p->mi_unity,
               p->mi_max);
+        CHECK(p->mi_floor <= 0, "%s: a floor above zero makes no sense, got %d", p->name,
+              p->mi_floor);
+        CHECK(p->mi_unity >= p->mi_floor, "%s: unity %d below floor %d", p->name, p->mi_unity,
+              p->mi_floor);
+        /* star_iq_read_field sign-extends by casting, which is only the
+         * whole story at four bytes. A narrower signed field would read
+         * back as a large positive and the range check would reject it. */
+        CHECK(p->mi_floor == 0 || p->width == 4,
+              "%s: a signed field must be 4 bytes wide, not %u", p->name, p->width);
 
         /*
          * An auto/manual entry must leave room for bEnable+enOpType, and
@@ -191,14 +200,14 @@ static void test_scale_neutral_is_unity(void)
         if (p->mi_unity == 0 || p->mi_unity >= p->mi_max)
             continue; /* bool/enum entries have no scale */
 
-        CHECK(star_iq_scale(STAR_ISP_NEUTRAL, p->mi_unity, p->mi_max) == p->mi_unity,
+        CHECK(star_iq_scale(STAR_ISP_NEUTRAL, p->mi_unity, 0, p->mi_max) == p->mi_unity,
               "%s: neutral 128 -> %u, expected unity %u", p->name,
-              star_iq_scale(STAR_ISP_NEUTRAL, p->mi_unity, p->mi_max), p->mi_unity);
+              star_iq_scale(STAR_ISP_NEUTRAL, p->mi_unity, 0, p->mi_max), p->mi_unity);
     }
 
-    CHECK(star_iq_scale(128, 32, 127) == 32, "saturation neutral must be unity gain (32), not 64");
-    CHECK(star_iq_scale(128, 50, 100) == 50, "brightness neutral");
-    CHECK(star_iq_scale(128, 100, 200) == 100, "ev comp neutral means no compensation");
+    CHECK(star_iq_scale(128, 32, 0, 127) == 32, "saturation neutral must be unity gain (32), not 64");
+    CHECK(star_iq_scale(128, 50, 0, 100) == 50, "brightness neutral");
+    CHECK(star_iq_scale(128, 100, 0, 200) == 100, "ev comp neutral means no compensation");
 }
 
 static void test_scale_endpoints_and_monotonicity(void)
@@ -213,13 +222,13 @@ static void test_scale_endpoints_and_monotonicity(void)
         if (p->mi_unity == 0 || p->mi_unity >= p->mi_max)
             continue;
 
-        CHECK(star_iq_scale(0, p->mi_unity, p->mi_max) == 0, "%s: 0 -> 0", p->name);
-        CHECK(star_iq_scale(255, p->mi_unity, p->mi_max) == p->mi_max, "%s: 255 -> max", p->name);
+        CHECK(star_iq_scale(0, p->mi_unity, 0, p->mi_max) == 0, "%s: 0 -> 0", p->name);
+        CHECK(star_iq_scale(255, p->mi_unity, 0, p->mi_max) == p->mi_max, "%s: 255 -> max", p->name);
 
         /* Never decreasing, and never out of range. */
         prev = 0;
         for (v = 0; v <= 255; v++) {
-            uint32_t got = star_iq_scale(v, p->mi_unity, p->mi_max);
+            uint32_t got = star_iq_scale(v, p->mi_unity, 0, p->mi_max);
 
             CHECK(got >= prev, "%s: not monotonic at %d (%u after %u)", p->name, v, got, prev);
             CHECK(got <= p->mi_max, "%s: %d -> %u exceeds max %u", p->name, v, got, p->mi_max);
@@ -228,8 +237,8 @@ static void test_scale_endpoints_and_monotonicity(void)
     }
 
     /* Out-of-range input is clamped rather than wrapped. */
-    CHECK(star_iq_scale(-40, 32, 127) == 0, "negative clamps to 0");
-    CHECK(star_iq_scale(9999, 32, 127) == 127, "over-range clamps to max");
+    CHECK(star_iq_scale(-40, 32, 0, 127) == 0, "negative clamps to 0");
+    CHECK(star_iq_scale(9999, 32, 0, 127) == 127, "over-range clamps to max");
 }
 
 /*
@@ -250,15 +259,15 @@ static void test_unscale_round_trip(void)
         if (p->mi_unity == 0 || p->mi_unity >= p->mi_max)
             continue;
 
-        CHECK(star_iq_unscale(p->mi_unity, p->mi_unity, p->mi_max) == STAR_ISP_NEUTRAL,
+        CHECK(star_iq_unscale(p->mi_unity, p->mi_unity, 0, p->mi_max) == STAR_ISP_NEUTRAL,
               "%s: unity must read back as neutral", p->name);
-        CHECK(star_iq_unscale(0, p->mi_unity, p->mi_max) == 0, "%s: 0 reads back as 0", p->name);
-        CHECK(star_iq_unscale(p->mi_max, p->mi_unity, p->mi_max) == 255, "%s: max reads back as 255",
+        CHECK(star_iq_unscale(0, p->mi_unity, 0, p->mi_max) == 0, "%s: 0 reads back as 0", p->name);
+        CHECK(star_iq_unscale(p->mi_max, p->mi_unity, 0, p->mi_max) == 255, "%s: max reads back as 255",
               p->name);
 
         for (v = 0; v <= 255; v += 5) {
-            uint32_t mi = star_iq_scale(v, p->mi_unity, p->mi_max);
-            int back = star_iq_unscale(mi, p->mi_unity, p->mi_max);
+            uint32_t mi = star_iq_scale(v, p->mi_unity, 0, p->mi_max);
+            int back = star_iq_unscale(mi, p->mi_unity, 0, p->mi_max);
             int drift = back > v ? back - v : v - back;
             /* One MI step is worth 255/mi_max raptor steps; allow that
              * plus a rounding unit. */
@@ -273,12 +282,12 @@ static void test_unscale_round_trip(void)
 /* Degenerate table entries must not divide by zero or misreport. */
 static void test_scale_degenerate_inputs(void)
 {
-    CHECK(star_iq_scale(200, 5, 5) == 5, "unity == max short-circuits");
-    CHECK(star_iq_unscale(0, 0, 0) == 255, "max 0 saturates rather than dividing by zero");
+    CHECK(star_iq_scale(200, 5, 0, 5) == 5, "unity == max short-circuits");
+    CHECK(star_iq_unscale(0, 0, 0, 0) == 255, "max 0 saturates rather than dividing by zero");
     /* In-range mi with a degenerate unity: falls back to neutral. An mi
      * at or above max saturates first, which is why this uses 5 not 99. */
-    CHECK(star_iq_unscale(5, 10, 10) == STAR_ISP_NEUTRAL, "unity >= max reads back neutral");
-    CHECK(star_iq_unscale(99, 10, 10) == 255, "mi above max saturates");
+    CHECK(star_iq_unscale(5, 10, 0, 10) == STAR_ISP_NEUTRAL, "unity >= max reads back neutral");
+    CHECK(star_iq_unscale(99, 10, 0, 10) == 255, "mi above max saturates");
 
     /*
      * A unity of 0 is not degenerate -- it is what a learned baseline looks
@@ -286,12 +295,12 @@ static void test_scale_degenerate_inputs(void)
      * still mean 0, the half below it collapse onto 0 because there is
      * nowhere lower, and the half above it must still reach max.
      */
-    CHECK(star_iq_scale(STAR_ISP_NEUTRAL, 0, 200) == 0, "unity 0: neutral is 0");
-    CHECK(star_iq_scale(64, 0, 200) == 0, "unity 0: below neutral collapses onto 0");
-    CHECK(star_iq_scale(255, 0, 200) == 200, "unity 0: the top still reaches max");
-    CHECK(star_iq_scale(192, 0, 200) > 0, "unity 0: above neutral still brightens");
-    CHECK(star_iq_unscale(0, 0, 200) == STAR_ISP_NEUTRAL, "unity 0: MI 0 reads back neutral");
-    CHECK(star_iq_unscale(100, 0, 200) > STAR_ISP_NEUTRAL,
+    CHECK(star_iq_scale(STAR_ISP_NEUTRAL, 0, 0, 200) == 0, "unity 0: neutral is 0");
+    CHECK(star_iq_scale(64, 0, 0, 200) == 0, "unity 0: below neutral collapses onto 0");
+    CHECK(star_iq_scale(255, 0, 0, 200) == 200, "unity 0: the top still reaches max");
+    CHECK(star_iq_scale(192, 0, 0, 200) > 0, "unity 0: above neutral still brightens");
+    CHECK(star_iq_unscale(0, 0, 0, 200) == STAR_ISP_NEUTRAL, "unity 0: MI 0 reads back neutral");
+    CHECK(star_iq_unscale(100, 0, 0, 200) > STAR_ISP_NEUTRAL,
           "unity 0: anything above it reads back above neutral");
 }
 
@@ -335,24 +344,94 @@ static void test_evcomp_neutral_comes_from_the_tuning(void)
           g_iq[IQ_EVCOMP].mi_unity);
     CHECK(!g_iq[IQ_EVCOMP].unity_stale, "and is read once, not on every fetch");
 
-    /* The point of the exercise: raptor's neutral is now inert, and the
-     * range below it darkens from the tuning's own value rather than from
-     * a guess of 100. */
-    CHECK(star_iq_scale(STAR_ISP_NEUTRAL, g_iq[IQ_EVCOMP].mi_unity, 200) == 20,
+    /* The point of the exercise: neutral writes the tuning's own value
+     * straight back, and the range is symmetric about it rather than
+     * anchored to a guess. */
+    CHECK(star_iq_scale(STAR_ISP_NEUTRAL, 20, -20, 20) == 20,
           "neutral writes the tuning's value straight back");
-    CHECK(star_iq_scale(64, g_iq[IQ_EVCOMP].mi_unity, 200) == 10, "half of neutral halves it");
-    CHECK(star_iq_scale(0, g_iq[IQ_EVCOMP].mi_unity, 200) == 0, "0 reaches the bottom");
+    CHECK(star_iq_scale(0, 20, -20, 20) == -20, "0 reaches the floor");
+    CHECK(star_iq_scale(255, 20, -20, 20) == 20, "255 reaches the ceiling");
 
     /* A reading outside the field's range means the offset or the width is
      * wrong, and adopting it would hide that for the rest of the run. */
     g_unity_probe_value = 4096;
     star_isp_arm_tuning_reads();
     CHECK(star_iq_fetch(&st, IQ_EVCOMP, buf) == RSS_OK, "an out-of-range fetch still succeeds");
-    CHECK(g_iq[IQ_EVCOMP].mi_unity == 20, "an impossible baseline is refused, got %u",
+    CHECK(g_iq[IQ_EVCOMP].mi_unity == 20, "an impossible baseline is refused, got %d",
           g_iq[IQ_EVCOMP].mi_unity);
     CHECK(!g_iq[IQ_EVCOMP].unity_stale, "and is not retried every frame");
 
+    /* And a negative baseline is legitimate for this row, where it would be
+     * a misread for any other. */
+    g_unity_probe_value = (uint32_t)(-7);
+    star_isp_arm_tuning_reads();
+    CHECK(star_iq_fetch(&st, IQ_EVCOMP, buf) == RSS_OK, "a negative baseline fetch succeeds");
+    CHECK(g_iq[IQ_EVCOMP].mi_unity == -7, "a negative baseline is adopted, got %d",
+          g_iq[IQ_EVCOMP].mi_unity);
+
     g_iq[IQ_EVCOMP] = saved;
+}
+
+/*
+ * ae_comp is the one knob whose MI field is signed, and the whole of its
+ * lower half depended on that being expressed.
+ *
+ * The tuning binaries we ship leave s32EV at 0, so the learned baseline is
+ * 0 -- and with an unsigned range that put raptor's 0..127 onto MI's 0..0.
+ * On the board, ae_comp 0 and 64 were indistinguishable from 128: half the
+ * knob did nothing, and the HAL's own log line said so without anyone
+ * reading it. The fix is the floor, not a special case in the setter.
+ *
+ * The span is measured (see STAR_AE_EV_SPAN): the AE's target clips a
+ * little under EV 20, so 255 lands on saturation instead of nine tenths
+ * past it.
+ */
+static void test_ae_comp_reaches_below_neutral(void)
+{
+    const star_iq_param_t *p = &g_iq[IQ_EVCOMP];
+    int32_t at_zero, at_neutral, at_max;
+
+    /* The row has to be signed for any of this to hold. */
+    CHECK(p->mi_floor < 0, "ae_comp's floor must be negative, got %d", p->mi_floor);
+    CHECK(p->mi_floor == -p->mi_max, "and symmetric about the baseline, got %d..%d", p->mi_floor,
+          p->mi_max);
+    CHECK(p->unity_from_tuning, "with the baseline still learned from the tuning");
+
+    /* With the shipped baseline of 0: neutral is no compensation, and the
+     * two halves reach opposite signs. This is the assertion that fails if
+     * anyone puts the floor back to 0. */
+    at_zero = star_iq_scale(0, 0, p->mi_floor, p->mi_max);
+    at_neutral = star_iq_scale(STAR_ISP_NEUTRAL, 0, p->mi_floor, p->mi_max);
+    at_max = star_iq_scale(255, 0, p->mi_floor, p->mi_max);
+    CHECK(at_neutral == 0, "neutral is no compensation, got %d", at_neutral);
+    CHECK(at_zero == p->mi_floor, "ae_comp 0 must reach the floor, got %d", at_zero);
+    CHECK(at_zero < 0, "which is negative EV -- the whole point, got %d", at_zero);
+    CHECK(at_max == p->mi_max, "ae_comp 255 must reach the ceiling, got %d", at_max);
+
+    /* Monotonic across the join, and every step distinguishable somewhere:
+     * the old mapping collapsed 0..127 onto one value. */
+    int32_t prev = star_iq_scale(0, 0, p->mi_floor, p->mi_max);
+    int distinct = 1;
+    for (int v = 1; v <= 255; v++) {
+        int32_t got = star_iq_scale(v, 0, p->mi_floor, p->mi_max);
+
+        CHECK(got >= prev, "ae_comp must be monotonic: %d gave %d after %d", v, got, prev);
+        if (got != prev)
+            distinct++;
+        prev = got;
+    }
+    CHECK(distinct >= 2 * p->mi_max, "the range should be reachable step by step, got %d values",
+          distinct);
+
+    /* A round trip through the getter's inverse has to come back to the
+     * same half of the scale. */
+    CHECK(star_iq_unscale(p->mi_floor, 0, p->mi_floor, p->mi_max) == 0, "the floor reads back as 0");
+    CHECK(star_iq_unscale(0, 0, p->mi_floor, p->mi_max) == STAR_ISP_NEUTRAL,
+          "the baseline reads back as neutral");
+    CHECK(star_iq_unscale(p->mi_max, 0, p->mi_floor, p->mi_max) == 255,
+          "the ceiling reads back as 255");
+    CHECK(star_iq_unscale(-p->mi_max / 2, 0, p->mi_floor, p->mi_max) < STAR_ISP_NEUTRAL,
+          "negative EV reads back below neutral");
 }
 
 /*
@@ -1490,6 +1569,7 @@ int main(void)
     test_unscale_round_trip();
     test_scale_degenerate_inputs();
     test_evcomp_neutral_comes_from_the_tuning();
+    test_ae_comp_reaches_below_neutral();
     test_antiflicker_translates_the_mains_frequency();
     test_pending_queue();
     test_orientation_carries_both_axes();
