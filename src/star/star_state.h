@@ -480,14 +480,6 @@ typedef struct {
     int pend_max_again;
     int pend_max_dgain;
 
-    /*
-     * Requested AE target scale, raptor's 0..255 with 128 meaning "the
-     * tuning's curve unchanged". Needs its own validity flag rather than a
-     * sentinel, because 0 is a legitimate request (the darkest the curve
-     * goes) and cannot double as "nothing asked".
-     */
-    int pend_ae_target;
-    bool pend_ae_target_set;
 
     /*
      * The AE's own gain ceilings, snapshotted from whichever tuning is in
@@ -763,7 +755,6 @@ int hal_isp_set_sharpness(void *ctx, int val);
 int hal_isp_set_sinter_strength(void *ctx, int val);
 int hal_isp_set_temper_strength(void *ctx, int val);
 int hal_isp_set_ae_comp(void *ctx, int val);
-int hal_isp_set_ae_target(void *ctx, int val);
 int hal_isp_set_defog(void *ctx, int enable);
 int hal_isp_set_antiflicker(void *ctx, rss_antiflicker_t mode);
 int hal_isp_set_max_again(void *ctx, int gain);
@@ -781,7 +772,6 @@ int hal_isp_get_sharpness(void *ctx, uint8_t *val);
 int hal_isp_get_sinter_strength(void *ctx, uint8_t *val);
 int hal_isp_get_temper_strength(void *ctx, uint8_t *val);
 int hal_isp_get_ae_comp(void *ctx, int *val);
-int hal_isp_get_ae_target(void *ctx, int *val);
 int hal_isp_get_antiflicker(void *ctx, rss_antiflicker_t *mode);
 int hal_isp_get_max_again(void *ctx, uint32_t *gain);
 int hal_isp_get_max_dgain(void *ctx, uint32_t *gain);
