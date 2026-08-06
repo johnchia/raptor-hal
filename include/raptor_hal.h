@@ -684,13 +684,6 @@ typedef struct {
     bool has_multi_sensor;
     int max_sensors;           /* 1 for T20-T31, 3 for T23-1.3.0/T32/T40/T41 */
     bool has_t23_multicam_api; /* T23 1.3.0 IMP_ISP_MultiCamera_* functions */
-    /*
-     * The SDK binds the sensor when its driver loads and addresses it by
-     * index, so the HAL resolves the sensor's identity itself and neither a
-     * name nor an I2C address is required configuration. Either may still be
-     * given, and is then advisory. False on Ingenic, which is told both.
-     */
-    bool sdk_owns_sensor;
     bool has_defog;
     bool has_dpc;
     bool has_drc;

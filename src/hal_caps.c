@@ -854,9 +854,6 @@ const rss_hal_caps_t g_hal_caps = {
     .max_sensors = 1,
     /* Permanent false: T23-specific IMP_ISP_MultiCamera_* API. */
     .has_t23_multicam_api = false,
-    /* MI binds the sensor when its driver loads and addresses it by index,
-     * so the backend resolves its identity and needs no I2C address. */
-    .sdk_owns_sensor = true,
 
     /*
      * ISP tuning — phase 3. True only where MI has a control that
