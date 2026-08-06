@@ -1714,13 +1714,13 @@ int hal_isp_get_max_dgain(void *ctx, uint32_t *gain)
  * returns the manual *setting* and AE_GetExposureLimit the bounds. But
  * CUS3A_GetAeStatus returns what the AE actually converged on.
  *
- * Two calls, and the second one is optional. MI_ISP_CUS3A_GetAeStatus
- * gives shutter and both gains, which is a complete ambient-light signal
- * on its own: a scene going dark drives the shutter and then the gain up,
- * and ric's night->day rule compares gain against its own night baseline
- * so it needs no absolute scale. MI_ISP_AE_GetAeHwAvgStats adds scene
- * luma, which ric's day->night rule prefers because IR illumination does
- * not inflate it the way it inflates gain.
+ * One call answers both of ric's rules. MI_ISP_CUS3A_GetAeStatus gives
+ * shutter and both gains, which is a complete ambient-light signal on its
+ * own: a scene going dark drives the shutter and then the gain up, and
+ * ric's night->day rule compares gain against its own night baseline so it
+ * needs no absolute scale. The same struct also carries the AE's own frame
+ * brightness, which ric's day->night rule prefers because IR illumination
+ * does not inflate it the way it inflates gain.
  *
  * Deliberately not filled: ev (an Ingenic GetEVAttr concept with no MI
  * equivalent) and wb_rgain/wb_bgain (MI_ISP_AWB_GetAwbHwAvgStats exists,
@@ -1758,7 +1758,9 @@ static uint32_t star_ae_total_gain(const i6_isp_ae_status *ae)
 }
 
 /*
- * Mean of the AE grid's Y lane, or 0 if the grid cannot be trusted.
+ * Mean of the AE grid's Y lane, or 0 if the grid cannot be trusted. The
+ * fallback behind star_ae_scene_luma, and the only source of *spatial* AE
+ * data, which is what a metering or ROI feature would want.
  *
  * The layout is MI_ISP_AE_HW_STATISTICS_t: the grid dimensions lead and
  * the cells are r,g,b,y with luma at lane 3 (see i6_isp.h). What still has
@@ -1854,6 +1856,52 @@ static uint32_t star_ae_luma(star_state_t *st, const i6_isp_ae_status *ae)
 
     free(stats);
     return luma;
+}
+
+/*
+ * Scene luma for ric, which the AE hands over in the status struct that
+ * has already been read: preAvgY is its own mean brightness for the
+ * previous frame.
+ *
+ * Wherever the AE is near its target it is not merely proportional to the
+ * mean of the grid's Y lane, it is the same number -- measured sample for
+ * sample from daylight (39) through IR-lit night (8..10) down to a dark
+ * room with the IR off (2), which brackets ric's threshold from both
+ * sides. So this costs no recalibration of night_luma, and the 46KB call
+ * and the 1024-cell average do not have to happen at all. One frame stale,
+ * against a poll once a second.
+ *
+ * The two do part company once ae_comp is driven far enough below neutral
+ * to crush the frame: at EV -15 in a dark room the grid mean sits at 1.2
+ * while this reads a steady 5, so preAvgY is the AE's own estimate rather
+ * than a mean of the delivered pixels. Both are far below any usable
+ * night_luma, so the day/night decision is the same either way -- but it
+ * is why this is not called the frame mean.
+ *
+ * The grid stays as the fallback. preAvgY is CUS3A V1.1, so a library that
+ * leaves it zero has to be able to report luma some other way rather than
+ * silently dropping ric to gain-only -- and zero is not hypothetical, a
+ * near-black frame reads it while the AE converges. A value above 255 is
+ * not the mean night_luma is calibrated against, whatever else it may be,
+ * so it is refused rather than passed on rescaled by a guess.
+ */
+static uint32_t star_ae_scene_luma(star_state_t *st, const i6_isp_ae_status *ae)
+{
+    if (ae->preAvgY > 0 && ae->preAvgY <= 255)
+        return ae->preAvgY;
+
+    if (ae->preAvgY > 255) {
+        static bool warned;
+
+        if (!warned) {
+            HAL_LOG_WARN("isp: AE reports a frame brightness of %u, which is not a 0..255 "
+                         "mean -- falling back to the AE grid for scene luma",
+                         ae->preAvgY);
+            warned = true;
+        }
+    }
+
+    return star_ae_luma(st, ae);
 }
 
 #define STAR_LIMIT_REASSERT_S 2
@@ -2097,7 +2145,7 @@ int hal_isp_get_exposure(void *ctx, rss_exposure_t *exposure)
 
     exposure->exposure_time = ae.shutterUs;
     exposure->total_gain = star_ae_total_gain(&ae);
-    exposure->ae_luma = star_ae_luma(st, &ae);
+    exposure->ae_luma = star_ae_scene_luma(st, &ae);
 
     star_isp_reload_if_reset(st, false);
     star_isp_reassert_limits(st);

@@ -216,7 +216,7 @@ static void test_scale_endpoints_and_monotonicity(void)
 
     for (i = 0; i < IQ_PARAM_COUNT; i++) {
         const star_iq_param_t *p = &g_iq[i];
-        uint32_t prev;
+        int32_t prev;
         int v;
 
         if (p->mi_unity == 0 || p->mi_unity >= p->mi_max)
@@ -228,10 +228,10 @@ static void test_scale_endpoints_and_monotonicity(void)
         /* Never decreasing, and never out of range. */
         prev = 0;
         for (v = 0; v <= 255; v++) {
-            uint32_t got = star_iq_scale(v, p->mi_unity, 0, p->mi_max);
+            int32_t got = star_iq_scale(v, p->mi_unity, 0, p->mi_max);
 
-            CHECK(got >= prev, "%s: not monotonic at %d (%u after %u)", p->name, v, got, prev);
-            CHECK(got <= p->mi_max, "%s: %d -> %u exceeds max %u", p->name, v, got, p->mi_max);
+            CHECK(got >= prev, "%s: not monotonic at %d (%d after %d)", p->name, v, got, prev);
+            CHECK(got <= p->mi_max, "%s: %d -> %d exceeds max %d", p->name, v, got, p->mi_max);
             prev = got;
         }
     }
@@ -951,8 +951,14 @@ static void test_tuning_waits_for_the_first_frame(void)
 /*
  * ── isp_get_exposure ──────────────────────────────────────────────────
  *
- * The AE grid's layout is the vendor's MI_ISP_AE_HW_STATISTICS_t, so what
- * is left to test is what still happens at runtime: the buffer is sized
+ * Scene luma comes from the AE status' own preAvgY, with the grid behind
+ * it as the fallback -- so what has to be tested is that the cheap path is
+ * the one taken, and that the expensive one is still reachable when the
+ * field is unfilled or reads outside the 0..255 mean ric is calibrated
+ * for.
+ *
+ * The grid's layout is the vendor's MI_ISP_AE_HW_STATISTICS_t, so what is
+ * left to test there is what still happens at runtime: the buffer is sized
  * for a 128x90 grid and the sensor reports 32x32, so the live dimensions
  * decide how much of it is averaged, and a buffer whose dimensions
  * disagree with the AE status must produce no luma rather than a number
@@ -1018,6 +1024,8 @@ static void exposure_setup(rss_hal_ctx_t *ctx, star_state_t *st)
     st->isp.fnGetAeStatus = fake_get_ae_status;
     st->isp.fnGetAeHwAvgStats = fake_get_ae_hw_stats;
 
+    /* preAvgY is left zero, so every grid test below runs against the
+     * fallback path deliberately rather than by accident. */
     memset(&g_ae_status, 0, sizeof(g_ae_status));
     g_ae_status.shutterUs = 8333;
     g_ae_status.sensorGain = 2048; /* 2.0x */
@@ -1091,6 +1099,64 @@ static void test_exposure_gain_is_x1024_fixed_point(void)
     /* A failed status read is a failed call, not a zeroed reading. */
     g_ae_status_ret = -1;
     CHECK(hal_isp_get_exposure(&ctx, &exp) == RSS_ERR_IO, "a failed AE status must report io");
+}
+
+static void test_exposure_luma_comes_from_the_ae_status(void)
+{
+    rss_hal_ctx_t ctx;
+    star_state_t st;
+    rss_exposure_t exp;
+    uint32_t want;
+
+    g_ae_stats = malloc(sizeof(*g_ae_stats));
+    assert(g_ae_stats);
+    want = fill_grid(g_ae_stats->cell, 8);
+    g_ae_stats->blkX = 4;
+    g_ae_stats->blkY = 2;
+
+    /* The AE's own frame brightness is the reading, and the 46KB grid call
+     * is not made at all -- on hardware the two agree exactly, so paying
+     * for the second one buys nothing. */
+    exposure_setup(&ctx, &st);
+    g_ae_status.preAvgY = 42;
+    CHECK(hal_isp_get_exposure(&ctx, &exp) == RSS_OK, "a healthy read must succeed");
+    CHECK(exp.ae_luma == 42, "luma must come from preAvgY, got %u", exp.ae_luma);
+    CHECK(g_ae_stats_calls == 0, "preAvgY must skip the grid call, got %u", g_ae_stats_calls);
+
+    /* The top of the scale is a reading, not an error. */
+    exposure_setup(&ctx, &st);
+    g_ae_status.preAvgY = 255;
+    CHECK(hal_isp_get_exposure(&ctx, &exp) == RSS_OK, "a full-scale read must succeed");
+    CHECK(exp.ae_luma == 255, "255 is a mean, got %u", exp.ae_luma);
+    CHECK(g_ae_stats_calls == 0, "255 must skip the grid call, got %u", g_ae_stats_calls);
+
+    /* Unfilled, as a CUS3A older than V1.1 would leave it: the grid still
+     * has to be tried, because reporting the "not available" zero here
+     * would drop ric to gain-only on a library that can answer. */
+    exposure_setup(&ctx, &st);
+    CHECK(hal_isp_get_exposure(&ctx, &exp) == RSS_OK, "an unfilled field must still read");
+    CHECK(exp.ae_luma == want, "an unfilled field must fall back to the grid, got %u", exp.ae_luma);
+    CHECK(g_ae_stats_calls == 1, "the fallback must make the grid call, got %u", g_ae_stats_calls);
+
+    /* Out of range is not the 0..255 mean night_luma is calibrated
+     * against, whatever else it may be, so it is refused rather than
+     * rescaled by a guess -- a guess here moves the IR-cut filter. */
+    exposure_setup(&ctx, &st);
+    g_ae_status.preAvgY = 1023;
+    CHECK(hal_isp_get_exposure(&ctx, &exp) == RSS_OK, "an out-of-range field must still read");
+    CHECK(exp.ae_luma == want, "an out-of-range field must fall back to the grid, got %u",
+          exp.ae_luma);
+    CHECK(g_ae_stats_calls == 1, "the fallback must make the grid call, got %u", g_ae_stats_calls);
+
+    /* Neither source: zero, which the contract reads as silence. */
+    exposure_setup(&ctx, &st);
+    st.isp.fnGetAeHwAvgStats = NULL;
+    CHECK(hal_isp_get_exposure(&ctx, &exp) == RSS_OK, "no luma source must not fail the read");
+    CHECK(exp.ae_luma == 0, "no luma source must report zero, got %u", exp.ae_luma);
+    CHECK(exp.total_gain == 2048, "gain must survive with no luma, got %u", exp.total_gain);
+
+    free(g_ae_stats);
+    g_ae_stats = NULL;
 }
 
 static void test_exposure_luma_covers_only_the_live_grid(void)
@@ -1579,6 +1645,7 @@ int main(void)
     test_tuning_waits_for_the_first_frame();
     test_exposure_waits_for_the_isp();
     test_exposure_gain_is_x1024_fixed_point();
+    test_exposure_luma_comes_from_the_ae_status();
     test_exposure_luma_covers_only_the_live_grid();
     test_exposure_refuses_a_grid_that_disagrees();
     test_bin_limits_snapshot_records_the_tuning();
