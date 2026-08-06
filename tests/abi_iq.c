@@ -35,9 +35,11 @@
 #include <mi_isp_datatype.h>
 #include <mi_isp_iq_datatype.h>
 #include <mi_isp_3a_datatype.h>
+#include <mi_aio_datatype.h>
 
 #include "i6_common.h"
 #include "i6_isp.h"
+#include "i6_aud.h"
 
 #define IQ_FITS(row, type)                                                  \
     _Static_assert(I6_ISP_##row##_PAYLOAD >= sizeof(type),                  \
@@ -52,6 +54,17 @@
 
 I6_ISP_IQ_AUTOMAN_ROWS(IQ_MANUAL_AT)
 I6_ISP_IQ_FLAT_ROWS(IQ_FITS)
+
+/*
+ * Not an IQ row, but the same rule and the reason the rule is written as
+ * >= throughout: i6_aud_i2s must stay LARGER than the vendor struct,
+ * because MI_AI_SetPubAttr reads 20 bytes where MI_AUDIO_I2sConfig_t
+ * declares 12 and rejects the call outright if it gets 12. Asserting
+ * equality anywhere in this file would invite exactly the "fix" that
+ * broke audio capture.
+ */
+_Static_assert(sizeof(i6_aud_i2s) >= sizeof(MI_AUDIO_I2sConfig_t),
+               "i6_aud_i2s must not shrink to the header's size");
 
 /*
  * The flat rows all write their one field at offset 0, which is only
