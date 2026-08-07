@@ -971,8 +971,11 @@ static int star_enc_bind_port_rate(star_state_t *st, int port, int chn, unsigned
     if (!src_fps)
         src_fps = enc->fps_num / (enc->fps_den ? enc->fps_den : 1);
 
-    /* No rate from the caller means "whatever this port was configured
-     * for" -- a video stream. A JPEG channel passes its own, lower rate. */
+    /* No rate from the caller means "whatever this channel is paced at" --
+     * a video stream, which is the port's rate until enc_set_fps overrides
+     * it. A JPEG channel passes its own, lower rate. */
+    if (!dst_fps)
+        dst_fps = enc->bind_fps;
     if (!dst_fps)
         dst_fps = port_fps;
     if (!dst_fps || dst_fps > src_fps)
@@ -1024,6 +1027,44 @@ int star_enc_unbind_port(star_state_t *st, int port, int chn)
     enc->src_port = -1;
 
     return ret ? RSS_ERR_IO : RSS_OK;
+}
+
+/*
+ * Re-pace a running channel at enc->bind_fps.
+ *
+ * MI fixes the source/destination ratio when the bind is made, so a bound
+ * channel's rate cannot be changed in place -- the bind has to be remade.
+ * The frames between unbind and bind are lost and the first frame after it
+ * would reference one of them, so the channel is asked for an IDR.
+ *
+ * A failed rebind leaves the channel unbound and therefore silent, which is
+ * worse than the wrong rate; the caller restores enc->bind_fps and calls
+ * this again to put the previous pacing back. The port is passed in rather
+ * than read from enc->src_port because unbinding clears it, so by the time
+ * that recovery call is made there is nothing left in the channel to say
+ * which port it came from.
+ */
+static int star_enc_rebind_rate(star_state_t *st, int port, int chn, star_venc_chn_t *enc)
+{
+    int ret;
+
+    ret = star_enc_unbind_port(st, port, chn);
+    if (ret)
+        return ret;
+
+    ret = star_enc_bind_port_rate(st, port, chn, enc->bind_fps);
+    if (ret) {
+        HAL_LOG_ERR("venc chn %d: rebind of VPE port %d at %u fps failed: %d", chn, port,
+                    enc->bind_fps, ret);
+        return ret;
+    }
+
+    if (st->venc.fnRequestIdr(chn, 1))
+        HAL_LOG_WARN("venc chn %d: no IDR after the rate change; a client will hold a stale "
+                     "picture until the next GOP",
+                     chn);
+
+    return RSS_OK;
 }
 
 void star_enc_release_all(star_state_t *st)
@@ -1408,23 +1449,57 @@ int hal_enc_set_gop_attr(void *ctx, int chn, uint32_t gop_length)
 
 int hal_enc_set_fps(void *ctx, int chn, uint32_t fps_num, uint32_t fps_den)
 {
-    unsigned int prev_num, prev_den;
-    int ret;
+    unsigned int prev_num, prev_den, prev_bind;
+    bool was_bound;
+    int port, ret;
 
     STAR_ENC_ENTER(ctx, chn, st, enc);
 
     if (!fps_num || !fps_den)
         return RSS_ERR_INVAL;
 
+    /* The bind takes whole frames per second; MI has no finer unit for it. */
+    unsigned int want = (fps_num + fps_den / 2) / fps_den;
+
+    /*
+     * The bind can only drop frames, never add them, so the sensor's rate is
+     * the ceiling. Left to itself star_enc_bind_port_rate would clamp and the
+     * caller would be told a rate nothing delivers had been applied.
+     */
+    if (st->fps && want > st->fps) {
+        HAL_LOG_WARN("venc chn %d: %u fps is above the sensor's %u; the bind can only drop frames",
+                     chn, want, st->fps);
+        return RSS_ERR_INVAL;
+    }
+
     prev_num = enc->fps_num;
     prev_den = enc->fps_den;
+    prev_bind = enc->bind_fps;
+    was_bound = enc->bound;
+    port = enc->src_port;
+
     enc->fps_num = fps_num;
     enc->fps_den = fps_den;
+    enc->bind_fps = want;
 
     ret = star_enc_reconfigure_rate(st, chn, enc);
+
+    /*
+     * Rewriting the rate struct only moves the bitrate budget and the rate
+     * the SPS advertises. Frames keep arriving at the bind's rate until it
+     * is remade, so a channel that is already running has to be rebound or
+     * the two disagree -- which reads as a stream that ignored the request.
+     */
+    if (!ret && was_bound)
+        ret = star_enc_rebind_rate(st, port, chn, enc);
+
     if (ret) {
         enc->fps_num = prev_num;
         enc->fps_den = prev_den;
+        enc->bind_fps = prev_bind;
+        star_enc_reconfigure_rate(st, chn, enc);
+        if (was_bound && !enc->bound)
+            star_enc_rebind_rate(st, port, chn, enc);
     }
 
     return ret;

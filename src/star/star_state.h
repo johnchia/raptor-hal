@@ -384,6 +384,15 @@ typedef struct {
     unsigned short height;
     unsigned int fps_num;
     unsigned int fps_den;
+
+    /*
+     * Destination rate for this channel's bind, 0 meaning "the rate the
+     * VPE port was configured for". MI paces a channel in the bind rather
+     * than in the encoder, so fps_num above buys only a bitrate budget;
+     * this is the rate frames actually arrive at. Recorded separately
+     * because a later rebind would otherwise revert to the port's rate.
+     */
+    unsigned int bind_fps;
     unsigned int gop;
     rss_rc_mode_t rc_mode;
     unsigned int bitrate;     /* bps, as the caller expressed it */
