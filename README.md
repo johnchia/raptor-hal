@@ -41,7 +41,7 @@ make PLATFORM=T31 CROSS_COMPILE=mipsel-linux-
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
-| `PLATFORM` | yes | -- | Target SoC: T20, T21, T23, T30, T31, T32, T33, T40, T41, INFINITY6E, INFINITY6B0 |
+| `PLATFORM` | yes | -- | Target SoC: T20, T21, T23, T30, T31, T32, T33, T40, T41, INFINITY6E, INFINITY6B0, INFINITY6C |
 | `CROSS_COMPILE` | yes | -- | Toolchain prefix (e.g. `mipsel-linux-`) |
 | `INGENIC_HEADERS` | no | `ingenic-headers` | Path to Ingenic SDK header repo |
 | `SIGMASTAR_HEADERS` | no | `sigmastar-headers` | Path to SigmaStar MI header repo |

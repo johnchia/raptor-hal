@@ -985,6 +985,49 @@ const rss_hal_caps_t g_hal_caps = {
     .max_osd_groups = 4,
 };
 
+/* ═══════════════════════════════════════════════════════════════════════
+ * INFINITY6C (SigmaStar SSC377 / SSC378 / SSC379)
+ *
+ * Deliberately its own block rather than an arm of the one above. The two
+ * share silicon lineage but not an ABI: MI 3.0 gives MI_SYS and MI_RGN a
+ * leading SoC id, MI_VENC a leading device, promotes the ISP to a pipeline
+ * stage and moves scaling to SCL. src/infinity6c/ is the backend.
+ *
+ * Everything here is false or zero, and that is a statement about this
+ * backend rather than about the part. src/infinity6c/ publishes the module
+ * loader and the system ops and nothing else, so there is no capability to
+ * advertise yet -- consumers check these flags precisely so they do not
+ * call into a vtable slot that is NULL.
+ *
+ * Two notes for whoever fills the limits in, because both are easy to get
+ * wrong here specifically:
+ *
+ *   MI_VENC_MAX_CHN_NUM_PER_DC is 3 on this part as it is on Infinity6E,
+ *   and it is still the per-device-group limit rather than the total. It
+ *   was misread once already; MI 3.0's explicit device layer makes it
+ *   look more like a total than it is.
+ *
+ *   max_fs_channels is a count of SCL output ports, not VPE ports. The
+ *   number is not in mi_scl_datatype.h, so it has to come from the vendor
+ *   SCL documentation or a board, and Infinity6E's four cannot simply be
+ *   carried across.
+ *
+ * The permanent falses are the same three as above and for the same
+ * reason -- xburst2, the IMP SDK generation and the IMPVI calling
+ * convention are Ingenic internals -- so they are stated once here and
+ * need no revisiting when the rest is filled in.
+ * ═══════════════════════════════════════════════════════════════════════ */
+#elif defined(PLATFORM_INFINITY6C)
+const rss_hal_caps_t g_hal_caps = {
+    .soc_name = HAL_PLATFORM_NAME,
+    /* Replaced at runtime from MI_SYS_GetVersion; this is the fallback. */
+    .sdk_version = "MI",
+
+    .uses_xburst2 = false,
+    .uses_new_sdk = false,
+    .uses_impvi = false,
+};
+
 #else
-#error "No PLATFORM_* defined. Set one of: PLATFORM_T10 T20 T21 T23 T30 T31 T32 T33 T40 T41 INFINITY6E INFINITY6B0"
+#error "No PLATFORM_* defined. Set one of: PLATFORM_T10 T20 T21 T23 T30 T31 T32 T33 T40 T41 INFINITY6E INFINITY6B0 INFINITY6C"
 #endif

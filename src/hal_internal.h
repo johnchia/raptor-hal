@@ -55,6 +55,8 @@
 #define HAL_PLATFORM_NAME "INFINITY6E"
 #elif defined(PLATFORM_INFINITY6B0)
 #define HAL_PLATFORM_NAME "INFINITY6B0"
+#elif defined(PLATFORM_INFINITY6C)
+#define HAL_PLATFORM_NAME "INFINITY6C"
 #else
 #error "No PLATFORM_* defined"
 #endif
@@ -68,14 +70,22 @@
  * other vendors. HAL_INGENIC_SDK / HAL_SIGMASTAR_SDK sit one level above them
  * and select which vendor SDK is in play at all.
  *
- * Every SigmaStar platform shares one backend. src/star/ is written against
- * the MI ABI as vendored in src/star/i6_*.h, and that ABI spans the Infinity6
- * family: divinus drives infinity6, infinity6e and infinity6b0 through the
- * same i6 HAL, switching implementations only at infinity6c and mercury6.
- * So a new family in this list needs no backend code -- only its own
- * capability block in hal_caps.c.
+ * SigmaStar has two backends, one per MI generation, and which one a platform
+ * needs is not a matter of degree:
+ *
+ *   src/star/   MI 2.x -- Infinity6E, Infinity6B0. Written against the ABI
+ *               vendored in sigmastar-headers/infinity6e. One backend covers
+ *               both, so either needs only its own block in hal_caps.c.
+ *   src/infinity6c/  MI 3.0 -- Infinity6C. MI_SYS and MI_RGN take a leading SoC
+ *               id, MI_VENC a leading device, the ISP is a pipeline stage
+ *               rather than tuning calls alone, and SCL holds the scaling
+ *               role VPE had. Struct layouts differ even where a signature
+ *               does not.
+ *
+ * A new family therefore needs a caps block, and a backend only if its MI
+ * generation has no home here yet.
  */
-#if defined(PLATFORM_INFINITY6E) || defined(PLATFORM_INFINITY6B0)
+#if defined(PLATFORM_INFINITY6E) || defined(PLATFORM_INFINITY6B0) || defined(PLATFORM_INFINITY6C)
 #define HAL_SIGMASTAR_SDK
 #else
 #define HAL_INGENIC_SDK
