@@ -75,8 +75,8 @@ static inline int i6c_venc_load(i6c_venc_api *venc)
               "i6c_venc", venc->lib, "MI_VENC_CreateDev")))
         return RSS_ERR_NOTSUP;
 
-    if (!(venc->destroy_dev = (int (*)(unsigned int))hal_symbol_load("i6c_venc", venc->lib,
-                                                                     "MI_VENC_DestroyDev")))
+    if (!(venc->destroy_dev =
+              (int (*)(unsigned int))hal_symbol_load("i6c_venc", venc->lib, "MI_VENC_DestroyDev")))
         return RSS_ERR_NOTSUP;
 
     if (!(venc->create_chn = (int (*)(unsigned int, unsigned int, i6c_venc_chn *))hal_symbol_load(
@@ -87,23 +87,20 @@ static inline int i6c_venc_load(i6c_venc_api *venc)
               "i6c_venc", venc->lib, "MI_VENC_DestroyChn")))
         return RSS_ERR_NOTSUP;
 
-    if (!(venc->get_chn_attr =
-              (int (*)(unsigned int, unsigned int, i6c_venc_chn *))hal_symbol_load(
-                  "i6c_venc", venc->lib, "MI_VENC_GetChnAttr")))
+    if (!(venc->get_chn_attr = (int (*)(unsigned int, unsigned int, i6c_venc_chn *))hal_symbol_load(
+              "i6c_venc", venc->lib, "MI_VENC_GetChnAttr")))
         return RSS_ERR_NOTSUP;
 
-    if (!(venc->set_chn_attr =
-              (int (*)(unsigned int, unsigned int, i6c_venc_chn *))hal_symbol_load(
-                  "i6c_venc", venc->lib, "MI_VENC_SetChnAttr")))
+    if (!(venc->set_chn_attr = (int (*)(unsigned int, unsigned int, i6c_venc_chn *))hal_symbol_load(
+              "i6c_venc", venc->lib, "MI_VENC_SetChnAttr")))
         return RSS_ERR_NOTSUP;
 
     if (!(venc->reset_chn = (int (*)(unsigned int, unsigned int))hal_symbol_load(
               "i6c_venc", venc->lib, "MI_VENC_ResetChn")))
         return RSS_ERR_NOTSUP;
 
-    if (!(venc->set_src_conf =
-              (int (*)(unsigned int, unsigned int, i6c_venc_src_conf *))hal_symbol_load(
-                  "i6c_venc", venc->lib, "MI_VENC_SetInputSourceConfig")))
+    if (!(venc->set_src_conf = (int (*)(unsigned int, unsigned int, i6c_venc_src_conf *))
+              hal_symbol_load("i6c_venc", venc->lib, "MI_VENC_SetInputSourceConfig")))
         return RSS_ERR_NOTSUP;
 
     if (!(venc->start_recv = (int (*)(unsigned int, unsigned int))hal_symbol_load(
@@ -118,8 +115,8 @@ static inline int i6c_venc_load(i6c_venc_api *venc)
               "i6c_venc", venc->lib, "MI_VENC_StopRecvPic")))
         return RSS_ERR_NOTSUP;
 
-    if (!(venc->get_fd = (int (*)(unsigned int, unsigned int))hal_symbol_load(
-              "i6c_venc", venc->lib, "MI_VENC_GetFd")))
+    if (!(venc->get_fd = (int (*)(unsigned int, unsigned int))hal_symbol_load("i6c_venc", venc->lib,
+                                                                              "MI_VENC_GetFd")))
         return RSS_ERR_NOTSUP;
 
     if (!(venc->close_fd = (int (*)(unsigned int, unsigned int))hal_symbol_load(
@@ -130,28 +127,24 @@ static inline int i6c_venc_load(i6c_venc_api *venc)
               "i6c_venc", venc->lib, "MI_VENC_Query")))
         return RSS_ERR_NOTSUP;
 
-    if (!(venc->get_stream =
-              (int (*)(unsigned int, unsigned int, i6c_venc_strm *, unsigned int))hal_symbol_load(
-                  "i6c_venc", venc->lib, "MI_VENC_GetStream")))
+    if (!(venc->get_stream = (int (*)(unsigned int, unsigned int, i6c_venc_strm *, unsigned int))
+              hal_symbol_load("i6c_venc", venc->lib, "MI_VENC_GetStream")))
         return RSS_ERR_NOTSUP;
 
-    if (!(venc->release_stream =
-              (int (*)(unsigned int, unsigned int, i6c_venc_strm *))hal_symbol_load(
-                  "i6c_venc", venc->lib, "MI_VENC_ReleaseStream")))
+    if (!(venc->release_stream = (int (*)(unsigned int, unsigned int, i6c_venc_strm *))
+              hal_symbol_load("i6c_venc", venc->lib, "MI_VENC_ReleaseStream")))
         return RSS_ERR_NOTSUP;
 
     if (!(venc->request_idr = (int (*)(unsigned int, unsigned int, char))hal_symbol_load(
               "i6c_venc", venc->lib, "MI_VENC_RequestIdr")))
         return RSS_ERR_NOTSUP;
 
-    if (!(venc->get_jpeg_param =
-              (int (*)(unsigned int, unsigned int, i6c_venc_jpg *))hal_symbol_load(
-                  "i6c_venc", venc->lib, "MI_VENC_GetJpegParam")))
+    if (!(venc->get_jpeg_param = (int (*)(unsigned int, unsigned int, i6c_venc_jpg *))
+              hal_symbol_load("i6c_venc", venc->lib, "MI_VENC_GetJpegParam")))
         return RSS_ERR_NOTSUP;
 
-    if (!(venc->set_jpeg_param =
-              (int (*)(unsigned int, unsigned int, i6c_venc_jpg *))hal_symbol_load(
-                  "i6c_venc", venc->lib, "MI_VENC_SetJpegParam")))
+    if (!(venc->set_jpeg_param = (int (*)(unsigned int, unsigned int, i6c_venc_jpg *))
+              hal_symbol_load("i6c_venc", venc->lib, "MI_VENC_SetJpegParam")))
         return RSS_ERR_NOTSUP;
 
     return RSS_OK;

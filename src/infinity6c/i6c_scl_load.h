@@ -58,8 +58,8 @@ static inline int i6c_scl_load(i6c_scl_api *scl)
               "i6c_scl", scl->lib, "MI_SCL_CreateDevice")))
         return RSS_ERR_NOTSUP;
 
-    if (!(scl->destroy_dev = (int (*)(unsigned int))hal_symbol_load("i6c_scl", scl->lib,
-                                                                    "MI_SCL_DestroyDevice")))
+    if (!(scl->destroy_dev =
+              (int (*)(unsigned int))hal_symbol_load("i6c_scl", scl->lib, "MI_SCL_DestroyDevice")))
         return RSS_ERR_NOTSUP;
 
     if (!(scl->create_chn = (int (*)(unsigned int, unsigned int, unsigned int *))hal_symbol_load(
@@ -78,24 +78,20 @@ static inline int i6c_scl_load(i6c_scl_api *scl)
               "i6c_scl", scl->lib, "MI_SCL_StopChannel")))
         return RSS_ERR_NOTSUP;
 
-    if (!(scl->set_chn_param =
-              (int (*)(unsigned int, unsigned int, i6c_scl_chn *))hal_symbol_load(
-                  "i6c_scl", scl->lib, "MI_SCL_SetChnParam")))
+    if (!(scl->set_chn_param = (int (*)(unsigned int, unsigned int, i6c_scl_chn *))hal_symbol_load(
+              "i6c_scl", scl->lib, "MI_SCL_SetChnParam")))
         return RSS_ERR_NOTSUP;
 
-    if (!(scl->set_port_param =
-              (int (*)(unsigned int, unsigned int, unsigned int, i6c_scl_port *))hal_symbol_load(
-                  "i6c_scl", scl->lib, "MI_SCL_SetOutputPortParam")))
+    if (!(scl->set_port_param = (int (*)(unsigned int, unsigned int, unsigned int, i6c_scl_port *))
+              hal_symbol_load("i6c_scl", scl->lib, "MI_SCL_SetOutputPortParam")))
         return RSS_ERR_NOTSUP;
 
-    if (!(scl->enable_port =
-              (int (*)(unsigned int, unsigned int, unsigned int))hal_symbol_load(
-                  "i6c_scl", scl->lib, "MI_SCL_EnableOutputPort")))
+    if (!(scl->enable_port = (int (*)(unsigned int, unsigned int, unsigned int))hal_symbol_load(
+              "i6c_scl", scl->lib, "MI_SCL_EnableOutputPort")))
         return RSS_ERR_NOTSUP;
 
-    if (!(scl->disable_port =
-              (int (*)(unsigned int, unsigned int, unsigned int))hal_symbol_load(
-                  "i6c_scl", scl->lib, "MI_SCL_DisableOutputPort")))
+    if (!(scl->disable_port = (int (*)(unsigned int, unsigned int, unsigned int))hal_symbol_load(
+              "i6c_scl", scl->lib, "MI_SCL_DisableOutputPort")))
         return RSS_ERR_NOTSUP;
 
     return RSS_OK;

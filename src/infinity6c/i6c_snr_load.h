@@ -77,22 +77,20 @@ static inline int i6c_snr_load(i6c_snr_api *snr)
               "i6c_snr", snr->lib, "MI_SNR_GetRes")))
         return RSS_ERR_NOTSUP;
 
-    if (!(snr->set_res = (int (*)(unsigned int, unsigned char))hal_symbol_load(
-              "i6c_snr", snr->lib, "MI_SNR_SetRes")))
+    if (!(snr->set_res = (int (*)(unsigned int, unsigned char))hal_symbol_load("i6c_snr", snr->lib,
+                                                                               "MI_SNR_SetRes")))
         return RSS_ERR_NOTSUP;
 
-    if (!(snr->get_cur_res =
-              (int (*)(unsigned int, unsigned char *, i6c_snr_res *))hal_symbol_load(
-                  "i6c_snr", snr->lib, "MI_SNR_GetCurRes")))
+    if (!(snr->get_cur_res = (int (*)(unsigned int, unsigned char *, i6c_snr_res *))hal_symbol_load(
+              "i6c_snr", snr->lib, "MI_SNR_GetCurRes")))
         return RSS_ERR_NOTSUP;
 
-    if (!(snr->set_fps = (int (*)(unsigned int, unsigned int))hal_symbol_load(
-              "i6c_snr", snr->lib, "MI_SNR_SetFps")))
+    if (!(snr->set_fps = (int (*)(unsigned int, unsigned int))hal_symbol_load("i6c_snr", snr->lib,
+                                                                              "MI_SNR_SetFps")))
         return RSS_ERR_NOTSUP;
 
-    if (!(snr->set_orien =
-              (int (*)(unsigned int, unsigned char, unsigned char))hal_symbol_load(
-                  "i6c_snr", snr->lib, "MI_SNR_SetOrien")))
+    if (!(snr->set_orien = (int (*)(unsigned int, unsigned char, unsigned char))hal_symbol_load(
+              "i6c_snr", snr->lib, "MI_SNR_SetOrien")))
         return RSS_ERR_NOTSUP;
 
     if (!(snr->set_plane_mode = (int (*)(unsigned int, unsigned char))hal_symbol_load(
@@ -103,9 +101,8 @@ static inline int i6c_snr_load(i6c_snr_api *snr)
               "i6c_snr", snr->lib, "MI_SNR_GetPadInfo")))
         return RSS_ERR_NOTSUP;
 
-    if (!(snr->get_plane_info =
-              (int (*)(unsigned int, unsigned int, i6c_snr_plane *))hal_symbol_load(
-                  "i6c_snr", snr->lib, "MI_SNR_GetPlaneInfo")))
+    if (!(snr->get_plane_info = (int (*)(unsigned int, unsigned int, i6c_snr_plane *))
+              hal_symbol_load("i6c_snr", snr->lib, "MI_SNR_GetPlaneInfo")))
         return RSS_ERR_NOTSUP;
 
     return RSS_OK;

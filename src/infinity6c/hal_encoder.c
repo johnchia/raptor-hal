@@ -155,8 +155,8 @@ static void i6c_enc_fill_rate(i6c_venc_rate *rate, const rss_video_config_t *cfg
 
     switch (cfg->rc_mode) {
     case RSS_RC_FIXQP:
-        rate->mode = codec == I6C_VENC_CODEC_H265 ? I6C_VENC_RATEMODE_H265QP
-                                                  : I6C_VENC_RATEMODE_H264QP;
+        rate->mode =
+            codec == I6C_VENC_CODEC_H265 ? I6C_VENC_RATEMODE_H265QP : I6C_VENC_RATEMODE_H264QP;
         rate->h264Qp.gop = gop;
         rate->h264Qp.fpsNum = fps_num;
         rate->h264Qp.fpsDen = fps_den;
@@ -165,8 +165,8 @@ static void i6c_enc_fill_rate(i6c_venc_rate *rate, const rss_video_config_t *cfg
         break;
 
     case RSS_RC_VBR:
-        rate->mode = codec == I6C_VENC_CODEC_H265 ? I6C_VENC_RATEMODE_H265VBR
-                                                  : I6C_VENC_RATEMODE_H264VBR;
+        rate->mode =
+            codec == I6C_VENC_CODEC_H265 ? I6C_VENC_RATEMODE_H265VBR : I6C_VENC_RATEMODE_H264VBR;
         rate->h264Vbr.gop = gop;
         rate->h264Vbr.statTime = 1;
         rate->h264Vbr.fpsNum = fps_num;
@@ -188,8 +188,8 @@ static void i6c_enc_fill_rate(i6c_venc_rate *rate, const rss_video_config_t *cfg
     case RSS_RC_SMART:
     case RSS_RC_CAPPED_VBR:
     case RSS_RC_CAPPED_QUALITY:
-        rate->mode = codec == I6C_VENC_CODEC_H265 ? I6C_VENC_RATEMODE_H265AVBR
-                                                  : I6C_VENC_RATEMODE_H264AVBR;
+        rate->mode =
+            codec == I6C_VENC_CODEC_H265 ? I6C_VENC_RATEMODE_H265AVBR : I6C_VENC_RATEMODE_H264AVBR;
         rate->h264Avbr.gop = gop;
         rate->h264Avbr.statTime = 1;
         rate->h264Avbr.fpsNum = fps_num;
@@ -201,8 +201,8 @@ static void i6c_enc_fill_rate(i6c_venc_rate *rate, const rss_video_config_t *cfg
 
     case RSS_RC_CBR:
     default:
-        rate->mode = codec == I6C_VENC_CODEC_H265 ? I6C_VENC_RATEMODE_H265CBR
-                                                  : I6C_VENC_RATEMODE_H264CBR;
+        rate->mode =
+            codec == I6C_VENC_CODEC_H265 ? I6C_VENC_RATEMODE_H265CBR : I6C_VENC_RATEMODE_H264CBR;
         rate->h264Cbr.gop = gop;
         rate->h264Cbr.statTime = 1;
         rate->h264Cbr.fpsNum = fps_num;
@@ -445,8 +445,7 @@ int i6c_unbind_scl_from_venc(infinity6c_state_t *st, int chn)
  * because the encoder is the consumer here and has nothing downstream to hand a
  * partial frame to.
  */
-static int i6c_enc_pool(infinity6c_state_t *st, unsigned int device,
-                        const rss_video_config_t *cfg)
+static int i6c_enc_pool(infinity6c_state_t *st, unsigned int device, const rss_video_config_t *cfg)
 {
     i6c_sys_pool pool;
     int ret;

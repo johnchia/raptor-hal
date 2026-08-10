@@ -110,9 +110,10 @@ static inline int i6c_sys_load(i6c_sys_api *sys)
               "i6c_sys", sys->lib, "MI_SYS_GetVersion")))
         return RSS_ERR_NOTSUP;
 
-    if (!(sys->bind_ext = (int (*)(unsigned short, i6c_sys_bind *, i6c_sys_bind *, unsigned int,
-                                   unsigned int, i6c_sys_link, unsigned int))
-              hal_symbol_load("i6c_sys", sys->lib, "MI_SYS_BindChnPort2")))
+    if (!(sys->bind_ext =
+              (int (*)(unsigned short, i6c_sys_bind *, i6c_sys_bind *, unsigned int, unsigned int,
+                       i6c_sys_link, unsigned int))hal_symbol_load("i6c_sys", sys->lib,
+                                                                   "MI_SYS_BindChnPort2")))
         return RSS_ERR_NOTSUP;
 
     if (!(sys->unbind = (int (*)(unsigned short, i6c_sys_bind *, i6c_sys_bind *))hal_symbol_load(

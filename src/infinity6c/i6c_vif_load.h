@@ -54,8 +54,8 @@ static inline int i6c_vif_load(i6c_vif_api *vif)
               "i6c_vif", vif->lib, "MI_VIF_CreateDevGroup")))
         return RSS_ERR_NOTSUP;
 
-    if (!(vif->destroy_group = (int (*)(unsigned int))hal_symbol_load(
-              "i6c_vif", vif->lib, "MI_VIF_DestroyDevGroup")))
+    if (!(vif->destroy_group = (int (*)(unsigned int))hal_symbol_load("i6c_vif", vif->lib,
+                                                                      "MI_VIF_DestroyDevGroup")))
         return RSS_ERR_NOTSUP;
 
     if (!(vif->set_dev_attr = (int (*)(unsigned int, i6c_vif_dev *))hal_symbol_load(
@@ -70,9 +70,8 @@ static inline int i6c_vif_load(i6c_vif_api *vif)
               (int (*)(unsigned int))hal_symbol_load("i6c_vif", vif->lib, "MI_VIF_DisableDev")))
         return RSS_ERR_NOTSUP;
 
-    if (!(vif->set_port_attr =
-              (int (*)(unsigned int, unsigned int, i6c_vif_port *))hal_symbol_load(
-                  "i6c_vif", vif->lib, "MI_VIF_SetOutputPortAttr")))
+    if (!(vif->set_port_attr = (int (*)(unsigned int, unsigned int, i6c_vif_port *))hal_symbol_load(
+              "i6c_vif", vif->lib, "MI_VIF_SetOutputPortAttr")))
         return RSS_ERR_NOTSUP;
 
     if (!(vif->enable_port = (int (*)(unsigned int, unsigned int))hal_symbol_load(

@@ -96,8 +96,8 @@ static inline int i6c_isp_load(i6c_isp_api *isp)
      * Spelled as the vendor spells it. The symbol is misspelt in the library, so
      * the correct spelling resolves to nothing.
      */
-    if (!(isp->destroy_dev = (int (*)(unsigned int))hal_symbol_load("i6c_isp", isp->lib,
-                                                                    "MI_ISP_DestoryDevice")))
+    if (!(isp->destroy_dev =
+              (int (*)(unsigned int))hal_symbol_load("i6c_isp", isp->lib, "MI_ISP_DestoryDevice")))
         return RSS_ERR_NOTSUP;
 
     if (!(isp->create_chn = (int (*)(unsigned int, unsigned int, i6c_isp_chn *))hal_symbol_load(
@@ -108,9 +108,8 @@ static inline int i6c_isp_load(i6c_isp_api *isp)
               "i6c_isp", isp->lib, "MI_ISP_DestroyChannel")))
         return RSS_ERR_NOTSUP;
 
-    if (!(isp->set_chn_param =
-              (int (*)(unsigned int, unsigned int, i6c_isp_para *))hal_symbol_load(
-                  "i6c_isp", isp->lib, "MI_ISP_SetChnParam")))
+    if (!(isp->set_chn_param = (int (*)(unsigned int, unsigned int, i6c_isp_para *))hal_symbol_load(
+              "i6c_isp", isp->lib, "MI_ISP_SetChnParam")))
         return RSS_ERR_NOTSUP;
 
     if (!(isp->start_chn = (int (*)(unsigned int, unsigned int))hal_symbol_load(
@@ -121,29 +120,24 @@ static inline int i6c_isp_load(i6c_isp_api *isp)
               "i6c_isp", isp->lib, "MI_ISP_StopChannel")))
         return RSS_ERR_NOTSUP;
 
-    if (!(isp->set_port_param =
-              (int (*)(unsigned int, unsigned int, unsigned int, i6c_isp_port *))hal_symbol_load(
-                  "i6c_isp", isp->lib, "MI_ISP_SetOutputPortParam")))
+    if (!(isp->set_port_param = (int (*)(unsigned int, unsigned int, unsigned int, i6c_isp_port *))
+              hal_symbol_load("i6c_isp", isp->lib, "MI_ISP_SetOutputPortParam")))
         return RSS_ERR_NOTSUP;
 
-    if (!(isp->enable_port =
-              (int (*)(unsigned int, unsigned int, unsigned int))hal_symbol_load(
-                  "i6c_isp", isp->lib, "MI_ISP_EnableOutputPort")))
+    if (!(isp->enable_port = (int (*)(unsigned int, unsigned int, unsigned int))hal_symbol_load(
+              "i6c_isp", isp->lib, "MI_ISP_EnableOutputPort")))
         return RSS_ERR_NOTSUP;
 
-    if (!(isp->disable_port =
-              (int (*)(unsigned int, unsigned int, unsigned int))hal_symbol_load(
-                  "i6c_isp", isp->lib, "MI_ISP_DisableOutputPort")))
+    if (!(isp->disable_port = (int (*)(unsigned int, unsigned int, unsigned int))hal_symbol_load(
+              "i6c_isp", isp->lib, "MI_ISP_DisableOutputPort")))
         return RSS_ERR_NOTSUP;
 
-    if (!(isp->load_bin =
-              (int (*)(unsigned int, unsigned int, char *, unsigned int))hal_symbol_load(
-                  "i6c_isp", isp->lib, "MI_ISP_ApiCmdLoadBinFile")))
+    if (!(isp->load_bin = (int (*)(unsigned int, unsigned int, char *, unsigned int))
+              hal_symbol_load("i6c_isp", isp->lib, "MI_ISP_ApiCmdLoadBinFile")))
         return RSS_ERR_NOTSUP;
 
-    if (!(isp->set_color_to_gray =
-              (int (*)(unsigned int, unsigned int, char *))hal_symbol_load(
-                  "i6c_isp", isp->lib, "MI_ISP_IQ_SetColorToGray")))
+    if (!(isp->set_color_to_gray = (int (*)(unsigned int, unsigned int, char *))hal_symbol_load(
+              "i6c_isp", isp->lib, "MI_ISP_IQ_SetColorToGray")))
         return RSS_ERR_NOTSUP;
 
     return RSS_OK;

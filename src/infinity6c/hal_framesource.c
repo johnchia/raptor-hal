@@ -72,8 +72,8 @@ static i6c_common_pixfmt i6c_vif_pixfmt(const i6c_snr_plane *plane)
     if (plane->bayer >= I6C_BAYER_END)
         return plane->pixFmt;
 
-    return (i6c_common_pixfmt)(I6C_PIXFMT_RGB_BAYER +
-                               (int)plane->precision * (int)I6C_BAYER_END + (int)plane->bayer);
+    return (i6c_common_pixfmt)(I6C_PIXFMT_RGB_BAYER + (int)plane->precision * (int)I6C_BAYER_END +
+                               (int)plane->bayer);
 }
 
 /* ================================================================
@@ -125,8 +125,8 @@ static int i6c_snr_select(infinity6c_state_t *st, unsigned short width, unsigned
             return RSS_ERR_IO;
         }
 
-        HAL_LOG_DBG("infinity6c: sensor mode %u: %ux%u, up to %u fps, \"%.*s\"", i,
-                    res.crop.width, res.crop.height, res.maxFps, (int)sizeof(res.desc), res.desc);
+        HAL_LOG_DBG("infinity6c: sensor mode %u: %ux%u, up to %u fps, \"%.*s\"", i, res.crop.width,
+                    res.crop.height, res.maxFps, (int)sizeof(res.desc), res.desc);
 
         if (width > res.crop.width || height > res.crop.height || fps > res.maxFps)
             continue;
@@ -340,8 +340,8 @@ static int i6c_isp_bringup(infinity6c_state_t *st)
     port.pixFmt = I6C_PIXFMT_YUV422_YUYV;
     port.compress = I6C_COMPR_NONE;
 
-    if ((ret = st->isp.set_port_param(I6C_DEV_ID(I6C_ISP_DEV), I6C_ISP_CHN, I6C_ISP_PORT,
-                                      &port)) != 0) {
+    if ((ret = st->isp.set_port_param(I6C_DEV_ID(I6C_ISP_DEV), I6C_ISP_CHN, I6C_ISP_PORT, &port)) !=
+        0) {
         HAL_LOG_ERR("MI_ISP_SetOutputPortParam failed: %d", ret);
         return RSS_ERR_IO;
     }
@@ -421,8 +421,8 @@ static int i6c_link(infinity6c_state_t *st, i6c_sys_mod src_mod, unsigned int sr
 
     ret = st->sys.bind_ext(I6C_SOC_ID, &src, &dst, st->fps, st->fps, I6C_SYS_LINK_REALTIME, 0);
     if (ret) {
-        HAL_LOG_ERR("MI_SYS_BindChnPort2(mod %d -> mod %d) failed: %d", (int)src_mod,
-                    (int)dst_mod, ret);
+        HAL_LOG_ERR("MI_SYS_BindChnPort2(mod %d -> mod %d) failed: %d", (int)src_mod, (int)dst_mod,
+                    ret);
         return RSS_ERR_IO;
     }
 
@@ -491,8 +491,8 @@ int i6c_pipeline_create(infinity6c_state_t *st, const rss_fs_config_t *cfg)
     st->pipeline_up = true;
     st->pipeline_refs = 1;
 
-    HAL_LOG_INFO("infinity6c: pipeline up, VIF -> ISP -> SCL at %ux%u %u fps",
-                 st->plane.capt.width, st->plane.capt.height, st->fps);
+    HAL_LOG_INFO("infinity6c: pipeline up, VIF -> ISP -> SCL at %ux%u %u fps", st->plane.capt.width,
+                 st->plane.capt.height, st->fps);
     /*
      * Said in the log rather than only in a comment, because this is where it is
      * read. With no tuning loaded the picture is whatever CUS3A's defaults
