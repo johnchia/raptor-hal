@@ -493,6 +493,16 @@ int i6c_pipeline_create(infinity6c_state_t *st, const rss_fs_config_t *cfg)
 
     HAL_LOG_INFO("infinity6c: pipeline up, VIF -> ISP -> SCL at %ux%u %u fps",
                  st->plane.capt.width, st->plane.capt.height, st->fps);
+    /*
+     * Said in the log rather than only in a comment, because this is where it is
+     * read. With no tuning loaded the picture is whatever CUS3A's defaults
+     * produce, which can look badly wrong while being exactly what this code
+     * asks for -- so on this backend a bad picture is expected and carries no
+     * information, while no picture at all is a real result. Anyone reading a
+     * bring-up log needs that distinction before they read the colour.
+     */
+    HAL_LOG_INFO("infinity6c: no IQ tuning is loaded on this backend -- judge capture and "
+                 "encode, not colour or exposure");
     return RSS_OK;
 
     /*
