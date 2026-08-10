@@ -163,6 +163,7 @@ ifeq ($(PLATFORM),INFINITY6C)
 # and the audio modules are the next generation's equivalents of star/hal_osd.c
 # and star/hal_audio.c and have not been ported. hal_gpio is vendor-neutral.
 VIDEO_SRCS := $(BACKEND_DIR)/hal_framesource.c \
+              $(BACKEND_DIR)/hal_encoder.c \
               src/hal_gpio.c
 
 AUDIO_SRCS :=
