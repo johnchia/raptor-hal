@@ -993,35 +993,63 @@ const rss_hal_caps_t g_hal_caps = {
  * leading SoC id, MI_VENC a leading device, promotes the ISP to a pipeline
  * stage and moves scaling to SCL. src/infinity6c/ is the backend.
  *
- * Everything here is false or zero, and that is a statement about this
- * backend rather than about the part. src/infinity6c/ publishes the module
- * loader and the system ops and nothing else, so there is no capability to
- * advertise yet -- consumers check these flags precisely so they do not
- * call into a vtable slot that is NULL.
+ * The capture and encode path is implemented (SNR, VIF, ISP, SCL, VENC);
+ * OSD and audio are not, so their capabilities stay false and their
+ * limits zero. Consumers check these flags precisely so they do not call
+ * into a vtable slot that is NULL.
  *
- * Two notes for whoever fills the limits in, because both are easy to get
- * wrong here specifically:
+ * Both channel limits are 4, and both are the *same* four: a raptor
+ * framesource channel is an SCL output port, and an encoder channel is fed
+ * by one, so a stream costs one port and the scaler's port count caps
+ * both. That number is derived rather than carried over from Infinity6E --
+ * mi_scl.ko answers it outright, since _MI_SCL_IMPL_GetPassOutputPortNum
+ * is a four-byte function returning 4 (its input counterpart returns 1).
+ * The ISP's equivalents are 1 in and 3 out, which is why the ISP sits
+ * upstream of the fan-out rather than being it.
  *
- *   MI_VENC_MAX_CHN_NUM_PER_DC is 3 on this part as it is on Infinity6E,
- *   and it is still the per-device-group limit rather than the total. It
- *   was misread once already; MI 3.0's explicit device layer makes it
- *   look more like a total than it is.
+ * max_enc_channels is therefore 4 and not the 8 or 12 VENC would accept.
+ * MI addresses 12 channels across two devices (H.26x from 0, MJPEG from 8),
+ * but a channel with nothing bound to it encodes nothing, so advertising
+ * more than the scaler can feed would promise streams that fail at bind
+ * time. Note also that MI_VENC_MAX_CHN_NUM_PER_DC is 3 on this part as on
+ * Infinity6E and is still the per-device-group limit rather than a total;
+ * it was misread that way once already, and MI 3.0's explicit device layer
+ * makes it look more like a total than it is.
  *
- *   max_fs_channels is a count of SCL output ports, not VPE ports. The
- *   number is not in mi_scl_datatype.h, so it has to come from the vendor
- *   SCL documentation or a board, and Infinity6E's four cannot simply be
- *   carried across.
+ * has_rotation is true but coarser than the flag suggests: rotation lives
+ * on the SCL channel, so it turns every stream at once. hal_fs_set_rotation
+ * accepts it for channel 0 and refuses it elsewhere rather than quietly
+ * rotating streams the caller did not name.
+ *
+ * has_color2grey is true because MI_ISP_IQ_SetColorToGray is bound and is a
+ * property of the ISP channel rather than of an encoder.
  *
  * The permanent falses are the same three as above and for the same
  * reason -- xburst2, the IMP SDK generation and the IMPVI calling
- * convention are Ingenic internals -- so they are stated once here and
- * need no revisiting when the rest is filled in.
+ * convention are Ingenic internals.
  * ═══════════════════════════════════════════════════════════════════════ */
 #elif defined(PLATFORM_INFINITY6C)
 const rss_hal_caps_t g_hal_caps = {
     .soc_name = HAL_PLATFORM_NAME,
     /* Replaced at runtime from MI_SYS_GetVersion; this is the fallback. */
     .sdk_version = "MI",
+
+    /* Encoder */
+    .has_h265 = true,
+    .has_rotation = true,
+    .has_set_bitrate = true,
+    .has_gop_attr = true,
+    /* AVBR is what the capped and smart modes map onto; see hal_encoder.c. */
+    .has_capped_rc = true,
+    .has_smart_rc = true,
+
+    /* ISP */
+    .has_color2grey = true,
+    .max_sensors = 1,
+
+    /* Limits — both counts are the scaler's four output ports. */
+    .max_enc_channels = 4,
+    .max_fs_channels = 4,
 
     .uses_xburst2 = false,
     .uses_new_sdk = false,
