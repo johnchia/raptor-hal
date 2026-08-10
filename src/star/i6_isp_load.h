@@ -25,7 +25,7 @@
 
 #include <i6_isp.h>
 
-#include "i6_symbols.h"
+#include "hal_symbols.h"
 
 typedef struct {
     void *handle, *handleCus3a, *handleIspAlgo;

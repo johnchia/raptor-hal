@@ -25,7 +25,7 @@
 
 #include <i6_aud.h>
 
-#include "i6_symbols.h"
+#include "hal_symbols.h"
 
 typedef struct {
     void *handle;
