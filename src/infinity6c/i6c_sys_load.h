@@ -44,6 +44,33 @@ typedef struct {
     int (*init)(unsigned short soc_id);
     int (*exit)(unsigned short soc_id);
     int (*get_version)(unsigned short soc_id, i6c_sys_ver *out);
+
+    /*
+     * The datapath half. Binding is what makes a stage feed the next one, so
+     * these are the calls that turn a set of configured modules into a
+     * pipeline.
+     *
+     * bind_ext is the one used throughout rather than the plain MI_SYS_BindChnPort,
+     * because the frame rates and the link type are not optional in practice:
+     * VIF -> ISP -> SCL wants REALTIME so no frame is buffered between stages,
+     * while SCL -> VENC wants RING for H.26x, and the plain bind chooses neither.
+     */
+    int (*bind_ext)(unsigned short soc_id, i6c_sys_bind *src, i6c_sys_bind *dest,
+                    unsigned int src_fps, unsigned int dest_fps, i6c_sys_link link,
+                    unsigned int link_param);
+    int (*unbind)(unsigned short soc_id, i6c_sys_bind *src, i6c_sys_bind *dest);
+
+    /*
+     * Private pools, which are not an optimisation here. A stage that hands
+     * frames onward through a ring needs one configured before it starts, and
+     * MI allocates from the shared heap otherwise -- so this is part of bring-up
+     * rather than tuning.
+     */
+    int (*config_pool)(unsigned short soc_id, i6c_sys_pool *config);
+
+    /* How many frames a port may hold for a user and for the next stage. */
+    int (*set_output_depth)(unsigned short soc_id, i6c_sys_bind *port, unsigned int user_depth,
+                            unsigned int buf_depth);
 } i6c_sys_api;
 
 static inline int i6c_sys_load(i6c_sys_api *sys)
@@ -81,6 +108,24 @@ static inline int i6c_sys_load(i6c_sys_api *sys)
 
     if (!(sys->get_version = (int (*)(unsigned short soc_id, i6c_sys_ver *out))hal_symbol_load(
               "i6c_sys", sys->lib, "MI_SYS_GetVersion")))
+        return RSS_ERR_NOTSUP;
+
+    if (!(sys->bind_ext = (int (*)(unsigned short, i6c_sys_bind *, i6c_sys_bind *, unsigned int,
+                                   unsigned int, i6c_sys_link, unsigned int))
+              hal_symbol_load("i6c_sys", sys->lib, "MI_SYS_BindChnPort2")))
+        return RSS_ERR_NOTSUP;
+
+    if (!(sys->unbind = (int (*)(unsigned short, i6c_sys_bind *, i6c_sys_bind *))hal_symbol_load(
+              "i6c_sys", sys->lib, "MI_SYS_UnBindChnPort")))
+        return RSS_ERR_NOTSUP;
+
+    if (!(sys->config_pool = (int (*)(unsigned short, i6c_sys_pool *))hal_symbol_load(
+              "i6c_sys", sys->lib, "MI_SYS_ConfigPrivateMMAPool")))
+        return RSS_ERR_NOTSUP;
+
+    if (!(sys->set_output_depth =
+              (int (*)(unsigned short, i6c_sys_bind *, unsigned int, unsigned int))hal_symbol_load(
+                  "i6c_sys", sys->lib, "MI_SYS_SetChnOutputPortDepth")))
         return RSS_ERR_NOTSUP;
 
     return RSS_OK;
