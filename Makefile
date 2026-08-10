@@ -159,10 +159,12 @@ endif
 HAL_COMMON_SRC := $(BACKEND_DIR)/hal_common.c
 
 ifeq ($(PLATFORM),INFINITY6C)
-# Bring-up order is deliberate: nothing but the module loader and the system
-# ops exist yet, so no video or audio subsystem is listed. hal_gpio is here
-# because it is vendor-neutral, not because a pipeline exists to use it.
-VIDEO_SRCS := src/hal_gpio.c
+# The capture and encode path, in datapath order. No OSD and no audio yet: RGN
+# and the audio modules are the next generation's equivalents of star/hal_osd.c
+# and star/hal_audio.c and have not been ported. hal_gpio is vendor-neutral.
+VIDEO_SRCS := $(BACKEND_DIR)/hal_framesource.c \
+              src/hal_gpio.c
+
 AUDIO_SRCS :=
 else
 VIDEO_SRCS := $(BACKEND_DIR)/hal_encoder.c \
