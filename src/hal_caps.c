@@ -1021,8 +1021,17 @@ const rss_hal_caps_t g_hal_caps = {
  * accepts it for channel 0 and refuses it elsewhere rather than quietly
  * rotating streams the caller did not name.
  *
- * has_color2grey is true because MI_ISP_IQ_SetColorToGray is bound and is a
- * property of the ISP channel rather than of an encoder.
+ * has_color2grey is false, and deliberately so even though
+ * MI_ISP_IQ_SetColorToGray is bound in the loader. This backend publishes no
+ * isp_* ops at all -- star/ publishes thirty -- so there is nothing for the flag
+ * to gate. rvd reports it straight out to its control API as an advertised
+ * capability, so a true here would promise callers something no vtable slot can
+ * service. The flag turns true when an ISP op surface exists, not when the
+ * symbol resolves.
+ *
+ * Nothing loads an IQ tuning binary on this backend either. MI_ISP_ApiCmdLoadBinFile
+ * is bound and unused, and the ordering constraint that governs it is recorded at
+ * the declaration in i6c_isp_load.h for whoever wires it up.
  *
  * The permanent falses are the same three as above and for the same
  * reason -- xburst2, the IMP SDK generation and the IMPVI calling
@@ -1043,8 +1052,8 @@ const rss_hal_caps_t g_hal_caps = {
     .has_capped_rc = true,
     .has_smart_rc = true,
 
-    /* ISP */
-    .has_color2grey = true,
+    /* ISP — no isp_* ops yet, so nothing here may claim a tuning capability. */
+    .has_color2grey = false,
     .max_sensors = 1,
 
     /* Limits — both counts are the scaler's four output ports. */
