@@ -43,7 +43,7 @@ typedef struct {
 
     int (*init)(unsigned short soc_id);
     int (*exit)(unsigned short soc_id);
-    int (*get_version)(unsigned short soc_id, i6c_sys_version *out);
+    int (*get_version)(unsigned short soc_id, i6c_sys_ver *out);
 } i6c_sys_api;
 
 static inline int i6c_sys_load(i6c_sys_api *sys)
@@ -79,7 +79,7 @@ static inline int i6c_sys_load(i6c_sys_api *sys)
               (int (*)(unsigned short soc_id))hal_symbol_load("i6c_sys", sys->lib, "MI_SYS_Exit")))
         return RSS_ERR_NOTSUP;
 
-    if (!(sys->get_version = (int (*)(unsigned short soc_id, i6c_sys_version *out))hal_symbol_load(
+    if (!(sys->get_version = (int (*)(unsigned short soc_id, i6c_sys_ver *out))hal_symbol_load(
               "i6c_sys", sys->lib, "MI_SYS_GetVersion")))
         return RSS_ERR_NOTSUP;
 

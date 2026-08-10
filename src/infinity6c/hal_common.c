@@ -141,7 +141,7 @@ static int hal_init(void *ctx, const rss_multi_sensor_config_t *cfg)
      * loaded libraries are the drop the headers were transcribed from.
      */
     {
-        i6c_sys_version ver;
+        i6c_sys_ver ver;
 
         memset(&ver, 0, sizeof(ver));
         if (st->sys.get_version(I6C_SOC_ID, &ver) == 0)
@@ -207,7 +207,7 @@ static int hal_sys_get_version(void *ctx, char *buf, int len)
 {
     rss_hal_ctx_t *hal = (rss_hal_ctx_t *)ctx;
     infinity6c_state_t *st;
-    i6c_sys_version ver;
+    i6c_sys_ver ver;
 
     if (!hal || !buf || len <= 0)
         return RSS_ERR_INVAL;
@@ -301,7 +301,7 @@ const rss_hal_ops_t *rss_hal_get_ops(rss_hal_ctx_t *ctx)
  */
 int rss_hal_get_imp_version(char *buf, int size)
 {
-    i6c_sys_version ver;
+    i6c_sys_ver ver;
 
     if (!buf || size <= 0)
         return RSS_ERR_INVAL;
