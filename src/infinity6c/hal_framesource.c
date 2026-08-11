@@ -97,21 +97,22 @@ static int i6c_snr_select(infinity6c_state_t *st, unsigned short width, unsigned
     int ret;
 
     /*
-     * Single-plane first, and before anything reads the mode list: multi-plane
-     * is for HDR sensors exposing one plane per exposure, and it changes what
-     * the list means.
+     * The mode list is read before the plane mode is set, which is the order the
+     * vendor's own bring-up sequence uses. Setting it first can empty the list on
+     * a sensor whose driver publishes its modes per plane mode -- an HDR part
+     * asked for single-plane then reports nothing to choose from, and the failure
+     * is indistinguishable from an unloaded driver.
+     *
+     * MI only requires that both the plane mode and the resolution are set before
+     * MI_SNR_Enable, which the tail of this function still satisfies.
      */
-    if ((ret = st->snr.set_plane_mode(I6C_DEV_ID(I6C_SNR_PAD), 0)) != 0) {
-        HAL_LOG_ERR("MI_SNR_SetPlaneMode failed: %d", ret);
-        return RSS_ERR_IO;
-    }
-
     if ((ret = st->snr.query_res_count(I6C_DEV_ID(I6C_SNR_PAD), &count)) != 0) {
         HAL_LOG_ERR("MI_SNR_QueryResCount failed: %d", ret);
         return RSS_ERR_IO;
     }
     if (!count) {
-        HAL_LOG_ERR("infinity6c: sensor reports no modes; is the sensor driver loaded?");
+        HAL_LOG_ERR("infinity6c: sensor reports no modes; is the sensor driver loaded, and on "
+                    "this family is its board-config module loaded with it?");
         return RSS_ERR_NOENT;
     }
 
@@ -138,6 +139,17 @@ static int i6c_snr_select(infinity6c_state_t *st, unsigned short width, unsigned
     if (st->snr_profile < 0) {
         HAL_LOG_ERR("infinity6c: no sensor mode covers %ux%u at %u fps", width, height, fps);
         return RSS_ERR_INVAL;
+    }
+
+    /*
+     * Single-plane, because a multi-plane sensor hands out one plane per exposure
+     * and pairing them is the HDR path this backend does not implement. It is set
+     * after the mode is chosen and before the resolution is applied, matching the
+     * vendor sequence.
+     */
+    if ((ret = st->snr.set_plane_mode(I6C_DEV_ID(I6C_SNR_PAD), 0)) != 0) {
+        HAL_LOG_ERR("MI_SNR_SetPlaneMode failed: %d", ret);
+        return RSS_ERR_IO;
     }
 
     if ((ret = st->snr.set_res(I6C_DEV_ID(I6C_SNR_PAD), (unsigned char)st->snr_profile)) != 0) {
