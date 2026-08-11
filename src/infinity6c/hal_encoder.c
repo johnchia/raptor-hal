@@ -707,13 +707,15 @@ int hal_enc_poll(void *ctx, int chn, uint32_t timeout_ms)
 
     ret = select(fd + 1, &readfds, NULL, NULL, &tv);
     if (ret < 0) {
+        /* A signal is a retry, not a fault -- the daemon takes signals routinely. */
         if (errno == EINTR)
             return -EAGAIN;
         HAL_LOG_ERR("i6c_venc: select on chn %d failed: %s", chn, strerror(errno));
         return RSS_ERR_IO;
     }
+    /* Named as the other backends name it; rvd only tests for RSS_OK. */
     if (ret == 0)
-        return -EAGAIN;
+        return RSS_ERR_TIMEOUT;
 
     return RSS_OK;
 }
