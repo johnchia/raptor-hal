@@ -663,6 +663,44 @@ static int i6c_enc_pool_slot(unsigned int device)
 }
 
 /*
+ * i6c_enc_dev_up -- bring up the codec engine a channel is about to live on.
+ *
+ * MI 3.0 puts a device above the VENC channel and refuses to create a channel on
+ * a device that has not been created -- MI_VENC_CreateChn returns NOT_CONFIG. MI
+ * 2.x had no such object, which is why this has no counterpart in star/. The
+ * device is created once by the first channel that needs it and torn down with
+ * the rest at deinit; the max dimensions are the vendor's own ceilings per
+ * engine, wide enough that no stream this part can source ever resizes it.
+ */
+static int i6c_enc_dev_up(infinity6c_state_t *st, unsigned int device)
+{
+    int slot = i6c_enc_pool_slot(device);
+    i6c_venc_init init;
+    int ret;
+
+    if (st->enc_dev_up[slot])
+        return RSS_OK;
+
+    memset(&init, 0, sizeof(init));
+    if (device == I6C_VENC_DEV_MJPG_0) {
+        init.maxWidth = 8192;
+        init.maxHeight = 6480;
+    } else {
+        init.maxWidth = 4096;
+        init.maxHeight = 2176;
+    }
+
+    if ((ret = st->venc.create_dev(device, &init)) != 0) {
+        HAL_LOG_ERR("MI_VENC_CreateDev(dev %u, %ux%u) failed: %d", device, init.maxWidth,
+                    init.maxHeight, ret);
+        return RSS_ERR_IO;
+    }
+
+    st->enc_dev_up[slot] = true;
+    return RSS_OK;
+}
+
+/*
  * i6c_enc_pool -- the encoder's own ring pool, one per codec engine.
  *
  * Distinct from the scaler's: a ring bind has a pool at each end, and this one
@@ -742,6 +780,10 @@ int hal_enc_create_channel(void *ctx, int chn, const rss_video_config_t *cfg)
         return ret;
     }
     if ((ret = i6c_enc_codec(cfg->codec, &codec)) != RSS_OK)
+        return ret;
+
+    /* The device before its pool and its channel: both hang off a created device. */
+    if ((ret = i6c_enc_dev_up(st, device)) != RSS_OK)
         return ret;
 
     if ((ret = i6c_enc_pool(st, device, cfg)) != RSS_OK)
@@ -1188,6 +1230,22 @@ void i6c_teardown_all(infinity6c_state_t *st)
         memset(enc, 0, sizeof(*enc));
         enc->fd = -1;
         enc->src_port = -1;
+    }
+
+    /*
+     * Devices after channels: MI_VENC_DestroyDev needs its channels gone, and the
+     * loop above has just removed them. Indices follow i6c_enc_pool_slot -- slot 0
+     * is the H.26x engine, slot 1 MJPEG.
+     */
+    {
+        static const unsigned int devs[I6C_VENC_DEV_SLOTS] = {I6C_VENC_DEV_H26X_0,
+                                                              I6C_VENC_DEV_MJPG_0};
+        for (i = 0; i < I6C_VENC_DEV_SLOTS; i++) {
+            if (!st->enc_dev_up[i])
+                continue;
+            st->venc.destroy_dev(devs[i]);
+            st->enc_dev_up[i] = false;
+        }
     }
 
     /* Forced rather than reference counted: the daemon is going away. */

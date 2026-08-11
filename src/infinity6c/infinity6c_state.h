@@ -231,6 +231,15 @@ typedef struct {
     unsigned short enc_pool_w[I6C_VENC_DEV_SLOTS];
     unsigned short enc_pool_h[I6C_VENC_DEV_SLOTS];
 
+    /*
+     * Whether each codec engine's VENC device has been created. MI 3.0 puts a
+     * device above the channel, and a channel cannot be created until its device
+     * has been -- MI 2.x had no such object, so star/ has no equivalent. Indexed
+     * like the ring pools above: the first channel on an engine brings the device
+     * up, and teardown takes it down once its channels are gone.
+     */
+    bool enc_dev_up[I6C_VENC_DEV_SLOTS];
+
     infinity6c_fs_chn_t fs[I6C_MAX_CHN];
     infinity6c_venc_chn_t enc[I6C_MAX_CHN];
 } infinity6c_state_t;
