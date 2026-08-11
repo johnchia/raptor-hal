@@ -437,32 +437,66 @@ int i6c_unbind_scl_from_venc(infinity6c_state_t *st, int chn)
  * CHANNEL LIFECYCLE
  * ================================================================ */
 
+/* Which of the two ring pools a codec engine owns. */
+static int i6c_enc_pool_slot(unsigned int device)
+{
+    return device == I6C_VENC_DEV_MJPG_0 ? 1 : 0;
+}
+
 /*
- * i6c_enc_pool -- the encoder's own ring pool.
+ * i6c_enc_pool -- the encoder's own ring pool, one per codec engine.
  *
  * Distinct from the scaler's: a ring bind has a pool at each end, and this one
  * is where the encoder reads from. The whole frame height rather than a quarter,
  * because the encoder is the consumer here and has nothing downstream to hand a
  * partial frame to.
+ *
+ * Sized for the largest channel on the engine rather than for the calling one.
+ * The pool is per *device*: i6c_sys_poolring names a module and a device and
+ * nothing finer, so every channel on one engine shares it. Configuring it once
+ * per channel would therefore have a sub-stream shrink the pool the main stream
+ * is already reading from -- so a request that fits what is there is skipped,
+ * and only a larger one reconfigures.
  */
 static int i6c_enc_pool(infinity6c_state_t *st, unsigned int device, const rss_video_config_t *cfg)
 {
+    int slot = i6c_enc_pool_slot(device);
+    unsigned short have_w = st->enc_pool_w[slot];
+    unsigned short have_h = st->enc_pool_h[slot];
     i6c_sys_pool pool;
     int ret;
+
+    if (have_w && have_w >= cfg->width && have_h >= cfg->height)
+        return RSS_OK;
+
+    /*
+     * Growing one that is already in use is the case with no evidence behind it:
+     * rvd creates its main stream first, so in practice the first channel sizes
+     * the pool and every later one fits. Said out loud because if this line ever
+     * appears it is the first thing to suspect.
+     */
+    if (have_w)
+        HAL_LOG_WARN("infinity6c: growing venc dev %u ring pool from %ux%u to %ux%u with channels "
+                     "already on it",
+                     device, have_w, have_h, cfg->width, cfg->height);
 
     memset(&pool, 0, sizeof(pool));
     pool.type = I6C_SYS_POOL_DEVICE_RING;
     pool.create = 1;
     pool.config.ring.module = I6C_SYS_MOD_VENC;
     pool.config.ring.device = device;
-    pool.config.ring.maxWidth = cfg->width;
-    pool.config.ring.maxHeight = cfg->height;
-    pool.config.ring.ringLine = cfg->height;
+    pool.config.ring.maxWidth = have_w > cfg->width ? have_w : cfg->width;
+    pool.config.ring.maxHeight = have_h > cfg->height ? have_h : cfg->height;
+    pool.config.ring.ringLine = pool.config.ring.maxHeight;
 
     if ((ret = st->sys.config_pool(I6C_SOC_ID, &pool)) != 0) {
-        HAL_LOG_ERR("MI_SYS_ConfigPrivateMMAPool(VENC ring) failed: %d", ret);
+        HAL_LOG_ERR("MI_SYS_ConfigPrivateMMAPool(VENC dev %u ring, %ux%u) failed: %d", device,
+                    pool.config.ring.maxWidth, pool.config.ring.maxHeight, ret);
         return RSS_ERR_IO;
     }
+
+    st->enc_pool_w[slot] = pool.config.ring.maxWidth;
+    st->enc_pool_h[slot] = pool.config.ring.maxHeight;
 
     return RSS_OK;
 }

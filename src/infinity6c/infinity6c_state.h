@@ -87,6 +87,13 @@
  */
 #define I6C_VENC_MAX_PACKS 8
 
+/*
+ * Codec engines a channel can live on: one H.26x, one MJPEG. Not a channel count
+ * -- the channel index space is shared between them -- but the number of ring
+ * pools, since a pool belongs to a device.
+ */
+#define I6C_VENC_DEV_SLOTS 2
+
 /* ================================================================
  * PER-CHANNEL STATE
  * ================================================================ */
@@ -173,6 +180,15 @@ typedef struct {
     i6c_snr_plane plane;
     int snr_profile; /* index into the sensor's resolution list; -1 = unset */
     unsigned int fps;
+
+    /*
+     * The geometry each VENC device's ring pool was configured for. Kept because
+     * the pool is per device and not per channel -- i6c_sys_poolring names a
+     * module and a device and nothing finer -- so several channels on one engine
+     * share it and the largest of them is what has to fit.
+     */
+    unsigned short enc_pool_w[I6C_VENC_DEV_SLOTS];
+    unsigned short enc_pool_h[I6C_VENC_DEV_SLOTS];
 
     infinity6c_fs_chn_t fs[I6C_MAX_CHN];
     infinity6c_venc_chn_t enc[I6C_MAX_CHN];
