@@ -12,18 +12,20 @@
  * had. Struct layouts differ even where a signature does not. Sharing files
  * would mean two disjoint implementations behind mutually exclusive guards.
  *
- * Current state: module loader and system ops only. The vtable publishes what
- * is implemented and nothing else; RSS_HAL_CALL NULL-guards every entry and
- * returns RSS_ERR_NOTSUP, so an absent subsystem needs no stub and no file.
- * hal_caps.c declares the matching zeroes, which is what keeps rvd from
- * asking for a stream this backend cannot yet build.
+ * Scope: the capture and encode datapath. ISP tuning, OSD and audio are not
+ * implemented, and the vtable publishes only what is -- RSS_HAL_CALL NULL-guards
+ * every entry and returns RSS_ERR_NOTSUP, so an absent subsystem needs no stub
+ * and no file. hal_caps.c declares the matching zeroes.
  *
- * What this stage is for: proving the argument lists. dlsym resolves by name,
- * so an MI 2.x table binds against these libraries without complaint and then
- * calls MI_SYS_Init with a stray value where the SoC id belongs. Nothing
- * reports that. A backend that loads the modules, initialises MI and reads
- * back a version string has exercised the one thing no compiler or linker
- * checks here.
+ * That has one exception, and it shapes this file: an op whose failure rvd
+ * treats as fatal cannot be absent, however little the hardware has to do for
+ * it. The encoder group ops are published for that reason alone, and hal_bind
+ * collapses a stage this generation does not have rather than refusing it.
+ *
+ * dlsym resolves by name, so an MI 2.x table binds against these libraries
+ * without complaint and then calls MI_SYS_Init with a stray value where the SoC
+ * id belongs. Nothing reports that, on either side -- which is why the loaders
+ * spell out every argument list rather than sharing one with star/.
  *
  * Copyright (C) 2026 Thingino Project
  * SPDX-License-Identifier: GPL-3.0-or-later
@@ -98,6 +100,10 @@ int hal_fs_set_rotation(void *ctx, int chn, int degrees);
 
 int hal_enc_create_channel(void *ctx, int chn, const rss_video_config_t *cfg);
 int hal_enc_destroy_channel(void *ctx, int chn);
+int hal_enc_create_group(void *ctx, int grp);
+int hal_enc_destroy_group(void *ctx, int grp);
+int hal_enc_register_channel(void *ctx, int grp, int chn);
+int hal_enc_unregister_channel(void *ctx, int chn);
 int hal_enc_start(void *ctx, int chn);
 int hal_enc_stop(void *ctx, int chn);
 int hal_enc_poll(void *ctx, int chn, uint32_t timeout_ms);
@@ -165,7 +171,16 @@ static int hal_init(void *ctx, const rss_multi_sensor_config_t *cfg)
     if (!st)
         return RSS_ERR_NOMEM;
 
+    /*
+     * -1 rather than the calloc'd zero: zero is a valid sensor mode, a valid SCL
+     * port and a valid encoder channel, so "unset" needs a value of its own.
+     */
     st->snr_profile = -1;
+    for (int i = 0; i < I6C_MAX_CHN; i++) {
+        st->osd_src_port[i] = -1;
+        st->enc[i].src_port = -1;
+        st->enc[i].fd = -1;
+    }
 
     if ((ret = i6c_sys_load(&st->sys)) != RSS_OK) {
         i6c_unload_all(st);
@@ -302,6 +317,152 @@ static const rss_hal_caps_t *hal_get_caps(void *ctx)
     return &c->caps;
 }
 
+#ifdef HAL_MODULE_VIDEO
+
+/* ================================================================
+ * BIND
+ *
+ * rvd builds its pipeline as a chain of cells: FS [-> IVS] [-> OSD]
+ * -> ENC. Here that chain is a single link, SCL output port -> VENC
+ * channel. There is no IVS stage and no OSD stage in the data path --
+ * MI_RGN composites onto a port in place rather than sitting between
+ * two modules.
+ *
+ * The OSD cell still must not be rejected. rvd inserts it on
+ * `[osd] enabled` alone, which defaults on, and it treats a failed
+ * bind step as fatal to the stream -- so refusing the stage would cost
+ * the video, not the overlay. It is collapsed instead:
+ *
+ *   FS  -> OSD   remember which SCL port feeds this encoder
+ *   OSD -> ENC   perform the real bind, using the remembered port
+ *
+ * Unlike star/, nothing then attaches an overlay to that port: this
+ * backend publishes no osd_* ops, so rvd's region calls fail on their
+ * own and the stream carries no overlay. The stage is collapsed to keep
+ * the pipeline up, not to suggest the overlay works.
+ *
+ * IVS cannot appear -- no ivs_* ops are published, so rvd never sets
+ * ivs_active -- and is refused by name rather than silently ignored.
+ * ================================================================ */
+
+static int i6c_bind_collapse(infinity6c_state_t *st, const rss_cell_t *src, const rss_cell_t *dst,
+                             int *port, int *chn, bool *collapsed)
+{
+    *collapsed = false;
+
+    if (!src || !dst)
+        return RSS_ERR_INVAL;
+
+    /* The direct chain, with OSD disabled. */
+    if (src->device == RSS_DEV_FS && dst->device == RSS_DEV_ENC) {
+        *port = src->group;
+        *chn = dst->group;
+        return RSS_OK;
+    }
+
+    /*
+     * First half of an OSD chain. Nothing to bind yet -- record the SCL port so
+     * the second half can name it, since rvd does not repeat it there.
+     */
+    if (src->device == RSS_DEV_FS && dst->device == RSS_DEV_OSD) {
+        if (dst->group < 0 || dst->group >= I6C_MAX_CHN)
+            return RSS_ERR_INVAL;
+
+        st->osd_src_port[dst->group] = src->group;
+        *collapsed = true;
+        return RSS_OK;
+    }
+
+    /* Second half: the bind rvd actually asked for. */
+    if (src->device == RSS_DEV_OSD && dst->device == RSS_DEV_ENC) {
+        if (src->group < 0 || src->group >= I6C_MAX_CHN)
+            return RSS_ERR_INVAL;
+
+        *port = st->osd_src_port[src->group];
+        *chn = dst->group;
+
+        if (*port < 0) {
+            HAL_LOG_ERR("bind: OSD %d -> ENC %d without a preceding FS -> OSD", src->group,
+                        dst->group);
+            return RSS_ERR_INVAL;
+        }
+        return RSS_OK;
+    }
+
+    HAL_LOG_ERR("bind: FS -> [OSD ->] ENC is the only chain this backend supports (got %d -> %d)",
+                (int)src->device, (int)dst->device);
+
+    return RSS_ERR_NOTSUP;
+}
+
+static int hal_bind(void *ctx, const rss_cell_t *src, const rss_cell_t *dst)
+{
+    rss_hal_ctx_t *hal = (rss_hal_ctx_t *)ctx;
+    infinity6c_state_t *st;
+    bool collapsed;
+    int port = -1;
+    int chn = -1;
+    int ret;
+
+    if (!hal)
+        return RSS_ERR_INVAL;
+    st = (infinity6c_state_t *)hal->platform;
+    if (!st)
+        return RSS_ERR_NOTSUP;
+
+    if ((ret = i6c_bind_collapse(st, src, dst, &port, &chn, &collapsed)) != RSS_OK)
+        return ret;
+    if (collapsed)
+        return RSS_OK; /* Recorded; the OSD -> ENC step does the work. */
+
+    if (port < 0 || port >= I6C_MAX_CHN || chn < 0 || chn >= I6C_MAX_CHN)
+        return RSS_ERR_INVAL;
+    if (!st->enc[chn].created)
+        return RSS_ERR_NOENT;
+
+    /*
+     * The source end of this bind is an SCL port, which does not exist until the
+     * chain does -- and the bind carries st->fps, which nothing has read from the
+     * sensor yet. Refused here so the log names the cause, rather than in MI as a
+     * code against a channel that was never created.
+     */
+    if (!st->pipeline_up) {
+        HAL_LOG_ERR("bind: SCL port %d -> venc chn %d before the pipeline is up", port, chn);
+        return RSS_ERR_INVAL;
+    }
+
+    /* Zero: a video stream is consumed at the rate the pipeline produces. */
+    return i6c_bind_scl_to_venc(st, port, chn, 0);
+}
+
+static int hal_unbind(void *ctx, const rss_cell_t *src, const rss_cell_t *dst)
+{
+    rss_hal_ctx_t *hal = (rss_hal_ctx_t *)ctx;
+    infinity6c_state_t *st;
+    bool collapsed;
+    int port = -1;
+    int chn = -1;
+    int ret;
+
+    if (!hal)
+        return RSS_ERR_INVAL;
+    st = (infinity6c_state_t *)hal->platform;
+    if (!st)
+        return RSS_ERR_NOTSUP;
+
+    if ((ret = i6c_bind_collapse(st, src, dst, &port, &chn, &collapsed)) != RSS_OK)
+        return ret;
+    if (collapsed)
+        return RSS_OK; /* FS -> OSD bound nothing, so it unbinds nothing. */
+
+    if (chn < 0 || chn >= I6C_MAX_CHN)
+        return RSS_ERR_INVAL;
+
+    return i6c_unbind_scl_from_venc(st, chn);
+}
+
+#endif /* HAL_MODULE_VIDEO */
+
 /* ================================================================
  * SYSTEM INFO
  * ================================================================ */
@@ -348,6 +509,13 @@ static const rss_hal_ops_t g_ops = {
     .gpio_get = hal_gpio_get,
     .ircut_set = hal_ircut_set,
 
+    /*
+     * The datapath link. rvd's chain is FS [-> OSD] -> ENC and both shapes
+     * arrive here; the OSD stage is collapsed rather than refused.
+     */
+    .bind = hal_bind,
+    .unbind = hal_unbind,
+
     /* SNR -> VIF -> ISP -> SCL. A channel is an SCL output port. */
     .fs_create_channel = hal_fs_create_channel,
     .fs_set_channel_attr = hal_fs_set_channel_attr,
@@ -364,6 +532,18 @@ static const rss_hal_ops_t g_ops = {
      */
     .enc_create_channel = hal_enc_create_channel,
     .enc_destroy_channel = hal_enc_destroy_channel,
+
+    /*
+     * MI has no encoder groups, but rvd's pipeline setup is IMP-shaped and calls
+     * for one before it creates a channel -- so these are published rather than
+     * left NOTSUP, which would fail every stream. register_channel is the one
+     * that does real work: it is how a JPEG channel is fed at all.
+     */
+    .enc_create_group = hal_enc_create_group,
+    .enc_destroy_group = hal_enc_destroy_group,
+    .enc_register_channel = hal_enc_register_channel,
+    .enc_unregister_channel = hal_enc_unregister_channel,
+
     .enc_start = hal_enc_start,
     .enc_stop = hal_enc_stop,
     .enc_poll = hal_enc_poll,

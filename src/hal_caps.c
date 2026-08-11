@@ -998,6 +998,14 @@ const rss_hal_caps_t g_hal_caps = {
  * limits zero. Consumers check these flags precisely so they do not call
  * into a vtable slot that is NULL.
  *
+ * A false flag is not the only thing keeping an unimplemented op from
+ * being called, though, and relying on it that way is the trap this block
+ * is worth re-reading for. rvd calls some ops unconditionally and treats
+ * RSS_ERR_NOTSUP from them as fatal to the stream -- the encoder group ops
+ * and bind among them -- so those must be published whatever the flags
+ * say. The flags gate what rvd *chooses* to ask for. They do not gate its
+ * pipeline setup.
+ *
  * Both channel limits are 4, and both are the *same* four: a raptor
  * framesource channel is an SCL output port, and an encoder channel is fed
  * by one, so a stream costs one port and the scaler's port count caps

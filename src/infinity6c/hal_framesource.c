@@ -666,6 +666,109 @@ static int i6c_fs_apply(infinity6c_state_t *st, int chn, const rss_fs_config_t *
     return RSS_OK;
 }
 
+/* ================================================================
+ * PORTS FOR A CONSUMER THAT IS NOT A FRAMESOURCE CHANNEL
+ *
+ * rvd creates a framesource channel per video stream and none for a
+ * JPEG stream -- it pairs the JPEG encoder with another stream's
+ * framesource instead, and feeds it by group membership. MI has no
+ * groups, so on this part that pairing has to become a port of its
+ * own. These exist for hal_enc_register_channel to build one with;
+ * see its comment for why a dedicated port rather than a shared one.
+ * ================================================================ */
+
+/*
+ * i6c_fs_spare_port -- the lowest SCL output port nothing is using, or -1.
+ *
+ * Safe to ask at register time because rvd configures every framesource port
+ * before creating any encoder channel: pipeline_init runs its fs_create_channel
+ * loop to completion first, and that loop skips JPEG streams outright. So an
+ * unconfigured port here is genuinely spare rather than merely not configured
+ * yet.
+ */
+int i6c_fs_spare_port(const infinity6c_state_t *st)
+{
+    int i;
+
+    for (i = 0; i < I6C_MAX_CHN; i++)
+        if (!st->fs[i].configured)
+            return i;
+
+    return -1;
+}
+
+/*
+ * i6c_fs_clone_port -- configure dst_port with src_port's geometry.
+ *
+ * Configure only. Enabling is left to the caller because the order that works
+ * for a framesource port is configure, bind, enable -- which is the order rvd
+ * drives, fs_create_channel then bind then fs_enable_channel -- and a port
+ * enabled before anything is bound to it has nowhere to put a frame.
+ */
+int i6c_fs_clone_port(infinity6c_state_t *st, int src_port, int dst_port)
+{
+    i6c_scl_port port;
+    int ret;
+
+    if (src_port < 0 || src_port >= I6C_MAX_CHN || dst_port < 0 || dst_port >= I6C_MAX_CHN)
+        return RSS_ERR_INVAL;
+    if (!st->fs[src_port].configured)
+        return RSS_ERR_INVAL;
+
+    memset(&port, 0, sizeof(port));
+    port.output.width = st->fs[src_port].width;
+    port.output.height = st->fs[src_port].height;
+    port.mirror = 0;
+    port.flip = 0;
+    port.pixFmt = st->fs[src_port].pixfmt;
+    port.compress = I6C_COMPR_NONE;
+
+    ret =
+        st->scl.set_port_param(I6C_DEV_ID(I6C_SCL_DEV), I6C_SCL_CHN, (unsigned int)dst_port, &port);
+    if (ret) {
+        HAL_LOG_ERR("MI_SCL_SetOutputPortParam(port %d, cloned from port %d) failed: %d", dst_port,
+                    src_port, ret);
+        return RSS_ERR_IO;
+    }
+
+    st->fs[dst_port].width = st->fs[src_port].width;
+    st->fs[dst_port].height = st->fs[src_port].height;
+    st->fs[dst_port].pixfmt = st->fs[src_port].pixfmt;
+    st->fs[dst_port].configured = true;
+
+    return RSS_OK;
+}
+
+/* Shared with hal_fs_enable_channel: the same port, reached two ways. */
+int i6c_fs_enable_port(infinity6c_state_t *st, int port)
+{
+    int ret;
+
+    if (st->fs[port].enabled)
+        return RSS_OK;
+
+    ret = st->scl.enable_port(I6C_DEV_ID(I6C_SCL_DEV), I6C_SCL_CHN, (unsigned int)port);
+    if (ret) {
+        HAL_LOG_ERR("MI_SCL_EnableOutputPort(%d) failed: %d", port, ret);
+        return RSS_ERR_IO;
+    }
+    st->fs[port].enabled = true;
+
+    return RSS_OK;
+}
+
+void i6c_fs_release_port(infinity6c_state_t *st, int port)
+{
+    if (port < 0 || port >= I6C_MAX_CHN)
+        return;
+
+    if (st->fs[port].enabled) {
+        st->scl.disable_port(I6C_DEV_ID(I6C_SCL_DEV), I6C_SCL_CHN, (unsigned int)port);
+        st->fs[port].enabled = false;
+    }
+    st->fs[port].configured = false;
+}
+
 int hal_fs_create_channel(void *ctx, int chn, const rss_fs_config_t *cfg)
 {
     int ret;
@@ -704,23 +807,12 @@ int hal_fs_set_channel_attr(void *ctx, int chn, const rss_fs_config_t *cfg)
 
 int hal_fs_enable_channel(void *ctx, int chn)
 {
-    int ret;
-
     I6C_ENTER(ctx, chn, st);
 
     if (!st->fs[chn].configured)
         return RSS_ERR_INVAL;
-    if (st->fs[chn].enabled)
-        return RSS_OK;
 
-    ret = st->scl.enable_port(I6C_DEV_ID(I6C_SCL_DEV), I6C_SCL_CHN, (unsigned int)chn);
-    if (ret) {
-        HAL_LOG_ERR("MI_SCL_EnableOutputPort(%d) failed: %d", chn, ret);
-        return RSS_ERR_IO;
-    }
-    st->fs[chn].enabled = true;
-
-    return RSS_OK;
+    return i6c_fs_enable_port(st, chn);
 }
 
 int hal_fs_disable_channel(void *ctx, int chn)

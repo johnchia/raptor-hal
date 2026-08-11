@@ -376,15 +376,26 @@ static void i6c_enc_fill_nals(infinity6c_venc_chn_t *enc, rss_frame_t *frame)
  * ================================================================ */
 
 /*
- * i6c_bind_scl_to_venc -- feed one encoder channel from its SCL port.
+ * i6c_bind_scl_to_venc -- feed one encoder channel from an SCL port.
  *
- * The link type is the interesting part. H.26x is bound through a ring so the
- * encoder can start on a partial frame, which is where this generation's low
- * latency comes from; JPEG is bound frame-by-frame because its engine has no
- * such mode. Getting this backwards costs latency on one path and fails
- * outright on the other.
+ * The port is an argument rather than the channel index reused. They are equal
+ * for a video stream and are not for a JPEG one: rvd pairs a JPEG encoder with
+ * another stream's framesource, so its channel number counts past the video
+ * streams while its frames come from one of their ports. Deriving the port from
+ * the channel there binds a port nothing configured.
+ *
+ * The link type is the other half of the argument list that matters. H.26x is
+ * bound through a ring so the encoder can start on a partial frame, which is
+ * where this generation's low latency comes from; JPEG is bound frame-by-frame
+ * because its engine has no such mode. Getting this backwards costs latency on
+ * one path and fails outright on the other.
+ *
+ * dst_fps is what the destination is asked to consume, and zero means "the same
+ * rate the pipeline runs at". A JPEG channel passes its own much lower rate so
+ * MI drops the difference in hardware, which is the only pacing this backend
+ * has -- the caps block sets no jpeg_pulse, so rvd's duty-cycling is off here.
  */
-int i6c_bind_scl_to_venc(infinity6c_state_t *st, int chn)
+int i6c_bind_scl_to_venc(infinity6c_state_t *st, int port, int chn, unsigned int dst_fps)
 {
     infinity6c_venc_chn_t *enc = &st->enc[chn];
     i6c_sys_bind src;
@@ -392,12 +403,17 @@ int i6c_bind_scl_to_venc(infinity6c_state_t *st, int chn)
     i6c_sys_link link;
     int ret;
 
+    if (port < 0 || port >= I6C_MAX_CHN)
+        return RSS_ERR_INVAL;
+    if (enc->bound)
+        return RSS_OK;
+
     memset(&src, 0, sizeof(src));
     memset(&dst, 0, sizeof(dst));
     src.module = I6C_SYS_MOD_SCL;
     src.device = I6C_SCL_DEV;
     src.channel = I6C_SCL_CHN;
-    src.port = (unsigned int)chn;
+    src.port = (unsigned int)port;
     dst.module = I6C_SYS_MOD_VENC;
     dst.device = enc->device;
     dst.channel = (unsigned int)chn;
@@ -405,13 +421,18 @@ int i6c_bind_scl_to_venc(infinity6c_state_t *st, int chn)
 
     link = enc->device == I6C_VENC_DEV_MJPG_0 ? I6C_SYS_LINK_FRAMEBASE : I6C_SYS_LINK_RING;
 
-    ret = st->sys.bind_ext(I6C_SOC_ID, &src, &dst, st->fps, st->fps, link, 0);
+    ret = st->sys.bind_ext(I6C_SOC_ID, &src, &dst, st->fps, dst_fps ? dst_fps : st->fps, link, 0);
     if (ret) {
-        HAL_LOG_ERR("MI_SYS_BindChnPort2(SCL port %d -> VENC dev %u chn %d) failed: %d", chn,
+        HAL_LOG_ERR("MI_SYS_BindChnPort2(SCL port %d -> VENC dev %u chn %d) failed: %d", port,
                     enc->device, chn, ret);
         return RSS_ERR_IO;
     }
     enc->bound = true;
+    enc->src_port = port;
+
+    HAL_LOG_DBG("infinity6c: SCL port %d -> venc dev %u chn %d bound, %s at %u fps", port,
+                enc->device, chn, link == I6C_SYS_LINK_RING ? "ring" : "frame-base",
+                dst_fps ? dst_fps : st->fps);
 
     return RSS_OK;
 }
@@ -425,13 +446,18 @@ int i6c_unbind_scl_from_venc(infinity6c_state_t *st, int chn)
 
     if (!enc->bound)
         return RSS_OK;
+    if (enc->src_port < 0 || enc->src_port >= I6C_MAX_CHN) {
+        HAL_LOG_ERR("i6c_venc chn %d: bound with no port recorded", chn);
+        enc->bound = false;
+        return RSS_ERR_INVAL;
+    }
 
     memset(&src, 0, sizeof(src));
     memset(&dst, 0, sizeof(dst));
     src.module = I6C_SYS_MOD_SCL;
     src.device = I6C_SCL_DEV;
     src.channel = I6C_SCL_CHN;
-    src.port = (unsigned int)chn;
+    src.port = (unsigned int)enc->src_port;
     dst.module = I6C_SYS_MOD_VENC;
     dst.device = enc->device;
     dst.channel = (unsigned int)chn;
@@ -439,10 +465,189 @@ int i6c_unbind_scl_from_venc(infinity6c_state_t *st, int chn)
 
     ret = st->sys.unbind(I6C_SOC_ID, &src, &dst);
     enc->bound = false;
+    enc->src_port = -1;
     if (ret) {
         HAL_LOG_ERR("MI_SYS_UnBindChnPort(chn %d) failed: %d", chn, ret);
         return RSS_ERR_IO;
     }
+
+    return RSS_OK;
+}
+
+/*
+ * i6c_enc_release_own_port -- give back a port this channel brought up itself.
+ *
+ * The port has to be read before the unbind, which forgets it. A no-op unless
+ * the channel owns one, so it is safe to call on every teardown path.
+ */
+static void i6c_enc_release_own_port(infinity6c_state_t *st, int chn)
+{
+    infinity6c_venc_chn_t *enc = &st->enc[chn];
+    int port = enc->src_port;
+
+    if (!enc->owns_port)
+        return;
+
+    i6c_unbind_scl_from_venc(st, chn);
+    i6c_fs_release_port(st, port);
+    enc->owns_port = false;
+}
+
+/* ================================================================
+ * GROUPS
+ *
+ * MI has no encoder groups, on either generation. rvd's model is
+ * IMP's -- create a group, register a channel into it, bind the group
+ * -- and here the whole triple is one MI_SYS bind, made by hal_bind.
+ *
+ * So create_group and destroy_group validate and do nothing else.
+ * Leaving them out instead is not the harmless honesty it looks like:
+ * rvd_stream_init calls enc_create_group first for every non-JPEG
+ * stream and returns on anything but RSS_OK, so an absent op fails the
+ * stream before the encoder channel is even created -- no video at
+ * all, for want of a concept the hardware does not have.
+ *
+ * register_channel is where the fiction stops being free.
+ * ================================================================ */
+
+int hal_enc_create_group(void *ctx, int grp)
+{
+    I6C_ENTER(ctx, grp, st);
+
+    (void)st;
+
+    return RSS_OK;
+}
+
+int hal_enc_destroy_group(void *ctx, int grp)
+{
+    return hal_enc_create_group(ctx, grp);
+}
+
+/*
+ * hal_enc_register_channel -- how a JPEG channel gets fed.
+ *
+ * rvd skips the bind chain entirely for a JPEG stream (`if (!s->is_jpeg)` around
+ * the chain in rvd_stream_init) because on IMP registering a second channel into
+ * the paired video stream's group is what feeds it -- the group is already bound
+ * to the framesource, so both registered channels see frames.
+ *
+ * MI has no groups, so validating and returning here would leave the JPEG
+ * channel connected to nothing: MI_VENC_CreateChn runs, MI_VENC_StartRecvPic
+ * runs, no SCL port is ever bound, and the poll times out forever. That failure
+ * is quiet by construction -- rvd reads a JPEG poll timeout as the expected
+ * "sensor idle" case -- so it looks like /snap saying no snapshot is available
+ * while the ring and the H.264 stream are healthy.
+ *
+ * A port of the channel's own is the shape the vendor asks for twice over:
+ * MI_SYS_BindChnPort2's note says neither end may already be bound, and SCL is
+ * documented as one output port per consumer rather than as a port to be shared.
+ * A dedicated port also buys the frame pacing, since the bind carries a
+ * destination rate and MI drops the difference in hardware -- the caps block
+ * sets no jpeg_pulse, so rvd's own duty-cycling is off on this part.
+ *
+ * Preferred, not required: SCL has four output ports and two video streams with
+ * JPEG on each want all four, so a shared port is the fallback rather than a
+ * failure. What it trades away is the vendor's rule above, and whether a second
+ * bind on one source honours its own rate is then MI's business -- so the log
+ * distinguishes the two paths for whoever reads it.
+ *
+ * Every failure warns and returns RSS_OK rather than propagating. rvd treats a
+ * register failure as fatal to the stream, and a board that cannot feed its JPEG
+ * channel should lose its snapshots, not its video.
+ */
+int hal_enc_register_channel(void *ctx, int grp, int chn)
+{
+    infinity6c_venc_chn_t *enc;
+    unsigned int snap_fps;
+    int src_port;
+    int port;
+    int ret;
+
+    I6C_ENTER(ctx, chn, st);
+
+    if (grp < 0 || grp >= I6C_MAX_CHN)
+        return RSS_ERR_INVAL;
+
+    enc = &st->enc[chn];
+    if (!enc->created)
+        return RSS_ERR_NOENT;
+
+    /*
+     * A video stream registers into its own group -- rvd passes s->chn twice --
+     * and hal_bind connects it immediately afterwards. The group is the fiction,
+     * the bind is the reality.
+     */
+    if (grp == chn)
+        return RSS_OK;
+
+    /* Already fed; rvd re-registers on a per-stream hot restart. */
+    if (enc->bound)
+        return RSS_OK;
+
+    src_port = st->enc[grp].src_port;
+    if (!st->enc[grp].bound || src_port < 0) {
+        HAL_LOG_WARN("venc chn %d: paired video chn %d is not bound to an SCL port yet, so there "
+                     "is no geometry to clone -- no snapshots on this stream",
+                     chn, grp);
+        return RSS_OK;
+    }
+
+    snap_fps = enc->cfg.fps_num / (enc->cfg.fps_den ? enc->cfg.fps_den : 1);
+
+    port = i6c_fs_spare_port(st);
+    if (port >= 0) {
+        if ((ret = i6c_fs_clone_port(st, src_port, port)) == RSS_OK) {
+            if ((ret = i6c_bind_scl_to_venc(st, port, chn, snap_fps)) == RSS_OK) {
+                if ((ret = i6c_fs_enable_port(st, port)) == RSS_OK) {
+                    enc->owns_port = true;
+                    HAL_LOG_DBG("venc chn %d: snapshot channel on SCL port %d, cloned from "
+                                "chn %d's port %d at %u fps",
+                                chn, port, grp, src_port, snap_fps);
+                    return RSS_OK;
+                }
+                i6c_unbind_scl_from_venc(st, chn);
+            }
+            i6c_fs_release_port(st, port);
+            HAL_LOG_WARN("venc chn %d: could not bring up SCL port %d from port %d: %d", chn, port,
+                         src_port, ret);
+        } else {
+            HAL_LOG_WARN("venc chn %d: cloning SCL port %d to %d failed: %d", chn, src_port, port,
+                         ret);
+        }
+    } else {
+        HAL_LOG_WARN("venc chn %d: no spare SCL output port (of %d)", chn, I6C_MAX_CHN);
+    }
+
+    /*
+     * Sharing the paired video stream's port. Against the vendor's note, and the
+     * alternative is no snapshots at all -- the cost of finding out is one error
+     * line from MI.
+     */
+    if ((ret = i6c_bind_scl_to_venc(st, src_port, chn, snap_fps)) != RSS_OK) {
+        HAL_LOG_WARN("venc chn %d: sharing chn %d's SCL port %d failed too: %d -- no snapshots "
+                     "on this stream",
+                     chn, grp, src_port, ret);
+        return RSS_OK;
+    }
+
+    HAL_LOG_DBG("venc chn %d: snapshot channel sharing chn %d's SCL port %d (no port of its "
+                "own); frame pacing is MI's to honour here",
+                chn, grp, src_port);
+
+    return RSS_OK;
+}
+
+int hal_enc_unregister_channel(void *ctx, int chn)
+{
+    I6C_ENTER(ctx, chn, st);
+
+    /*
+     * Only a snapshot channel has anything to undo. A video channel's bind
+     * belongs to rvd's unbind chain rather than to its group membership, and
+     * dropping it here would disconnect a stream that is still running.
+     */
+    i6c_enc_release_own_port(st, chn);
 
     return RSS_OK;
 }
@@ -556,6 +761,7 @@ int hal_enc_create_channel(void *ctx, int chn, const rss_video_config_t *cfg)
     enc->width = cfg->width;
     enc->height = cfg->height;
     enc->fd = -1;
+    enc->src_port = -1;
     enc->cfg = *cfg;
 
     /*
@@ -573,9 +779,14 @@ int hal_enc_create_channel(void *ctx, int chn, const rss_video_config_t *cfg)
         }
     }
 
-    if ((ret = i6c_bind_scl_to_venc(st, chn)) != RSS_OK)
-        goto fail;
-
+    /*
+     * Not bound here. rvd binds a video stream itself, through the FS -> ENC
+     * chain that reaches this backend as hal_bind, and it skips that chain for a
+     * JPEG stream -- which hal_enc_register_channel serves instead. Binding at
+     * creation would double-bind the first case and bind an unconfigured port in
+     * the second, and MI_SYS_BindChnPort2 requires that neither end already be
+     * bound.
+     */
     HAL_LOG_INFO("infinity6c: venc chn %d created on dev %u, %ux%u", chn, device, cfg->width,
                  cfg->height);
     return RSS_OK;
@@ -603,12 +814,15 @@ int hal_enc_destroy_channel(void *ctx, int chn)
     if (enc->fd >= 0)
         st->venc.close_fd(enc->device, (unsigned int)chn);
 
+    /* Gives back a snapshot channel's own port; no-op for a video channel. */
+    i6c_enc_release_own_port(st, chn);
     i6c_unbind_scl_from_venc(st, chn);
     st->venc.destroy_chn(enc->device, (unsigned int)chn);
 
     free(enc->heap_packs);
     memset(enc, 0, sizeof(*enc));
     enc->fd = -1;
+    enc->src_port = -1;
 
     return RSS_OK;
 }
@@ -713,7 +927,7 @@ int hal_enc_poll(void *ctx, int chn, uint32_t timeout_ms)
         HAL_LOG_ERR("i6c_venc: select on chn %d failed: %s", chn, strerror(errno));
         return RSS_ERR_IO;
     }
-    /* Named as the other backends name it; rvd only tests for RSS_OK. */
+    /* Named the same as the other backends report it; rvd only tests for RSS_OK. */
     if (ret == 0)
         return RSS_ERR_TIMEOUT;
 
@@ -966,12 +1180,14 @@ void i6c_teardown_all(infinity6c_state_t *st)
         if (enc->fd >= 0)
             st->venc.close_fd(enc->device, (unsigned int)i);
 
+        i6c_enc_release_own_port(st, i);
         i6c_unbind_scl_from_venc(st, i);
         st->venc.destroy_chn(enc->device, (unsigned int)i);
 
         free(enc->heap_packs);
         memset(enc, 0, sizeof(*enc));
         enc->fd = -1;
+        enc->src_port = -1;
     }
 
     /* Forced rather than reference counted: the daemon is going away. */

@@ -125,6 +125,21 @@ typedef struct {
     bool bound;
 
     /*
+     * Set when this channel brought up an SCL output port of its own rather than
+     * being handed one by rvd's bind chain -- a JPEG snapshot channel, which rvd
+     * feeds by group membership instead. Only such a channel releases its port
+     * again, since a video channel's port belongs to its framesource.
+     */
+    bool owns_port;
+
+    /*
+     * The SCL output port that feeds this channel, -1 when unbound. Not derivable
+     * from the channel index: rvd pairs a JPEG channel with the framesource of
+     * another stream, so its port and its channel number differ.
+     */
+    int src_port;
+
+    /*
      * Which codec engine this channel lives on. Not a topology index: H.26x and
      * MJPEG are different devices, so this follows from the codec.
      */
@@ -199,6 +214,15 @@ typedef struct {
     unsigned int fps;
 
     /*
+     * Which SCL output port feeds each encoder channel, taken from the FS -> OSD
+     * half of rvd's bind chain so that the OSD -> ENC half can name it. rvd does
+     * not repeat the framesource there, and it inserts the OSD stage on
+     * `[osd] enabled` alone -- which defaults on -- so this is the normal path
+     * rather than a special case. -1 when unset. See hal_bind.
+     */
+    int osd_src_port[I6C_MAX_CHN];
+
+    /*
      * The geometry each VENC device's ring pool was configured for. Kept because
      * the pool is per device and not per channel -- i6c_sys_poolring names a
      * module and a device and nothing finer -- so several channels on one engine
@@ -237,8 +261,24 @@ typedef struct {
 int i6c_pipeline_create(infinity6c_state_t *st, const rss_fs_config_t *cfg);
 void i6c_pipeline_destroy(infinity6c_state_t *st);
 
-/* Bind and unbind one SCL output port to its encoder channel (hal_encoder.c). */
-int i6c_bind_scl_to_venc(infinity6c_state_t *st, int chn);
+/*
+ * SCL output ports for a consumer that is not a raptor framesource channel --
+ * a JPEG snapshot channel, which rvd never creates a framesource for.
+ * (hal_framesource.c)
+ */
+int i6c_fs_spare_port(const infinity6c_state_t *st);
+int i6c_fs_clone_port(infinity6c_state_t *st, int src_port, int dst_port);
+int i6c_fs_enable_port(infinity6c_state_t *st, int port);
+void i6c_fs_release_port(infinity6c_state_t *st, int port);
+
+/*
+ * Bind and unbind an SCL output port to an encoder channel (hal_encoder.c).
+ *
+ * The port is passed rather than inferred from the channel: they are equal for a
+ * video stream and are not for a JPEG one, and inferring it binds an
+ * unconfigured port.
+ */
+int i6c_bind_scl_to_venc(infinity6c_state_t *st, int port, int chn, unsigned int dst_fps);
 int i6c_unbind_scl_from_venc(infinity6c_state_t *st, int chn);
 
 /* Release every channel's MI object, in dependency order (hal_common.c). */
