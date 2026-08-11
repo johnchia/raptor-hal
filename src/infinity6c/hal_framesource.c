@@ -97,19 +97,38 @@ static int i6c_snr_select(infinity6c_state_t *st, unsigned short width, unsigned
     int ret;
 
     /*
-     * The mode list is read before the plane mode is set, which is the order the
-     * vendor's own bring-up sequence uses. Setting it first can empty the list on
-     * a sensor whose driver publishes its modes per plane mode -- an HDR part
-     * asked for single-plane then reports nothing to choose from, and the failure
-     * is indistinguishable from an unloaded driver.
+     * Single-plane, set before the list is read. Multi-plane is for HDR sensors
+     * exposing one plane per exposure, which this backend does not pair up.
      *
-     * MI only requires that both the plane mode and the resolution are set before
-     * MI_SNR_Enable, which the tail of this function still satisfies.
+     * The order is deliberate and the vendor's own sample has it the other way
+     * round, so it is worth saying why. MI_SNR_SetPlaneMode does nothing but
+     * store a flag against the pad, and MI_SNR_QueryResCount reads that flag to
+     * pick which of the sensor driver's registered handles it counts -- the
+     * single-plane handle, or the per-plane ones. Setting it first is therefore
+     * what guarantees the list enumerated here and the mode applied below come
+     * from the same handle. The vendor can afford to set it afterwards because
+     * its sample branches on an HDR type it already knows.
+     *
+     * The count being zero does not follow from this order: with the flag
+     * unset the pad defaults to single-plane, which selects the same handle.
      */
+    if ((ret = st->snr.set_plane_mode(I6C_DEV_ID(I6C_SNR_PAD), 0)) != 0) {
+        HAL_LOG_ERR("MI_SNR_SetPlaneMode failed: %d", ret);
+        return RSS_ERR_IO;
+    }
+
     if ((ret = st->snr.query_res_count(I6C_DEV_ID(I6C_SNR_PAD), &count)) != 0) {
         HAL_LOG_ERR("MI_SNR_QueryResCount failed: %d", ret);
         return RSS_ERR_IO;
     }
+    /*
+     * Zero comes back as a success, so it is caught here rather than by the
+     * return code. It means the pad has no handle with a resolution list, which
+     * on this family needs the sensor driver *and* the board's sensor-reset
+     * module: without the latter the driver inserts cleanly and registers
+     * nothing. It does not mean the sensor is unreachable -- the list is filled
+     * from the driver's static tables at registration, with no I2C.
+     */
     if (!count) {
         HAL_LOG_ERR("infinity6c: sensor reports no modes; is the sensor driver loaded, and on "
                     "this family is its board-config module loaded with it?");
@@ -139,17 +158,6 @@ static int i6c_snr_select(infinity6c_state_t *st, unsigned short width, unsigned
     if (st->snr_profile < 0) {
         HAL_LOG_ERR("infinity6c: no sensor mode covers %ux%u at %u fps", width, height, fps);
         return RSS_ERR_INVAL;
-    }
-
-    /*
-     * Single-plane, because a multi-plane sensor hands out one plane per exposure
-     * and pairing them is the HDR path this backend does not implement. It is set
-     * after the mode is chosen and before the resolution is applied, matching the
-     * vendor sequence.
-     */
-    if ((ret = st->snr.set_plane_mode(I6C_DEV_ID(I6C_SNR_PAD), 0)) != 0) {
-        HAL_LOG_ERR("MI_SNR_SetPlaneMode failed: %d", ret);
-        return RSS_ERR_IO;
     }
 
     if ((ret = st->snr.set_res(I6C_DEV_ID(I6C_SNR_PAD), (unsigned char)st->snr_profile)) != 0) {
