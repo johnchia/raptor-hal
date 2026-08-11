@@ -287,11 +287,19 @@ static int hal_deinit(void *ctx)
     return RSS_OK;
 }
 
+/*
+ * The per-context copy rather than the static one, matching the other two
+ * backends: a caller holding a context expects the caps that belong to it, and a
+ * NULL context has none to report.
+ */
 static const rss_hal_caps_t *hal_get_caps(void *ctx)
 {
-    (void)ctx;
+    rss_hal_ctx_t *c = (rss_hal_ctx_t *)ctx;
 
-    return &g_hal_caps;
+    if (!c)
+        return NULL;
+
+    return &c->caps;
 }
 
 /* ================================================================
