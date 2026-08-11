@@ -94,6 +94,14 @@
  */
 #define I6C_VENC_DEV_SLOTS 2
 
+/*
+ * Elements in a vendor array, for bounding a loop by the declaration rather than
+ * by a literal that matches it today. The packs-within-a-pack array is the one
+ * that matters: its length is the vendor's to change, and the loop over it is
+ * driven by a count the vendor also supplies.
+ */
+#define I6C_ARRAY_LEN(a) (unsigned int)(sizeof(a) / sizeof((a)[0]))
+
 /* ================================================================
  * PER-CHANNEL STATE
  * ================================================================ */
@@ -138,6 +146,15 @@ typedef struct {
     i6c_venc_pack packs[I6C_VENC_MAX_PACKS];
     i6c_venc_pack *heap_packs;
     unsigned int heap_count;
+
+    /*
+     * How many packs the array handed to MI_VENC_GetStream can hold. Kept because
+     * the count comes back through the same struct it went out in: the array is
+     * sized from a preceding MI_VENC_Query, and reading the returned count
+     * without bounding it by this trusts a vendor library not to answer with more
+     * than it was given room for.
+     */
+    unsigned int pack_cap;
     rss_nal_unit_t nals[I6C_VENC_MAX_PACKS];
 
     /*

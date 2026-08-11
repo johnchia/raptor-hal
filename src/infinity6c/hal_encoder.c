@@ -275,6 +275,7 @@ static i6c_venc_pack *i6c_enc_packs(infinity6c_venc_chn_t *enc, unsigned int cou
 {
     if (count <= I6C_VENC_MAX_PACKS) {
         memset(enc->packs, 0, sizeof(enc->packs));
+        enc->pack_cap = I6C_VENC_MAX_PACKS;
         return enc->packs;
     }
 
@@ -290,6 +291,7 @@ static i6c_venc_pack *i6c_enc_packs(infinity6c_venc_chn_t *enc, unsigned int cou
     }
 
     memset(enc->heap_packs, 0, enc->heap_count * sizeof(*enc->heap_packs));
+    enc->pack_cap = enc->heap_count;
 
     return enc->heap_packs;
 }
@@ -305,6 +307,18 @@ static void i6c_enc_fill_nals(infinity6c_venc_chn_t *enc, rss_frame_t *frame)
 {
     unsigned int count = enc->strm.count;
     unsigned int i;
+
+    /*
+     * Bounded by the array before it is bounded by nals[]. The count arrives in
+     * the same struct the array pointer went out in, so a library answering with
+     * more packs than it was given room for would be read past the end of it --
+     * cheaper to refuse than to trust.
+     */
+    if (count > enc->pack_cap) {
+        HAL_LOG_ERR("i6c_venc: MI_VENC_GetStream returned %u packs for room for %u", count,
+                    enc->pack_cap);
+        count = enc->pack_cap;
+    }
 
     if (count > I6C_VENC_MAX_PACKS) {
         HAL_LOG_WARN("i6c_venc: %u packs in one frame, reporting %d", count, I6C_VENC_MAX_PACKS);
@@ -340,7 +354,7 @@ static void i6c_enc_fill_nals(infinity6c_venc_chn_t *enc, rss_frame_t *frame)
          * the keyframe, and reporting it as SPS would have rvd take a parameter
          * set for the primary type of every IDR.
          */
-        for (k = 0; k < pack->packNum && k < 8; k++) {
+        for (k = 0; k < pack->packNum && k < I6C_ARRAY_LEN(pack->packetInfo); k++) {
             rss_nal_type_t sub = i6c_enc_nal_type(enc->codec, pack->packetInfo[k].packType);
 
             if (i6c_enc_nal_is_key(sub))
