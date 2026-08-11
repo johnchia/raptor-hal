@@ -1040,14 +1040,24 @@ const rss_hal_caps_t g_hal_caps = {
 #elif defined(PLATFORM_INFINITY6C)
 const rss_hal_caps_t g_hal_caps = {
     .soc_name = HAL_PLATFORM_NAME,
-    /* Replaced at runtime from MI_SYS_GetVersion; this is the fallback. */
+    /*
+     * A family name, not a release. MI_SYS_GetVersion answers with the
+     * running library's own string and hal_sys_get_version passes that
+     * straight through, so anything wanting the exact drop asks the op
+     * rather than reading this.
+     */
     .sdk_version = "MI",
 
     /* Encoder */
     .has_h265 = true,
     .has_rotation = true,
     .has_set_bitrate = true,
-    .has_gop_attr = true,
+    /*
+     * has_gop_attr stays false: enc_set_gop_attr and enc_get_gop_attr are
+     * not published, and a flag whose ops are absent promises what nothing
+     * can service. Plain enc_set_gop is implemented and is not gated by it.
+     */
+    .has_gop_attr = false,
     /* AVBR is what the capped and smart modes map onto; see hal_encoder.c. */
     .has_capped_rc = true,
     .has_smart_rc = true,
