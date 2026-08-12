@@ -56,6 +56,14 @@
 #define I6C_ISP_DEV 0
 #define I6C_ISP_CHN 0
 #define I6C_ISP_PORT 0
+
+/*
+ * The key MI_ISP_ApiCmdLoadBinFile validates a per-sensor API bin against. A
+ * fixed protocol value, not per-file: the same 1234 loads every sensor's bin
+ * across this ecosystem's tuning files (OpenIPC/thingino), as the i6e backend's
+ * STAR_IQ_LOAD_KEY does.
+ */
+#define I6C_ISP_IQ_LOAD_KEY 1234u
 #define I6C_SCL_DEV 0
 #define I6C_SCL_CHN 0
 
@@ -284,6 +292,16 @@ typedef struct {
      */
     int scl_video_port;
 
+    /*
+     * ISP tuning. iq_file is the per-sensor IQ bin found on disk when the
+     * pipeline came up, empty if none. CUS3A's AE init runs on a frame interrupt
+     * and writes over a load issued before it, so the load is deferred to the
+     * first delivered frame; iq_load_started latches that one load across the
+     * encoder threads that each call get_frame. See i6c_isp_note_frame.
+     */
+    char iq_file[128];
+    char iq_load_started;
+
     infinity6c_fs_chn_t fs[I6C_MAX_CHN];
     infinity6c_venc_chn_t enc[I6C_MAX_CHN];
 } infinity6c_state_t;
@@ -331,6 +349,14 @@ int i6c_fs_clone_port(infinity6c_state_t *st, int src_port, int dst_port);
 int i6c_fs_port_ifc(infinity6c_state_t *st, int port);
 int i6c_fs_enable_port(infinity6c_state_t *st, int port);
 void i6c_fs_release_port(infinity6c_state_t *st, int port);
+
+/*
+ * Load the per-sensor IQ tuning on the first delivered frame (hal_framesource.c).
+ * Called from every encoder channel's get_frame; loads once, or never if no bin
+ * was found on disk. Deferred to the first frame because CUS3A's AE init would
+ * otherwise overwrite it.
+ */
+void i6c_isp_note_frame(infinity6c_state_t *st);
 
 /*
  * Bind and unbind an SCL output port to an encoder channel (hal_encoder.c).

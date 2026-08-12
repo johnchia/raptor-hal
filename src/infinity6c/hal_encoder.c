@@ -1169,6 +1169,9 @@ int hal_enc_get_frame(void *ctx, int chn, rss_frame_t *frame)
 
     enc->frame_held = true;
 
+    /* A frame is through: safe now to load the ISP tuning (loads once). */
+    i6c_isp_note_frame(st);
+
     memset(frame, 0, sizeof(*frame));
     frame->codec = enc->codec;
     frame->seq = enc->strm.sequence;

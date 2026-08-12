@@ -52,22 +52,16 @@ typedef struct {
     int (*disable_port)(unsigned int device, unsigned int channel, unsigned int port);
 
     /*
-     * The last two are bound but have NO CALLER yet: this backend publishes no
-     * isp_* ops, so there is no tuning surface for them to sit behind. They are
-     * declared here because the constraints on using them are what cost the
-     * investigation, and rediscovering those is the expensive part.
-     *
-     * The IQ tuning binary, and the ordering is the whole difficulty. CUS3A's AE
+     * The IQ tuning binary. The ordering is the whole difficulty: CUS3A's AE
      * initialisation writes over the API-level tuning, so a load issued before the
      * first frame is silently read back over -- the call succeeds, the tuning does
-     * not take, and nothing anywhere reports it. Gate the load on the first frame
-     * the way star/hal_isp.c does. Until something does, tuning on this part is
-     * inert rather than mis-ordered, which is a different symptom with a different
-     * first suspect.
+     * not take, and nothing anywhere reports it. So the load is gated on the first
+     * delivered frame (i6c_isp_note_frame, from the encoder's get_frame), which is
+     * late enough that it sticks.
      */
     int (*load_bin)(unsigned int device, unsigned int channel, char *path, unsigned int key);
 
-    /* Day/night without touching the sensor, for a mono night mode. Also uncalled. */
+    /* Day/night without touching the sensor, for a mono night mode. Uncalled. */
     int (*set_color_to_gray)(unsigned int device, unsigned int channel, char *enable);
 } i6c_isp_api;
 

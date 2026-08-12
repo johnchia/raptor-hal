@@ -27,6 +27,8 @@
 
 #include "infinity6c_state.h"
 
+#include <ctype.h>
+
 /* ================================================================
  * FORMAT MAPPING
  * ================================================================ */
@@ -300,6 +302,82 @@ static int i6c_vif_bringup(infinity6c_state_t *st)
     return RSS_OK;
 }
 
+/*
+ * i6c_isp_resolve_iq -- find the per-sensor IQ tuning bin, or leave none.
+ *
+ * The file is named after the sensor (IMX335_MIPI -> imx335.bin) and searched in
+ * the two directories the distributions disagree on -- OpenIPC's /etc/sensors and
+ * thingino's /usr/share/sensor -- so one build finds it on either rootfs. Only
+ * the path is settled here; the load waits for the first frame (i6c_isp_note_frame).
+ * Missing tuning is a degraded picture, not a failure, so this never fails the
+ * pipeline.
+ */
+static void i6c_isp_resolve_iq(infinity6c_state_t *st)
+{
+    static const char *dirs[] = {"/etc/sensors", "/usr/share/sensor"};
+    char name[64];
+    unsigned int j;
+    size_t d;
+
+    st->iq_file[0] = '\0';
+
+    /* Lowercase up to the first separator: "IMX335_MIPI" -> "imx335". */
+    for (j = 0; j + 1 < sizeof(name) && j < sizeof(st->plane.sensName) && st->plane.sensName[j];
+         j++) {
+        char c = st->plane.sensName[j];
+        if (c == '_' || c == ' ' || c == '-')
+            break;
+        name[j] = (char)tolower((unsigned char)c);
+    }
+    name[j] = '\0';
+    if (!name[0])
+        return;
+
+    for (d = 0; d < sizeof(dirs) / sizeof(dirs[0]); d++) {
+        char path[128];
+        FILE *f;
+
+        snprintf(path, sizeof(path), "%s/%s.bin", dirs[d], name);
+        if ((f = fopen(path, "r"))) {
+            fclose(f);
+            snprintf(st->iq_file, sizeof(st->iq_file), "%s", path);
+            HAL_LOG_INFO("infinity6c: ISP tuning is %s (loads on the first frame)", st->iq_file);
+            return;
+        }
+    }
+
+    HAL_LOG_WARN("infinity6c: no IQ tuning for \"%s\" in /etc/sensors or /usr/share/sensor -- the "
+                 "picture stays on CUS3A defaults (dark/untuned)",
+                 name);
+}
+
+/*
+ * i6c_isp_note_frame -- load the tuning once, on the first delivered frame.
+ *
+ * CUS3A's AE initialisation runs on a frame interrupt and writes over any tuning
+ * loaded before it, so a load at bring-up is silently lost. Waiting for a frame
+ * to have come through puts the load on the far side of that init, where it
+ * sticks. rvd runs an encoder thread per stream and every one reaches here, so
+ * the latch is atomic and exactly one thread does the load. A hot restart tears
+ * the pipeline down, which clears the latch, so the next run loads again.
+ */
+void i6c_isp_note_frame(infinity6c_state_t *st)
+{
+    int ret;
+
+    if (!st->iq_file[0] || !st->isp.load_bin)
+        return;
+    if (__atomic_test_and_set(&st->iq_load_started, __ATOMIC_ACQ_REL))
+        return;
+
+    ret = st->isp.load_bin(I6C_DEV_ID(I6C_ISP_DEV), I6C_ISP_CHN, st->iq_file, I6C_ISP_IQ_LOAD_KEY);
+    if (ret)
+        HAL_LOG_WARN("infinity6c: MI_ISP_ApiCmdLoadBinFile(%s) failed: %d -- picture stays untuned",
+                     st->iq_file, ret);
+    else
+        HAL_LOG_INFO("infinity6c: ISP tuning %s loaded", st->iq_file);
+}
+
 static int i6c_isp_bringup(infinity6c_state_t *st)
 {
     unsigned int combo = 1u << I6C_SNR_PAD;
@@ -370,6 +448,9 @@ static int i6c_isp_bringup(infinity6c_state_t *st)
         HAL_LOG_ERR("MI_ISP_EnableOutputPort failed: %d", ret);
         return RSS_ERR_IO;
     }
+
+    /* Find the tuning bin now; the load itself waits for the first frame. */
+    i6c_isp_resolve_iq(st);
 
     return RSS_OK;
 }
@@ -623,6 +704,8 @@ void i6c_pipeline_destroy(infinity6c_state_t *st)
         st->fs[i].shadow = false;
     }
     st->scl_video_port = -1;
+    st->iq_file[0] = '\0';
+    st->iq_load_started = 0;
 
     memset(&src, 0, sizeof(src));
     memset(&dst, 0, sizeof(dst));
