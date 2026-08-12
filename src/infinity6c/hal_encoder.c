@@ -429,6 +429,23 @@ int i6c_bind_scl_to_venc(infinity6c_state_t *st, int port, int chn, unsigned int
     if (enc->uses_ring && (ret = i6c_fs_port_ifc(st, port)) != RSS_OK)
         return ret;
 
+    /*
+     * The encoder must already be receiving when the bind connects it: the vendor
+     * order is CreateChn -> SetInputSourceConfig -> StartRecvPic -> bind, and both
+     * i6c references start the channel before binding it. A ring bound to a
+     * channel that has not started has no consumer, so it never drains -- the
+     * scaler back-pressures, the ISP rewinds, and VIF completes no frame. Started
+     * here rather than left to hal_enc_start, which rvd calls only after the whole
+     * pipeline is bound; that call then finds it already receiving and no-ops.
+     */
+    if (!enc->receiving) {
+        if ((ret = st->venc.start_recv(enc->device, (unsigned int)chn)) != 0) {
+            HAL_LOG_ERR("MI_VENC_StartRecvPic(chn %d) failed: %d", chn, ret);
+            return RSS_ERR_IO;
+        }
+        enc->receiving = true;
+    }
+
     link = enc->uses_ring ? I6C_SYS_LINK_RING : I6C_SYS_LINK_FRAMEBASE;
 
     ret = st->sys.bind_ext(I6C_SOC_ID, &src, &dst, st->fps, dst_fps ? dst_fps : st->fps, link, 0);
