@@ -620,7 +620,9 @@ void i6c_pipeline_destroy(infinity6c_state_t *st)
             st->fs[i].enabled = false;
         }
         st->fs[i].configured = false;
+        st->fs[i].shadow = false;
     }
+    st->scl_video_port = -1;
 
     memset(&src, 0, sizeof(src));
     memset(&dst, 0, sizeof(dst));
@@ -832,6 +834,10 @@ int i6c_fs_enable_port(infinity6c_state_t *st, int port)
 {
     int ret;
 
+    /* A cascade sub has no SCL port to enable; its frames come from the main. */
+    if (st->fs[port].shadow)
+        return RSS_OK;
+
     if (st->fs[port].enabled)
         return RSS_OK;
 
@@ -858,6 +864,7 @@ void i6c_fs_release_port(infinity6c_state_t *st, int port)
         st->fs[port].enabled = false;
     }
     st->fs[port].configured = false;
+    st->fs[port].shadow = false;
 }
 
 int hal_fs_create_channel(void *ctx, int chn, const rss_fs_config_t *cfg)
@@ -874,10 +881,26 @@ int hal_fs_create_channel(void *ctx, int chn, const rss_fs_config_t *cfg)
     if ((ret = i6c_pipeline_create(st, cfg)) != RSS_OK)
         return ret;
 
+    /*
+     * One SCL output port feeds the encoder ring, and the first video framesource
+     * owns it. A second video stream is a VENC main->sub cascade off that port
+     * (a second SCL port cannot ring an H.26x channel), so it is recorded as a
+     * shadow: no port to apply, enable or tear down. The encoder makes the
+     * cascade at bind time; see i6c_bind_scl_to_venc.
+     */
+    if (st->scl_video_port >= 0) {
+        st->fs[chn].configured = true;
+        st->fs[chn].shadow = true;
+        HAL_LOG_INFO("infinity6c: fs chn %d is a VENC cascade sub of fs chn %d, no SCL port", chn,
+                     st->scl_video_port);
+        return RSS_OK;
+    }
+
     if ((ret = i6c_fs_apply(st, chn, cfg)) != RSS_OK) {
         i6c_pipeline_destroy(st);
         return ret;
     }
+    st->scl_video_port = chn;
 
     HAL_LOG_INFO("infinity6c: fs chn %d configured, %ux%u", chn, st->fs[chn].width,
                  st->fs[chn].height);
@@ -892,6 +915,10 @@ int hal_fs_set_channel_attr(void *ctx, int chn, const rss_fs_config_t *cfg)
         return RSS_ERR_INVAL;
     if (!st->fs[chn].configured)
         return RSS_ERR_INVAL;
+
+    /* A cascade sub carries no SCL port; its size is the encoder channel's. */
+    if (st->fs[chn].shadow)
+        return RSS_OK;
 
     return i6c_fs_apply(st, chn, cfg);
 }
@@ -934,6 +961,9 @@ int hal_fs_destroy_channel(void *ctx, int chn)
 
     hal_fs_disable_channel(ctx, chn);
     st->fs[chn].configured = false;
+    st->fs[chn].shadow = false;
+    if (st->scl_video_port == chn)
+        st->scl_video_port = -1;
 
     /* Drops the shared chain once the last channel using it is gone. */
     i6c_pipeline_destroy(st);

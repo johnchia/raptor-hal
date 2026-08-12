@@ -176,9 +176,11 @@ static int hal_init(void *ctx, const rss_multi_sensor_config_t *cfg)
      * port and a valid encoder channel, so "unset" needs a value of its own.
      */
     st->snr_profile = -1;
+    st->scl_video_port = -1;
     for (int i = 0; i < I6C_MAX_CHN; i++) {
         st->osd_src_port[i] = -1;
         st->enc[i].src_port = -1;
+        st->enc[i].cascade_src = -1;
         st->enc[i].fd = -1;
     }
     for (int i = 0; i < I6C_VENC_DEV_SLOTS; i++)

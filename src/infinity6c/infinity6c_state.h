@@ -114,6 +114,17 @@
 typedef struct {
     bool configured;
     bool enabled;
+
+    /*
+     * A shadow channel carries no SCL output port. Only one SCL port feeds the
+     * encoder ring; a second video stream is a VENC main->sub cascade off that
+     * port, not a port of its own (a second SCL port cannot ring an H.26x
+     * channel). rvd still creates a framesource for the sub, so its channel is
+     * recorded here as a shadow -- configured, never a real port to apply or
+     * enable. See i6c_bind_scl_to_venc.
+     */
+    bool shadow;
+
     unsigned short width;
     unsigned short height;
     i6c_common_pixfmt pixfmt;
@@ -125,13 +136,21 @@ typedef struct {
     bool bound;
 
     /*
-     * Whether this channel is fed by the low-latency ring or by a frame handed
-     * through DRAM. The SCL channel's realtime/ring datapath carries one consumer
-     * at a time, so the first H.26x channel on a codec engine takes the ring and
-     * any later one reads frames instead -- which is what lets a main and a sub
-     * stream coexist. JPEG is always frame-based. See i6c_bind_scl_to_venc.
+     * Whether this channel holds the SCL output ring. The first H.26x channel on
+     * the codec engine takes it (SCL port -> VENC main, HW_RING); a later H.26x
+     * channel is a sub that cascades off the main in VENC rather than binding SCL
+     * again, and JPEG is frame-based off its own port. See i6c_bind_scl_to_venc.
      */
     bool uses_ring;
+
+    /*
+     * A sub H.26x channel fed by a VENC main->sub HW_RING cascade rather than by
+     * SCL directly, with cascade_src the main channel it hangs off. The VENC
+     * hardware reduces the main's frame to this channel's (smaller) size, so a sub
+     * needs no SCL port and no input-source config of its own.
+     */
+    bool cascade;
+    int cascade_src;
 
     /*
      * Set when this channel brought up an SCL output port of its own rather than
@@ -251,11 +270,19 @@ typedef struct {
 
     /*
      * Which encoder channel holds each engine's SCL ring, -1 when none does. The
-     * SCL channel feeds one ring consumer at a time, so the first H.26x channel on
-     * an engine claims it and later ones bind frame-based off DRAM. Indexed like
-     * the pools above.
+     * first H.26x channel on an engine claims it (SCL -> VENC main); later H.26x
+     * channels cascade off it in VENC. It is also the cascade source: a sub binds
+     * VENC(enc_ring_chn) -> VENC(sub). Indexed like the pools above.
      */
     int enc_ring_chn[I6C_VENC_DEV_SLOTS];
+
+    /*
+     * The framesource channel that owns the one SCL output port feeding the
+     * encoder ring, -1 when none does. The first video framesource claims it; a
+     * later one is a cascade shadow with no port of its own. JPEG snapshot ports
+     * are separate (the clone/spare-port path) and not counted here.
+     */
+    int scl_video_port;
 
     infinity6c_fs_chn_t fs[I6C_MAX_CHN];
     infinity6c_venc_chn_t enc[I6C_MAX_CHN];

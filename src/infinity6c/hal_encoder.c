@@ -371,6 +371,12 @@ static void i6c_enc_fill_nals(infinity6c_venc_chn_t *enc, rss_frame_t *frame)
     frame->nal_count = count;
 }
 
+/* Which of the two ring pools a codec engine owns. */
+static int i6c_enc_pool_slot(unsigned int device)
+{
+    return device == I6C_VENC_DEV_MJPG_0 ? 1 : 0;
+}
+
 /* ================================================================
  * BINDING
  * ================================================================ */
@@ -409,6 +415,62 @@ int i6c_bind_scl_to_venc(infinity6c_state_t *st, int port, int chn, unsigned int
         return RSS_ERR_INVAL;
     if (enc->bound)
         return RSS_OK;
+
+    /*
+     * A second H.26x stream is not a second SCL port. Only one SCL port can ring
+     * an H.26x channel -- a second SCL port bound to a second channel is refused
+     * (a frame-based bind to an H.26x channel is NOT_SUPPORT) -- so the engine
+     * cascades further H.26x channels off the one that holds the ring: the VENC
+     * hardware reduces the main's frame to the sub channel's smaller size. A sub
+     * binds VENC(main) -> VENC(this) as a ring, takes no SCL port, and sets no
+     * input-source config of its own (the main's ring feeds the whole cascade).
+     * JPEG never rings and is handled by the SCL path below.
+     */
+    if (enc->device != I6C_VENC_DEV_MJPG_0 && !enc->uses_ring) {
+        int main_chn = st->enc_ring_chn[i6c_enc_pool_slot(enc->device)];
+
+        if (main_chn < 0) {
+            HAL_LOG_ERR("venc chn %d: no main H.26x channel holds the ring to cascade from", chn);
+            return RSS_ERR_INVAL;
+        }
+
+        if (!enc->receiving) {
+            if ((ret = st->venc.start_recv(enc->device, (unsigned int)chn)) != 0) {
+                HAL_LOG_ERR("MI_VENC_StartRecvPic(chn %d) failed: %d", chn, ret);
+                return RSS_ERR_IO;
+            }
+            enc->receiving = true;
+        }
+
+        memset(&src, 0, sizeof(src));
+        memset(&dst, 0, sizeof(dst));
+        src.module = I6C_SYS_MOD_VENC;
+        src.device = enc->device;
+        src.channel = (unsigned int)main_chn;
+        src.port = 0;
+        dst.module = I6C_SYS_MOD_VENC;
+        dst.device = enc->device;
+        dst.channel = (unsigned int)chn;
+        dst.port = 0;
+
+        ret = st->sys.bind_ext(I6C_SOC_ID, &src, &dst, st->fps, dst_fps ? dst_fps : st->fps,
+                               I6C_SYS_LINK_RING, 0);
+        if (ret) {
+            HAL_LOG_ERR("MI_SYS_BindChnPort2(venc chn %d -> venc chn %d) cascade failed: %d",
+                        main_chn, chn, ret);
+            return RSS_ERR_IO;
+        }
+        enc->bound = true;
+        enc->cascade = true;
+        enc->cascade_src = main_chn;
+
+        /* A shallow queue on the encoder's output for the packetiser to drain. */
+        i6c_set_output_depth(st, I6C_SYS_MOD_VENC, enc->device, (unsigned int)chn, 0, 1, 3);
+
+        HAL_LOG_DBG("infinity6c: venc chn %d cascaded off main chn %d, ring at %u fps", chn,
+                    main_chn, dst_fps ? dst_fps : st->fps);
+        return RSS_OK;
+    }
 
     memset(&src, 0, sizeof(src));
     memset(&dst, 0, sizeof(dst));
@@ -486,14 +548,38 @@ int i6c_unbind_scl_from_venc(infinity6c_state_t *st, int chn)
 
     if (!enc->bound)
         return RSS_OK;
+
+    memset(&src, 0, sizeof(src));
+    memset(&dst, 0, sizeof(dst));
+
+    /* A cascade sub is unbound from its main VENC channel, not from an SCL port. */
+    if (enc->cascade) {
+        src.module = I6C_SYS_MOD_VENC;
+        src.device = enc->device;
+        src.channel = (unsigned int)enc->cascade_src;
+        src.port = 0;
+        dst.module = I6C_SYS_MOD_VENC;
+        dst.device = enc->device;
+        dst.channel = (unsigned int)chn;
+        dst.port = 0;
+
+        ret = st->sys.unbind(I6C_SOC_ID, &src, &dst);
+        enc->bound = false;
+        enc->cascade = false;
+        enc->cascade_src = -1;
+        if (ret) {
+            HAL_LOG_ERR("MI_SYS_UnBindChnPort(venc chn %d cascade) failed: %d", chn, ret);
+            return RSS_ERR_IO;
+        }
+        return RSS_OK;
+    }
+
     if (enc->src_port < 0 || enc->src_port >= I6C_MAX_CHN) {
         HAL_LOG_ERR("i6c_venc chn %d: bound with no port recorded", chn);
         enc->bound = false;
         return RSS_ERR_INVAL;
     }
 
-    memset(&src, 0, sizeof(src));
-    memset(&dst, 0, sizeof(dst));
     src.module = I6C_SYS_MOD_SCL;
     src.device = I6C_SCL_DEV;
     src.channel = I6C_SCL_CHN;
@@ -695,12 +781,6 @@ int hal_enc_unregister_channel(void *ctx, int chn)
 /* ================================================================
  * CHANNEL LIFECYCLE
  * ================================================================ */
-
-/* Which of the two ring pools a codec engine owns. */
-static int i6c_enc_pool_slot(unsigned int device)
-{
-    return device == I6C_VENC_DEV_MJPG_0 ? 1 : 0;
-}
 
 /*
  * i6c_enc_dev_up -- bring up the codec engine a channel is about to live on.
@@ -1296,6 +1376,23 @@ void i6c_teardown_all(infinity6c_state_t *st)
     if (drained) {
         struct timeval tv = {.tv_sec = 0, .tv_usec = 50000};
         select(0, NULL, NULL, NULL, &tv);
+    }
+
+    /*
+     * Unbind the cascade subs before the loop below destroys any channel: a sub
+     * consumes the main's VENC ring, so destroying the main while a sub is still
+     * bound to it would strand the sub. Their own destroy happens in the loop.
+     */
+    for (i = 0; i < I6C_MAX_CHN; i++) {
+        infinity6c_venc_chn_t *enc = &st->enc[i];
+
+        if (!enc->created || !enc->cascade)
+            continue;
+        if (enc->receiving) {
+            st->venc.stop_recv(enc->device, (unsigned int)i);
+            enc->receiving = false;
+        }
+        i6c_unbind_scl_from_venc(st, i);
     }
 
     for (i = 0; i < I6C_MAX_CHN; i++) {
