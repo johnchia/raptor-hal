@@ -352,30 +352,68 @@ static void i6c_isp_resolve_iq(infinity6c_state_t *st)
 }
 
 /*
- * i6c_isp_note_frame -- load the tuning once, on the first delivered frame.
+ * i6c_isp_arm_3a -- start the vendor 3A. The SDK does not arm it for us: without
+ * MI_ISP_EnableUserspace3A the 3A worker thread never spawns, so the AE loop
+ * never runs (exposure and gains stay at their power-on defaults) and no white
+ * balance is applied -- and a Bayer sensor, about twice as sensitive to green,
+ * then reads green. cus3a_enable brings the AE and AWB algorithms up in the
+ * engine (a two-step AE-then-AE+AWB bring-up, the order the vendor uses), and
+ * enable_3a spawns the worker that runs them and feeds the just-loaded IQ
+ * calibration into the algorithm init -- which is why this follows the load.
  *
- * CUS3A's AE initialisation runs on a frame interrupt and writes over any tuning
- * loaded before it, so a load at bring-up is silently lost. Waiting for a frame
- * to have come through puts the load on the far side of that init, where it
- * sticks. rvd runs an encoder thread per stream and every one reaches here, so
- * the latch is atomic and exactly one thread does the load. A hot restart tears
- * the pipeline down, which clears the latch, so the next run loads again.
+ * Runs once per process: MI_ISP_CUS3A_Enable deadlocks its own mutex on a second
+ * call, so a pipeline rebuilt in the same process is not re-armed.
+ */
+static void i6c_isp_arm_3a(infinity6c_state_t *st)
+{
+    static const unsigned char ae_only[3] = {1, 0, 0}; /* AE */
+    static const unsigned char ae_awb[3] = {1, 1, 0};  /* AE + AWB, no AF */
+    static bool armed;
+    int ret;
+
+    if (armed || !st->isp.cus3a_enable || !st->isp.enable_3a)
+        return;
+
+    st->isp.cus3a_enable(I6C_DEV_ID(I6C_ISP_DEV), I6C_ISP_CHN, ae_only);
+    st->isp.cus3a_enable(I6C_DEV_ID(I6C_ISP_DEV), I6C_ISP_CHN, ae_awb);
+    ret = st->isp.enable_3a(I6C_DEV_ID(I6C_ISP_DEV), I6C_ISP_CHN);
+    armed = true;
+
+    if (ret)
+        HAL_LOG_WARN("infinity6c: MI_ISP_EnableUserspace3A failed: %d -- "
+                     "AE will not converge and no white balance is applied",
+                     ret);
+    else
+        HAL_LOG_INFO("infinity6c: vendor 3A armed (AE+AWB)");
+}
+
+/*
+ * i6c_isp_note_frame -- the first-frame work, done once. Loads the IQ tuning and
+ * then arms the vendor 3A. Both wait for a delivered frame: a tuning load issued
+ * at bring-up is silently overwritten by the SDK's own AE init, and the 3A arm
+ * has to follow the load so the algorithm picks the calibration up. rvd runs an
+ * encoder thread per stream and every one reaches here, so the latch is atomic
+ * and exactly one thread does the work. A hot restart tears the pipeline down,
+ * which clears the latch, so the tuning is reloaded on the next run (the 3A arm
+ * is process-wide and does not repeat -- see i6c_isp_arm_3a).
  */
 void i6c_isp_note_frame(infinity6c_state_t *st)
 {
-    int ret;
-
-    if (!st->iq_file[0] || !st->isp.load_bin)
-        return;
     if (__atomic_test_and_set(&st->iq_load_started, __ATOMIC_ACQ_REL))
         return;
 
-    ret = st->isp.load_bin(I6C_DEV_ID(I6C_ISP_DEV), I6C_ISP_CHN, st->iq_file, I6C_ISP_IQ_LOAD_KEY);
-    if (ret)
-        HAL_LOG_WARN("infinity6c: MI_ISP_ApiCmdLoadBinFile(%s) failed: %d -- picture stays untuned",
-                     st->iq_file, ret);
-    else
-        HAL_LOG_INFO("infinity6c: ISP tuning %s loaded", st->iq_file);
+    if (st->iq_file[0] && st->isp.load_bin) {
+        int ret = st->isp.load_bin(I6C_DEV_ID(I6C_ISP_DEV), I6C_ISP_CHN, st->iq_file,
+                                   I6C_ISP_IQ_LOAD_KEY);
+        if (ret)
+            HAL_LOG_WARN(
+                "infinity6c: MI_ISP_ApiCmdLoadBinFile(%s) failed: %d -- picture stays untuned",
+                st->iq_file, ret);
+        else
+            HAL_LOG_INFO("infinity6c: ISP tuning %s loaded", st->iq_file);
+    }
+
+    i6c_isp_arm_3a(st);
 }
 
 static int i6c_isp_bringup(infinity6c_state_t *st)

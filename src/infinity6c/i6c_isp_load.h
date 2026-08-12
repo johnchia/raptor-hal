@@ -75,6 +75,21 @@ typedef struct {
      */
     int (*ae_status)(unsigned int device, unsigned int channel, i6c_cus_ae_info *info);
     int (*awb_status)(unsigned int device, unsigned int channel, i6c_cus_awb_info *info);
+
+    /*
+     * CUS3A framework enable, MI 3.0. The vendor 3A does not arm itself. Without
+     * MI_ISP_EnableUserspace3A the SDK's 3A worker thread never spawns, so the AE
+     * loop never runs -- exposure and gains stay at their power-on defaults -- and
+     * no white balance is applied, which reads as a green cast (a Bayer sensor is
+     * about twice as sensitive to green, so unity gains leave the image green).
+     * cus3a_enable brings the AE and AWB algorithms up in the engine; enable_3a
+     * spawns the worker that runs them each frame and feeds the loaded IQ
+     * calibration into the algorithm's initialisation. The enable argument is a
+     * Cus3AEnable_t -- three MI_BOOLs {AE, AWB, AF}. Optional, bound by dlsym: a
+     * library without them leaves 3A on whatever the SDK gives by default.
+     */
+    int (*cus3a_enable)(unsigned int device, unsigned int channel, const unsigned char *enable);
+    int (*enable_3a)(unsigned int device, unsigned int channel);
 } i6c_isp_api;
 
 static inline int i6c_isp_load(i6c_isp_api *isp)
@@ -150,6 +165,11 @@ static inline int i6c_isp_load(i6c_isp_api *isp)
         isp->lib, "MI_ISP_CUS3A_GetAeStatus");
     isp->awb_status = (int (*)(unsigned int, unsigned int, i6c_cus_awb_info *))dlsym(
         isp->lib, "MI_ISP_CUS3A_GetAwbStatus");
+
+    isp->cus3a_enable = (int (*)(unsigned int, unsigned int, const unsigned char *))dlsym(
+        isp->lib, "MI_ISP_CUS3A_Enable");
+    isp->enable_3a =
+        (int (*)(unsigned int, unsigned int))dlsym(isp->lib, "MI_ISP_EnableUserspace3A");
 
     return RSS_OK;
 }
