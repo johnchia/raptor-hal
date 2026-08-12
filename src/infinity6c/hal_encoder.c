@@ -766,6 +766,8 @@ int hal_enc_create_channel(void *ctx, int chn, const rss_video_config_t *cfg)
     i6c_venc_codec codec;
     i6c_venc_chn attr;
     unsigned int device;
+    int slot;
+    bool uses_ring;
     int ret;
 
     I6C_ENTER(ctx, chn, st);
@@ -788,7 +790,20 @@ int hal_enc_create_channel(void *ctx, int chn, const rss_video_config_t *cfg)
     if ((ret = i6c_enc_dev_up(st, device)) != RSS_OK)
         return ret;
 
-    if ((ret = i6c_enc_pool(st, device, cfg)) != RSS_OK)
+    /*
+     * The first H.26x channel on an engine takes the SCL ring; a later one reads
+     * frames from DRAM instead, because the SCL channel drives one ring consumer
+     * at a time and a second ring bind is refused. JPEG is always frame-based and
+     * never takes the ring. Decided before the pool because the two go together:
+     * the VENC ring pool is what a ring-fed channel reads from, and a frame-fed one
+     * takes its frames from the SCL output port's pool instead. Creating a ring
+     * pool on the JPEG engine -- which never takes a ring -- faults the kernel
+     * allocator, so the pool is made only for the ring channel.
+     */
+    slot = i6c_enc_pool_slot(device);
+    uses_ring = device != I6C_VENC_DEV_MJPG_0 && st->enc_ring_chn[slot] < 0;
+
+    if (uses_ring && (ret = i6c_enc_pool(st, device, cfg)) != RSS_OK)
         return ret;
 
     i6c_enc_fill_attrib(&attr.attrib, cfg, codec);
@@ -806,30 +821,25 @@ int hal_enc_create_channel(void *ctx, int chn, const rss_video_config_t *cfg)
     enc->height = cfg->height;
     enc->fd = -1;
     enc->src_port = -1;
+    enc->uses_ring = uses_ring;
     enc->cfg = *cfg;
 
     /*
-     * The first H.26x channel on an engine takes the SCL ring; a later one reads
-     * frames from DRAM instead, because the SCL channel drives one ring consumer
-     * at a time and a second ring bind is refused. JPEG is always frame-based and
-     * never takes the ring. Only the ring channel gets the ring-DMA input config;
-     * a frame channel stays in MI's default frame input. See i6c_bind_scl_to_venc.
+     * Only the ring channel gets the ring-DMA input config; a frame channel stays
+     * in MI's default frame input. The engine's ring slot is claimed here, once
+     * the channel is known to exist, so a create that fails earlier never holds it.
+     * See i6c_bind_scl_to_venc.
      */
-    {
-        int slot = i6c_enc_pool_slot(device);
+    if (uses_ring) {
+        i6c_venc_src_conf src = I6C_VENC_SRC_CONF_RING_DMA;
+        int mi;
 
-        enc->uses_ring = device != I6C_VENC_DEV_MJPG_0 && st->enc_ring_chn[slot] < 0;
-        if (enc->uses_ring) {
-            i6c_venc_src_conf src = I6C_VENC_SRC_CONF_RING_DMA;
-            int mi;
-
-            if ((mi = st->venc.set_src_conf(device, (unsigned int)chn, &src)) != 0) {
-                HAL_LOG_ERR("MI_VENC_SetInputSourceConfig(chn %d) failed: %d", chn, mi);
-                ret = RSS_ERR_IO;
-                goto fail;
-            }
-            st->enc_ring_chn[slot] = chn;
+        if ((mi = st->venc.set_src_conf(device, (unsigned int)chn, &src)) != 0) {
+            HAL_LOG_ERR("MI_VENC_SetInputSourceConfig(chn %d) failed: %d", chn, mi);
+            ret = RSS_ERR_IO;
+            goto fail;
         }
+        st->enc_ring_chn[slot] = chn;
     }
 
     /*
