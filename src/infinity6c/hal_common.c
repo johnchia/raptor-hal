@@ -120,6 +120,7 @@ int hal_enc_query(void *ctx, int chn, bool *busy);
 /* ── ISP tuning (infinity6c/hal_isp.c) ── */
 
 int hal_isp_get_exposure(void *ctx, rss_exposure_t *exposure);
+int hal_isp_get_sensor_attr(void *ctx, uint32_t *width, uint32_t *height);
 #endif
 
 /* ================================================================
@@ -566,6 +567,7 @@ static const rss_hal_ops_t g_ops = {
     .enc_query = hal_enc_query,
 
     .isp_get_exposure = hal_isp_get_exposure,
+    .isp_get_sensor_attr = hal_isp_get_sensor_attr,
 #endif
 };
 

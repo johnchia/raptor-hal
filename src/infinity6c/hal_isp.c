@@ -99,3 +99,61 @@ int hal_isp_get_exposure(void *ctx, rss_exposure_t *exposure)
 
     return RSS_OK;
 }
+
+/*
+ * hal_isp_get_sensor_attr -- the sensor's resolution, for the daemon's stream
+ * sizing. Without it the daemon falls back to a config default and the scaler
+ * quietly downsamples a full-resolution sensor to it.
+ *
+ * Once the pipeline is up the selected mode's geometry is the answer. Before
+ * that -- which is when the daemon asks, since it sizes the streams before it
+ * creates the channels that build the pipeline -- the sensor's native geometry
+ * is read from the driver's mode list directly. That list is filled from the
+ * driver's static tables at registration, so it is available with no I2C and
+ * without enabling the sensor; the largest mode is the native array. The probe
+ * only reads and sets a plane-mode flag the real bringup sets again, so it does
+ * not disturb the mode the pipeline later selects. If the driver has registered
+ * no modes yet it reports "none", and the daemon keeps its config fallback.
+ */
+int hal_isp_get_sensor_attr(void *ctx, uint32_t *width, uint32_t *height)
+{
+    infinity6c_state_t *st = i6c_state(ctx);
+    uint32_t best_w = 0, best_h = 0;
+    unsigned int count = 0, i;
+
+    if (!st || !width || !height)
+        return RSS_ERR_INVAL;
+
+    if (st->pipeline_up) {
+        *width = st->plane.capt.width;
+        *height = st->plane.capt.height;
+        return RSS_OK;
+    }
+
+    if (!st->snr.set_plane_mode || !st->snr.query_res_count || !st->snr.get_res)
+        return RSS_ERR_NOTSUP;
+
+    if (st->snr.set_plane_mode(I6C_DEV_ID(I6C_SNR_PAD), 0) != 0 ||
+        st->snr.query_res_count(I6C_DEV_ID(I6C_SNR_PAD), &count) != 0 || !count)
+        return RSS_ERR_NOENT;
+
+    for (i = 0; i < count; i++) {
+        i6c_snr_res res;
+
+        memset(&res, 0, sizeof(res));
+        if (st->snr.get_res(I6C_DEV_ID(I6C_SNR_PAD), (unsigned char)i, &res) != 0)
+            return RSS_ERR_IO;
+
+        if ((uint32_t)res.crop.width * res.crop.height > best_w * best_h) {
+            best_w = res.crop.width;
+            best_h = res.crop.height;
+        }
+    }
+
+    if (!best_w || !best_h)
+        return RSS_ERR_NOENT;
+
+    *width = best_w;
+    *height = best_h;
+    return RSS_OK;
+}
