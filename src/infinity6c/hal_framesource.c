@@ -645,8 +645,9 @@ void i6c_pipeline_destroy(infinity6c_state_t *st)
  * i6c_fs_apply -- push a channel's geometry to its SCL output port.
  *
  * A zero crop means "take the whole input", so the port's only real content is
- * the output size -- the scale factor, in effect. Compression is left off
- * because the encoder reads these frames directly.
+ * the output size -- the scale factor, in effect. Compression starts off and is
+ * turned on for a ring leg at bind time (i6c_fs_port_ifc), once the bind type is
+ * known; a frame-fed leg and the JPEG leg keep it off.
  */
 static int i6c_fs_apply(infinity6c_state_t *st, int chn, const rss_fs_config_t *cfg)
 {
@@ -755,6 +756,41 @@ int i6c_fs_clone_port(infinity6c_state_t *st, int src_port, int dst_port)
     st->fs[dst_port].height = st->fs[src_port].height;
     st->fs[dst_port].pixfmt = st->fs[src_port].pixfmt;
     st->fs[dst_port].configured = true;
+
+    return RSS_OK;
+}
+
+/*
+ * i6c_fs_port_ifc -- turn on IFC compression for an SCL output port.
+ *
+ * A HW_RING leg to VENC only moves data from an IFC-compressed source port; a
+ * frame-fed leg takes none and the JPEG (MJPEG) leg rejects IFC outright. The
+ * port is created uncompressed and switched here once the bind type -- and with
+ * it the consumer -- is known, so the compression follows the leg rather than
+ * being guessed before any encoder channel exists. Geometry and format are
+ * re-sent unchanged because MI_SCL_SetOutputPortParam sets the port whole.
+ */
+int i6c_fs_port_ifc(infinity6c_state_t *st, int port)
+{
+    i6c_scl_port cfg;
+    int ret;
+
+    if (port < 0 || port >= I6C_MAX_CHN || !st->fs[port].configured)
+        return RSS_ERR_INVAL;
+
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.output.width = st->fs[port].width;
+    cfg.output.height = st->fs[port].height;
+    cfg.mirror = 0;
+    cfg.flip = 0;
+    cfg.pixFmt = st->fs[port].pixfmt;
+    cfg.compress = I6C_COMPR_IFC;
+
+    ret = st->scl.set_port_param(I6C_DEV_ID(I6C_SCL_DEV), I6C_SCL_CHN, (unsigned int)port, &cfg);
+    if (ret) {
+        HAL_LOG_ERR("MI_SCL_SetOutputPortParam(port %d, IFC) failed: %d", port, ret);
+        return RSS_ERR_IO;
+    }
 
     return RSS_OK;
 }

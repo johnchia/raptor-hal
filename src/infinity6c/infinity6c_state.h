@@ -294,6 +294,7 @@ void i6c_pipeline_destroy(infinity6c_state_t *st);
  */
 int i6c_fs_spare_port(const infinity6c_state_t *st);
 int i6c_fs_clone_port(infinity6c_state_t *st, int src_port, int dst_port);
+int i6c_fs_port_ifc(infinity6c_state_t *st, int port);
 int i6c_fs_enable_port(infinity6c_state_t *st, int port);
 void i6c_fs_release_port(infinity6c_state_t *st, int port);
 

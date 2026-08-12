@@ -421,6 +421,14 @@ int i6c_bind_scl_to_venc(infinity6c_state_t *st, int port, int chn, unsigned int
     dst.channel = (unsigned int)chn;
     dst.port = 0;
 
+    /*
+     * A ring leg only moves data from an IFC-compressed source port, so the port
+     * is switched to IFC now that this bind is known to be a ring. A frame leg
+     * keeps the uncompressed port it was created with.
+     */
+    if (enc->uses_ring && (ret = i6c_fs_port_ifc(st, port)) != RSS_OK)
+        return ret;
+
     link = enc->uses_ring ? I6C_SYS_LINK_RING : I6C_SYS_LINK_FRAMEBASE;
 
     ret = st->sys.bind_ext(I6C_SOC_ID, &src, &dst, st->fps, dst_fps ? dst_fps : st->fps, link, 0);
