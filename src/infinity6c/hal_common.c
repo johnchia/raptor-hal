@@ -116,6 +116,10 @@ int hal_enc_set_bitrate(void *ctx, int chn, uint32_t bitrate);
 int hal_enc_set_gop(void *ctx, int chn, uint32_t gop_length);
 int hal_enc_set_fps(void *ctx, int chn, uint32_t fps_num, uint32_t fps_den);
 int hal_enc_query(void *ctx, int chn, bool *busy);
+
+/* ── ISP tuning (infinity6c/hal_isp.c) ── */
+
+int hal_isp_get_exposure(void *ctx, rss_exposure_t *exposure);
 #endif
 
 /* ================================================================
@@ -560,6 +564,8 @@ static const rss_hal_ops_t g_ops = {
     .enc_set_gop = hal_enc_set_gop,
     .enc_set_fps = hal_enc_set_fps,
     .enc_query = hal_enc_query,
+
+    .isp_get_exposure = hal_isp_get_exposure,
 #endif
 };
 
