@@ -430,6 +430,16 @@ int i6c_bind_scl_to_venc(infinity6c_state_t *st, int port, int chn, unsigned int
         return ret;
 
     /*
+     * Enable the source port before the bind on a ring leg, the order both
+     * references use (divinus's channel_bind is EnablePort -> BindExt): the ring's
+     * producer has to be live when the ring is connected. rvd enables the
+     * framesource port later, in its own enable pass; that call finds it already
+     * enabled and no-ops.
+     */
+    if (enc->uses_ring && (ret = i6c_fs_enable_port(st, port)) != RSS_OK)
+        return ret;
+
+    /*
      * The encoder must already be receiving when the bind connects it: the vendor
      * order is CreateChn -> SetInputSourceConfig -> StartRecvPic -> bind, and both
      * i6c references start the channel before binding it. A ring bound to a
