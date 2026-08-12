@@ -66,16 +66,15 @@ typedef struct {
     int (*set_color_to_gray)(unsigned int device, unsigned int channel, char *enable);
 
     /*
-     * 3A readback, MI 3.0. Optional: the capture path does not use them, so a
-     * library that lacks one leaves the pointer NULL and the matching op says
-     * "not supported" rather than failing bringup. Bound with dlsym directly
-     * for that reason -- hal_symbol_load logs a miss as an error, which these
-     * are not. ae_query drives ric's day/night; the awb pair is the readback
-     * that says whether white balance is adapting.
+     * CUS3A live 3A status, MI 3.0. Optional: the capture path does not use
+     * them, so a library that lacks one leaves the pointer NULL and the matching
+     * op says "not supported" rather than failing bringup. Bound with dlsym
+     * directly for that reason -- hal_symbol_load logs a miss as an error, which
+     * these are not. ae_status drives ric's day/night; awb_status is the
+     * readback that says where white balance has settled.
      */
-    int (*ae_query)(unsigned int device, unsigned int channel, i6c_isp_ae_info *info);
-    int (*awb_query)(unsigned int device, unsigned int channel, i6c_isp_awb_info *info);
-    int (*awb_get_attr)(unsigned int device, unsigned int channel, i6c_isp_awb_attr *attr);
+    int (*ae_status)(unsigned int device, unsigned int channel, i6c_cus_ae_info *info);
+    int (*awb_status)(unsigned int device, unsigned int channel, i6c_cus_awb_info *info);
 } i6c_isp_api;
 
 static inline int i6c_isp_load(i6c_isp_api *isp)
@@ -147,12 +146,10 @@ static inline int i6c_isp_load(i6c_isp_api *isp)
               "i6c_isp", isp->lib, "MI_ISP_IQ_SetColorToGray")))
         return RSS_ERR_NOTSUP;
 
-    isp->ae_query = (int (*)(unsigned int, unsigned int, i6c_isp_ae_info *))dlsym(
-        isp->lib, "MI_ISP_AE_QueryExposureInfo");
-    isp->awb_query = (int (*)(unsigned int, unsigned int, i6c_isp_awb_info *))dlsym(
-        isp->lib, "MI_ISP_AWB_QueryInfo");
-    isp->awb_get_attr = (int (*)(unsigned int, unsigned int, i6c_isp_awb_attr *))dlsym(
-        isp->lib, "MI_ISP_AWB_GetAttr");
+    isp->ae_status = (int (*)(unsigned int, unsigned int, i6c_cus_ae_info *))dlsym(
+        isp->lib, "MI_ISP_CUS3A_GetAeStatus");
+    isp->awb_status = (int (*)(unsigned int, unsigned int, i6c_cus_awb_info *))dlsym(
+        isp->lib, "MI_ISP_CUS3A_GetAwbStatus");
 
     return RSS_OK;
 }
