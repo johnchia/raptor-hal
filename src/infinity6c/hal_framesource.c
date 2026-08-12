@@ -496,16 +496,20 @@ static int i6c_isp_bringup(infinity6c_state_t *st)
 static int i6c_scl_bringup(infinity6c_state_t *st)
 {
     /*
-     * A mask of the input sources this device will accept, not a count. All four
-     * are declared because which one a bind names is decided later, and a source
-     * the device was not told about is refused at bind time.
+     * MI_SCL_DevAttr_t.u32NeedUseHWOutPortMask: which of the chip's hardware
+     * scalers this device reserves, as a mask of scaler ids. The set bits are
+     * handed to output ports in ascending order -- lowest bit to port 0, next to
+     * port 1 -- so four contiguous bits give ports 0-3 a scaler each, which is
+     * every port this backend configures. The scalers are not interchangeable
+     * (the driver caps HWSCL4's input at 1920 wide, for one), so taking the
+     * lowest four rather than an arbitrary four is deliberate.
      */
-    unsigned int binds = 0xf;
+    unsigned int scalers = 0xf;
     unsigned int reserved = 0;
     i6c_scl_chn channel;
     int ret;
 
-    if ((ret = st->scl.create_dev(I6C_DEV_ID(I6C_SCL_DEV), &binds)) != 0) {
+    if ((ret = st->scl.create_dev(I6C_DEV_ID(I6C_SCL_DEV), &scalers)) != 0) {
         HAL_LOG_ERR("MI_SCL_CreateDevice failed: %d", ret);
         return RSS_ERR_IO;
     }

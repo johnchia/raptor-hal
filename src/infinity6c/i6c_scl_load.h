@@ -26,11 +26,12 @@ typedef struct {
     void *lib;
 
     /*
-     * The binds argument is a bitmask of the input sources this device may be
-     * bound to, not a count -- the device has to be told which it will accept
-     * before a bind naming it will succeed.
+     * MI_SCL_DevAttr_t, whose one field is u32NeedUseHWOutPortMask: a bitmask of
+     * the hardware scalers this device reserves, assigned to output ports in
+     * ascending bit order (lowest set bit to port 0). Not a count, and not the
+     * input sources the device accepts.
      */
-    int (*create_dev)(unsigned int device, unsigned int *binds);
+    int (*create_dev)(unsigned int device, unsigned int *scalers);
     int (*destroy_dev)(unsigned int device);
 
     int (*create_chn)(unsigned int device, unsigned int channel, unsigned int *reserved);
