@@ -1274,7 +1274,29 @@ int hal_enc_query(void *ctx, int chn, bool *busy)
  */
 void i6c_teardown_all(infinity6c_state_t *st)
 {
+    bool drained = false;
     int i;
+
+    /*
+     * Stop the producers first. Every SCL output port is disabled and given a
+     * moment to settle before any StopRecvPic or unbind below: a source port left
+     * producing while its encoder stops strands an SCL -> VENC task that can never
+     * complete, and the unbind's kernel flush then waits on it forever in
+     * uninterruptible D-state. The wait is bounded, so a leg that never delivered
+     * a frame still tears down rather than wedging. This is the order the working
+     * i6c reference tears down in.
+     */
+    for (i = 0; i < I6C_MAX_CHN; i++) {
+        if (st->fs[i].enabled) {
+            st->scl.disable_port(I6C_DEV_ID(I6C_SCL_DEV), I6C_SCL_CHN, (unsigned int)i);
+            st->fs[i].enabled = false;
+            drained = true;
+        }
+    }
+    if (drained) {
+        struct timeval tv = {.tv_sec = 0, .tv_usec = 50000};
+        select(0, NULL, NULL, NULL, &tv);
+    }
 
     for (i = 0; i < I6C_MAX_CHN; i++) {
         infinity6c_venc_chn_t *enc = &st->enc[i];
