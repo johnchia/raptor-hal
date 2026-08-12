@@ -120,6 +120,36 @@ static bool i6c_osd_scl_port(infinity6c_state_t *st, int grp, i6c_sys_bind *port
     return true;
 }
 
+/*
+ * Whether an SCL output port scales, which is what decides if it can carry an
+ * overlay at all.
+ *
+ * A port whose output matches the ISP frame it is fed does no scaling, and the
+ * driver runs it as a pass-through with no output buffer of its own. MI_RGN has
+ * nothing to blend into there: the attach still *succeeds*, and then the port
+ * stops draining, VIF parks in MI_SYS_InferGraph_EnsureInputPortFifoEmpty and
+ * every stream on the device stalls -- not just the one that asked for the
+ * overlay. Since the failure is silent and total, the port has to be checked
+ * here rather than trusted to refuse.
+ *
+ * Any real scale factor is enough; a stream 16 pixels short of the sensor in one
+ * axis overlays correctly. Callers that want an overlay on a full-sensor stream
+ * have to give up the last few pixels to get one.
+ */
+static bool i6c_osd_port_scales(infinity6c_state_t *st, unsigned int port)
+{
+    const infinity6c_fs_chn_t *fs;
+
+    if (port >= I6C_MAX_CHN)
+        return false;
+
+    fs = &st->fs[port];
+    if (!fs->configured)
+        return false;
+
+    return fs->width != st->plane.capt.width || fs->height != st->plane.capt.height;
+}
+
 /* Fill the per-channel display attr MI wants from a tracked region. */
 static void i6c_osd_fill_chn(const infinity6c_osd_region_t *r, i6c_rgn_chn *chn)
 {
@@ -257,6 +287,17 @@ static int i6c_osd_try_attach(infinity6c_state_t *st, int handle, infinity6c_osd
     if (!i6c_osd_scl_port(st, r->grp, &port))
         return RSS_OK; /* Deferred, not failed. */
 
+    if (!i6c_osd_port_scales(st, port.port)) {
+        if (!st->osd_noscale_warned) {
+            HAL_LOG_WARN("osd: stream on SCL port %u runs at the full sensor frame (%ux%u) and "
+                         "does not scale, so it cannot carry an overlay -- ask for any smaller "
+                         "size to get one",
+                         port.port, st->plane.capt.width, st->plane.capt.height);
+            st->osd_noscale_warned = true;
+        }
+        return RSS_OK;
+    }
+
     i6c_osd_fill_chn(r, &chn);
 
     ret = st->rgn.fnAttachChannel(I6C_SOC_ID, (unsigned int)handle, &port, &chn);
@@ -333,9 +374,9 @@ static int i6c_osd_create_mi(infinity6c_state_t *st, int handle, infinity6c_osd_
 
 /*
  * Attach every region whose group is this VENC channel. Called from
- * i6c_bind_scl_to_venc once the channel exists. Failures are logged and not
- * propagated: a region that will not attach costs an overlay, and taking the
- * stream down over it would be worse than the missing text.
+ * i6c_bind_scl_to_venc with the SCL port enabled and not yet bound. Failures are
+ * logged and not propagated: a region that will not attach costs an overlay, and
+ * taking the stream down over it would be worse than the missing text.
  */
 void i6c_osd_flush_pending(infinity6c_state_t *st, int chn)
 {

@@ -470,9 +470,13 @@ int i6c_bind_scl_to_venc(infinity6c_state_t *st, int port, int chn, unsigned int
         HAL_LOG_DBG("infinity6c: venc chn %d cascaded off main chn %d, ring at %u fps", chn,
                     main_chn, dst_fps ? dst_fps : st->fps);
 
-        /* The channel exists now, so any OSD region rvd registered on it before
-         * the bind can attach. A no-op when OSD is off. */
-        i6c_osd_flush_pending(st, chn);
+        /*
+         * No OSD attach on a cascaded channel. Its frames come from the main
+         * encoder's ring, downstream of the SCL port the overlay would live on,
+         * so the region would cost a scaler port that nothing here encodes and
+         * still not appear in this stream. A cascaded stream carries whatever
+         * overlay the main one has.
+         */
         return RSS_OK;
     }
 
@@ -504,6 +508,15 @@ int i6c_bind_scl_to_venc(infinity6c_state_t *st, int port, int chn, unsigned int
      */
     if (enc->uses_ring && (ret = i6c_fs_enable_port(st, port)) != RSS_OK)
         return ret;
+
+    /*
+     * OSD regions attach while the SCL port is configured and enabled but not yet
+     * bound, and before StartRecvPic spawns the encoder kthread -- the point both
+     * i6c references attach at. The kernel RGN driver builds its singlethread
+     * workqueue on the task that first calls into it, which is this one, the same
+     * thread that brings the pipeline up.
+     */
+    i6c_osd_flush_pending(st, chn);
 
     /*
      * The encoder must already be receiving when the bind connects it: the vendor
@@ -539,10 +552,6 @@ int i6c_bind_scl_to_venc(infinity6c_state_t *st, int port, int chn, unsigned int
     HAL_LOG_DBG("infinity6c: SCL port %d -> venc dev %u chn %d bound, %s at %u fps", port,
                 enc->device, chn, link == I6C_SYS_LINK_RING ? "ring" : "frame-base",
                 dst_fps ? dst_fps : st->fps);
-
-    /* The channel exists now, so any OSD region rvd registered on it before the
-     * bind can attach. A no-op when OSD is off. */
-    i6c_osd_flush_pending(st, chn);
 
     return RSS_OK;
 }
