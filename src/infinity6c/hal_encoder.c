@@ -384,11 +384,13 @@ static void i6c_enc_fill_nals(infinity6c_venc_chn_t *enc, rss_frame_t *frame)
  * streams while its frames come from one of their ports. Deriving the port from
  * the channel there binds a port nothing configured.
  *
- * The link type is the other half of the argument list that matters. H.26x is
- * bound through a ring so the encoder can start on a partial frame, which is
- * where this generation's low latency comes from; JPEG is bound frame-by-frame
- * because its engine has no such mode. Getting this backwards costs latency on
- * one path and fails outright on the other.
+ * The link type is the other half of the argument list that matters, and it is
+ * the channel's own uses_ring that decides it, not the codec. The one H.26x
+ * channel that holds the engine's ring is bound through it so the encoder can
+ * start on a partial frame, which is where this generation's low latency comes
+ * from. A second H.26x channel and every JPEG channel are bound frame-by-frame:
+ * the SCL channel drives one ring consumer at a time, so a second ring bind is
+ * refused outright, and JPEG has no ring mode to begin with.
  *
  * dst_fps is what the destination is asked to consume, and zero means "the same
  * rate the pipeline runs at". A JPEG channel passes its own much lower rate so
@@ -419,7 +421,7 @@ int i6c_bind_scl_to_venc(infinity6c_state_t *st, int port, int chn, unsigned int
     dst.channel = (unsigned int)chn;
     dst.port = 0;
 
-    link = enc->device == I6C_VENC_DEV_MJPG_0 ? I6C_SYS_LINK_FRAMEBASE : I6C_SYS_LINK_RING;
+    link = enc->uses_ring ? I6C_SYS_LINK_RING : I6C_SYS_LINK_FRAMEBASE;
 
     ret = st->sys.bind_ext(I6C_SOC_ID, &src, &dst, st->fps, dst_fps ? dst_fps : st->fps, link, 0);
     if (ret) {
@@ -807,17 +809,26 @@ int hal_enc_create_channel(void *ctx, int chn, const rss_video_config_t *cfg)
     enc->cfg = *cfg;
 
     /*
-     * Ring DMA on the H.26x device only. It is what pairs with the ring bind, and
-     * the JPEG engine rejects it.
+     * The first H.26x channel on an engine takes the SCL ring; a later one reads
+     * frames from DRAM instead, because the SCL channel drives one ring consumer
+     * at a time and a second ring bind is refused. JPEG is always frame-based and
+     * never takes the ring. Only the ring channel gets the ring-DMA input config;
+     * a frame channel stays in MI's default frame input. See i6c_bind_scl_to_venc.
      */
-    if (device == I6C_VENC_DEV_H26X_0) {
-        i6c_venc_src_conf src = I6C_VENC_SRC_CONF_RING_DMA;
-        int mi;
+    {
+        int slot = i6c_enc_pool_slot(device);
 
-        if ((mi = st->venc.set_src_conf(device, (unsigned int)chn, &src)) != 0) {
-            HAL_LOG_ERR("MI_VENC_SetInputSourceConfig(chn %d) failed: %d", chn, mi);
-            ret = RSS_ERR_IO;
-            goto fail;
+        enc->uses_ring = device != I6C_VENC_DEV_MJPG_0 && st->enc_ring_chn[slot] < 0;
+        if (enc->uses_ring) {
+            i6c_venc_src_conf src = I6C_VENC_SRC_CONF_RING_DMA;
+            int mi;
+
+            if ((mi = st->venc.set_src_conf(device, (unsigned int)chn, &src)) != 0) {
+                HAL_LOG_ERR("MI_VENC_SetInputSourceConfig(chn %d) failed: %d", chn, mi);
+                ret = RSS_ERR_IO;
+                goto fail;
+            }
+            st->enc_ring_chn[slot] = chn;
         }
     }
 
@@ -860,6 +871,14 @@ int hal_enc_destroy_channel(void *ctx, int chn)
     i6c_enc_release_own_port(st, chn);
     i6c_unbind_scl_from_venc(st, chn);
     st->venc.destroy_chn(enc->device, (unsigned int)chn);
+
+    /* Free the engine's ring if this channel held it, so a later one can take it. */
+    {
+        int slot = i6c_enc_pool_slot(enc->device);
+
+        if (st->enc_ring_chn[slot] == chn)
+            st->enc_ring_chn[slot] = -1;
+    }
 
     free(enc->heap_packs);
     memset(enc, 0, sizeof(*enc));
@@ -1241,6 +1260,7 @@ void i6c_teardown_all(infinity6c_state_t *st)
         static const unsigned int devs[I6C_VENC_DEV_SLOTS] = {I6C_VENC_DEV_H26X_0,
                                                               I6C_VENC_DEV_MJPG_0};
         for (i = 0; i < I6C_VENC_DEV_SLOTS; i++) {
+            st->enc_ring_chn[i] = -1;
             if (!st->enc_dev_up[i])
                 continue;
             st->venc.destroy_dev(devs[i]);

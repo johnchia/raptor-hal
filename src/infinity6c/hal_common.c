@@ -181,6 +181,8 @@ static int hal_init(void *ctx, const rss_multi_sensor_config_t *cfg)
         st->enc[i].src_port = -1;
         st->enc[i].fd = -1;
     }
+    for (int i = 0; i < I6C_VENC_DEV_SLOTS; i++)
+        st->enc_ring_chn[i] = -1;
 
     if ((ret = i6c_sys_load(&st->sys)) != RSS_OK) {
         i6c_unload_all(st);

@@ -125,6 +125,15 @@ typedef struct {
     bool bound;
 
     /*
+     * Whether this channel is fed by the low-latency ring or by a frame handed
+     * through DRAM. The SCL channel's realtime/ring datapath carries one consumer
+     * at a time, so the first H.26x channel on a codec engine takes the ring and
+     * any later one reads frames instead -- which is what lets a main and a sub
+     * stream coexist. JPEG is always frame-based. See i6c_bind_scl_to_venc.
+     */
+    bool uses_ring;
+
+    /*
      * Set when this channel brought up an SCL output port of its own rather than
      * being handed one by rvd's bind chain -- a JPEG snapshot channel, which rvd
      * feeds by group membership instead. Only such a channel releases its port
@@ -239,6 +248,14 @@ typedef struct {
      * up, and teardown takes it down once its channels are gone.
      */
     bool enc_dev_up[I6C_VENC_DEV_SLOTS];
+
+    /*
+     * Which encoder channel holds each engine's SCL ring, -1 when none does. The
+     * SCL channel feeds one ring consumer at a time, so the first H.26x channel on
+     * an engine claims it and later ones bind frame-based off DRAM. Indexed like
+     * the pools above.
+     */
+    int enc_ring_chn[I6C_VENC_DEV_SLOTS];
 
     infinity6c_fs_chn_t fs[I6C_MAX_CHN];
     infinity6c_venc_chn_t enc[I6C_MAX_CHN];
