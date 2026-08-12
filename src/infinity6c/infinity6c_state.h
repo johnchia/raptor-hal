@@ -358,8 +358,6 @@ typedef struct {
     bool rgn_fmt_known;
     i6c_rgn_pixfmt rgn_fmt;
     bool osd_grp[I6C_MAX_CHN];
-    /* One warning per run for a stream whose port cannot carry an overlay. */
-    bool osd_noscale_warned;
     infinity6c_osd_region_t osd[I6C_OSD_REGION_MAX];
 
     infinity6c_fs_chn_t fs[I6C_MAX_CHN];

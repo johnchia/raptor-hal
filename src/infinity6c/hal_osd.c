@@ -120,36 +120,6 @@ static bool i6c_osd_scl_port(infinity6c_state_t *st, int grp, i6c_sys_bind *port
     return true;
 }
 
-/*
- * Whether an SCL output port scales, which is what decides if it can carry an
- * overlay at all.
- *
- * A port whose output matches the ISP frame it is fed does no scaling, and the
- * driver runs it as a pass-through with no output buffer of its own. MI_RGN has
- * nothing to blend into there: the attach still *succeeds*, and then the port
- * stops draining, VIF parks in MI_SYS_InferGraph_EnsureInputPortFifoEmpty and
- * every stream on the device stalls -- not just the one that asked for the
- * overlay. Since the failure is silent and total, the port has to be checked
- * here rather than trusted to refuse.
- *
- * Any real scale factor is enough; a stream 16 pixels short of the sensor in one
- * axis overlays correctly. Callers that want an overlay on a full-sensor stream
- * have to give up the last few pixels to get one.
- */
-static bool i6c_osd_port_scales(infinity6c_state_t *st, unsigned int port)
-{
-    const infinity6c_fs_chn_t *fs;
-
-    if (port >= I6C_MAX_CHN)
-        return false;
-
-    fs = &st->fs[port];
-    if (!fs->configured)
-        return false;
-
-    return fs->width != st->plane.capt.width || fs->height != st->plane.capt.height;
-}
-
 /* Fill the per-channel display attr MI wants from a tracked region. */
 static void i6c_osd_fill_chn(const infinity6c_osd_region_t *r, i6c_rgn_chn *chn)
 {
@@ -187,13 +157,23 @@ static void i6c_osd_fill_chn(const infinity6c_osd_region_t *r, i6c_rgn_chn *chn)
  *
  * Same rationale as i6e: the accepted set is decided in mi_rgn.ko and cannot be
  * known statically, so probe by creating and destroying a 2x2 region,
- * cheapest-conversion-first (ARGB8888 is a straight copy of rvd's BGRA, then
- * ARGB4444, then ARGB1555). RSS_OSD_PIXFMT narrows the list for bring-up.
+ * cheapest-conversion-first. RSS_OSD_PIXFMT narrows the list for bring-up.
+ *
+ * ARGB8888 is not a candidate on this part, even though it is the one format that
+ * needs no conversion from rvd's BGRA. The RGN chapter of the vendor
+ * documentation gives a per-chip table of formats each overlay path accepts, and
+ * for this one (Maruko) every path -- SCL0-3, VENC0, JPE0, DISP0 -- lists
+ * ARGB1555, ARGB4444, I2, I4 and I8 as supported and ARGB8888 and RGB565 as not.
+ * The probe cannot discover that: MI_RGN_Create *accepts* an ARGB8888 region, and
+ * the format only fails later, in the blend. It fails by hanging rather than by
+ * complaining -- the attached port stops draining, VIF parks in
+ * MI_SYS_InferGraph_EnsureInputPortFifoEmpty, and every stream on the device
+ * stalls -- and it does so only at some frame sizes, which makes an unsupported
+ * format look like a resolution limit.
  */
 static int i6c_osd_probe_pixfmt(infinity6c_state_t *st)
 {
-    static const i6c_rgn_pixfmt tries[] = {I6C_RGN_PIXFMT_ARGB8888, I6C_RGN_PIXFMT_ARGB4444,
-                                           I6C_RGN_PIXFMT_ARGB1555};
+    static const i6c_rgn_pixfmt tries[] = {I6C_RGN_PIXFMT_ARGB4444, I6C_RGN_PIXFMT_ARGB1555};
     const unsigned int probe_handle = I6C_OSD_REGION_MAX;
     const char *want = getenv("RSS_OSD_PIXFMT");
     unsigned int i;
@@ -286,17 +266,6 @@ static int i6c_osd_try_attach(infinity6c_state_t *st, int handle, infinity6c_osd
         return RSS_OK;
     if (!i6c_osd_scl_port(st, r->grp, &port))
         return RSS_OK; /* Deferred, not failed. */
-
-    if (!i6c_osd_port_scales(st, port.port)) {
-        if (!st->osd_noscale_warned) {
-            HAL_LOG_WARN("osd: stream on SCL port %u runs at the full sensor frame (%ux%u) and "
-                         "does not scale, so it cannot carry an overlay -- ask for any smaller "
-                         "size to get one",
-                         port.port, st->plane.capt.width, st->plane.capt.height);
-            st->osd_noscale_warned = true;
-        }
-        return RSS_OK;
-    }
 
     i6c_osd_fill_chn(r, &chn);
 
@@ -704,8 +673,10 @@ int hal_osd_set_region_attr(void *ctx, int handle, const rss_osd_region_t *attr)
  * BGRA8888 from rvd -> whatever MI accepted.
  *
  * rvd's "BGRA, width*height*4" is byte order in memory, so as a little-endian
- * 32-bit word each pixel is already 0xAARRGGBB -- MI's ARGB8888. That is why the
- * 8888 path is a copy and 8888 is probed first.
+ * 32-bit word each pixel is already 0xAARRGGBB -- MI's ARGB8888, which is why
+ * that case is a plain copy. No overlay path on this part accepts ARGB8888
+ * though (see i6c_osd_probe_pixfmt), so the formats actually reached here are the
+ * 16-bit two.
  */
 static void i6c_osd_convert(const uint8_t *src, void *dst, int pixels, i6c_rgn_pixfmt fmt)
 {
