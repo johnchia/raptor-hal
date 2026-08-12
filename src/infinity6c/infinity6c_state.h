@@ -25,6 +25,7 @@
 #include "hal_internal.h"
 
 #include "i6c_isp_load.h"
+#include "i6c_rgn_load.h"
 #include "i6c_scl_load.h"
 #include "i6c_snr_load.h"
 #include "i6c_sys_load.h"
@@ -86,6 +87,14 @@
  * ceiling on simultaneous streams, whatever VENC would accept.
  */
 #define I6C_MAX_CHN 4
+
+/*
+ * OSD regions across all streams. MI_RGN handles are global -- a region is
+ * created once and attached to whichever VENC channel shows it -- so this is a
+ * flat pool, not per channel. Sixteen is what the i6e backend carries and more
+ * than rvd asks for (a timestamp plus a handful of user elements per stream).
+ */
+#define I6C_OSD_REGION_MAX 16
 
 /*
  * Packs per frame handled without allocating. One frame arrives as several
@@ -216,6 +225,40 @@ typedef struct {
     rss_video_config_t cfg;
 } infinity6c_venc_chn_t;
 
+/*
+ * One OSD region. MI owns the pixel memory (allocated at create), so this holds
+ * only the geometry and display attrs raptor tracks plus the converted bitmap
+ * staging buffer. `grp` is the VENC channel the region shows on, -1 when
+ * unregistered; `attached` is whether MI_RGN_AttachToChn has run, which is
+ * deferred until that channel exists (see i6c_osd_flush_pending). Mirrors
+ * star_osd_region_t.
+ */
+typedef struct {
+    bool used;
+    rss_osd_type_t type;
+
+    int x;
+    int y;
+    int width;
+    int height;
+    int layer;
+
+    bool global_alpha_en;
+    unsigned char fg_alpha;
+    unsigned char bg_alpha;
+    unsigned int cover_color;
+
+    int grp;
+    bool attached;
+    bool show;
+
+    /* Converted bitmap handed to MI_RGN_SetBitMap, kept per region so a
+     * per-frame update reuses it; resized only on a geometry change. */
+    void *bmp;
+    size_t bmp_size;
+    bool bmp_logged;
+} infinity6c_osd_region_t;
+
 /* ================================================================
  * BACKEND STATE
  * ================================================================ */
@@ -227,6 +270,7 @@ typedef struct {
     i6c_isp_api isp;
     i6c_scl_api scl;
     i6c_venc_api venc;
+    i6c_rgn_api rgn;
 
     bool sys_inited; /* MI_SYS_Init succeeded, so MI_SYS_Exit is owed */
 
@@ -302,6 +346,20 @@ typedef struct {
     char iq_file[128];
     char iq_load_started;
 
+    /*
+     * OSD over MI_RGN. Brought up on the first region rather than at init, since
+     * a stream with [osd] disabled never loads the library. rgn_fmt is the pixel
+     * format the driver accepted at first create -- not knowable statically (the
+     * accepted set is decided in mi_rgn.ko), so it is probed once. osd_grp[c] is
+     * whether rvd created an OSD group on VENC channel c.
+     */
+    bool rgn_loaded;
+    bool rgn_inited;
+    bool rgn_fmt_known;
+    i6c_rgn_pixfmt rgn_fmt;
+    bool osd_grp[I6C_MAX_CHN];
+    infinity6c_osd_region_t osd[I6C_OSD_REGION_MAX];
+
     infinity6c_fs_chn_t fs[I6C_MAX_CHN];
     infinity6c_venc_chn_t enc[I6C_MAX_CHN];
 } infinity6c_state_t;
@@ -367,6 +425,22 @@ void i6c_isp_note_frame(infinity6c_state_t *st);
  */
 int i6c_bind_scl_to_venc(infinity6c_state_t *st, int port, int chn, unsigned int dst_fps);
 int i6c_unbind_scl_from_venc(infinity6c_state_t *st, int chn);
+
+/*
+ * Attach every registered region whose group is this VENC channel (hal_osd.c).
+ * Called from i6c_bind_scl_to_venc once the channel exists, which is the first
+ * moment MI_RGN_AttachToChn can succeed; rvd creates and registers its regions
+ * before it binds the chain, so the attach is deferred to here. A no-op when OSD
+ * was never brought up.
+ */
+void i6c_osd_flush_pending(infinity6c_state_t *st, int chn);
+
+/*
+ * Detach, destroy and free every region, then MI_RGN_DeInit (hal_osd.c). Called
+ * at the head of i6c_teardown_all, before the VENC channels a region is attached
+ * to are destroyed.
+ */
+void i6c_osd_release_all(infinity6c_state_t *st);
 
 /* Release every channel's MI object, in dependency order (hal_common.c). */
 void i6c_teardown_all(infinity6c_state_t *st);

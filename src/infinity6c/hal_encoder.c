@@ -469,6 +469,10 @@ int i6c_bind_scl_to_venc(infinity6c_state_t *st, int port, int chn, unsigned int
 
         HAL_LOG_DBG("infinity6c: venc chn %d cascaded off main chn %d, ring at %u fps", chn,
                     main_chn, dst_fps ? dst_fps : st->fps);
+
+        /* The channel exists now, so any OSD region rvd registered on it before
+         * the bind can attach. A no-op when OSD is off. */
+        i6c_osd_flush_pending(st, chn);
         return RSS_OK;
     }
 
@@ -535,6 +539,10 @@ int i6c_bind_scl_to_venc(infinity6c_state_t *st, int port, int chn, unsigned int
     HAL_LOG_DBG("infinity6c: SCL port %d -> venc dev %u chn %d bound, %s at %u fps", port,
                 enc->device, chn, link == I6C_SYS_LINK_RING ? "ring" : "frame-base",
                 dst_fps ? dst_fps : st->fps);
+
+    /* The channel exists now, so any OSD region rvd registered on it before the
+     * bind can attach. A no-op when OSD is off. */
+    i6c_osd_flush_pending(st, chn);
 
     return RSS_OK;
 }
@@ -1359,6 +1367,13 @@ void i6c_teardown_all(infinity6c_state_t *st)
 {
     bool drained = false;
     int i;
+
+    /*
+     * OSD first of all: a region is attached to a VENC channel, and detaching it
+     * after that channel is destroyed would reference an object that no longer
+     * exists. i6c_osd_release_all detaches, destroys and deinits RGN.
+     */
+    i6c_osd_release_all(st);
 
     /*
      * Stop the producers first. Every SCL output port is disabled and given a

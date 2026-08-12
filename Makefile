@@ -159,13 +159,13 @@ endif
 HAL_COMMON_SRC := $(BACKEND_DIR)/hal_common.c
 
 ifeq ($(PLATFORM),INFINITY6C)
-# The capture and encode path, in datapath order, then the ISP tuning ops. No
-# OSD and no audio yet: RGN and the audio modules are the next generation's
-# equivalents of star/hal_osd.c and star/hal_audio.c and have not been ported.
-# hal_gpio is vendor-neutral.
+# The capture and encode path, in datapath order, then OSD and the ISP tuning
+# ops. Audio is not ported yet: the MI 3.0 AI module is the next generation's
+# equivalent of star/hal_audio.c. hal_gpio is vendor-neutral.
 VIDEO_SRCS := $(BACKEND_DIR)/hal_framesource.c \
               $(BACKEND_DIR)/hal_encoder.c \
               $(BACKEND_DIR)/hal_isp.c \
+              $(BACKEND_DIR)/hal_osd.c \
               src/hal_gpio.c
 
 AUDIO_SRCS :=

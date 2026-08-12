@@ -121,6 +121,21 @@ int hal_enc_query(void *ctx, int chn, bool *busy);
 
 int hal_isp_get_exposure(void *ctx, rss_exposure_t *exposure);
 int hal_isp_get_sensor_attr(void *ctx, uint32_t *width, uint32_t *height);
+
+/* ── OSD: MI_RGN (infinity6c/hal_osd.c) ── */
+
+int hal_osd_set_pool_size(void *ctx, uint32_t bytes);
+int hal_osd_create_group(void *ctx, int grp);
+int hal_osd_destroy_group(void *ctx, int grp);
+int hal_osd_start(void *ctx, int grp);
+int hal_osd_stop(void *ctx, int grp);
+int hal_osd_create_region(void *ctx, int *handle, const rss_osd_region_t *attr);
+int hal_osd_destroy_region(void *ctx, int handle);
+int hal_osd_register_region(void *ctx, int handle, int grp);
+int hal_osd_unregister_region(void *ctx, int handle, int grp);
+int hal_osd_set_region_attr(void *ctx, int handle, const rss_osd_region_t *attr);
+int hal_osd_update_region_data(void *ctx, int handle, const uint8_t *data);
+int hal_osd_show_region(void *ctx, int handle, int grp, int show, int layer);
 #endif
 
 /* ================================================================
@@ -568,6 +583,24 @@ static const rss_hal_ops_t g_ops = {
 
     .isp_get_exposure = hal_isp_get_exposure,
     .isp_get_sensor_attr = hal_isp_get_sensor_attr,
+
+    /*
+     * OSD over MI_RGN. Regions attach to the VENC channel (see hal_osd.c), so a
+     * main and its cascaded sub get independent overlays. The get/timestamp/
+     * attach-to-group ops rvd never calls are left NULL -> RSS_ERR_NOTSUP.
+     */
+    .osd_set_pool_size = hal_osd_set_pool_size,
+    .osd_create_group = hal_osd_create_group,
+    .osd_destroy_group = hal_osd_destroy_group,
+    .osd_start = hal_osd_start,
+    .osd_stop = hal_osd_stop,
+    .osd_create_region = hal_osd_create_region,
+    .osd_destroy_region = hal_osd_destroy_region,
+    .osd_register_region = hal_osd_register_region,
+    .osd_unregister_region = hal_osd_unregister_region,
+    .osd_set_region_attr = hal_osd_set_region_attr,
+    .osd_update_region_data = hal_osd_update_region_data,
+    .osd_show_region = hal_osd_show_region,
 #endif
 };
 
