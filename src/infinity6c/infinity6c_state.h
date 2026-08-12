@@ -288,6 +288,13 @@ int i6c_pipeline_create(infinity6c_state_t *st, const rss_fs_config_t *cfg);
 void i6c_pipeline_destroy(infinity6c_state_t *st);
 
 /*
+ * Buffer one stage's output port (hal_framesource.c). Best-effort against the
+ * zero-depth default that makes the chain drop frames under jitter.
+ */
+void i6c_set_output_depth(infinity6c_state_t *st, i6c_sys_mod mod, unsigned int dev,
+                          unsigned int chn, unsigned int port, unsigned int user, unsigned int buf);
+
+/*
  * SCL output ports for a consumer that is not a raptor framesource channel --
  * a JPEG snapshot channel, which rvd never creates a framesource for.
  * (hal_framesource.c)

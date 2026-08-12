@@ -450,6 +450,34 @@ static int i6c_link(infinity6c_state_t *st, i6c_sys_mod src_mod, unsigned int sr
 }
 
 /*
+ * i6c_set_output_depth -- give a stage's output port a short buffer queue.
+ *
+ * Every MI output port defaults to zero buffering, so a moment's jitter between a
+ * producer and its consumer drops the frame rather than holding it -- which on
+ * this chain shows up as ISP output rewinds and a frame rate far below the
+ * sensor's. A shallow queue absorbs the jitter. Best-effort: a port that refuses
+ * a depth still runs, just without the slack, so the failure is logged and not
+ * fatal. Depths follow the working i6c reference -- VIF (0,4), the stages below
+ * it (1,3).
+ */
+void i6c_set_output_depth(infinity6c_state_t *st, i6c_sys_mod mod, unsigned int dev,
+                          unsigned int chn, unsigned int port, unsigned int user, unsigned int buf)
+{
+    i6c_sys_bind p;
+    int ret;
+
+    memset(&p, 0, sizeof(p));
+    p.module = mod;
+    p.device = dev;
+    p.channel = chn;
+    p.port = port;
+
+    if ((ret = st->sys.set_output_depth(I6C_SOC_ID, &p, user, buf)) != 0)
+        HAL_LOG_WARN("infinity6c: SetChnOutputPortDepth(mod %d dev %u chn %u port %u) = %d",
+                     (int)mod, dev, chn, port, ret);
+}
+
+/*
  * i6c_pipeline_create -- everything from the sensor to the scaler.
  *
  * Reference counted rather than tied to hal_init, because the chain is shared:
@@ -507,6 +535,10 @@ int i6c_pipeline_create(infinity6c_state_t *st, const rss_fs_config_t *cfg)
     if ((ret = i6c_link(st, I6C_SYS_MOD_ISP, I6C_ISP_DEV, I6C_ISP_CHN, I6C_ISP_PORT,
                         I6C_SYS_MOD_SCL, I6C_SCL_DEV, I6C_SCL_CHN, 0)) != RSS_OK)
         goto fail_vif_isp_link;
+
+    /* Buffer the pipeline-global ports now that both are bound. */
+    i6c_set_output_depth(st, I6C_SYS_MOD_VIF, I6C_VIF_DEV, I6C_VIF_PORT, 0, 0, 4);
+    i6c_set_output_depth(st, I6C_SYS_MOD_ISP, I6C_ISP_DEV, I6C_ISP_CHN, I6C_ISP_PORT, 1, 3);
 
     st->pipeline_up = true;
     st->pipeline_refs = 1;
@@ -809,6 +841,9 @@ int i6c_fs_enable_port(infinity6c_state_t *st, int port)
         return RSS_ERR_IO;
     }
     st->fs[port].enabled = true;
+
+    /* A shallow queue on the port now that it is producing. */
+    i6c_set_output_depth(st, I6C_SYS_MOD_SCL, I6C_SCL_DEV, I6C_SCL_CHN, (unsigned int)port, 1, 3);
 
     return RSS_OK;
 }

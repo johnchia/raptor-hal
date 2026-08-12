@@ -440,6 +440,9 @@ int i6c_bind_scl_to_venc(infinity6c_state_t *st, int port, int chn, unsigned int
     enc->bound = true;
     enc->src_port = port;
 
+    /* A shallow queue on the encoder's output for the packetiser to drain. */
+    i6c_set_output_depth(st, I6C_SYS_MOD_VENC, enc->device, (unsigned int)chn, 0, 1, 3);
+
     HAL_LOG_DBG("infinity6c: SCL port %d -> venc dev %u chn %d bound, %s at %u fps", port,
                 enc->device, chn, link == I6C_SYS_LINK_RING ? "ring" : "frame-base",
                 dst_fps ? dst_fps : st->fps);
