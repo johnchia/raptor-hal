@@ -40,6 +40,13 @@ typedef struct {
     int (*get_cur_res)(unsigned int pad, unsigned char *index, i6c_snr_res *res);
 
     int (*set_fps)(unsigned int pad, unsigned int fps);
+    /*
+     * The rate in force, which is not always the rate that was asked for: the
+     * driver clamps a request to what the selected mode supports. The argument is
+     * read on the way in as well as written on the way out -- the wrapper copies
+     * it into the ioctl payload before the call -- so clear it first.
+     */
+    int (*get_fps)(unsigned int pad, unsigned int *fps);
     int (*set_orien)(unsigned int pad, unsigned char mirror, unsigned char flip);
 
     /*
@@ -87,6 +94,10 @@ static inline int i6c_snr_load(i6c_snr_api *snr)
 
     if (!(snr->set_fps = (int (*)(unsigned int, unsigned int))hal_symbol_load("i6c_snr", snr->lib,
                                                                               "MI_SNR_SetFps")))
+        return RSS_ERR_NOTSUP;
+
+    if (!(snr->get_fps = (int (*)(unsigned int, unsigned int *))hal_symbol_load("i6c_snr", snr->lib,
+                                                                                "MI_SNR_GetFps")))
         return RSS_ERR_NOTSUP;
 
     if (!(snr->set_orien = (int (*)(unsigned int, unsigned char, unsigned char))hal_symbol_load(

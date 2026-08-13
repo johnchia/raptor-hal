@@ -89,7 +89,23 @@ else
 	@echo "abi-check: IQ table matches the vendor headers"
 endif
 
+# The same check for Infinity6C, against its own SDK and its own ISP header
+# set. Separate because MI 3.0's tuning calls take a leading device argument
+# and because two of the modules moved -- see abi_iq_i6c.c. SIGMASTAR_SDK
+# points at an SSC377-generation release/include here, not Infinity6E's.
+ABI_I6C_CFLAGS = -Wall -Wextra -std=c11 -DPLATFORM_INFINITY6C=1 \
+		 -I$(SIGMASTAR_HEADERS)/infinity6c \
+		 -I$(SIGMASTAR_SDK)
+
+abi-check-i6c:
+ifeq ($(SIGMASTAR_SDK),)
+	@echo "abi-check-i6c: skipped, set SIGMASTAR_SDK=/path/to/project/release/include"
+else
+	$(ABI_CC) $(ABI_I6C_CFLAGS) -c -o /dev/null abi_iq_i6c.c
+	@echo "abi-check-i6c: IQ table matches the vendor headers"
+endif
+
 clean:
 	rm -f $(BINS)
 
-.PHONY: test clean abi-check $(addprefix test-,$(SUITES))
+.PHONY: test clean abi-check abi-check-i6c $(addprefix test-,$(SUITES))

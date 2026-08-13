@@ -44,6 +44,14 @@ typedef struct {
     int (*create_chn)(unsigned int device, unsigned int channel, i6c_isp_chn *config);
     int (*destroy_chn)(unsigned int device, unsigned int channel);
     int (*set_chn_param)(unsigned int device, unsigned int channel, i6c_isp_para *config);
+    /*
+     * Read the channel parameters back, which is how orientation and the 3DNR
+     * level are changed at runtime: the block is set whole, so a blind write
+     * would put this file's idea of every other field over the SDK's. The SDK
+     * also clamps what it is given (the 3DNR level to the per-chip maximum), so
+     * the value read back is the one in force rather than the one asked for.
+     */
+    int (*get_chn_param)(unsigned int device, unsigned int channel, i6c_isp_para *config);
     int (*start_chn)(unsigned int device, unsigned int channel);
     int (*stop_chn)(unsigned int device, unsigned int channel);
 
@@ -62,8 +70,19 @@ typedef struct {
      */
     int (*load_bin)(unsigned int device, unsigned int channel, char *path, unsigned int key);
 
-    /* Day/night without touching the sensor, for a mono night mode. Uncalled. */
-    int (*set_color_to_gray)(unsigned int device, unsigned int channel, char *enable);
+    /*
+     * The tuning API, reached generically. MI_ISP_IQ_* and MI_ISP_AE_* are all
+     * one wrapper shape -- a descriptor naming a payload length and an api id,
+     * handed to MI_ISP_GENERAL_{Set,Get}IspApiData -- so a module is a name and
+     * two numbers rather than a typed entry point, and hal_isp.c resolves the
+     * names it needs from its own table through this handle. There is nothing to
+     * bind here beyond the library.
+     *
+     * That is also why MI_ISP_IQ_SetColorToGray has no dedicated pointer: the
+     * mono night mode reaches it as a table row like any other module. Its own
+     * argument is a four-byte enum, not the byte the name suggests, which is a
+     * good reason to have exactly one way in.
+     */
 
     /*
      * CUS3A live 3A status, MI 3.0. Optional: the capture path does not use
@@ -133,6 +152,10 @@ static inline int i6c_isp_load(i6c_isp_api *isp)
               "i6c_isp", isp->lib, "MI_ISP_SetChnParam")))
         return RSS_ERR_NOTSUP;
 
+    if (!(isp->get_chn_param = (int (*)(unsigned int, unsigned int, i6c_isp_para *))hal_symbol_load(
+              "i6c_isp", isp->lib, "MI_ISP_GetChnParam")))
+        return RSS_ERR_NOTSUP;
+
     if (!(isp->start_chn = (int (*)(unsigned int, unsigned int))hal_symbol_load(
               "i6c_isp", isp->lib, "MI_ISP_StartChannel")))
         return RSS_ERR_NOTSUP;
@@ -155,10 +178,6 @@ static inline int i6c_isp_load(i6c_isp_api *isp)
 
     if (!(isp->load_bin = (int (*)(unsigned int, unsigned int, char *, unsigned int))
               hal_symbol_load("i6c_isp", isp->lib, "MI_ISP_ApiCmdLoadBinFile")))
-        return RSS_ERR_NOTSUP;
-
-    if (!(isp->set_color_to_gray = (int (*)(unsigned int, unsigned int, char *))hal_symbol_load(
-              "i6c_isp", isp->lib, "MI_ISP_IQ_SetColorToGray")))
         return RSS_ERR_NOTSUP;
 
     isp->ae_status = (int (*)(unsigned int, unsigned int, i6c_cus_ae_info *))dlsym(

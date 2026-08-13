@@ -414,6 +414,14 @@ void i6c_isp_note_frame(infinity6c_state_t *st)
     }
 
     i6c_isp_arm_3a(st);
+
+    /*
+     * Last, and the order is the point: every tuning value rvd asked for during
+     * pipeline setup has been held until now, because the load above and CUS3A's
+     * AE init both write over the API store. This is the first moment a write
+     * survives.
+     */
+    i6c_isp_flush_knobs(st);
 }
 
 static int i6c_isp_bringup(infinity6c_state_t *st)
@@ -450,9 +458,17 @@ static int i6c_isp_bringup(infinity6c_state_t *st)
      */
     memset(&param, 0, sizeof(param));
     param.hdr = I6C_HDR_OFF;
-    param.level3DNR = 1;
-    param.mirror = 0;
-    param.flip = 0;
+    /*
+     * Orientation and the 3DNR level as raptor asked for them, which is why they
+     * are read out of the state rather than written as constants: rvd applies its
+     * whole [image] block during pipeline setup, before this channel exists, so
+     * hal_isp.c holds the request and this is where it lands. Rotation stays zero
+     * -- that is the scaler's, in hal_fs_set_rotation, where it can change output
+     * geometry.
+     */
+    param.level3DNR = st->isp_nr3d_req;
+    param.mirror = (char)(st->isp_mirror_req ? 1 : 0);
+    param.flip = (char)(st->isp_flip_req ? 1 : 0);
     param.rotate = 0;
     /* A sensor already sending YUV needs the demosaic run backwards. */
     param.yuv2BayerOn = st->plane.bayer >= I6C_BAYER_END;
@@ -618,7 +634,15 @@ int i6c_pipeline_create(infinity6c_state_t *st, const rss_fs_config_t *cfg)
         return RSS_OK;
     }
 
-    fps = cfg->fps_den ? cfg->fps_num / cfg->fps_den : cfg->fps_num;
+    /*
+     * A rate asked for through isp_set_sensor_fps outranks the stream's, because
+     * it names the sensor specifically where cfg names the stream: rvd sets the
+     * sensor rate first and then creates a channel whose encoder rate may be a
+     * division of it.
+     */
+    fps = st->snr_fps_req;
+    if (!fps)
+        fps = cfg->fps_den ? cfg->fps_num / cfg->fps_den : cfg->fps_num;
     if (!fps)
         fps = 25;
 
@@ -676,8 +700,12 @@ int i6c_pipeline_create(infinity6c_state_t *st, const rss_fs_config_t *cfg)
      * information, while no picture at all is a real result. Anyone reading a
      * bring-up log needs that distinction before they read the colour.
      */
-    HAL_LOG_INFO("infinity6c: no IQ tuning is loaded on this backend -- judge capture and "
-                 "encode, not colour or exposure");
+    if (st->iq_file[0])
+        HAL_LOG_INFO("infinity6c: %s loads on the first frame, and the image knobs with it",
+                     st->iq_file);
+    else
+        HAL_LOG_INFO("infinity6c: no IQ tuning found for this sensor -- colour and exposure are "
+                     "whatever CUS3A's defaults give, so judge capture and encode instead");
     return RSS_OK;
 
     /*
@@ -789,6 +817,13 @@ void i6c_pipeline_destroy(infinity6c_state_t *st)
 
     st->pipeline_up = false;
     st->snr_profile = -1;
+    /*
+     * The next pipeline reloads the tuning, which puts every module back to what
+     * the binary says -- so the knobs go back to being queued until it has. The
+     * queued values themselves are kept: they are what the operator asked for,
+     * and restoring them is the whole point of keeping them.
+     */
+    st->isp_knobs_live = false;
 
     HAL_LOG_INFO("infinity6c: pipeline down");
 }

@@ -122,6 +122,29 @@ int hal_enc_query(void *ctx, int chn, bool *busy);
 
 int hal_isp_get_exposure(void *ctx, rss_exposure_t *exposure);
 int hal_isp_get_sensor_attr(void *ctx, uint32_t *width, uint32_t *height);
+int hal_isp_set_brightness(void *ctx, int val);
+int hal_isp_get_brightness(void *ctx, uint8_t *val);
+int hal_isp_set_contrast(void *ctx, int val);
+int hal_isp_get_contrast(void *ctx, uint8_t *val);
+int hal_isp_set_saturation(void *ctx, int val);
+int hal_isp_get_saturation(void *ctx, uint8_t *val);
+int hal_isp_set_defog(void *ctx, int enable);
+int hal_isp_set_defog_strength(void *ctx, int val);
+int hal_isp_set_defog_strength_adv(void *ctx, const void *defog_attr);
+int hal_isp_get_defog_strength(void *ctx, uint8_t *val);
+int hal_isp_set_ae_comp(void *ctx, int val);
+int hal_isp_get_ae_comp(void *ctx, int *val);
+int hal_isp_set_antiflicker(void *ctx, rss_antiflicker_t mode);
+int hal_isp_get_antiflicker(void *ctx, rss_antiflicker_t *mode);
+int hal_isp_set_running_mode(void *ctx, rss_isp_mode_t mode);
+int hal_isp_get_running_mode(void *ctx, rss_isp_mode_t *mode);
+int hal_isp_set_hflip(void *ctx, int enable);
+int hal_isp_set_vflip(void *ctx, int enable);
+int hal_isp_get_hvflip(void *ctx, int *hflip, int *vflip);
+int hal_isp_set_temper_strength(void *ctx, int val);
+int hal_isp_get_temper_strength(void *ctx, uint8_t *val);
+int hal_isp_set_sensor_fps(void *ctx, uint32_t fps_num, uint32_t fps_den);
+int hal_isp_get_sensor_fps(void *ctx, uint32_t *fps_num, uint32_t *fps_den);
 
 /* ── OSD: MI_RGN (infinity6c/hal_osd.c) ── */
 
@@ -155,6 +178,8 @@ static void i6c_unload_all(infinity6c_state_t *st)
 #ifdef HAL_MODULE_VIDEO
     i6c_venc_unload(&st->venc);
     i6c_scl_unload(&st->scl);
+    /* Before the handle goes: the tuning table caches symbols out of it. */
+    i6c_isp_forget_knobs();
     i6c_isp_unload(&st->isp);
     i6c_vif_unload(&st->vif);
     i6c_snr_unload(&st->snr);
@@ -198,6 +223,8 @@ static int hal_init(void *ctx, const rss_multi_sensor_config_t *cfg)
      */
     st->snr_profile = -1;
     st->scl_video_port = -1;
+    /* Not the calloc'd zero either: the flip predicates are gated on 3DNR. */
+    st->isp_nr3d_req = 1;
     for (int i = 0; i < I6C_MAX_CHN; i++) {
         st->osd_src_port[i] = -1;
         st->enc[i].src_port = -1;
@@ -617,6 +644,48 @@ static const rss_hal_ops_t g_ops = {
 
     .isp_get_exposure = hal_isp_get_exposure,
     .isp_get_sensor_attr = hal_isp_get_sensor_attr,
+
+    /*
+     * ISP tuning. Three mechanisms behind one surface -- the tuning API for the
+     * image knobs, the ISP channel's parameter block for orientation and 3DNR,
+     * and MI_SNR for the sensor rate; hal_isp.c's header says which is which.
+     *
+     * What is absent is absent on purpose. Sharpness and spatial denoise are
+     * per-frequency-band arrays on this generation with no place for a single
+     * scalar, so isp_set_sharpness and isp_set_sinter_strength stay NULL rather
+     * than moving one band and calling it sharpness. Manual white balance, DRC,
+     * DPC, hue, highlight depress and backlight compensation have no counterpart
+     * bound yet. RSS_HAL_CALL answers all of them RSS_ERR_NOTSUP, which rvd
+     * treats as "this SoC does not have it" rather than as a fault.
+     */
+    .isp_set_brightness = hal_isp_set_brightness,
+    .isp_get_brightness = hal_isp_get_brightness,
+    .isp_set_contrast = hal_isp_set_contrast,
+    .isp_get_contrast = hal_isp_get_contrast,
+    .isp_set_saturation = hal_isp_set_saturation,
+    .isp_get_saturation = hal_isp_get_saturation,
+    .isp_set_defog = hal_isp_set_defog,
+    .isp_set_defog_strength = hal_isp_set_defog_strength,
+    /* The one rvd's [image] block calls; the plain setter serves the ctrl API. */
+    .isp_set_defog_strength_adv = hal_isp_set_defog_strength_adv,
+    .isp_get_defog_strength = hal_isp_get_defog_strength,
+    .isp_set_ae_comp = hal_isp_set_ae_comp,
+    .isp_get_ae_comp = hal_isp_get_ae_comp,
+    .isp_set_antiflicker = hal_isp_set_antiflicker,
+    .isp_get_antiflicker = hal_isp_get_antiflicker,
+
+    /* Day/night, which is colour or monochrome here: the IR-cut filter and the
+     * illuminator are GPIOs ric drives itself. */
+    .isp_set_running_mode = hal_isp_set_running_mode,
+    .isp_get_running_mode = hal_isp_get_running_mode,
+
+    .isp_set_hflip = hal_isp_set_hflip,
+    .isp_set_vflip = hal_isp_set_vflip,
+    .isp_get_hvflip = hal_isp_get_hvflip,
+    .isp_set_temper_strength = hal_isp_set_temper_strength,
+    .isp_get_temper_strength = hal_isp_get_temper_strength,
+    .isp_set_sensor_fps = hal_isp_set_sensor_fps,
+    .isp_get_sensor_fps = hal_isp_get_sensor_fps,
 
     /*
      * OSD over MI_RGN. Regions attach to the VENC channel (see hal_osd.c), so a

@@ -481,6 +481,38 @@ typedef struct {
     char iq_load_started;
 
     /*
+     * Clear until the first frame has been through i6c_isp_note_frame, which is
+     * the earliest moment a tuning value sticks: the IQ load and CUS3A's own AE
+     * initialisation both write over the API store, and both happen there. A knob
+     * set before this is queued in hal_isp.c's table and flushed once it is set.
+     * Cleared with the pipeline, so a hot restart re-queues.
+     */
+    bool isp_knobs_live;
+
+    /*
+     * Sensor rate asked for before the sensor existed, 0 for none. rvd sets the
+     * rate during pipeline setup, which on this backend runs before the sensor is
+     * enabled, so the request is held here and applied once it is.
+     */
+    unsigned int snr_fps_req;
+
+    /*
+     * The ISP channel's parameter block as raptor wants it: orientation and the
+     * 3DNR level. Held rather than written, for the same reason as the rate --
+     * rvd applies its whole [image] block before any channel exists, so there is
+     * no ISP channel to write to yet -- and i6c_isp_bringup fills the block from
+     * these. Once the channel exists they are read-modify-written directly and
+     * these are the shadow, refreshed on the way past.
+     *
+     * nr3d starts at 1 rather than 0 because the driver's flip and rotate
+     * predicates are gated on 3DNR being on (RotFlipRelyOn3Dnr), so a level of
+     * zero can refuse an orientation that would otherwise be accepted.
+     */
+    int isp_mirror_req;
+    int isp_flip_req;
+    int isp_nr3d_req;
+
+    /*
      * OSD over MI_RGN. Brought up on the first region rather than at init, since
      * a stream with [osd] disabled never loads the library. rgn_fmt is the pixel
      * format the driver accepted at first create -- not knowable statically (the
@@ -612,6 +644,15 @@ void i6c_fs_release_port(infinity6c_state_t *st, int port);
  * otherwise overwrite it.
  */
 void i6c_isp_note_frame(infinity6c_state_t *st);
+
+/*
+ * Apply every tuning value that was asked for before the ISP would keep it
+ * (hal_isp.c). Called from i6c_isp_note_frame once the IQ binary is loaded and
+ * the vendor 3A is armed, which is the first moment a write to the API store
+ * survives. Also drops the queue's claim on the resolved symbols at teardown.
+ */
+void i6c_isp_flush_knobs(infinity6c_state_t *st);
+void i6c_isp_forget_knobs(void);
 
 /*
  * Bind and unbind an SCL output port to an encoder channel (hal_encoder.c).
