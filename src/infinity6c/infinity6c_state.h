@@ -355,6 +355,15 @@ typedef struct {
      * attribute, which is read, modified and written back whole.
      */
     rss_video_config_t cfg;
+
+    /*
+     * Said once: the rate control asked for was not available and a substitute
+     * went in its place -- H.265 CBR, see i6c_enc_fill_rate. Sticky, because the
+     * rate half is rebuilt on every bitrate and GOP change and the notice belongs
+     * to the decision rather than to each write. Cleared when a caller names a
+     * mode again, so asking a second time is answered a second time.
+     */
+    bool rc_substituted;
 } infinity6c_venc_chn_t;
 
 /*

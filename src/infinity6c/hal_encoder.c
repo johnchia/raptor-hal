@@ -118,14 +118,19 @@ static void i6c_enc_fill_attrib(i6c_venc_attrib *attrib, const rss_video_config_
  * The mode enum is per codec rather than shared, so an H.265 channel asking for
  * CBR is a different value from an H.264 one -- which is why this switches on
  * both.
+ *
+ * Returns true when the mode asked for was not one this part can encode in this
+ * codec and a working one went in its place; see the H.265 remap below.
  */
-static void i6c_enc_fill_rate(i6c_venc_rate *rate, const rss_video_config_t *cfg,
+static bool i6c_enc_fill_rate(i6c_venc_rate *rate, const rss_video_config_t *cfg,
                               i6c_venc_codec codec)
 {
     unsigned int fps_num = cfg->fps_num ? cfg->fps_num : 25;
     unsigned int fps_den = cfg->fps_den ? cfg->fps_den : 1;
     unsigned int gop = cfg->gop_length ? cfg->gop_length : fps_num / fps_den * 2;
     unsigned int bitrate = cfg->bitrate;
+    rss_rc_mode_t mode = cfg->rc_mode;
+    bool substituted = false;
 
     memset(rate, 0, sizeof(*rate));
 
@@ -150,10 +155,38 @@ static void i6c_enc_fill_rate(i6c_venc_rate *rate, const rss_video_config_t *cfg
             rate->mjpgCbr.fpsNum = fps_num;
             rate->mjpgCbr.fpsDen = fps_den;
         }
-        return;
+        return false;
     }
 
-    switch (cfg->rc_mode) {
+    /*
+     * H.265 has two working rate controls on this part, VBR and fixed QP, and
+     * everything else is remapped onto VBR rather than passed through. Both of
+     * the modes that go through here fail, and they fail differently:
+     *
+     *   CBR (mode 9)  the driver refuses at create -- "eType:3 unsupport rc
+     *                 mode:9" from CheckRcMode, MI_VENC_CreateChn returns
+     *                 ILLEGAL_PARAM, and the stream never comes up.
+     *   AVBR (mode 12) worse. The channel is created, and then
+     *                 MI_VENC_StartRecvPic calls through a NULL pointer inside
+     *                 the driver and oopses the kernel (PC 0x0, from
+     *                 MI_VENC_IMPL_StartRecvPicEx). rvd is left unkillable in Z
+     *                 with MI resources held, so it takes a reboot -- and the
+     *                 same config comes back up at boot and does it again.
+     *
+     * Board-measured, 3/3 each, both by asking outright and via this remap. So
+     * refusing is not the honest alternative it would normally be: CBR is
+     * raptor's default rate control and AVBR is what "smart" means, so a plain
+     * `codec = h265` or one dropdown in Home Assistant is a camera off air or a
+     * kernel oops loop. VBR is what works, and it is also what Majestic sends
+     * for a CBR request on this SoC -- silently, which is why this cost a
+     * driver-level trace to find. Hence the return value: say so out loud.
+     */
+    if (codec == I6C_VENC_CODEC_H265 && mode != RSS_RC_VBR && mode != RSS_RC_FIXQP) {
+        mode = RSS_RC_VBR;
+        substituted = true;
+    }
+
+    switch (mode) {
     case RSS_RC_FIXQP:
         rate->mode =
             codec == I6C_VENC_CODEC_H265 ? I6C_VENC_RATEMODE_H265QP : I6C_VENC_RATEMODE_H264QP;
@@ -184,6 +217,7 @@ static void i6c_enc_fill_rate(i6c_venc_rate *rate, const rss_video_config_t *cfg
     /*
      * The capped and smart modes map onto AVBR, which is what MI offers that is
      * bounded above but free to spend less. Nothing here distinguishes them.
+     * H.264 only -- H.265 never arrives here, see the remap above.
      */
     case RSS_RC_SMART:
     case RSS_RC_CAPPED_VBR:
@@ -199,10 +233,10 @@ static void i6c_enc_fill_rate(i6c_venc_rate *rate, const rss_video_config_t *cfg
         rate->h264Avbr.minQual = cfg->max_qp >= 0 ? (unsigned int)cfg->max_qp : 48;
         break;
 
+    /* H.264 only for the same reason: an H.265 CBR request left as VBR above. */
     case RSS_RC_CBR:
     default:
-        rate->mode =
-            codec == I6C_VENC_CODEC_H265 ? I6C_VENC_RATEMODE_H265CBR : I6C_VENC_RATEMODE_H264CBR;
+        rate->mode = I6C_VENC_RATEMODE_H264CBR;
         rate->h264Cbr.gop = gop;
         rate->h264Cbr.statTime = 1;
         rate->h264Cbr.fpsNum = fps_num;
@@ -211,6 +245,49 @@ static void i6c_enc_fill_rate(i6c_venc_rate *rate, const rss_video_config_t *cfg
         rate->h264Cbr.avgLvl = 0;
         break;
     }
+
+    return substituted;
+}
+
+static const char *i6c_rc_mode_name(rss_rc_mode_t mode)
+{
+    switch (mode) {
+    case RSS_RC_FIXQP:
+        return "fixqp";
+    case RSS_RC_CBR:
+        return "cbr";
+    case RSS_RC_VBR:
+        return "vbr";
+    case RSS_RC_SMART:
+        return "smart";
+    case RSS_RC_CAPPED_VBR:
+        return "capped_vbr";
+    case RSS_RC_CAPPED_QUALITY:
+        return "capped_quality";
+    default:
+        return "an unknown mode";
+    }
+}
+
+/*
+ * i6c_enc_note_rc_substitution -- say what went in instead, once per decision.
+ *
+ * Reached from both the create and the reapply path, since the rate half is
+ * rebuilt whole for every bitrate or GOP change and the substitution is made
+ * again each time. Repeating it per write would bury the notice under an
+ * adjustment loop; saying it never is Majestic's mistake.
+ */
+static void i6c_enc_note_rc_substitution(infinity6c_venc_chn_t *enc, int chn, rss_rc_mode_t asked,
+                                         const i6c_venc_rate *rate)
+{
+    if (enc->rc_substituted)
+        return;
+
+    enc->rc_substituted = true;
+    HAL_LOG_WARN("venc chn %d: H.265 does not encode at rc_mode = %s on this part -- the driver "
+                 "refuses CBR and faults on AVBR -- so the channel runs VBR capped at %u bps "
+                 "instead; set rc_mode = vbr or fixqp to choose for yourself",
+                 chn, i6c_rc_mode_name(asked), rate->h264Vbr.maxBitrate);
 }
 
 /* ================================================================
@@ -943,7 +1020,8 @@ int hal_enc_create_channel(void *ctx, int chn, const rss_video_config_t *cfg)
         return ret;
 
     i6c_enc_fill_attrib(&attr.attrib, cfg, codec);
-    i6c_enc_fill_rate(&attr.rate, cfg, codec);
+    if (i6c_enc_fill_rate(&attr.rate, cfg, codec))
+        i6c_enc_note_rc_substitution(enc, chn, cfg->rc_mode, &attr.rate);
 
     if ((ret = st->venc.create_chn(device, (unsigned int)chn, &attr)) != 0) {
         HAL_LOG_ERR("MI_VENC_CreateChn(dev %u, chn %d) failed: %d", device, chn, ret);
@@ -1286,7 +1364,8 @@ static int i6c_enc_reapply_rate(infinity6c_state_t *st, int chn)
         return RSS_ERR_IO;
     }
 
-    i6c_enc_fill_rate(&attr.rate, &enc->cfg, codec);
+    if (i6c_enc_fill_rate(&attr.rate, &enc->cfg, codec))
+        i6c_enc_note_rc_substitution(enc, chn, enc->cfg.rc_mode, &attr.rate);
 
     if ((ret = st->venc.set_chn_attr(enc->device, (unsigned int)chn, &attr)) != 0) {
         HAL_LOG_ERR("MI_VENC_SetChnAttr(chn %d) failed: %d", chn, ret);
@@ -1303,6 +1382,9 @@ int hal_enc_set_rc_mode(void *ctx, int chn, rss_rc_mode_t mode, uint32_t bitrate
     st->enc[chn].cfg.rc_mode = mode;
     if (bitrate)
         st->enc[chn].cfg.bitrate = bitrate;
+
+    /* Naming a mode is a fresh question, so it gets a fresh answer if it is refused. */
+    st->enc[chn].rc_substituted = false;
 
     return i6c_enc_reapply_rate(st, chn);
 }
