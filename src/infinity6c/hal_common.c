@@ -12,10 +12,11 @@
  * had. Struct layouts differ even where a signature does not. Sharing files
  * would mean two disjoint implementations behind mutually exclusive guards.
  *
- * Scope: the capture and encode datapath. ISP tuning, OSD and audio are not
- * implemented, and the vtable publishes only what is -- RSS_HAL_CALL NULL-guards
- * every entry and returns RSS_ERR_NOTSUP, so an absent subsystem needs no stub
- * and no file. hal_caps.c declares the matching zeroes.
+ * Scope: the capture and encode datapath, ISP tuning, OSD, and audio input. The
+ * vtable publishes only what is implemented -- RSS_HAL_CALL NULL-guards every
+ * entry and returns RSS_ERR_NOTSUP, so an absent subsystem needs no stub and no
+ * file. hal_caps.c declares the matching zeroes. What is still absent: raw frame
+ * readback, IVS, and the whole audio *output* half.
  *
  * That has one exception, and it shapes this file: an op whose failure rvd
  * treats as fatal cannot be absent, however little the hardware has to do for
@@ -269,7 +270,13 @@ static int hal_init(void *ctx, const rss_multi_sensor_config_t *cfg)
     HAL_LOG_INFO("infinity6c: %s up, SNR/VIF/ISP/SCL/VENC loaded; pipeline builds on first channel",
                  HAL_PLATFORM_NAME);
 #else
-    HAL_LOG_INFO("infinity6c: %s up, MI_SYS only -- no audio subsystem yet", HAL_PLATFORM_NAME);
+    /*
+     * MI_SYS only: libmi_ai is loaded by audio_init rather than here, since a
+     * caller that never asks for audio should not hold it open -- and rad reaches
+     * audio_init without calling this op at all.
+     */
+    HAL_LOG_INFO("infinity6c: %s up, MI_SYS only; MI_AI loads on audio_init",
+                 HAL_PLATFORM_NAME);
 #endif
     return RSS_OK;
 
@@ -526,6 +533,33 @@ static const rss_hal_ops_t g_ops = {
     .get_caps = hal_get_caps,
 
     .sys_get_version = hal_sys_get_version,
+
+#ifdef HAL_MODULE_AUDIO
+    /*
+     * MI_AI capture. Only in the audio archive, since hal_audio.c is an
+     * AUDIO_SRCS member and the video build has no such symbols.
+     *
+     * Capture only, and a short list -- see hal_audio.c's OP COVERAGE comment for
+     * why each absent op is absent. The short version: this generation's
+     * libmi_ai.so has no noise reduction, AGC, high-pass filter, echo
+     * cancellation, resampler or audio encoder in it at all, and nothing in scope
+     * plays audio out.
+     *
+     * Longer than the i6e backend's list by set_gain and get_gain, because MI 3.0
+     * separates the analog interface gain from the DPGA's digital gain into two
+     * calls. On MI 2.x both ops would have written the same register, whichever
+     * raptor called last.
+     */
+    .audio_init = hal_audio_init,
+    .audio_deinit = hal_audio_deinit,
+    .audio_read_frame = hal_audio_read_frame,
+    .audio_release_frame = hal_audio_release_frame,
+    .audio_set_volume = hal_audio_set_volume,
+    .audio_get_volume = hal_audio_get_volume,
+    .audio_set_gain = hal_audio_set_gain,
+    .audio_get_gain = hal_audio_get_gain,
+    .audio_set_mute = hal_audio_set_mute,
+#endif
 
 #ifdef HAL_MODULE_VIDEO
     /* Vendor-neutral sysfs, so it works before any MI subsystem does. */

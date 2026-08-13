@@ -160,15 +160,17 @@ HAL_COMMON_SRC := $(BACKEND_DIR)/hal_common.c
 
 ifeq ($(PLATFORM),INFINITY6C)
 # The capture and encode path, in datapath order, then OSD and the ISP tuning
-# ops. Audio is not ported yet: the MI 3.0 AI module is the next generation's
-# equivalent of star/hal_audio.c. hal_gpio is vendor-neutral.
+# ops. hal_gpio is vendor-neutral.
 VIDEO_SRCS := $(BACKEND_DIR)/hal_framesource.c \
               $(BACKEND_DIR)/hal_encoder.c \
               $(BACKEND_DIR)/hal_isp.c \
               $(BACKEND_DIR)/hal_osd.c \
               src/hal_gpio.c
 
-AUDIO_SRCS :=
+# MI 3.0 audio input. Capture only, and no src/hal_dmic.c counterpart: the
+# digital microphone is an MI_AI interface here rather than a separate module,
+# so it is a value passed to MI_AI_AttachIf and not a library of its own.
+AUDIO_SRCS := $(BACKEND_DIR)/hal_audio.c
 else
 VIDEO_SRCS := $(BACKEND_DIR)/hal_encoder.c \
               $(BACKEND_DIR)/hal_framesource.c \

@@ -24,6 +24,7 @@
 
 #include "hal_internal.h"
 
+#include "i6c_aud_load.h"
 #include "i6c_isp_load.h"
 #include "i6c_rgn_load.h"
 #include "i6c_scl_load.h"
@@ -118,6 +119,137 @@
  * driven by a count the vendor also supplies.
  */
 #define I6C_ARRAY_LEN(a) (unsigned int)(sizeof(a) / sizeof((a)[0]))
+
+/* ================================================================
+ * AUDIO INPUT
+ *
+ * MI_AI's own vocabulary, which does not line up with raptor's: a device is a
+ * DMA writer, a "channel" is a channel *group*, and the input is chosen by
+ * attaching an interface rather than by an index. See i6c_aud.h.
+ * ================================================================ */
+
+/*
+ * The one audio input device. Not a choice on this part: the vendor's Maruko
+ * resource list is "WDMA * 1", and an AI device *is* a WDMA, so device 0 is the
+ * only one that exists. MI 2.x's STAR_AUD_DEV is 0 for a different reason --
+ * there the index selected the physical input, which here is MI_AI_AttachIf's
+ * job.
+ *
+ * rad's `[audio] device` defaults to 1, an Ingenic index, so hal_audio.c
+ * configures this device regardless and says so once.
+ */
+#define I6C_AUD_DEV 0
+
+/*
+ * Channel groups this backend sizes its arrays for.
+ *
+ * Attaching one interface gives two physical channels, so a single-interface
+ * configuration has at most two groups -- two of one channel in MONO, one of two
+ * in STEREO (the formula is in i6c_aud.h). That is the ceiling raptor can reach,
+ * since rss_audio_config_t.chn_count distinguishes mono from stereo and nothing
+ * more.
+ *
+ * This bounds the arrays, not what runs: only one group is ever enabled, and
+ * aud_grp_count is what says which indices are valid.
+ */
+#define I6C_AUD_GRP_MAX 2
+
+/*
+ * How long a blocking MI_AI_Read waits, in ms. Carried from the i6e backend,
+ * where it is divinus's value: at the 20 ms period rad configures this is
+ * several periods of slack, and since rad treats a timeout as "try again" the
+ * only thing a longer wait costs is how promptly a stopped device is noticed.
+ */
+#define I6C_AUD_READ_TIMEOUT_MS 128
+
+/*
+ * Interface (analog) gain ceilings, in hardware steps. Per interface *and* per
+ * chip, and the vendor doc states Maruko's separately from the rest -- ADC is
+ * [0, 21] here for -6..+57 dB in 3 dB steps, where Muffin and Mochi are [0, 19]
+ * for 0..+57 dB. The i6e backend quotes the same 0..21 for Amic from the MI 2.x
+ * table, so the analog front end did not change between the generations even
+ * though the call to reach it did.
+ *
+ * DMIC is the one number here with a live disagreement behind it. The doc body
+ * says [0, 6] for 0..+36 dB in 6 dB steps; mi_ai.h's inline comment on
+ * MI_AI_SetIfGain says "DMIC 4 steps(0 - 4)", and the MI 2.x table likewise
+ * gives Dmic 0..4 for 0..+24 dB. Two sources say 4 and one says 6. The doc's is
+ * used because it is the most specific and internally consistent statement
+ * (6 steps x 6 dB = the 36 dB it claims), and because being wrong here is loud
+ * and harmless: an out-of-range step earns MI_AI_ERR_ILLEGAL_PARAM, which
+ * hal_audio.c names in the log. It also cannot bite this board, whose sound node
+ * has no DMIC padmux and therefore runs the ADC path.
+ */
+#define I6C_AUD_IF_GAIN_MAX_ADC 21
+#define I6C_AUD_IF_GAIN_MAX_DMIC 6
+
+/*
+ * DPGA (digital) gain bounds in whole dB, from MI_AI_SetGain's documented
+ * [-60, 30].
+ */
+#define I6C_AUD_DPGA_MIN_DB (-60)
+#define I6C_AUD_DPGA_MAX_DB 30
+
+/*
+ * The volume that means "no digital gain".
+ *
+ * rad's `[audio] volume` defaults to 80 and its `gain` to 25, and both are
+ * applied immediately after audio_init. Mapping volume linearly onto the DPGA's
+ * full range would put the shipped default at about +12 dB of digital gain on
+ * top of whatever the analog stage is doing, i.e. clipping out of the box for a
+ * value nobody chose. So 80 is the map's unity point: below it attenuates toward
+ * -60 dB, above it boosts toward +30 dB, and a default install applies exactly
+ * 0 dB. See i6c_audio_volume_db.
+ */
+#define I6C_AUD_VOL_UNITY 80
+
+/*
+ * MI_SYS output-port queue for each enabled channel group, set right after
+ * MI_AI_EnableChnGroup.
+ *
+ * Not tuning. This generation has no device-side ring at all -- MI 2.x's frmNum
+ * is gone from the device attributes -- so this queue is the only thing between
+ * the DMA writer and rad's read loop, and the vendor's own capture example sets
+ * it in the same breath as enabling the group.
+ *
+ * user_depth 1 because read_frame structurally holds at most one period per
+ * group: it refuses a second read until the first is released.
+ *
+ * buf_depth is the slack between rad's reads. 16 (~320 ms at 20 ms periods)
+ * rather than the vendor example's 8, carrying the i6e backend's finding: at 4
+ * (~80 ms) that board logged "Buffer(s) is lost due to slow fetching" while rad
+ * independently reported an audio clock resync, which are the two halves of one
+ * event -- rad's read loop is a plain SCHED_OTHER thread competing with VENC and
+ * the ISP, so stalls of that size are a property of the system rather than a bug
+ * to eliminate. A deeper queue costs nothing in steady state, since a read
+ * returns the oldest queued period and the queue only fills when rad is behind.
+ */
+#define I6C_AUD_PORT_USR_DEPTH 1
+#define I6C_AUD_PORT_BUF_DEPTH 16
+
+/*
+ * What to fall back to if MI refuses the pair above. Exactly the vendor capture
+ * example's (4, 8), so the fallback is the one depth with documentation behind
+ * it -- and a refused depth is worth retrying rather than failing init over,
+ * because failing means no audio at all where a shallow queue merely risks a
+ * dropped period under load.
+ */
+#define I6C_AUD_PORT_USR_DEPTH_FALLBACK 4
+#define I6C_AUD_PORT_BUF_DEPTH_FALLBACK 8
+
+/*
+ * The two MI_AI codes that mean "nothing captured yet" rather than "something is
+ * wrong", from the vendor error table. One digit apart and unrelated in meaning,
+ * which is why hal_audio.c names codes in its log instead of printing bare hex.
+ *
+ * BUF_EMPTY is the documented answer to a poll of an empty queue. NOBUF is
+ * documented as "insufficient audio input buffer" -- a port with no user-side
+ * queue -- but the i6e backend found MI_AI overloads it as the empty-queue
+ * answer too when the timeout is 0, so a non-blocking read must not treat it as
+ * a lost queue.
+ */
+#define I6C_AUD_ERR_NOBUF 0xA004200Du
+#define I6C_AUD_ERR_BUF_EMPTY 0xA004200Eu
 
 /* ================================================================
  * PER-CHANNEL STATE
@@ -364,6 +496,69 @@ typedef struct {
 
     infinity6c_fs_chn_t fs[I6C_MAX_CHN];
     infinity6c_venc_chn_t enc[I6C_MAX_CHN];
+
+    /*
+     * Audio capture -- src/infinity6c/hal_audio.c, and only ever touched by the
+     * audio archive. Both archives share this struct, as they do on the i6e
+     * backend, and each simply leaves the other's half zero.
+     *
+     * aud_owns_sys records that audio_init brought MI_SYS up itself. rad calls
+     * rss_hal_create and then audio_init directly -- it never calls the init op
+     * -- so on this backend audio_init has to do the system bring-up hal_init
+     * would otherwise have done, and deinit must undo exactly that much and no
+     * more.
+     */
+    i6c_aud_api aud;
+    bool aud_loaded;
+    bool aud_owns_sys;
+    bool aud_dev_open; /* MI_AI_Open succeeded, so MI_AI_Close is owed */
+    bool aud_dev_warned;
+
+    unsigned int aud_dev; /* composed with I6C_DEV_ID, not a bare index */
+
+    /*
+     * The attached interface, and the gain ceiling that goes with it. Kept
+     * because MI_AI_SetIfGain is addressed by interface rather than by device, so
+     * every volume change needs to know which one was attached -- and because
+     * the ceiling differs between the ADC and DMIC paths.
+     */
+    i6c_aud_if aud_if;
+    int aud_if_gain_max;
+
+    /*
+     * Groups enabled -- so also the range a group index may take -- and how many
+     * physical channels each holds.
+     *
+     * Both are derived at open from the sound mode rather than configured. One
+     * interface is two physical channels, so MONO makes two groups of one channel
+     * *available*; only the first is enabled, because raptor consumes one stream
+     * and an enabled group nobody reads still runs its DMA. STEREO makes one
+     * group of two interleaved channels, which is how both microphones are
+     * reached. Either way this is 1. See i6c_audio_open_dev.
+     *
+     * The channel count is what sizes the gain and mute arrays MI_AI expects.
+     */
+    unsigned int aud_grp_count;
+    unsigned int aud_chn_per_grp;
+
+    int aud_rate;
+    int aud_volume; /* as raptor gave it, 0..100 */
+    int aud_gain;   /* as raptor gave it, 0..31 */
+    rss_audio_input_t aud_input;
+
+    bool aud_grp_enabled[I6C_AUD_GRP_MAX];
+
+    /*
+     * The descriptor MI_AI_Read filled, held until release_frame gives it back.
+     * Kept here rather than in the caller's rss_audio_frame_t because that has
+     * nowhere to store 80 bytes, and MI needs to see the same struct again.
+     */
+    i6c_aud_frm aud_frame[I6C_AUD_GRP_MAX];
+    bool aud_frame_held[I6C_AUD_GRP_MAX];
+
+    /* Last MI_AI_Read failure, so a persistent fault is named once and not per
+     * period. */
+    int aud_last_err;
 } infinity6c_state_t;
 
 /* ================================================================
@@ -446,5 +641,24 @@ void i6c_osd_release_all(infinity6c_state_t *st);
 
 /* Release every channel's MI object, in dependency order (hal_common.c). */
 void i6c_teardown_all(infinity6c_state_t *st);
+
+/*
+ * Audio capture ops -- src/infinity6c/hal_audio.c.
+ *
+ * This is the whole of it, and the list is short for reasons the file's OP
+ * COVERAGE comment gives per op. The short version: MI 3.0's libmi_ai.so exports
+ * no noise reduction, AGC, high-pass filter, echo cancellation, resampler or
+ * audio encoder at all, and there is no playback in scope. Everything else in
+ * the audio half of rss_hal_ops_t stays NULL and resolves to RSS_ERR_NOTSUP.
+ */
+int hal_audio_init(void *ctx, const rss_audio_config_t *cfg);
+int hal_audio_deinit(void *ctx);
+int hal_audio_read_frame(void *ctx, int dev, int chn, rss_audio_frame_t *frame, bool block);
+int hal_audio_release_frame(void *ctx, int dev, int chn, rss_audio_frame_t *frame);
+int hal_audio_set_volume(void *ctx, int dev, int chn, int vol);
+int hal_audio_get_volume(void *ctx, int dev, int chn, int *vol);
+int hal_audio_set_gain(void *ctx, int dev, int chn, int gain);
+int hal_audio_get_gain(void *ctx, int dev, int chn, int *gain);
+int hal_audio_set_mute(void *ctx, int dev, int chn, int mute);
 
 #endif /* INFINITY6C_STATE_H */
