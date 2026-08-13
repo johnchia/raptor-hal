@@ -1,0 +1,62 @@
+name: fork surface
+
+# Two cheap invariants, on every push and weekly.
+#
+# The weekly run matters as much as the push run: upstream moves on its own
+# schedule, and this is what turns "we drifted for four months" into "we drifted
+# since Monday".
+on:
+  push:
+  pull_request:
+  schedule:
+    - cron: '17 6 * * 1'   # Mondays, so drift is one week old at most
+  workflow_dispatch:
+
+jobs:
+  surface:
+    name: shared-file contact with upstream
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0        # the check diffs against upstream history
+
+      - name: Fetch upstream
+        run: |
+          git remote add upstream https://github.com/gtxaspec/raptor-hal.git \
+            || git remote set-url upstream https://github.com/gtxaspec/raptor-hal.git
+          git fetch --no-tags upstream main
+
+      - name: Check fork surface
+        run: UPSTREAM=upstream/main scripts/check-fork-surface.sh
+
+      - name: Report drift from upstream
+        if: always()
+        run: |
+          echo "commits upstream has that this branch does not:"
+          git log --oneline HEAD..upstream/main | head -40
+          echo "--- count: $(git rev-list --count HEAD..upstream/main)"
+
+  build:
+    name: build ${{ matrix.platform }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # T31 is the Ingenic control: it proves the shared files still build the
+        # way upstream builds them. The SigmaStar platforms need an ARM cross
+        # toolchain and are covered locally; see FORK.md.
+        platform: [T31]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Build
+        run: make PLATFORM=${{ matrix.platform }} CROSS_COMPILE= CC=gcc
+
+      - name: Check the archives exist
+        run: |
+          test -s libraptor_hal_video.a
+          test -s libraptor_hal_audio.a
+          ls -l libraptor_hal_*.a
