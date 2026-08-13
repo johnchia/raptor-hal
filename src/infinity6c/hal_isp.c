@@ -18,7 +18,11 @@
  *
  * Orientation and the 3DNR level are neither: they are fields of the ISP
  * channel's parameter block, set with MI_ISP_SetChnParam. That block is written
- * whole, so they are read-modify-written rather than assigned.
+ * whole, so they are read-modify-written rather than assigned -- and it is only
+ * writable while the channel is being created. A running channel refuses it
+ * (-1610121208, measured), so these three are start-up settings on this part,
+ * which is why they are held in the state for i6c_isp_bringup rather than
+ * queued like the tuning values.
  *
  * Each is queried per (device, channel), and the device index carries the SoC id
  * in its high halfword, so I6C_DEV_ID composes it as elsewhere.
@@ -983,6 +987,13 @@ static int i6c_isp_chn_param(infinity6c_state_t *st, i6c_isp_para *para)
  * on this backend the ISP channel is not created until the first framesource
  * channel is. i6c_isp_bringup fills the block from the same three fields, so a
  * request made early lands then instead of being lost.
+ *
+ * Which turns out to be the only way any of it lands: a running channel refuses
+ * the write. That makes the early path the working one and a live `raptorctl rvd
+ * set-hflip` the one that cannot be honoured -- so the failure explains itself
+ * rather than returning a bare error, and the request is rolled back rather than
+ * held for a later rebuild, since a command that reports failure and then quietly
+ * takes effect minutes later is worse than one that simply fails.
  */
 static int i6c_isp_apply_chn_param(infinity6c_state_t *st)
 {
@@ -1006,8 +1017,24 @@ static int i6c_isp_apply_chn_param(infinity6c_state_t *st)
 
     ret = st->isp.set_chn_param(I6C_DEV_ID(I6C_ISP_DEV), I6C_ISP_CHN, &para);
     if (ret) {
+        /*
+         * A running channel refuses this, measured: with the pipeline up every
+         * call returns -1610121208, and bring-up accepts the same values. So
+         * orientation and the 3DNR level are creation-time settings on this part
+         * rather than runtime ones, and the caller is told where they do work
+         * instead of being left with a vendor error code to look up. Said once,
+         * because rvd re-applies its whole [image] block on demand.
+         */
+        static bool explained;
+
         HAL_LOG_WARN("isp: MI_ISP_SetChnParam(mirror=%d flip=%d 3dnr=%d) failed: %d", para.mirror,
                      para.flip, para.level3DNR, ret);
+        if (!explained) {
+            explained = true;
+            HAL_LOG_WARN("isp: this part takes orientation and 3DNR only while the ISP channel is "
+                         "being created -- set hflip, vflip and temper in the config and restart "
+                         "the stream. The SDK refuses a live change; it is not being dropped here");
+        }
         return RSS_ERR_IO;
     }
 

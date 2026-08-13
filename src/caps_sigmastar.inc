@@ -194,12 +194,15 @@ const rss_hal_caps_t g_hal_caps = {
  * leading SoC id, MI_VENC a leading device, promotes the ISP to a pipeline
  * stage and moves scaling to SCL. src/infinity6c/ is the backend.
  *
- * Capture, encode, OSD and audio input are all implemented (SNR, VIF,
- * ISP, SCL, VENC, RGN, AI), and all four are board-verified. The ISP
- * *tuning* surface is implemented but not, so a flag below that promises a
- * knob is promising an op that exists rather than one that has been
- * watched working. Consumers check these flags precisely so they do not
- * call into a vtable slot that is NULL.
+ * Capture, encode, OSD, audio input and the ISP tuning surface are all
+ * implemented (SNR, VIF, ISP, SCL, VENC, RGN, AI) and all board-verified.
+ * Consumers check these flags precisely so they do not call into a vtable
+ * slot that is NULL.
+ *
+ * One thing the flags cannot express, and it is the surprise of the
+ * family: orientation and the 3DNR level are settable only while the ISP
+ * channel is being created. A running channel refuses the write, so those
+ * three are config settings rather than runtime ones. See hal_isp.c.
  *
  * A false flag is not the only thing keeping an unimplemented op from
  * being called, though, and relying on it that way is the trap this block
