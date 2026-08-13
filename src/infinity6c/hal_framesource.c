@@ -893,63 +893,110 @@ static int i6c_fs_apply(infinity6c_state_t *st, int chn, const rss_fs_config_t *
  * ================================================================ */
 
 /*
- * i6c_fs_spare_port -- the lowest SCL output port nothing is using, or -1.
+ * i6c_fs_port_takes_width -- can this SCL output port be configured this wide?
+ *
+ * The four ports are not interchangeable, because the four hardware scalers
+ * behind them are not: the device reserves scalers 0-3 for ports 0-3 (see
+ * i6c_scl_bringup), and the last two are narrow. Board-measured on SSC377QE by
+ * asking MI_SCL_SetOutputPortParam for one size after another:
+ *
+ *   port 0, 1   2560x1920 accepted
+ *   port 2, 3   1920x1920 accepted, 1921x1080 refused, 2048x1080 refused,
+ *               2560x360 refused
+ *
+ * So it is a width ceiling and nothing else -- height is free, and the failure
+ * is MI_ERR_SCL_ILLEGAL_PARAM at configure time rather than anything visible
+ * later. Asking a narrow port for a full-resolution snapshot is what left this
+ * part with no snapshots at all.
+ */
+#define I6C_SCL_NARROW_PORT_FIRST 2
+#define I6C_SCL_NARROW_PORT_MAX_WIDTH 1920
+
+static bool i6c_fs_port_takes_width(int port, unsigned int width)
+{
+    return port < I6C_SCL_NARROW_PORT_FIRST || width <= I6C_SCL_NARROW_PORT_MAX_WIDTH;
+}
+
+/*
+ * i6c_fs_spare_port -- the lowest SCL output port free for a `width`-wide
+ * snapshot, or -1.
  *
  * Safe to ask at register time because rvd configures every framesource port
  * before creating any encoder channel: pipeline_init runs its fs_create_channel
  * loop to completion first, and that loop skips JPEG streams outright. So an
  * unconfigured port here is genuinely spare rather than merely not configured
  * yet.
+ *
+ * A shadow is spare too, and that is the case that matters. A cascade sub is
+ * recorded as a configured framesource channel while holding no SCL port at all
+ * (hal_fs_create_channel), so counting it as occupied reserves a port nothing
+ * will ever use -- and on the usual two-stream layout the index it reserves is
+ * port 1, the only spare port wide enough for a full-resolution snapshot. That
+ * alone is why the full-size JPEG channel used to be handed port 2 and refused.
  */
-int i6c_fs_spare_port(const infinity6c_state_t *st)
+int i6c_fs_spare_port(const infinity6c_state_t *st, unsigned int width)
 {
     int i;
 
-    for (i = 0; i < I6C_MAX_CHN; i++)
-        if (!st->fs[i].configured)
-            return i;
+    for (i = 0; i < I6C_MAX_CHN; i++) {
+        if (st->fs[i].configured && !st->fs[i].shadow)
+            continue;
+        if (st->fs[i].snapshot)
+            continue;
+        if (!i6c_fs_port_takes_width(i, width))
+            continue;
+        return i;
+    }
 
     return -1;
 }
 
 /*
- * i6c_fs_clone_port -- configure dst_port with src_port's geometry.
+ * i6c_fs_snapshot_port -- configure `port` at the given geometry for a snapshot
+ * channel.
  *
  * Configure only. Enabling is left to the caller because the order that works
  * for a framesource port is configure, bind, enable -- which is the order rvd
  * drives, fs_create_channel then bind then fs_enable_channel -- and a port
  * enabled before anything is bound to it has nowhere to put a frame.
+ *
+ * The geometry is passed rather than copied from another port because the
+ * channel that needs one may have no port to copy from: a JPEG channel paired
+ * with a cascade sub is paired with a framesource that holds no SCL port at
+ * all. What it wants is its own size, which is what its encoder channel was
+ * created for -- cloning a port was only ever a way of arriving at that.
  */
-int i6c_fs_clone_port(infinity6c_state_t *st, int src_port, int dst_port)
+int i6c_fs_snapshot_port(infinity6c_state_t *st, int port, unsigned short width,
+                         unsigned short height, i6c_common_pixfmt pixfmt)
 {
-    i6c_scl_port port;
+    i6c_scl_port cfg;
     int ret;
 
-    if (src_port < 0 || src_port >= I6C_MAX_CHN || dst_port < 0 || dst_port >= I6C_MAX_CHN)
+    if (port < 0 || port >= I6C_MAX_CHN || !width || !height)
         return RSS_ERR_INVAL;
-    if (!st->fs[src_port].configured)
-        return RSS_ERR_INVAL;
+    if (!i6c_fs_port_takes_width(port, width))
+        return RSS_ERR_NOTSUP;
 
-    memset(&port, 0, sizeof(port));
-    port.output.width = st->fs[src_port].width;
-    port.output.height = st->fs[src_port].height;
-    port.mirror = 0;
-    port.flip = 0;
-    port.pixFmt = st->fs[src_port].pixfmt;
-    port.compress = I6C_COMPR_NONE;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.output.width = width;
+    cfg.output.height = height;
+    cfg.mirror = 0;
+    cfg.flip = 0;
+    cfg.pixFmt = pixfmt;
+    cfg.compress = I6C_COMPR_NONE;
 
-    ret =
-        st->scl.set_port_param(I6C_DEV_ID(I6C_SCL_DEV), I6C_SCL_CHN, (unsigned int)dst_port, &port);
+    ret = st->scl.set_port_param(I6C_DEV_ID(I6C_SCL_DEV), I6C_SCL_CHN, (unsigned int)port, &cfg);
     if (ret) {
-        HAL_LOG_ERR("MI_SCL_SetOutputPortParam(port %d, cloned from port %d) failed: %d", dst_port,
-                    src_port, ret);
+        HAL_LOG_ERR("MI_SCL_SetOutputPortParam(port %d, %ux%u for a snapshot) failed: %d", port,
+                    width, height, ret);
         return RSS_ERR_IO;
     }
 
-    st->fs[dst_port].width = st->fs[src_port].width;
-    st->fs[dst_port].height = st->fs[src_port].height;
-    st->fs[dst_port].pixfmt = st->fs[src_port].pixfmt;
-    st->fs[dst_port].configured = true;
+    st->fs[port].width = width;
+    st->fs[port].height = height;
+    st->fs[port].pixfmt = pixfmt;
+    st->fs[port].configured = true;
+    st->fs[port].snapshot = true;
 
     return RSS_OK;
 }
@@ -994,8 +1041,12 @@ int i6c_fs_enable_port(infinity6c_state_t *st, int port)
 {
     int ret;
 
-    /* A cascade sub has no SCL port to enable; its frames come from the main. */
-    if (st->fs[port].shadow)
+    /*
+     * A cascade sub has no SCL port to enable; its frames come from the main.
+     * Unless a snapshot channel has taken that index for a port of its own, in
+     * which case there is a real port here and the encoder is asking for it.
+     */
+    if (st->fs[port].shadow && !st->fs[port].snapshot)
         return RSS_OK;
 
     if (st->fs[port].enabled)
@@ -1023,8 +1074,15 @@ void i6c_fs_release_port(infinity6c_state_t *st, int port)
         st->scl.disable_port(I6C_DEV_ID(I6C_SCL_DEV), I6C_SCL_CHN, (unsigned int)port);
         st->fs[port].enabled = false;
     }
-    st->fs[port].configured = false;
-    st->fs[port].shadow = false;
+    st->fs[port].snapshot = false;
+    /*
+     * A borrowed index goes back to being what it was. The shadow belongs to the
+     * framesource channel and outlives the port the encoder built on top of it,
+     * so clearing it here would tell hal_fs_destroy_channel there is a port to
+     * tear down where there is none.
+     */
+    if (!st->fs[port].shadow)
+        st->fs[port].configured = false;
 }
 
 int hal_fs_create_channel(void *ctx, int chn, const rss_fs_config_t *cfg)
@@ -1099,6 +1157,15 @@ int hal_fs_disable_channel(void *ctx, int chn)
 
     I6C_ENTER(ctx, chn, st);
 
+    /*
+     * The port at this index is a snapshot channel's, not this framesource
+     * channel's -- this one is a cascade sub with no port. Disabling it here
+     * would stop another stream's snapshots on a call that has nothing to do
+     * with them; the encoder releases it in hal_enc_unregister_channel.
+     */
+    if (st->fs[chn].snapshot)
+        return RSS_OK;
+
     if (!st->fs[chn].enabled)
         return RSS_OK;
 
@@ -1120,7 +1187,10 @@ int hal_fs_destroy_channel(void *ctx, int chn)
         return RSS_OK;
 
     hal_fs_disable_channel(ctx, chn);
-    st->fs[chn].configured = false;
+    /* A snapshot channel's port survives its host index being destroyed; it is
+     * released with the encoder channel that built it. */
+    if (!st->fs[chn].snapshot)
+        st->fs[chn].configured = false;
     st->fs[chn].shadow = false;
     if (st->scl_video_port == chn)
         st->scl_video_port = -1;

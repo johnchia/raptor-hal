@@ -274,6 +274,20 @@ typedef struct {
      */
     bool shadow;
 
+    /*
+     * The SCL output port at this index belongs to a snapshot channel rather
+     * than to the framesource channel of the same number.
+     *
+     * The two are the same thing everywhere else in this backend -- framesource
+     * channel N is SCL output port N -- and they only come apart because a
+     * cascade sub holds an index without holding a port. That index is the one
+     * spare port wide enough for a full-resolution snapshot, so the encoder
+     * borrows it (see hal_enc_register_channel), and from then on the port is
+     * the encoder's: the framesource entry points must not apply, enable,
+     * disable or destroy it on behalf of a channel that has no port of its own.
+     */
+    bool snapshot;
+
     unsigned short width;
     unsigned short height;
     i6c_common_pixfmt pixfmt;
@@ -640,8 +654,9 @@ void i6c_set_output_depth(infinity6c_state_t *st, i6c_sys_mod mod, unsigned int 
  * a JPEG snapshot channel, which rvd never creates a framesource for.
  * (hal_framesource.c)
  */
-int i6c_fs_spare_port(const infinity6c_state_t *st);
-int i6c_fs_clone_port(infinity6c_state_t *st, int src_port, int dst_port);
+int i6c_fs_spare_port(const infinity6c_state_t *st, unsigned int width);
+int i6c_fs_snapshot_port(infinity6c_state_t *st, int port, unsigned short width,
+                         unsigned short height, i6c_common_pixfmt pixfmt);
 int i6c_fs_port_ifc(infinity6c_state_t *st, int port);
 int i6c_fs_enable_port(infinity6c_state_t *st, int port);
 void i6c_fs_release_port(infinity6c_state_t *st, int port);

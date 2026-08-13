@@ -760,18 +760,21 @@ int hal_enc_destroy_group(void *ctx, int grp)
  * "sensor idle" case -- so it looks like /snap saying no snapshot is available
  * while the ring and the H.264 stream are healthy.
  *
- * A port of the channel's own is the shape the vendor asks for twice over:
- * MI_SYS_BindChnPort2's note says neither end may already be bound, and SCL is
- * documented as one output port per consumer rather than as a port to be shared.
- * A dedicated port also buys the frame pacing, since the bind carries a
+ * So the channel gets an SCL output port of its own, and it must be its own:
+ * sharing the video stream's port is not a fallback here, it is refused. MI
+ * answers a second bind on an already-bound source with MI_ERR_SYS_BUSY
+ * (0xA0092012), which is the vendor's "neither end may already be bound" note
+ * being enforced rather than merely documented -- unlike on MI 2.x, where the
+ * same shape works and star/ relies on it.
+ *
+ * A port of its own is also what buys the frame pacing, since the bind carries a
  * destination rate and MI drops the difference in hardware -- the caps block
  * sets no jpeg_pulse, so rvd's own duty-cycling is off on this part.
  *
- * Preferred, not required: SCL has four output ports and two video streams with
- * JPEG on each want all four, so a shared port is the fallback rather than a
- * failure. What it trades away is the vendor's rule above, and whether a second
- * bind on one source honours its own rate is then MI's business -- so the log
- * distinguishes the two paths for whoever reads it.
+ * Which port it can have is not a free choice: the narrow scalers behind ports 2
+ * and 3 stop at 1920 wide, so a full-resolution snapshot fits only on port 0 or
+ * 1. See i6c_fs_spare_port, which knows both that and the fact that a cascade
+ * sub occupies an index without occupying a port.
  *
  * Every failure warns and returns RSS_OK rather than propagating. rvd treats a
  * register failure as fatal to the stream, and a board that cannot feed its JPEG
@@ -780,8 +783,8 @@ int hal_enc_destroy_group(void *ctx, int grp)
 int hal_enc_register_channel(void *ctx, int grp, int chn)
 {
     infinity6c_venc_chn_t *enc;
+    i6c_common_pixfmt pixfmt;
     unsigned int snap_fps;
-    int src_port;
     int port;
     int ret;
 
@@ -806,55 +809,57 @@ int hal_enc_register_channel(void *ctx, int grp, int chn)
     if (enc->bound)
         return RSS_OK;
 
-    src_port = st->enc[grp].src_port;
-    if (!st->enc[grp].bound || src_port < 0) {
-        HAL_LOG_WARN("venc chn %d: paired video chn %d is not bound to an SCL port yet, so there "
-                     "is no geometry to clone -- no snapshots on this stream",
-                     chn, grp);
-        return RSS_OK;
-    }
-
+    /*
+     * The paired video channel is not consulted for geometry: this channel has
+     * its own, and MI_VENC_CreateChn has already been told it. So a pairing that
+     * never got an SCL port is no longer a reason to give up, which on this part
+     * is the ordinary case for a sub stream -- it is a VENC cascade off the main
+     * and holds no port at all, and that used to cost the sub its snapshots
+     * outright.
+     */
     snap_fps = enc->cfg.fps_num / (enc->cfg.fps_den ? enc->cfg.fps_den : 1);
 
-    port = i6c_fs_spare_port(st);
-    if (port >= 0) {
-        if ((ret = i6c_fs_clone_port(st, src_port, port)) == RSS_OK) {
-            if ((ret = i6c_bind_scl_to_venc(st, port, chn, snap_fps)) == RSS_OK) {
-                if ((ret = i6c_fs_enable_port(st, port)) == RSS_OK) {
-                    enc->owns_port = true;
-                    HAL_LOG_DBG("venc chn %d: snapshot channel on SCL port %d, cloned from "
-                                "chn %d's port %d at %u fps",
-                                chn, port, grp, src_port, snap_fps);
-                    return RSS_OK;
-                }
-                i6c_unbind_scl_from_venc(st, chn);
-            }
-            i6c_fs_release_port(st, port);
-            HAL_LOG_WARN("venc chn %d: could not bring up SCL port %d from port %d: %d", chn, port,
-                         src_port, ret);
-        } else {
-            HAL_LOG_WARN("venc chn %d: cloning SCL port %d to %d failed: %d", chn, src_port, port,
-                         ret);
-        }
-    } else {
-        HAL_LOG_WARN("venc chn %d: no spare SCL output port (of %d)", chn, I6C_MAX_CHN);
+    port = i6c_fs_spare_port(st, enc->width);
+    if (port < 0) {
+        HAL_LOG_WARN("venc chn %d: no SCL output port free that will go %u wide -- no snapshots "
+                     "on this stream",
+                     chn, enc->width);
+        return RSS_OK;
     }
 
     /*
-     * Sharing the paired video stream's port. Against the vendor's note, and the
-     * alternative is no snapshots at all -- the cost of finding out is one error
-     * line from MI.
+     * The format the rest of the chain already runs in. Taken from the video
+     * port rather than assumed, and only defaulted when there is somehow no
+     * video port to ask -- which cannot happen on the path that gets here, since
+     * an encoder channel exists.
      */
-    if ((ret = i6c_bind_scl_to_venc(st, src_port, chn, snap_fps)) != RSS_OK) {
-        HAL_LOG_WARN("venc chn %d: sharing chn %d's SCL port %d failed too: %d -- no snapshots "
-                     "on this stream",
-                     chn, grp, src_port, ret);
+    pixfmt = st->scl_video_port >= 0 ? st->fs[st->scl_video_port].pixfmt : I6C_PIXFMT_YUV420SP;
+
+    if ((ret = i6c_fs_snapshot_port(st, port, enc->width, enc->height, pixfmt)) != RSS_OK) {
+        HAL_LOG_WARN("venc chn %d: SCL port %d would not take %ux%u: %d -- no snapshots on this "
+                     "stream",
+                     chn, port, enc->width, enc->height, ret);
         return RSS_OK;
     }
 
-    HAL_LOG_DBG("venc chn %d: snapshot channel sharing chn %d's SCL port %d (no port of its "
-                "own); frame pacing is MI's to honour here",
-                chn, grp, src_port);
+    if ((ret = i6c_bind_scl_to_venc(st, port, chn, snap_fps)) != RSS_OK) {
+        i6c_fs_release_port(st, port);
+        HAL_LOG_WARN("venc chn %d: could not bind SCL port %d: %d -- no snapshots on this stream",
+                     chn, port, ret);
+        return RSS_OK;
+    }
+
+    if ((ret = i6c_fs_enable_port(st, port)) != RSS_OK) {
+        i6c_unbind_scl_from_venc(st, chn);
+        i6c_fs_release_port(st, port);
+        HAL_LOG_WARN("venc chn %d: could not enable SCL port %d: %d -- no snapshots on this stream",
+                     chn, port, ret);
+        return RSS_OK;
+    }
+
+    enc->owns_port = true;
+    HAL_LOG_INFO("infinity6c: venc chn %d takes SCL port %d for snapshots, %ux%u at %u fps", chn,
+                 port, enc->width, enc->height, snap_fps);
 
     return RSS_OK;
 }
