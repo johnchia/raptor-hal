@@ -40,6 +40,7 @@
 typedef struct {
     void *lib;
     void *lib_cam_os;
+    void *lib_mi_common;
 
     int (*init)(unsigned short soc_id);
     int (*exit)(unsigned short soc_id);
@@ -124,6 +125,36 @@ static inline int i6c_sys_load(i6c_sys_api *sys)
         return RSS_ERR_NOENT;
     }
 
+    /*
+     * libmi_common.so, for the same reason and with the same subtlety: no MI
+     * library names another as NEEDED -- every one of them lists libc.so.0 and
+     * nothing else -- so a symbol one borrows from another resolves only if the
+     * lender is already in the process, RTLD_GLOBAL.
+     *
+     * This one exports a single function, _MI_PRINT_GetDebugLevel, and libmi_ai,
+     * libmi_ao, libmi_venc, libmi_rgn, libmi_ipu and libmi_shadow all call it
+     * before printing anything. Without it, those calls are the only unresolved
+     * references in the process, and they are unresolved *quietly*: musl leaves
+     * the PLT slot at its link-time value rather than failing the dlopen, so
+     * bring-up succeeds, the pipeline runs, and the first vendor library that
+     * decides to log something jumps to a small absolute address and takes the
+     * daemon down with SIGSEGV.
+     *
+     * That was rad: it survived indefinitely until MI_AI_Read hit a path that
+     * wanted to print, which a config save to /etc was slow enough to provoke.
+     * The crash is inside libmi_ai with no message of its own, so it reads as a
+     * fault in whatever the daemon did last -- see
+     * ~/raptor/KNOWN-rad-segv-on-dirty-config-save.md, where it did.
+     *
+     * Not fatal if it is absent: it is one diagnostic helper, and a vendor drop
+     * without it is no worse off than before this call existed. Loading it when
+     * it is there is what matters.
+     */
+    if (!(sys->lib_mi_common = dlopen("libmi_common.so", RTLD_LAZY | RTLD_GLOBAL)))
+        HAL_LOG_WARN("i6c_sys: dlopen(libmi_common.so) failed: %s -- libmi_* will crash rather "
+                     "than print if one of them ever logs",
+                     dlerror());
+
     if (!(sys->lib = dlopen("libmi_sys.so", RTLD_LAZY | RTLD_GLOBAL))) {
         HAL_LOG_ERR("i6c_sys: dlopen(libmi_sys.so) failed: %s", dlerror());
         return RSS_ERR_NOENT;
@@ -176,6 +207,8 @@ static inline void i6c_sys_unload(i6c_sys_api *sys)
 {
     if (sys->lib)
         dlclose(sys->lib);
+    if (sys->lib_mi_common)
+        dlclose(sys->lib_mi_common);
     if (sys->lib_cam_os)
         dlclose(sys->lib_cam_os);
     memset(sys, 0, sizeof(*sys));

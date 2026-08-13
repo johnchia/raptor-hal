@@ -104,13 +104,19 @@ typedef struct {
 } i6c_aud_api;
 
 /*
- * libmi_ai.so names only libc as NEEDED, yet leaves CamOs* and MI_SYS_*
- * undefined and GLOBAL -- six CamOs entries (MemAlloc, MemRelease, RwsemInit,
- * RwsemDownWrite, RwsemUpWrite, TsemDown/Up) and MI_SYS_GetFd, MI_SYS_CloseFd
- * and the channel-output pair. Nothing else defines them, so both
- * libcam_os_wrapper.so and libmi_sys.so must already be in the process
- * RTLD_GLOBAL. i6c_sys_load does exactly that, and hal_audio_init calls it
- * first for that reason rather than for MI_SYS_Init's sake alone.
+ * libmi_ai.so names only libc as NEEDED, yet leaves CamOs*, MI_SYS_* and
+ * _MI_PRINT_GetDebugLevel undefined and GLOBAL -- six CamOs entries (MemAlloc,
+ * MemRelease, RwsemInit, RwsemDownWrite, RwsemUpWrite, TsemDown/Up), MI_SYS_GetFd,
+ * MI_SYS_CloseFd and the channel-output pair, and the debug-level query every one
+ * of its own log lines starts with. Nothing else defines them, so
+ * libcam_os_wrapper.so, libmi_sys.so and libmi_common.so must all already be in
+ * the process RTLD_GLOBAL. i6c_sys_load does exactly that, and hal_audio_init
+ * calls it first for that reason rather than for MI_SYS_Init's sake alone.
+ *
+ * The debug-level one is the reason this list is worth keeping accurate: it is
+ * not called on any path that runs during bring-up, so leaving it unresolved
+ * costs nothing until the day the library decides to log, and then costs the
+ * whole daemon (see i6c_sys_load.h).
  *
  * RTLD_LAZY as everywhere else in this backend: there is nothing to gain from
  * binding eagerly, and this generation's library has no optional algorithm packs
