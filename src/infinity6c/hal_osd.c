@@ -6,33 +6,32 @@
  *
  * WHERE THE OVERLAY ATTACHES
  *
- * Two places, because this backend's two kinds of video channel are fed
- * differently, and each has to be overlaid where its own frame is assembled.
+ * Two places, chosen by what the region is rather than which stream asked for it.
+ * Both are overlay paths in the vendor RGN documentation's per-chip table, which
+ * also settles the split: the scaler has cover layers and the encoder does not.
  *
- * A channel fed from the scaler -- the main H.26x stream, and JPEG -- is overlaid
- * on its SCL output port (I6C_SYS_MOD_SCL), the port recorded in osd_src_port[]
- * as rvd's FS -> OSD bind names it, which is the whole reason that array exists.
- * That is what the working i6c reference does: waybeam attaches RGN to the SCL
- * module. It is not a free choice for the main stream, whose SCL port is bound to
- * the encoder by a hardware ring; the overlay has to be applied on the producing
- * side of that ring.
+ * Text and images go on the stream's own VENC input port (I6C_SYS_MOD_VENC,
+ * port 0). That is the first point a stream's frame exists apart from every
+ * other's, and it is the reason not to use the scaler port here: a second H.26x
+ * stream is ringed off the first (see i6c_bind_scl_to_venc), so anything overlaid
+ * on the shared scaler port arrives in the second stream as well, scaled by the
+ * cascade -- board-checked as a legible timestamp on the main and a four-times
+ * smaller copy of it above the sub's own. Per-channel attach gives each stream
+ * exactly its own regions, at its own size.
  *
- * A cascaded channel -- a second H.26x stream, which takes no SCL port of its own
- * and is instead ringed off the main encoder (see i6c_bind_scl_to_venc) -- is
- * overlaid on its own VENC channel (I6C_SYS_MOD_VENC, port 0, the encoder's input
- * port). The cascade taps the main's frame upstream of the SCL overlay, so a
- * region on the main's port never reaches the sub; the sub's own encoder input is
- * the first place its frame exists separately. The vendor RGN documentation lists
- * VENC0 as an overlay path with its own GOP hardware, independent of the GOP that
- * SCL and DISP share, so a main-on-SCL and a sub-on-VENC overlay coexist.
+ * Covers go on the scaler output port that feeds the stream, the port recorded in
+ * osd_src_port[] as rvd's FS -> OSD bind names it, because the encoder has no
+ * cover layer to put one on (VENC0's cover layer count is NA in that table). Here
+ * the cascade works in our favour: a cover on the scaler port is upstream of the
+ * ring, so one privacy mask covers every stream, which is what a privacy mask has
+ * to do. A cascaded stream therefore needs no cover of its own and gets none --
+ * its osd_src_port names a shadow framesource rather than a live port.
  *
- * The earlier reading of this backend, that MI_RGN simply refuses a ring-fed VENC
- * channel, came from an attach rejected with RGN ILLEGAL_PARAM while the region
- * was ARGB8888 -- a format no path on this part accepts (see
- * i6c_osd_probe_pixfmt). It was the format being refused, not the module.
- *
- * COVER regions are SCL-only: the same table gives VENC0 a cover layer count of
- * NA. A cover asked for on a cascaded channel is declined rather than attached.
+ * The earlier reading of this backend, that MI_RGN refuses a ring-fed VENC channel
+ * and so only the scaler would do, came from an attach rejected with RGN
+ * ILLEGAL_PARAM while the region was ARGB8888 -- a format no path on this part
+ * accepts (see i6c_osd_probe_pixfmt). It was the format being refused, not the
+ * module.
  *
  * WHY ATTACH IS DEFERRED
  *
@@ -96,18 +95,28 @@ static infinity6c_osd_region_t *i6c_osd_region(infinity6c_state_t *st, int handl
 }
 
 /*
- * The port a region attaches to for a given group, and whether that port is an
- * encoder input rather than a scaler output.
+ * The port a region attaches to, and whether that port is an encoder input
+ * rather than a scaler output. The region's type decides, not its stream.
  *
- * Groups are encoder channels. A cascaded channel is overlaid on its own VENC
- * input port; every other channel is overlaid on the SCL output port rvd's
- * FS -> OSD bind recorded as feeding it. Returns false while neither is available
- * yet, which is the normal case during rvd's OSD setup and the reason attach is
- * deferred: for the scaler case that means osd_src_port still -1, and for a
- * cascade that the channel has not been bound and so does not know it is one.
+ * A cover goes on the scaler port feeding the stream -- the port rvd's FS -> OSD
+ * bind recorded in osd_src_port[], which is the whole reason that array exists --
+ * because the scaler is the only module on this part with cover layers. A cover on
+ * a cascaded stream has no port of its own to go on: osd_src_port names a shadow
+ * framesource, not a live one. It needs none, since a cover on the scaler port is
+ * upstream of the ring the cascade is fed by and so reaches every stream already.
+ *
+ * Everything else goes on the stream's own VENC input port, which is where its
+ * frame first exists apart from any other stream's. Overlaying text on the scaler
+ * port instead would put the main stream's glyphs, scaled by the cascade, into the
+ * sub as well as the sub's own.
+ *
+ * Returns false while the chosen target does not exist yet, which is the normal
+ * case during rvd's OSD setup and the reason attach is deferred.
  */
-static bool i6c_osd_target_port(infinity6c_state_t *st, int grp, i6c_sys_bind *port, bool *on_venc)
+static bool i6c_osd_target_port(infinity6c_state_t *st, const infinity6c_osd_region_t *r,
+                                i6c_sys_bind *port, bool *on_venc)
 {
+    int grp = r->grp;
     int src;
 
     if (!st || grp < 0 || grp >= I6C_MAX_CHN)
@@ -115,7 +124,10 @@ static bool i6c_osd_target_port(infinity6c_state_t *st, int grp, i6c_sys_bind *p
 
     memset(port, 0, sizeof(*port));
 
-    if (st->enc[grp].created && st->enc[grp].cascade) {
+    if (r->type != RSS_OSD_COVER) {
+        if (!st->enc[grp].created)
+            return false;
+
         port->module = I6C_SYS_MOD_VENC;
         port->device = st->enc[grp].device;
         port->channel = (unsigned int)grp;
@@ -125,7 +137,7 @@ static bool i6c_osd_target_port(infinity6c_state_t *st, int grp, i6c_sys_bind *p
     }
 
     src = st->osd_src_port[grp];
-    if (src < 0 || src >= I6C_MAX_CHN)
+    if (src < 0 || src >= I6C_MAX_CHN || st->fs[src].shadow)
         return false;
 
     port->module = I6C_SYS_MOD_SCL;
@@ -137,8 +149,35 @@ static bool i6c_osd_target_port(infinity6c_state_t *st, int grp, i6c_sys_bind *p
     return true;
 }
 
-/* Fill the per-channel display attr MI wants from a tracked region. */
-static void i6c_osd_fill_chn(const infinity6c_osd_region_t *r, i6c_rgn_chn *chn)
+/*
+ * A cover's colour, from rvd's 0xAARRGGBB to the VYU444 word MI_RGN wants: V in
+ * bits 23-16, Y in 15-8, U in 7-0. Passing the caller's RGB through unconverted
+ * turns the usual opaque black into a flat green, 0x000000 being Y=0 U=0 V=0.
+ * BT.601 studio swing, matching the range the encoder is fed.
+ */
+static unsigned int i6c_osd_cover_vyu(unsigned int argb)
+{
+    int r = (int)((argb >> 16) & 0xff);
+    int g = (int)((argb >> 8) & 0xff);
+    int b = (int)(argb & 0xff);
+    int y = (((66 * r + 129 * g + 25 * b + 128) >> 8) + 16);
+    int u = (((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128);
+    int v = (((112 * r - 94 * g - 18 * b + 128) >> 8) + 128);
+
+    y = y < 0 ? 0 : (y > 255 ? 255 : y);
+    u = u < 0 ? 0 : (u > 255 ? 255 : u);
+    v = v < 0 ? 0 : (v > 255 ? 255 : v);
+
+    return ((unsigned int)v << 16) | ((unsigned int)y << 8) | (unsigned int)u;
+}
+
+/*
+ * Fill the per-channel display attr MI wants from a tracked region. frame_w and
+ * frame_h are the size of the frame at the target port, needed only to scale a
+ * cover; pass zero where there is no cover to place.
+ */
+static void i6c_osd_fill_chn(const infinity6c_osd_region_t *r, i6c_rgn_chn *chn,
+                             unsigned int frame_w, unsigned int frame_h)
 {
     memset(chn, 0, sizeof(*chn));
     chn->show = r->show ? 1 : 0;
@@ -146,10 +185,21 @@ static void i6c_osd_fill_chn(const infinity6c_osd_region_t *r, i6c_rgn_chn *chn)
     chn->point.y = (unsigned int)r->y;
 
     if (r->type == RSS_OSD_COVER) {
+        /*
+         * A cover's size is not in pixels: it is a fraction of the frame in
+         * 8192ths, so a full-frame cover is 8192x8192 whatever the stream's
+         * dimensions. Handing MI the pixel count instead scales the cover by
+         * frame/8192 -- a 2560x1920 stream asking to be covered entirely got a box
+         * over the top-left third of it. The starting point *is* in pixels, which
+         * the documentation leaves implicit and only a cover placed away from the
+         * origin would expose.
+         */
         chn->cover.layer = (unsigned int)r->layer;
-        chn->cover.size.width = (unsigned int)r->width;
-        chn->cover.size.height = (unsigned int)r->height;
-        chn->cover.color = r->cover_color;
+        chn->cover.size.width =
+            frame_w ? (unsigned int)r->width * 8192u / frame_w : (unsigned int)r->width;
+        chn->cover.size.height =
+            frame_h ? (unsigned int)r->height * 8192u / frame_h : (unsigned int)r->height;
+        chn->cover.color = i6c_osd_cover_vyu(r->cover_color);
         return;
     }
 
@@ -282,23 +332,25 @@ static int i6c_osd_try_attach(infinity6c_state_t *st, int handle, infinity6c_osd
 
     if (r->attached || r->grp < 0)
         return RSS_OK;
-    if (!i6c_osd_target_port(st, r->grp, &port, &on_venc))
-        return RSS_OK; /* Deferred, not failed. */
-
-    /* An encoder input port carries OSD layers but no cover layers, so a cover
-     * asked for on a cascaded stream has nowhere to go. Said once per region, at
-     * INFO: it is a property of the part, not a fault to be fixed. */
-    if (on_venc && r->type == RSS_OSD_COVER) {
-        if (!r->cover_declined) {
-            HAL_LOG_INFO("osd: region %d is a cover on cascaded stream %d, which has no cover "
-                         "layer -- only the scaler-fed streams can carry one",
+    if (!i6c_osd_target_port(st, r, &port, &on_venc)) {
+        /*
+         * A cover on a cascaded stream is the one case that will never resolve,
+         * as opposed to merely not yet. Say so once, at INFO: the stream is still
+         * covered, by the scaler-port cover the cascade carries down to it.
+         */
+        if (r->type == RSS_OSD_COVER && st->enc[r->grp].created && st->enc[r->grp].cascade &&
+            !r->cover_declined) {
+            HAL_LOG_INFO("osd: region %d is a cover on cascaded stream %d, which has no scaler "
+                         "port of its own -- the cover on the scaler-fed stream reaches it "
+                         "through the cascade",
                          handle, r->grp);
             r->cover_declined = true;
         }
-        return RSS_OK;
+        return RSS_OK; /* Deferred, not failed. */
     }
 
-    i6c_osd_fill_chn(r, &chn);
+    i6c_osd_fill_chn(r, &chn, on_venc ? 0 : st->fs[port.port].width,
+                     on_venc ? 0 : st->fs[port.port].height);
 
     ret = st->rgn.fnAttachChannel(I6C_SOC_ID, (unsigned int)handle, &port, &chn);
     if (ret) {
@@ -324,7 +376,7 @@ static void i6c_osd_detach(infinity6c_state_t *st, int handle, infinity6c_osd_re
     if (!r->attached)
         return;
 
-    if (i6c_osd_target_port(st, r->grp, &port, &on_venc))
+    if (i6c_osd_target_port(st, r, &port, &on_venc))
         st->rgn.fnDetachChannel(I6C_SOC_ID, (unsigned int)handle, &port);
 
     r->attached = false;
@@ -340,10 +392,11 @@ static int i6c_osd_push_chn(infinity6c_state_t *st, int handle, infinity6c_osd_r
 
     if (!r->attached)
         return RSS_OK;
-    if (!i6c_osd_target_port(st, r->grp, &port, &on_venc))
+    if (!i6c_osd_target_port(st, r, &port, &on_venc))
         return RSS_OK;
 
-    i6c_osd_fill_chn(r, &chn);
+    i6c_osd_fill_chn(r, &chn, on_venc ? 0 : st->fs[port.port].width,
+                     on_venc ? 0 : st->fs[port.port].height);
 
     ret = st->rgn.fnSetChannelConfig(I6C_SOC_ID, (unsigned int)handle, &port, &chn);
     if (ret) {

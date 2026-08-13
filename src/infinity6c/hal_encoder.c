@@ -471,10 +471,10 @@ int i6c_bind_scl_to_venc(infinity6c_state_t *st, int port, int chn, unsigned int
                     main_chn, dst_fps ? dst_fps : st->fps);
 
         /*
-         * Now that the channel knows it is a cascade, its OSD regions can attach
-         * to its own encoder input port -- the first point its frame exists apart
-         * from the main's, the SCL overlay being upstream of the ring it is fed
-         * by. i6c_osd_target_port reads the cascade flag set just above.
+         * The channel exists and knows it is a cascade, so its regions can settle:
+         * text attaches to this encoder's own input port, and a cover is declined
+         * here because the scaler-port cover already reaches this stream through
+         * the ring. See i6c_osd_target_port.
          */
         i6c_osd_flush_pending(st, chn);
 
