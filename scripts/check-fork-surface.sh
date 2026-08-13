@@ -50,18 +50,26 @@ if ! git rev-parse --verify --quiet "$UPSTREAM" >/dev/null; then
 	exit 2
 fi
 
+# Measure from the merge base, not from the upstream tip. A two-dot diff against
+# the tip reports every upstream commit we have not merged yet as though the fork
+# had reverted it -- an upstream file we simply do not have yet shows up as our
+# deletion. What belongs to the fork is what it changed since it diverged.
+BASE=$(git merge-base HEAD "$UPSTREAM")
+
 added_total=0
 removed_total=0
 offenders=''
 rows=''
 
-# Only files that exist upstream count as shared; anything else is additive.
+# Only files that exist in the base count as shared; anything else is additive.
+# Diffing BASE against the working tree (not BASE..HEAD) so uncommitted edits
+# are caught too; on a clean tree, as in CI, the two are identical.
 while read -r added removed path; do
 	[ -n "${path:-}" ] || continue
 	# binary diffs report '-' for counts
 	[ "$added" = '-' ] && added=0
 	[ "$removed" = '-' ] && removed=0
-	git cat-file -e "$UPSTREAM:$path" 2>/dev/null || continue
+	git cat-file -e "$BASE:$path" 2>/dev/null || continue
 
 	rows="$rows$path|$added|$removed
 "
@@ -73,10 +81,11 @@ while read -r added removed path; do
 "
 	fi
 done <<EOF
-$(git diff --numstat "$UPSTREAM")
+$(git diff --numstat "$BASE")
 EOF
 
-printf 'fork surface vs %s\n' "$(git rev-parse --short "$UPSTREAM")"
+printf 'fork surface vs %s (merge base with %s)\n' \
+	"$(git rev-parse --short "$BASE")" "$UPSTREAM"
 printf '%s' "$rows" | while IFS='|' read -r p a r; do
 	[ -n "${p:-}" ] || continue
 	printf '  %-24s +%-5s -%s\n' "$p" "$a" "$r"

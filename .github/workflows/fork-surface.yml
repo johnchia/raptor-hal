@@ -49,8 +49,12 @@ jobs:
         platform: [T31]
     steps:
       - uses: actions/checkout@v4
-        with:
-          submodules: recursive
+
+      # Only ingenic-headers, deliberately. sigmastar-headers is a private
+      # repository and the workflow token is scoped to this one, so a recursive
+      # checkout fails with "Repository not found" -- and T31 does not need it.
+      - name: Check out the Ingenic headers
+        run: git submodule update --init --depth=1 ingenic-headers
 
       - name: Build
         run: make PLATFORM=${{ matrix.platform }} CROSS_COMPILE= CC=gcc
