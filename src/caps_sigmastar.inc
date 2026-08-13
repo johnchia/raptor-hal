@@ -194,10 +194,12 @@ const rss_hal_caps_t g_hal_caps = {
  * leading SoC id, MI_VENC a leading device, promotes the ISP to a pipeline
  * stage and moves scaling to SCL. src/infinity6c/ is the backend.
  *
- * The capture and encode path is implemented (SNR, VIF, ISP, SCL, VENC);
- * OSD and audio are not, so their capabilities stay false and their
- * limits zero. Consumers check these flags precisely so they do not call
- * into a vtable slot that is NULL.
+ * Capture, encode, OSD and audio input are all implemented (SNR, VIF,
+ * ISP, SCL, VENC, RGN, AI), and all four are board-verified. The ISP
+ * *tuning* surface is implemented but not, so a flag below that promises a
+ * knob is promising an op that exists rather than one that has been
+ * watched working. Consumers check these flags precisely so they do not
+ * call into a vtable slot that is NULL.
  *
  * A false flag is not the only thing keeping an unimplemented op from
  * being called, though, and relying on it that way is the trap this block
@@ -206,6 +208,12 @@ const rss_hal_caps_t g_hal_caps = {
  * and bind among them -- so those must be published whatever the flags
  * say. The flags gate what rvd *chooses* to ask for. They do not gate its
  * pipeline setup.
+ *
+ * There is no audio capability to declare, which is worth stating so the
+ * silence is not read as an omission: rss_hal_caps_t carries no audio
+ * fields at all. What the audio backend does and does not implement is
+ * recorded at the vtable in src/infinity6c/hal_common.c and argued op by
+ * op in hal_audio.c's OP COVERAGE comment.
  *
  * Both channel limits are 4, and both are the *same* four: a raptor
  * framesource channel is an SCL output port, and an encoder channel is fed
@@ -230,17 +238,21 @@ const rss_hal_caps_t g_hal_caps = {
  * accepts it for channel 0 and refuses it elsewhere rather than quietly
  * rotating streams the caller did not name.
  *
- * has_color2grey is false, and deliberately so even though
- * MI_ISP_IQ_SetColorToGray is bound in the loader. This backend publishes no
- * isp_* ops at all -- star/ publishes thirty -- so there is nothing for the flag
- * to gate. rvd reports it straight out to its control API as an advertised
- * capability, so a true here would promise callers something no vtable slot can
- * service. The flag turns true when an ISP op surface exists, not when the
- * symbol resolves.
+ * has_color2grey stays false even though monochrome works, which looks wrong
+ * until you check what the flag gates: rvd maps it to enc_set_color2grey, an
+ * *encoder* op, and this backend has no such thing. Grey here is
+ * MI_ISP_IQ_SetColorToGray, one setting on the single ISP channel every stream
+ * draws from, reached through isp_set_running_mode. A true flag would advertise
+ * per-channel greying that nothing can service, and an encoder op that greyed
+ * both streams at once would be worse than an absent one.
  *
- * Nothing loads an IQ tuning binary on this backend either. MI_ISP_ApiCmdLoadBinFile
- * is bound and unused, and the ordering constraint that governs it is recorded at
- * the declaration in i6c_isp_load.h for whoever wires it up.
+ * The ISP flags that are true are the ones whose ops hal_isp.c publishes:
+ * defog, temper and ae_comp. sinter and the rest stay false because their
+ * modules are per-frequency-band arrays on maruko with no place for a single
+ * scalar -- see i6c_isp.h, which excludes them from the ABI table for the same
+ * reason. Nothing in raptor reads these three today, so they are advertising
+ * rather than gating; they are set because a wrong advertisement is what sent
+ * the last reader looking in the wrong place.
  *
  * The permanent falses are the same three as above and for the same
  * reason -- xburst2, the IMP SDK generation and the IMPVI calling
@@ -271,13 +283,32 @@ const rss_hal_caps_t g_hal_caps = {
     .has_capped_rc = true,
     .has_smart_rc = true,
 
-    /* ISP — no isp_* ops yet, so nothing here may claim a tuning capability. */
+    /* ISP — only what hal_isp.c publishes an op for; see above for the rest. */
     .has_color2grey = false,
+    .has_defog = true,
+    .has_temper = true,
+    .has_ae_comp = true,
     .max_sensors = 1,
 
     /* Limits — both counts are the scaler's four output ports. */
     .max_enc_channels = 4,
     .max_fs_channels = 4,
+
+    /*
+     * OSD limits. A group here is a VENC channel that regions attach to, so
+     * there are as many as there are encoder channels; regions are bounded by
+     * the backend's own tracking array rather than by anything MI publishes.
+     * Keep in step with I6C_OSD_REGION_MAX and I6C_MAX_CHN in
+     * src/infinity6c/infinity6c_state.h -- not referenced symbolically because
+     * this file is compiled for every platform and must not pull in the MI
+     * headers.
+     *
+     * The has_osd_* flags stay false for the reason the Infinity6E block gives:
+     * MI has only OSD and COVER region types, no mosaic and no group callback,
+     * and rss_osd_region_t has no field to drive the invert attribute with.
+     */
+    .max_osd_regions = 16,
+    .max_osd_groups = 4,
 
     .uses_xburst2 = false,
     .uses_new_sdk = false,
