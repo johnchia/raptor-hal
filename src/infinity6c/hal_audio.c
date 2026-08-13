@@ -191,6 +191,36 @@ static int i6c_audio_if_gain_max(rss_audio_input_t input)
  * of whatever the analog stage is doing, which is clipping nobody asked for. The
  * analog stage is where level belongs (see hal_audio_set_gain); this knob is for
  * trimming around it.
+ *
+ * WHAT THE DPGA ACTUALLY DOES, MEASURED
+ *
+ * The requested dB and the delivered level part company at the bottom of the
+ * range. Measured on the board at a fixed analog gain, level relative to unity:
+ *
+ *      volume   requested   delivered
+ *         80       0 dB       0.0 dB
+ *         75      -4 dB      -4.2 dB
+ *         70      -7 dB      -7.7 dB
+ *         65     -11 dB     -12.6 dB
+ *         60     -15 dB     -19.1 dB
+ *         50     -22 dB     -47.8 dB
+ *         40     -30 dB     silence
+ *
+ * So it tracks to within a few tenths down to about -8 dB, grows optimistic
+ * through -19, and collapses to effectively mute below roughly volume 55 -- the
+ * usable cut is 60..80 and anything under that is an off switch. Upward it
+ * behaves: volume 100 measured +26.7 dB against a requested +30, the shortfall
+ * being the clipping it ran into rather than the DPGA.
+ *
+ * The map is left as the documented [-60, 30] anyway. Reshaping it to spread the
+ * usable range over 0..80 would be calibrating against one board whose ADC input
+ * is unloaded (see hal_audio_set_gain), so the curve above may not be the curve a
+ * fitted microphone produces. Worth revisiting on hardware that has one.
+ *
+ * Do not try to verify this from procfs. `Dpga Gain[n]` in
+ * /proc/mi_modules/mi_ai/mi_ai0 reads 0 whatever is set -- it stays 0 even when
+ * driven by the vendor's own `echo set_dpga_gain` -- so the readout is broken and
+ * only a level measurement says whether this op did anything.
  */
 static int i6c_audio_volume_db(int vol)
 {
@@ -796,6 +826,20 @@ int hal_audio_set_volume(void *ctx, int dev, int chn, int vol)
  * Both sides of the pair get the same step. For ADC A+B the two sides are two
  * separate microphone inputs rather than a stereo pair's halves, so setting only
  * the left would leave a stereo configuration lopsided.
+ *
+ * The step scale is confirmed against hardware rather than assumed. Sweeping the
+ * ADC's steps 0 to 14 moved the captured level from -53.6 to -10.6 dBFS, i.e.
+ * **3.07 dB per step**, which is the doc's "Maruko [0, 21], -6..+57 dB, 3 dB/step"
+ * to two significant figures. Above step 17 it stops responding (step 21 buys
+ * 0.4 dB over 17) because the front end has run out of headroom.
+ *
+ * That headroom limit is a property of the board this was measured on, not of the
+ * mapping: with nothing loading the ADC input, step 17 is already amplifying the
+ * converter's own noise floor into hard clipping, and no gain setting produces
+ * speech-band content. The evidence says no microphone is fitted here. So the
+ * capture path is proven and its acoustic performance is not -- and a default of
+ * gain 25 landing on step 17 should be re-judged on hardware with a real mic
+ * rather than turned down to suit an unloaded input.
  */
 int hal_audio_set_gain(void *ctx, int dev, int chn, int gain)
 {
