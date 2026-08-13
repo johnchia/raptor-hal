@@ -471,12 +471,13 @@ int i6c_bind_scl_to_venc(infinity6c_state_t *st, int port, int chn, unsigned int
                     main_chn, dst_fps ? dst_fps : st->fps);
 
         /*
-         * No OSD attach on a cascaded channel. Its frames come from the main
-         * encoder's ring, downstream of the SCL port the overlay would live on,
-         * so the region would cost a scaler port that nothing here encodes and
-         * still not appear in this stream. A cascaded stream carries whatever
-         * overlay the main one has.
+         * Now that the channel knows it is a cascade, its OSD regions can attach
+         * to its own encoder input port -- the first point its frame exists apart
+         * from the main's, the SCL overlay being upstream of the ring it is fed
+         * by. i6c_osd_target_port reads the cascade flag set just above.
          */
+        i6c_osd_flush_pending(st, chn);
+
         return RSS_OK;
     }
 

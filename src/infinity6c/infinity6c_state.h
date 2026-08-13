@@ -251,6 +251,8 @@ typedef struct {
     int grp;
     bool attached;
     bool show;
+    /* Said once: a cover region whose stream has no cover layer to attach it to. */
+    bool cover_declined;
 
     /* Converted bitmap handed to MI_RGN_SetBitMap, kept per region so a
      * per-frame update reuses it; resized only on a geometry change. */

@@ -6,36 +6,40 @@
  *
  * WHERE THE OVERLAY ATTACHES
  *
- * The i6e backend attaches a region to the VPE output port that feeds an
- * encoder. This one attaches to the SCL output port (I6C_SYS_MOD_SCL, the
- * scaler port that feeds the encoder), which is what the working i6c reference
- * does -- waybeam attaches RGN to the SCL module, not VENC. It is not a free
- * choice: this backend's main H.26x channel is fed by a HW ring from SCL, and
- * MI_RGN cannot attach to a ring-input VENC channel -- the attach is refused
- * with RGN ILLEGAL_PARAM. (divinus attaches to VENC because its channels are
- * frame-based; raptor's are not.) The port is the one recorded in
- * osd_src_port[] as rvd's FS -> OSD bind names it -- the whole reason that array
- * exists.
+ * Two places, because this backend's two kinds of video channel are fed
+ * differently, and each has to be overlaid where its own frame is assembled.
  *
- * A LIMITATION FOR THE SUB STREAM
+ * A channel fed from the scaler -- the main H.26x stream, and JPEG -- is overlaid
+ * on its SCL output port (I6C_SYS_MOD_SCL), the port recorded in osd_src_port[]
+ * as rvd's FS -> OSD bind names it, which is the whole reason that array exists.
+ * That is what the working i6c reference does: waybeam attaches RGN to the SCL
+ * module. It is not a free choice for the main stream, whose SCL port is bound to
+ * the encoder by a hardware ring; the overlay has to be applied on the producing
+ * side of that ring.
  *
- * A second video stream is a VENC main->sub cascade off the main's one SCL
- * output port (see i6c_bind_scl_to_venc), and the cascade taps the frame the
- * main receives *before* the SCL port's RGN overlay is applied -- board-checked:
- * the sub carries no timestamp while the main does. So OSD lands on the main
- * stream only. The sub has no SCL port to attach to, and MI_RGN refuses a VENC
- * channel fed by a ring (the ILLEGAL_PARAM this backend first hit), so there is
- * no attach point for it here. The sub's regions are registered by rvd but their
- * osd_src_port never resolves to a live port, so they defer harmlessly rather
- * than erroring. Per-stream sub OSD would need the sub off its own SCL port
- * (frame-based, not the ring cascade), which is a bigger topology change.
+ * A cascaded channel -- a second H.26x stream, which takes no SCL port of its own
+ * and is instead ringed off the main encoder (see i6c_bind_scl_to_venc) -- is
+ * overlaid on its own VENC channel (I6C_SYS_MOD_VENC, port 0, the encoder's input
+ * port). The cascade taps the main's frame upstream of the SCL overlay, so a
+ * region on the main's port never reaches the sub; the sub's own encoder input is
+ * the first place its frame exists separately. The vendor RGN documentation lists
+ * VENC0 as an overlay path with its own GOP hardware, independent of the GOP that
+ * SCL and DISP share, so a main-on-SCL and a sub-on-VENC overlay coexist.
+ *
+ * The earlier reading of this backend, that MI_RGN simply refuses a ring-fed VENC
+ * channel, came from an attach rejected with RGN ILLEGAL_PARAM while the region
+ * was ARGB8888 -- a format no path on this part accepts (see
+ * i6c_osd_probe_pixfmt). It was the format being refused, not the module.
+ *
+ * COVER regions are SCL-only: the same table gives VENC0 a cover layer count of
+ * NA. A cover asked for on a cascaded channel is declined rather than attached.
  *
  * WHY ATTACH IS DEFERRED
  *
- * rvd creates and registers every region before the SCL port that carries a
- * stream is live. register_region records the intent; i6c_osd_flush_pending
- * performs the attach from i6c_bind_scl_to_venc, once that port is enabled and
- * bound.
+ * rvd creates and registers every region before the port or channel that carries
+ * a stream is live. register_region records the intent; i6c_osd_flush_pending
+ * performs the attach from i6c_bind_scl_to_venc, once there is something to
+ * attach to.
  *
  * The SoC id leads every MI_RGN call (I6C_SOC_ID); see i6c_rgn.h.
  *
@@ -92,30 +96,43 @@ static infinity6c_osd_region_t *i6c_osd_region(infinity6c_state_t *st, int handl
 }
 
 /*
- * The SCL output port a region attaches to for a given group.
+ * The port a region attaches to for a given group, and whether that port is an
+ * encoder input rather than a scaler output.
  *
- * Groups are encoder channels; the port is whichever SCL output port rvd's
- * FS -> OSD bind recorded as feeding that encoder. Returns false when that bind
- * has not happened yet (osd_src_port still -1), which is the normal case during
- * rvd's OSD setup and the reason attach is deferred. A cascade sub's recorded
- * port is a shadow framesource with no live SCL port; it too returns false, and
- * the sub inherits the main's overlay through the cascade (see the file header).
+ * Groups are encoder channels. A cascaded channel is overlaid on its own VENC
+ * input port; every other channel is overlaid on the SCL output port rvd's
+ * FS -> OSD bind recorded as feeding it. Returns false while neither is available
+ * yet, which is the normal case during rvd's OSD setup and the reason attach is
+ * deferred: for the scaler case that means osd_src_port still -1, and for a
+ * cascade that the channel has not been bound and so does not know it is one.
  */
-static bool i6c_osd_scl_port(infinity6c_state_t *st, int grp, i6c_sys_bind *port)
+static bool i6c_osd_target_port(infinity6c_state_t *st, int grp, i6c_sys_bind *port, bool *on_venc)
 {
     int src;
 
     if (!st || grp < 0 || grp >= I6C_MAX_CHN)
         return false;
+
+    memset(port, 0, sizeof(*port));
+
+    if (st->enc[grp].created && st->enc[grp].cascade) {
+        port->module = I6C_SYS_MOD_VENC;
+        port->device = st->enc[grp].device;
+        port->channel = (unsigned int)grp;
+        port->port = 0;
+        *on_venc = true;
+        return true;
+    }
+
     src = st->osd_src_port[grp];
     if (src < 0 || src >= I6C_MAX_CHN)
         return false;
 
-    memset(port, 0, sizeof(*port));
     port->module = I6C_SYS_MOD_SCL;
     port->device = I6C_SCL_DEV;
     port->channel = I6C_SCL_CHN;
     port->port = (unsigned int)src;
+    *on_venc = false;
 
     return true;
 }
@@ -255,30 +272,46 @@ static int i6c_osd_ensure_init(infinity6c_state_t *st)
     return RSS_OK;
 }
 
-/* Attach one region to its group's VENC channel, if that channel exists yet. */
+/* Attach one region to its group's overlay port, if that port exists yet. */
 static int i6c_osd_try_attach(infinity6c_state_t *st, int handle, infinity6c_osd_region_t *r)
 {
     i6c_sys_bind port;
     i6c_rgn_chn chn;
+    bool on_venc = false;
     int ret;
 
     if (r->attached || r->grp < 0)
         return RSS_OK;
-    if (!i6c_osd_scl_port(st, r->grp, &port))
+    if (!i6c_osd_target_port(st, r->grp, &port, &on_venc))
         return RSS_OK; /* Deferred, not failed. */
+
+    /* An encoder input port carries OSD layers but no cover layers, so a cover
+     * asked for on a cascaded stream has nowhere to go. Said once per region, at
+     * INFO: it is a property of the part, not a fault to be fixed. */
+    if (on_venc && r->type == RSS_OSD_COVER) {
+        if (!r->cover_declined) {
+            HAL_LOG_INFO("osd: region %d is a cover on cascaded stream %d, which has no cover "
+                         "layer -- only the scaler-fed streams can carry one",
+                         handle, r->grp);
+            r->cover_declined = true;
+        }
+        return RSS_OK;
+    }
 
     i6c_osd_fill_chn(r, &chn);
 
     ret = st->rgn.fnAttachChannel(I6C_SOC_ID, (unsigned int)handle, &port, &chn);
     if (ret) {
-        HAL_LOG_WARN("MI_RGN_AttachToChn(region %d, SCL port %u) failed: %#x", handle, port.port,
+        HAL_LOG_WARN("MI_RGN_AttachToChn(region %d, %s %u) failed: %#x", handle,
+                     on_venc ? "VENC chn" : "SCL port", on_venc ? port.channel : port.port,
                      (unsigned int)ret);
         return RSS_ERR_IO;
     }
 
     r->attached = true;
-    HAL_LOG_DBG("osd: region %d attached to SCL port %u (group %d), layer %d, alpha bg/fg %u/%u",
-                handle, port.port, r->grp, r->layer, r->bg_alpha, r->fg_alpha);
+    HAL_LOG_DBG("osd: region %d attached to %s %u (group %d), layer %d, alpha bg/fg %u/%u", handle,
+                on_venc ? "VENC chn" : "SCL port", on_venc ? port.channel : port.port, r->grp,
+                r->layer, r->bg_alpha, r->fg_alpha);
 
     return RSS_OK;
 }
@@ -286,11 +319,12 @@ static int i6c_osd_try_attach(infinity6c_state_t *st, int handle, infinity6c_osd
 static void i6c_osd_detach(infinity6c_state_t *st, int handle, infinity6c_osd_region_t *r)
 {
     i6c_sys_bind port;
+    bool on_venc = false;
 
     if (!r->attached)
         return;
 
-    if (i6c_osd_scl_port(st, r->grp, &port))
+    if (i6c_osd_target_port(st, r->grp, &port, &on_venc))
         st->rgn.fnDetachChannel(I6C_SOC_ID, (unsigned int)handle, &port);
 
     r->attached = false;
@@ -301,11 +335,12 @@ static int i6c_osd_push_chn(infinity6c_state_t *st, int handle, infinity6c_osd_r
 {
     i6c_sys_bind port;
     i6c_rgn_chn chn;
+    bool on_venc = false;
     int ret;
 
     if (!r->attached)
         return RSS_OK;
-    if (!i6c_osd_scl_port(st, r->grp, &port))
+    if (!i6c_osd_target_port(st, r->grp, &port, &on_venc))
         return RSS_OK;
 
     i6c_osd_fill_chn(r, &chn);
