@@ -212,10 +212,12 @@ static int i6c_audio_if_gain_max(rss_audio_input_t input)
  * behaves: volume 100 measured +26.7 dB against a requested +30, the shortfall
  * being the clipping it ran into rather than the DPGA.
  *
- * The map is left as the documented [-60, 30] anyway. Reshaping it to spread the
- * usable range over 0..80 would be calibrating against one board whose ADC input
- * is unloaded (see hal_audio_set_gain), so the curve above may not be the curve a
- * fitted microphone produces. Worth revisiting on hardware that has one.
+ * The map is left as the documented [-60, 30] anyway. The curve above was
+ * measured with the ADC input unloaded (see hal_audio_set_gain), so reshaping it
+ * to spread the usable range over 0..80 would be calibrating against a curve a
+ * fitted microphone need not reproduce. Acoustic capture is now confirmed with a
+ * mic fitted; if the volume knob's usable range wants widening, re-measure this
+ * curve against that mic before touching the map.
  *
  * Do not try to verify this from procfs. `Dpga Gain[n]` in
  * /proc/mi_modules/mi_ai/mi_ai0 reads 0 whatever is set -- it stays 0 even when
@@ -833,13 +835,13 @@ int hal_audio_set_volume(void *ctx, int dev, int chn, int vol)
  * to two significant figures. Above step 17 it stops responding (step 21 buys
  * 0.4 dB over 17) because the front end has run out of headroom.
  *
- * That headroom limit is a property of the board this was measured on, not of the
- * mapping: with nothing loading the ADC input, step 17 is already amplifying the
- * converter's own noise floor into hard clipping, and no gain setting produces
- * speech-band content. The evidence says no microphone is fitted here. So the
- * capture path is proven and its acoustic performance is not -- and a default of
- * gain 25 landing on step 17 should be re-judged on hardware with a real mic
- * rather than turned down to suit an unloaded input.
+ * That sweep was taken with no microphone fitted, so its top end was the
+ * converter's own noise floor being amplified into hard clipping rather than a
+ * real signal -- which is why the step scale below the ceiling is the part worth
+ * trusting from it. Acoustic capture has since been confirmed on hardware with a
+ * microphone fitted, so the path is proven end to end, not only electrically. The
+ * default gain of 25 (step 17) is left as rad ships it, now that a fitted mic no
+ * longer makes it clip; a quieter capture environment can still trim it down.
  */
 int hal_audio_set_gain(void *ctx, int dev, int chn, int gain)
 {
