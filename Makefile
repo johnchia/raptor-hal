@@ -1,15 +1,12 @@
-# Raptor HAL - Hardware Abstraction Layer for Ingenic and SigmaStar SoCs
+# Raptor HAL - Hardware Abstraction Layer for Ingenic SoCs
 #
 # Usage:
 #   make PLATFORM=T31 CROSS_COMPILE=mipsel-linux-
 #   make PLATFORM=T40 CROSS_COMPILE=mipsel-linux- INGENIC_HEADERS=/path/to/headers
-#   make PLATFORM=INFINITY6E CROSS_COMPILE=arm-linux-gnueabihf-
 #   make PLATFORM=T31 clean
 #
 # Required variables:
-#   PLATFORM        - Target SoC:
-#                       Ingenic   - T10, T20, T21, T23, T30, T31, T32, T33, T40, T41
-#                       SigmaStar - INFINITY6E, INFINITY6B0, INFINITY6C
+#   PLATFORM        - Target SoC: T10, T20, T21, T23, T30, T31, T32, T40, T41
 #   CROSS_COMPILE   - Cross-compiler prefix (e.g. mipsel-linux-)
 #
 # Optional variables:
@@ -18,28 +15,20 @@
 #   DEBUG           - Set to 1 for debug build
 #   V               - Set to 1 for verbose output
 
+# Fork-local vendor backends (absent upstream, hence -include); see FORK.md.
+-include mk/sigmastar.mk
+
 ifeq ($(filter clean,$(MAKECMDGOALS)),)
 ifndef PLATFORM
 $(error PLATFORM not set. Use: make PLATFORM=T31)
 endif
 
 # Validate platform
-VALID_PLATFORMS := T10 T20 T21 T23 T30 T31 T32 T33 T40 T41 INFINITY6E INFINITY6B0 INFINITY6C
+VALID_PLATFORMS := T10 T20 T21 T23 T30 T31 T32 T33 T40 T41 $(SIGMASTAR_PLATFORMS)
 ifeq ($(filter $(PLATFORM),$(VALID_PLATFORMS)),)
 $(error Invalid PLATFORM=$(PLATFORM). Valid: $(VALID_PLATFORMS))
 endif
 endif # clean guard
-
-# Vendor selection — which SDK family this platform belongs to.
-# Ingenic parts use the single-library IMP SDK; SigmaStar parts use the
-# per-module MI SDK. Set unconditionally (not inside the clean guard) so
-# `make clean` still resolves the right object paths.
-SIGMASTAR_PLATFORMS := INFINITY6E INFINITY6B0 INFINITY6C
-ifneq ($(filter $(PLATFORM),$(SIGMASTAR_PLATFORMS)),)
-VENDOR := sigmastar
-else
-VENDOR := ingenic
-endif
 
 # SDK version mapping
 HEADER_VER_T10 := 3.12.0
@@ -69,28 +58,11 @@ HEADER_VER  := $(HEADER_VER_$(PLATFORM))
 HEADER_LANG := $(HEADER_LANG_$(PLATFORM))
 
 # Paths
-INGENIC_HEADERS   ?= ingenic-headers
-INGENIC_LIB       ?= ../ingenic-lib
-SIGMASTAR_HEADERS ?= sigmastar-headers
+INGENIC_HEADERS ?= ingenic-headers
+INGENIC_LIB     ?= ../ingenic-lib
 
-# SigmaStar keys on the chip family rather than an SDK version, because these
-# declarations are reconstructions rather than vendor drops and the submodule
-# commit is what pins them. Still no MI libraries to link: the loaders in
-# $(BACKEND_DIR)/i6*_load.h reach MI through dlopen.
-#
-# INFINITY6C names its own family because MI 3.0 shares no struct layout with
-# MI 2.x -- even the calls whose signatures are unchanged take different
-# payloads. That family is written from the vendor SDK rather than reconstructed
-# from a third-party HAL, which is why it does not reuse infinity6e's.
-HEADER_FAMILY_INFINITY6E  := infinity6e
-HEADER_FAMILY_INFINITY6B0 := infinity6e
-HEADER_FAMILY_INFINITY6C  := infinity6c
-
-ifeq ($(VENDOR),sigmastar)
-SDK_INCLUDE     := $(SIGMASTAR_HEADERS)/$(HEADER_FAMILY_$(PLATFORM))
-else
-SDK_INCLUDE     := $(INGENIC_HEADERS)/$(PLATFORM)/$(HEADER_VER)/$(HEADER_LANG)
-endif
+# SDK_INCLUDE may already be set by a vendor fragment.
+SDK_INCLUDE     ?= $(INGENIC_HEADERS)/$(PLATFORM)/$(HEADER_VER)/$(HEADER_LANG)
 
 # Toolchain
 CC      := $(CROSS_COMPILE)gcc
@@ -108,9 +80,7 @@ CFLAGS  += -ffunction-sections -fdata-sections -flto
 CFLAGS  += -fno-asynchronous-unwind-tables -fmerge-all-constants -fno-ident
 CFLAGS  += -DPLATFORM_$(PLATFORM)
 CFLAGS  += -I$(SDK_INCLUDE)
-# IMP headers live in an imp/ subdir and are included as <imp/imp_system.h>.
-# sigmastar-headers is flat, so this one is Ingenic-only.
-ifeq ($(VENDOR),ingenic)
+ifneq ($(VENDOR),sigmastar)   # IMP headers sit in an imp/ subdir; MI headers are flat
 CFLAGS  += -I$(SDK_INCLUDE)/imp
 endif
 CFLAGS  += -Iinclude
@@ -133,58 +103,11 @@ else
 Q := @
 endif
 
-# Sources — shared across both archives.
-# hal_caps.c is pure per-SoC capability data and hal_gpio.c is plain sysfs
-# GPIO with no SDK dependency, so both are vendor-neutral.
+# Sources — shared across both archives
 CORE_SRCS := src/hal_caps.c
 
-ifeq ($(VENDOR),sigmastar)
-
-# SigmaStar MI backend. Subsystems not yet ported simply omit their ops from
-# the vtable — RSS_HAL_CALL NULL-guards every entry and returns RSS_ERR_NOTSUP,
-# so there is no need for stub translation units per unimplemented subsystem.
-#
-# Two backends, because there are two incompatible MI generations. src/star/
-# is MI 2.x (Infinity6E, Infinity6B0); src/infinity6c/ is MI 3.0 (Infinity6C),
-# where MI_SYS and MI_RGN take a leading SoC id, MI_VENC takes a leading
-# device, the ISP is a pipeline stage in its own right and VPE's scaling role
-# belongs to SCL. Sharing a translation unit would mean wrapping nearly every
-# call site in a macro to hide an argument list, which buys nothing.
-ifeq ($(PLATFORM),INFINITY6C)
-BACKEND_DIR := src/infinity6c
-else
-BACKEND_DIR := src/star
-endif
-
-HAL_COMMON_SRC := $(BACKEND_DIR)/hal_common.c
-
-ifeq ($(PLATFORM),INFINITY6C)
-# The capture and encode path, in datapath order, then OSD and the ISP tuning
-# ops. hal_gpio is vendor-neutral.
-VIDEO_SRCS := $(BACKEND_DIR)/hal_framesource.c \
-              $(BACKEND_DIR)/hal_encoder.c \
-              $(BACKEND_DIR)/hal_isp.c \
-              $(BACKEND_DIR)/hal_osd.c \
-              src/hal_gpio.c
-
-# MI 3.0 audio input. Capture only, and no src/hal_dmic.c counterpart: the
-# digital microphone is an MI_AI interface here rather than a separate module,
-# so it is a value passed to MI_AI_AttachIf and not a library of its own.
-AUDIO_SRCS := $(BACKEND_DIR)/hal_audio.c
-else
-VIDEO_SRCS := $(BACKEND_DIR)/hal_encoder.c \
-              $(BACKEND_DIR)/hal_framesource.c \
-              $(BACKEND_DIR)/hal_isp.c \
-              $(BACKEND_DIR)/hal_osd.c \
-              src/hal_gpio.c
-
-AUDIO_SRCS := $(BACKEND_DIR)/hal_audio.c
-endif
-
-else
-
-HAL_COMMON_SRC := src/hal_common.c
-
+# VIDEO_SRCS/AUDIO_SRCS/HAL_COMMON_SRC may already be set by a vendor fragment.
+ifneq ($(VENDOR),sigmastar)
 VIDEO_SRCS := src/hal_encoder.c \
               src/hal_framesource.c \
               src/hal_isp.c \
@@ -195,8 +118,9 @@ VIDEO_SRCS := src/hal_encoder.c \
 
 AUDIO_SRCS := src/hal_audio.c \
               src/hal_dmic.c
-
 endif
+
+HAL_COMMON_SRC ?= src/hal_common.c
 
 CXX_SRCS :=
 ifneq ($(JZDL_INCLUDE),)
