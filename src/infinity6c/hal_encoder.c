@@ -166,12 +166,16 @@ static bool i6c_enc_fill_rate(i6c_venc_rate *rate, const rss_video_config_t *cfg
      *   CBR (mode 9)  the driver refuses at create -- "eType:3 unsupport rc
      *                 mode:9" from CheckRcMode, MI_VENC_CreateChn returns
      *                 ILLEGAL_PARAM, and the stream never comes up.
-     *   AVBR (mode 12) worse. The channel is created, and then
-     *                 MI_VENC_StartRecvPic calls through a NULL pointer inside
-     *                 the driver and oopses the kernel (PC 0x0, from
-     *                 MI_VENC_IMPL_StartRecvPicEx). rvd is left unkillable in Z
-     *                 with MI resources held, so it takes a reboot -- and the
-     *                 same config comes back up at boot and does it again.
+     *   AVBR (mode 12) worse, and it does not stop at this process. The channel
+     *                 is created, and then MI_VENC_StartRecvPic calls through a
+     *                 NULL pointer inside the driver and oopses the kernel (PC
+     *                 0x0, from MI_VENC_IMPL_StartRecvPicEx). MI_DEVICE_Ioctl
+     *                 releases the VENC device's rwsem only after the handler
+     *                 returns, and this handler never does, so the lock is held
+     *                 for the rest of the boot: the next MI_DEVICE_Open on that
+     *                 device sleeps in down_write and cannot be killed. That is
+     *                 a reboot, and the same config comes back up and does it
+     *                 again.
      *
      * Board-measured, 3/3 each, both by asking outright and via this remap. So
      * refusing is not the honest alternative it would normally be: CBR is
