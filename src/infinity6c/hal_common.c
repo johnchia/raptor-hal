@@ -547,6 +547,63 @@ static int hal_sys_get_version(void *ctx, char *buf, int len)
     return RSS_OK;
 }
 
+/*
+ * The media clock.
+ *
+ * rvd samples this twice around a wall-clock read and publishes the mapping in
+ * the ring, which is what lets a consumer stamp a frame with an absolute capture
+ * time -- the SEI timecodes rest on it. Without the op the mapping is simply
+ * never published: rvd's publish_utc_mapping returns early and the stream is
+ * fine, just not locatable in wall time.
+ *
+ * Cheap enough to be called on a timer: the wrapper is one ioctl, and rvd
+ * re-samples every five seconds and rejects a pair that straddled a preemption.
+ */
+static int hal_sys_get_timestamp(void *ctx, int64_t *ts)
+{
+    rss_hal_ctx_t *hal = (rss_hal_ctx_t *)ctx;
+    infinity6c_state_t *st;
+    unsigned long long pts = 0;
+
+    if (!hal || !ts)
+        return RSS_ERR_INVAL;
+
+    st = (infinity6c_state_t *)hal->platform;
+    if (!st || !st->sys.get_cur_pts)
+        return RSS_ERR_NOTSUP;
+
+    if (st->sys.get_cur_pts(I6C_SOC_ID, &pts))
+        return RSS_ERR_IO;
+
+    *ts = (int64_t)pts;
+    return RSS_OK;
+}
+
+/*
+ * Move the media clock's origin.
+ *
+ * MI_SYS_InitPtsBase rather than MI_SYS_SyncPts, as on Infinity6E: the base call
+ * sets where the clock counts from, which is what a rebase means, while SyncPts
+ * nudges a running clock toward a value and is for keeping two devices together.
+ */
+static int hal_sys_rebase_timestamp(void *ctx, int64_t base)
+{
+    rss_hal_ctx_t *hal = (rss_hal_ctx_t *)ctx;
+    infinity6c_state_t *st;
+
+    if (!hal)
+        return RSS_ERR_INVAL;
+
+    st = (infinity6c_state_t *)hal->platform;
+    if (!st || !st->sys.init_pts_base)
+        return RSS_ERR_NOTSUP;
+
+    if (st->sys.init_pts_base(I6C_SOC_ID, (unsigned long long)base))
+        return RSS_ERR_IO;
+
+    return RSS_OK;
+}
+
 /* ================================================================
  * OPS VTABLE
  *
@@ -560,6 +617,10 @@ static const rss_hal_ops_t g_ops = {
     .get_caps = hal_get_caps,
 
     .sys_get_version = hal_sys_get_version,
+
+    /* The media clock rvd maps to wall time for the SEI timecodes. */
+    .sys_get_timestamp = hal_sys_get_timestamp,
+    .sys_rebase_timestamp = hal_sys_rebase_timestamp,
 
 #ifdef HAL_MODULE_AUDIO
     /*

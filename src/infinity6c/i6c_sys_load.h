@@ -71,6 +71,37 @@ typedef struct {
     /* How many frames a port may hold for a user and for the next stage. */
     int (*set_output_depth)(unsigned short soc_id, i6c_sys_bind *port, unsigned int user_depth,
                             unsigned int buf_depth);
+
+    /*
+     * The media clock, which rvd samples alongside the wall clock to publish the
+     * mapping consumers stamp absolute capture times from (rvd_frame_loop.c's
+     * publish_utc_mapping, and the SEI timecodes that rest on it).
+     *
+     * Optional, bound by dlsym: a library without them costs the timecodes and
+     * nothing else, so it is not worth failing bring-up over.
+     *
+     * The arities are read off libmi_sys.so rather than taken from the MI 2.x
+     * loader, and they differ from it -- which is the whole reason this comment is
+     * here. star/i6_sys_load.h records the question ("waybeam calls
+     * MI_SYS_GetCurPts with a leading device argument, which is Mercury6") and
+     * this family answers it: every one of the three leads with the SoC id, the
+     * same as MI_SYS_Init.
+     *
+     *   MI_SYS_GetCurPts     strh.w r0, [sp]      -> r0 is the SoC id halfword
+     *                        strd of r1 sign-extended, payload size 8
+     *                        -> r1 is the pointer, to 8 bytes
+     *   MI_SYS_InitPtsBase   strh.w r0, [sp, #8]  -> SoC id
+     *                        strd r2, r3, [sp]    -> the u64 passed by value,
+     *                        in r2:r3 because AAPCS aligns it to an even pair
+     *                        past the leading halfword in r0
+     *   MI_SYS_SyncPts       identical to InitPtsBase
+     *
+     * Getting this wrong on the MI 2.x form -- one argument, the pointer in r0 --
+     * would pass the SoC id as the output address and write the clock through it.
+     */
+    int (*get_cur_pts)(unsigned short soc_id, unsigned long long *pts);
+    int (*init_pts_base)(unsigned short soc_id, unsigned long long base);
+    int (*sync_pts)(unsigned short soc_id, unsigned long long pts);
 } i6c_sys_api;
 
 static inline int i6c_sys_load(i6c_sys_api *sys)
@@ -128,6 +159,15 @@ static inline int i6c_sys_load(i6c_sys_api *sys)
               (int (*)(unsigned short, i6c_sys_bind *, unsigned int, unsigned int))hal_symbol_load(
                   "i6c_sys", sys->lib, "MI_SYS_SetChnOutputPortDepth")))
         return RSS_ERR_NOTSUP;
+
+    /* The media clock, optional; see the declarations. dlsym rather than
+     * hal_symbol_load, which would log a miss as an error, and a library without
+     * these is not in error -- it just cannot stamp absolute time. */
+    sys->get_cur_pts =
+        (int (*)(unsigned short, unsigned long long *))dlsym(sys->lib, "MI_SYS_GetCurPts");
+    sys->init_pts_base =
+        (int (*)(unsigned short, unsigned long long))dlsym(sys->lib, "MI_SYS_InitPtsBase");
+    sys->sync_pts = (int (*)(unsigned short, unsigned long long))dlsym(sys->lib, "MI_SYS_SyncPts");
 
     return RSS_OK;
 }
