@@ -713,6 +713,129 @@ static int i6c_iq_get_raw(void *ctx, int idx, uint32_t *raw)
     return RSS_OK;
 }
 
+/*
+ * The rate the camera is configured to hold, which is the one the shutter
+ * ceiling is derived from.
+ *
+ * Deliberately not the rate the sensor reports. MI_SNR_GetFps answers from the
+ * frame length currently programmed, and the frame length is exactly what the AE
+ * stretches to buy a longer exposure -- so asking the sensor how fast it is
+ * running, in order to decide how long an exposure to permit, closes a loop
+ * around the cap's own output.
+ *
+ * Measured on an SSC377QE + IMX335, one binary, one config, two restarts.
+ * Against a lit scene the sensor answered 24 and the ceiling came down to one
+ * frame. Against a dark one, where the AE had already stretched VMAX towards the
+ * tuning's 100 ms, it answered 9 -- so 100 ms looked comfortably inside a 111 ms
+ * frame and the ceiling was left alone. That is a latch and not a one-off: having
+ * declined, the ceiling stays up, so the AE keeps VMAX stretched, so the next
+ * tuning load reads the same depressed rate and declines again. Nothing recovers
+ * it but the scene getting brighter on its own.
+ *
+ * Both fields are needed. st->fps is the rate that was programmed and
+ * snr_fps_req the rate that was asked for; rvd sets the rate while it is still
+ * building the pipeline, which on this backend runs before the sensor is
+ * enabled, so early on only the latter has anything in it -- reading st->fps
+ * alone is the trap the cap fell into first time out, declining silently on a
+ * board whose streams were plainly 25 fps.
+ *
+ * 0 when nothing has asked for a rate yet.
+ */
+static unsigned int i6c_isp_nominal_fps(const infinity6c_state_t *st)
+{
+    return st->fps ? st->fps : st->snr_fps_req;
+}
+
+/*
+ * Hold the frame rate by refusing the AE a shutter longer than one frame.
+ *
+ * A rolling-shutter sensor buys a longer exposure by stretching VMAX, so an AE
+ * free to reach the tuning's own 100 ms ceiling takes the frame rate with it:
+ * measured on IMX335 here, 90 ms of shutter is VMAX 4950 -> 11139 and 25 fps ->
+ * about 11. The tuning is right that the sensitivity exists; what it cannot know
+ * is that this camera would rather have the frame rate. One frame period is the
+ * largest exposure that costs none of it.
+ *
+ * Only the ceiling moves. The AE still regulates freely underneath it, and when
+ * it runs out of shutter it goes on to gain, which after the arm-then-load fix
+ * reaches 63x sensor and about 2.8x ISP -- so the scene does not simply go dark,
+ * it gets noisier instead of blurrier. That is the trade being made here.
+ *
+ * Written after every tuning load, never once at bring-up: a load reinstalls the
+ * binary's own envelope over this, exactly as it does for every knob in g_iq.
+ *
+ * MI keeps its own value when a bound is outside the calibrated range, so the
+ * readback is what decides whether the cap took, and it is logged either way. An
+ * exposure ceiling that quietly did not apply looks identical to a camera that
+ * is simply dark.
+ */
+static void i6c_isp_apply_shutter_cap(infinity6c_state_t *st)
+{
+    i6c_isp_exp limit;
+    unsigned int want;
+    unsigned int fps;
+    int ret;
+
+    if (!st->isp.get_expo_limit || !st->isp.set_expo_limit) {
+        HAL_LOG_WARN("isp: no MI_ISP_AE_{Get,Set}ExposureLimit; the frame rate is not held");
+        return;
+    }
+
+    /*
+     * Warned rather than logged at debug: the cap is derived from the rate, so
+     * without one nothing happens, and "nothing happens" is indistinguishable
+     * from a working cap on a camera that is simply well lit.
+     */
+    fps = i6c_isp_nominal_fps(st);
+    if (!fps) {
+        HAL_LOG_WARN("isp: sensor rate unknown; leaving the tuning's shutter ceiling");
+        return;
+    }
+
+    want = 1000000u / fps;
+
+    memset(&limit, 0, sizeof(limit));
+    ret = st->isp.get_expo_limit(I6C_DEV_ID(I6C_ISP_DEV), I6C_ISP_CHN, &limit);
+    if (ret) {
+        HAL_LOG_WARN("isp: MI_ISP_AE_GetExposureLimit failed: %d", ret);
+        return;
+    }
+
+    if (limit.maxShutterUs && limit.maxShutterUs <= want) {
+        HAL_LOG_INFO("isp: shutter ceiling %u us already within one frame at %u fps (%u us)",
+                     limit.maxShutterUs, fps, want);
+        return;
+    }
+
+    /*
+     * A ceiling below the floor is not a cap, it is a broken envelope, and MI
+     * would take it. Leave the tuning's alone and say so: at that point the frame
+     * rate the operator asked for is not one this sensor can hold.
+     */
+    if (limit.minShutterUs && want < limit.minShutterUs) {
+        HAL_LOG_WARN("isp: one frame at %u fps is %u us, below the tuning's %u us floor; "
+                     "leaving the shutter ceiling at %u us",
+                     fps, want, limit.minShutterUs, limit.maxShutterUs);
+        return;
+    }
+
+    HAL_LOG_INFO("isp: capping shutter %u -> %u us to hold %u fps", limit.maxShutterUs, want, fps);
+    limit.maxShutterUs = want;
+
+    ret = st->isp.set_expo_limit(I6C_DEV_ID(I6C_ISP_DEV), I6C_ISP_CHN, &limit);
+    if (ret) {
+        HAL_LOG_WARN("isp: MI_ISP_AE_SetExposureLimit failed: %d", ret);
+        return;
+    }
+
+    memset(&limit, 0, sizeof(limit));
+    if (st->isp.get_expo_limit(I6C_DEV_ID(I6C_ISP_DEV), I6C_ISP_CHN, &limit) == 0 &&
+        limit.maxShutterUs != want)
+        HAL_LOG_WARN("isp: shutter ceiling read back as %u us, not the %u us asked for; "
+                     "MI kept its own and the frame rate will still fall",
+                     limit.maxShutterUs, want);
+}
+
 void i6c_isp_flush_knobs(infinity6c_state_t *st)
 {
     size_t i;
@@ -743,6 +866,8 @@ void i6c_isp_flush_knobs(infinity6c_state_t *st)
         else
             i6c_iq_apply_scalar(st, (int)i, p->pending);
     }
+
+    i6c_isp_apply_shutter_cap(st);
 }
 
 void i6c_isp_forget_knobs(void)
@@ -1231,6 +1356,15 @@ int hal_isp_set_sensor_fps(void *ctx, uint32_t fps_num, uint32_t fps_den)
 
     st->fps = fps;
     HAL_LOG_INFO("isp: sensor rate %u fps", fps);
+
+    /*
+     * The shutter ceiling is one frame period, so a rate change moves it. Only
+     * once the knobs are live: before that there is no tuning in the ISP to cap,
+     * and the load that installs one calls this on its way past.
+     */
+    if (st->isp_knobs_live)
+        i6c_isp_apply_shutter_cap(st);
+
     return RSS_OK;
 }
 
@@ -1248,11 +1382,17 @@ int hal_isp_get_sensor_fps(void *ctx, uint32_t *fps_num, uint32_t *fps_den)
     if (!st || !fps_num || !fps_den)
         return RSS_ERR_INVAL;
 
-    if (st->pipeline_up && st->snr.get_fps && st->snr.get_fps(I6C_DEV_ID(I6C_SNR_PAD), &fps) == 0 &&
-        fps)
-        st->fps = fps;
-    else
-        fps = st->fps ? st->fps : st->snr_fps_req;
+    /*
+     * The sensor's own answer first, since the driver may clamp a request to
+     * what the selected mode supports and this backend does not check the mode
+     * itself. What it must not do is cache that answer: it moves with the AE
+     * (see i6c_isp_nominal_fps), while st->fps is what the pipeline binds its
+     * rates to, so letting a dark frame overwrite it would carry a stretched
+     * rate into the next bind_ext.
+     */
+    if (!(st->pipeline_up && st->snr.get_fps &&
+          st->snr.get_fps(I6C_DEV_ID(I6C_SNR_PAD), &fps) == 0 && fps))
+        fps = i6c_isp_nominal_fps(st);
 
     if (!fps)
         return RSS_ERR_BUSY;

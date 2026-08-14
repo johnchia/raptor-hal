@@ -42,11 +42,14 @@ LDFLAGS = -fsanitize=$(SAN) -lpthread
 # rests on it and its behaviour is which file gets written in what order,
 # which a host can check once the sysfs root is redirected.
 SUITES = osd isp audio gpio
-BINS = $(addprefix t_,$(SUITES))
+BINS = $(addprefix t_,$(SUITES)) t_isp_i6c
 
-test: $(addprefix test-,$(SUITES))
+test: $(addprefix test-,$(SUITES)) test-isp_i6c
 
 $(addprefix test-,$(SUITES)): test-%: t_%
+	@./$<
+
+test-isp_i6c: t_isp_i6c
 	@./$<
 
 # The suites #include the sources they test, so those are prerequisites --
@@ -61,6 +64,22 @@ DEPS = $(wildcard ../src/star/*.c ../src/star/*.h ../src/*.c ../src/*.h \
 
 t_%: t_%.c $(DEPS)
 	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
+
+# Infinity6C, which needs its own everything: a different PLATFORM_ define
+# selects a different state struct, and the MI 3.0 headers are a separate
+# include directory whose types collide with Infinity6E's. Hence a rule of
+# its own rather than another name in SUITES -- the two cannot share CFLAGS,
+# and putting both in one binary is not possible at all.
+I6C_CFLAGS = -Wall -Wextra -std=c11 -D_GNU_SOURCE -g -fsanitize=$(SAN) \
+	     -D'_Static_assert(c,m)=' -DPLATFORM_INFINITY6C=1 \
+	     -I../src -I../include -I../../raptor-common/include \
+	     -I$(SIGMASTAR_HEADERS)/infinity6c
+
+I6C_DEPS = $(wildcard ../src/infinity6c/*.c ../src/infinity6c/*.h ../src/*.c ../src/*.h \
+		      ../include/*.h ../../raptor-common/include/*.h)
+
+t_isp_i6c: t_isp_i6c.c $(I6C_DEPS)
+	$(CC) $(I6C_CFLAGS) -o $@ $< $(LDFLAGS)
 
 # ABI conformance against SigmaStar's own headers. Opt-in: the vendor
 # headers are not redistributable and are not in the repo, so this is
@@ -108,4 +127,4 @@ endif
 clean:
 	rm -f $(BINS)
 
-.PHONY: test clean abi-check abi-check-i6c $(addprefix test-,$(SUITES))
+.PHONY: test clean abi-check abi-check-i6c test-isp_i6c $(addprefix test-,$(SUITES))

@@ -111,6 +111,20 @@ typedef struct {
      */
     int (*cus3a_enable)(unsigned int device, unsigned int channel, const unsigned char *enable);
     int (*enable_3a)(unsigned int device, unsigned int channel);
+
+    /*
+     * The AE's own envelope: shutter, aperture and the two gain ceilings. What
+     * the shutter cap is written through, and the only readable statement of
+     * what the tuning binary installed -- the plain long exposure table behind
+     * it is a curve, this is its bounds.
+     *
+     * Optional and dlsym'd for the same reason as the CUS3A pair: a library
+     * without them should cost the cap, not the pipeline. The Infinity6E backend
+     * reaches the identical call through hal_symbol_load because there it is a
+     * hard requirement of its gain-ceiling ops.
+     */
+    int (*get_expo_limit)(unsigned int device, unsigned int channel, i6c_isp_exp *limit);
+    int (*set_expo_limit)(unsigned int device, unsigned int channel, i6c_isp_exp *limit);
 } i6c_isp_api;
 
 static inline int i6c_isp_load(i6c_isp_api *isp)
@@ -191,6 +205,11 @@ static inline int i6c_isp_load(i6c_isp_api *isp)
         isp->lib, "MI_ISP_CUS3A_Enable");
     isp->enable_3a =
         (int (*)(unsigned int, unsigned int))dlsym(isp->lib, "MI_ISP_EnableUserspace3A");
+
+    isp->get_expo_limit = (int (*)(unsigned int, unsigned int, i6c_isp_exp *))dlsym(
+        isp->lib, "MI_ISP_AE_GetExposureLimit");
+    isp->set_expo_limit = (int (*)(unsigned int, unsigned int, i6c_isp_exp *))dlsym(
+        isp->lib, "MI_ISP_AE_SetExposureLimit");
 
     return RSS_OK;
 }

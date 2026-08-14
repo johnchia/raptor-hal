@@ -87,3 +87,26 @@ _Static_assert(sizeof(MI_ISP_IQ_Nr3dType_t) != 1776,
  */
 _Static_assert(sizeof(i6c_isp_para) <= sizeof(MI_ISP_ChnParam_t),
                "the ISP channel parameter block is larger than the struct we send it");
+
+/*
+ * The AE envelope, field by field rather than by size alone. Size is the weakest
+ * possible check on this one: eight same-width words in the wrong order are the
+ * same 32 bytes, and the vendor's order is not the one it looks like -- the two
+ * gain minima sit together ahead of the two maxima, so the natural min/max
+ * pairing would put the shutter ceiling this backend writes into u32MaxFNx10,
+ * and holding the frame rate would silently do nothing at all.
+ */
+#define AE_FIELD_AT(ours, theirs)                                                                  \
+    _Static_assert(offsetof(i6c_isp_exp, ours) == offsetof(MI_ISP_AE_ExpoLimitType_t, theirs),     \
+                   "i6c_isp_exp." #ours " is not at MI_ISP_AE_ExpoLimitType_t." #theirs);
+
+_Static_assert(sizeof(i6c_isp_exp) == sizeof(MI_ISP_AE_ExpoLimitType_t),
+               "the AE exposure limit struct is not the vendor's size");
+AE_FIELD_AT(minShutterUs, u32MinShutterUS)
+AE_FIELD_AT(maxShutterUs, u32MaxShutterUS)
+AE_FIELD_AT(minApertX10, u32MinFNx10)
+AE_FIELD_AT(maxApertX10, u32MaxFNx10)
+AE_FIELD_AT(minSensorGain, u32MinSensorGain)
+AE_FIELD_AT(minIspGain, u32MinISPGain)
+AE_FIELD_AT(maxSensorGain, u32MaxSensorGain)
+AE_FIELD_AT(maxIspGain, u32MaxISPGain)
