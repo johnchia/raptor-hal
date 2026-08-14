@@ -59,11 +59,23 @@
 
 /*
  * Big enough for every row in g_iq, checked against each row's payload before
- * the buffer is used. Saturation's 416 is the largest; the two modules with
- * per-band tables are deliberately not in the table (see i6c_isp.h) and would
- * otherwise pull this to 6264.
+ * the buffer is used. Sharpness is what sets it: its module carries sixteen
+ * per-ISO copies of a 368-byte parameter block, so the whole payload is 6264
+ * bytes and the library copies all of it in both directions.
+ *
+ * It is a stack buffer and it stays one. The alternative -- a small buffer for
+ * the eight scalar rows and a large one only where it is needed -- means two
+ * copies of the apply and the fetch, which is a worse thing to own than one and
+ * a half pages of stack in a call that runs a handful of times per pipeline.
  */
-#define I6C_IQ_PAYLOAD_MAX 512
+#define I6C_IQ_PAYLOAD_MAX 6264
+
+/*
+ * The longest strength run a vector row can have, which is sharpness's six.
+ * Only the run is held per row, not the payload: what is learned from the
+ * tuning is a handful of gains, not the module.
+ */
+#define I6C_IQ_VECTOR_MAX 6
 
 /*
  * MI's flicker enum, which is not raptor's. MI orders 60Hz before 50Hz and
@@ -238,10 +250,15 @@ int hal_isp_get_sensor_attr(void *ctx, uint32_t *width, uint32_t *height)
  * ================================================================ */
 
 typedef enum {
-    IQ_FLAT,   /* the value is the whole payload, at offset 0 */
-    IQ_BOOL,   /* bEnable at offset 0 is itself the value */
-    IQ_AUTOMAN /* bEnable, enOpType, stAuto[16], stManual at manual_off */
+    IQ_FLAT,    /* the value is the whole payload, at offset 0 */
+    IQ_BOOL,    /* bEnable at offset 0 is itself the value */
+    IQ_AUTOMAN, /* bEnable, enOpType, stAuto[16], stManual at manual_off */
+    IQ_VECTOR   /* as IQ_AUTOMAN, but the value is a run of `count` fields */
 } i6c_iq_shape_t;
+
+/* The two shapes that carry enOpType, so that neutral can hand the module back
+ * to the tuning rather than pinning it to the tuning's own numbers. */
+#define I6C_IQ_HAS_AUTO(p) ((p)->shape == IQ_AUTOMAN || (p)->shape == IQ_VECTOR)
 
 typedef struct {
     const char *name; /* for diagnostics only */
@@ -250,6 +267,7 @@ typedef struct {
     uint16_t payload;    /* the wrapper's own declared payload length */
     uint16_t manual_off; /* where the value lives (0 for FLAT and BOOL) */
     uint8_t width;       /* 1, 2 or 4 bytes */
+    uint8_t count;       /* fields in the run: 1 for everything but IQ_VECTOR */
     uint8_t shape;       /* i6c_iq_shape_t */
     int32_t mi_max;      /* MI's maximum for the field */
     int32_t mi_unity;    /* the MI value that means the same as raptor's 128 */
@@ -273,12 +291,31 @@ typedef struct {
     /* Armed by each tuning load, cleared by the fetch that reads the baseline
      * back out. Only meaningful with unity_from_tuning. */
     bool unity_stale;
+
+    /*
+     * A vector row's baseline: the tuning's own value for each field of the
+     * run, which is what raptor's 128 means for that field. Held per row rather
+     * than re-read on each write, and that is the whole point -- scaling from
+     * the field's current value would compound, so a knob nudged from 128 to
+     * 160 four times would end up somewhere quite different from one set to 160
+     * once, with no way back short of a tuning reload.
+     */
+    bool base_valid;
+    uint16_t base[I6C_IQ_VECTOR_MAX];
+
+    /*
+     * Which field of the run the getter reports from; chosen with the baseline
+     * rather than fixed at 0. See i6c_iq_pick_report_field.
+     */
+    uint8_t report;
 } i6c_iq_param_t;
 
 enum {
     IQ_BRIGHTNESS,
     IQ_CONTRAST,
     IQ_SATURATION,
+    IQ_SHARPNESS,
+    IQ_NRLUMAADV,
     IQ_DEFOG,
     IQ_DEFOG_EN,
     IQ_GRAY,
@@ -301,20 +338,62 @@ enum {
  *                        isp_set_defog switches
  *   EV compensation      signed, +/-I6C_AE_EV_SPAN about the tuning's own value
  *
+ * The two vector rows have no constant to put here at all, which is why both
+ * learn their neutral from the tuning; see i6c_iq_apply_vector. What is in
+ * mi_unity for them is the fallback for a board with no tuning file, and it is
+ * the midpoint of the field because nothing better is knowable without one.
+ *
  * Single-instance, like the Infinity6E table: the resolved symbols and the
  * pending queue belong to one HAL context, which is what rvd creates. Cleared by
  * i6c_isp_forget_knobs at teardown.
  */
 static i6c_iq_param_t g_iq[IQ_PARAM_COUNT] = {
     [IQ_BRIGHTNESS] = {"brightness", "MI_ISP_IQ_GetBrightness", "MI_ISP_IQ_SetBrightness",
-                       I6C_ISP_IQ_BRIGHTNESS_PAYLOAD, I6C_ISP_IQ_BRIGHTNESS_MANUAL, 4, IQ_AUTOMAN,
-                       100, 50, 0, false, NULL, NULL, 0, false, false, false},
+                       I6C_ISP_IQ_BRIGHTNESS_PAYLOAD, I6C_ISP_IQ_BRIGHTNESS_MANUAL, 4, 1,
+                       IQ_AUTOMAN, 100, 50, 0, false, NULL, NULL, 0, false, false, false},
     [IQ_CONTRAST] = {"contrast", "MI_ISP_IQ_GetContrast", "MI_ISP_IQ_SetContrast",
-                     I6C_ISP_IQ_CONTRAST_PAYLOAD, I6C_ISP_IQ_CONTRAST_MANUAL, 4, IQ_AUTOMAN, 100,
+                     I6C_ISP_IQ_CONTRAST_PAYLOAD, I6C_ISP_IQ_CONTRAST_MANUAL, 4, 1, IQ_AUTOMAN, 100,
                      50, 0, false, NULL, NULL, 0, false, false, false},
     [IQ_SATURATION] = {"saturation", "MI_ISP_IQ_GetSaturation", "MI_ISP_IQ_SetSaturation",
-                       I6C_ISP_IQ_SATURATION_PAYLOAD, I6C_ISP_IQ_SATURATION_MANUAL, 1, IQ_AUTOMAN,
-                       127, 32, 0, false, NULL, NULL, 0, false, false, false},
+                       I6C_ISP_IQ_SATURATION_PAYLOAD, I6C_ISP_IQ_SATURATION_MANUAL, 1, 1,
+                       IQ_AUTOMAN, 127, 32, 0, false, NULL, NULL, 0, false, false, false},
+    /*
+     * Sharpness, and the reason this file grew a vector shape.
+     *
+     * MI has no sharpness level on this generation. What it has is six gains --
+     * three frequency bands for the undirectional sharpener and three for the
+     * directional one, each 0..127 -- and the tuning binary sets all six to a
+     * shape that is the tuner's judgement about this sensor. So the knob scales
+     * the run and leaves the shape alone, which is the only reading of "more
+     * sharpness" that does not throw the tuning away.
+     *
+     * 63 is the no-tuning fallback and is a midpoint, not a measurement.
+     */
+    [IQ_SHARPNESS] = {"sharpness", "MI_ISP_IQ_GetSharpness", "MI_ISP_IQ_SetSharpness",
+                      I6C_ISP_IQ_SHARPNESS_PAYLOAD,
+                      I6C_ISP_IQ_SHARPNESS_MANUAL + I6C_ISP_IQ_SHARPNESS_STRENGTH, 1,
+                      I6C_ISP_IQ_SHARPNESS_STRENGTH_NUM, IQ_VECTOR,
+                      I6C_ISP_IQ_SHARPNESS_STRENGTH_MAX, 63, 0, true, NULL, NULL, 0, false, false,
+                      false},
+    /*
+     * Spatial luma denoise, which raptor calls sinter and MI calls NrLumaAdv.
+     *
+     * Two fields rather than sharpness's six, and they are the module's own
+     * blend weights: how much of the filtered luma replaces the original, per
+     * level. 256 is unity there -- a full swap -- so the field is sixteen bits
+     * and the ceiling is one past what a byte holds, which is worth stating
+     * because 255 would look like the obvious maximum and would be a step short
+     * of the one the vendor documents.
+     *
+     * Not MI_ISP_IQ_SetNRLuma, which is the older module of the same name and
+     * is not what the maruko tuning binaries carry.
+     */
+    [IQ_NRLUMAADV] = {"sinter", "MI_ISP_IQ_GetNrLumaAdv", "MI_ISP_IQ_SetNrLumaAdv",
+                      I6C_ISP_IQ_NRLUMAADV_PAYLOAD,
+                      I6C_ISP_IQ_NRLUMAADV_MANUAL + I6C_ISP_IQ_NRLUMAADV_STRENGTH, 2,
+                      I6C_ISP_IQ_NRLUMAADV_STRENGTH_NUM, IQ_VECTOR,
+                      I6C_ISP_IQ_NRLUMAADV_STRENGTH_MAX, 128, 0, true, NULL, NULL, 0, false, false,
+                      false},
     /*
      * Defog is the one module whose Infinity6E counterpart is a bare enable. Here
      * it is a full auto/manual module with a strength byte, so raptor's two ops --
@@ -327,13 +406,13 @@ static i6c_iq_param_t g_iq[IQ_PARAM_COUNT] = {
      * both before the first frame.
      */
     [IQ_DEFOG] = {"defog", "MI_ISP_IQ_GetDefog", "MI_ISP_IQ_SetDefog", I6C_ISP_IQ_DEFOG_PAYLOAD,
-                  I6C_ISP_IQ_DEFOG_MANUAL, 1, IQ_AUTOMAN, 255, 128, 0, false, NULL, NULL, 0, false,
-                  false, false},
+                  I6C_ISP_IQ_DEFOG_MANUAL, 1, 1, IQ_AUTOMAN, 255, 128, 0, false, NULL, NULL, 0,
+                  false, false, false},
     [IQ_DEFOG_EN] = {"defog enable", "MI_ISP_IQ_GetDefog", "MI_ISP_IQ_SetDefog",
-                     I6C_ISP_IQ_DEFOG_PAYLOAD, I6C_ISP_ENABLE_OFF, 4, IQ_BOOL, 1, 0, 0, false, NULL,
-                     NULL, 0, false, false, false},
+                     I6C_ISP_IQ_DEFOG_PAYLOAD, I6C_ISP_ENABLE_OFF, 4, 1, IQ_BOOL, 1, 0, 0, false,
+                     NULL, NULL, 0, false, false, false},
     [IQ_GRAY] = {"gray", "MI_ISP_IQ_GetColorToGray", "MI_ISP_IQ_SetColorToGray",
-                 I6C_ISP_IQ_GRAY_PAYLOAD, 0, 4, IQ_BOOL, 1, 0, 0, false, NULL, NULL, 0, false,
+                 I6C_ISP_IQ_GRAY_PAYLOAD, 0, 4, 1, IQ_BOOL, 1, 0, 0, false, NULL, NULL, 0, false,
                  false, false},
     /*
      * The only row whose neutral has to be learned and the only one whose MI
@@ -342,11 +421,11 @@ static i6c_iq_param_t g_iq[IQ_PARAM_COUNT] = {
      * shifts every default image.
      */
     [AE_EVCOMP] = {"ae_comp", "MI_ISP_AE_GetEvComp", "MI_ISP_AE_SetEvComp",
-                   I6C_ISP_AE_EVCOMP_PAYLOAD, 0, 4, IQ_FLAT, I6C_AE_EV_SPAN, 0, -I6C_AE_EV_SPAN,
+                   I6C_ISP_AE_EVCOMP_PAYLOAD, 0, 4, 1, IQ_FLAT, I6C_AE_EV_SPAN, 0, -I6C_AE_EV_SPAN,
                    true, NULL, NULL, 0, false, false, false},
     [AE_FLICKER] = {"antiflicker", "MI_ISP_AE_GetFlicker", "MI_ISP_AE_SetFlicker",
-                    I6C_ISP_AE_FLICKER_PAYLOAD, 0, 4, IQ_FLAT, 3, 0, 0, false, NULL, NULL, 0, false,
-                    false, false},
+                    I6C_ISP_AE_FLICKER_PAYLOAD, 0, 4, 1, IQ_FLAT, 3, 0, 0, false, NULL, NULL, 0,
+                    false, false, false},
 };
 
 /* memcpy rather than a cast: the payload is a byte buffer and these offsets
@@ -411,6 +490,20 @@ static int i6c_iq_resolve(infinity6c_state_t *st, i6c_iq_param_t *p)
         return RSS_ERR_INVAL;
     }
 
+    /*
+     * Both bounds, because a row is wrong in two different ways and only one of
+     * them is a buffer overrun. A run longer than base[] would overrun the
+     * baseline on the way in; a run that reaches past the payload would have the
+     * library copy from past the staging buffer on the way out. Checked here
+     * rather than asserted, because the test build defines _Static_assert away.
+     */
+    if (p->count > I6C_IQ_VECTOR_MAX ||
+        (uint32_t)p->manual_off + (uint32_t)p->count * p->width > p->payload) {
+        HAL_LOG_ERR("isp: %s run of %u x %u at %u does not fit its %u-byte payload", p->name,
+                    p->count, p->width, p->manual_off, p->payload);
+        return RSS_ERR_INVAL;
+    }
+
     p->fn_get = (i6c_isp_cmd_fn)hal_symbol_load("i6c_isp", st->isp.lib, p->get_sym);
     p->fn_set = (i6c_isp_cmd_fn)hal_symbol_load("i6c_isp", st->isp.lib, p->set_sym);
     if (!p->fn_get || !p->fn_set) {
@@ -429,12 +522,89 @@ static int i6c_iq_resolve(infinity6c_state_t *st, i6c_iq_param_t *p)
  * fetch clears -- so what it reads is the binary's value and not one of ours.
  * Without it the sub-neutral half of the knob is measured from a guess.
  */
+/*
+ * Which field of a run the getter should read back from.
+ *
+ * Every field was scaled from the same 0..255, so in principle any of them
+ * recovers it. In practice a field whose baseline sits on one of MI's bounds
+ * cannot: half the knob maps onto the one value there, and unscaling it reports
+ * neutral for everything on that side.
+ *
+ * That is not hypothetical. The IMX335 tuning on this board leaves the first
+ * sharpening gain -- low-frequency undirectional -- at 0 of 127, so reporting
+ * from field 0 answered 128 for a knob set to 64, and again for one set to 0.
+ * The write was right and every field moved; only the reading was blind.
+ *
+ * So pick the best-conditioned field: the one furthest from both bounds, which
+ * is the one with the most resolution to report with in either direction. Ties
+ * go to the earlier field, and a run that is entirely on a bound has no good
+ * answer to give -- but a tuning that turned the module off has genuinely made
+ * "off" and "as the tuning left it" the same picture, so reporting neutral for
+ * both is not wrong there.
+ */
+static void i6c_iq_pick_report_field(i6c_iq_param_t *p)
+{
+    int32_t best_room = -1;
+    unsigned int i;
+
+    p->report = 0;
+
+    for (i = 0; i < p->count; i++) {
+        int32_t base = p->base[i];
+        int32_t below = base - p->mi_floor;
+        int32_t above = p->mi_max - base;
+        int32_t room = below < above ? below : above;
+
+        if (room > best_room) {
+            best_room = room;
+            p->report = (uint8_t)i;
+        }
+    }
+}
+
 static void i6c_iq_learn_unity(i6c_iq_param_t *p, const uint8_t *buf)
 {
     int32_t base;
+    unsigned int i;
 
     if (!p->unity_from_tuning || !p->unity_stale)
         return;
+
+    /*
+     * A vector row learns the whole run at once, and all or nothing: one field
+     * out of range means the offset or the width is wrong for the module, not
+     * that one gain is unusual, so adopting the rest would scale five good
+     * fields about a misread sixth and look almost right.
+     *
+     * All-zero is not out of range and is not rejected. A tuning is entitled to
+     * turn a module off, and if it has, then raptor's neutral is off too and
+     * everything above it scales up from nothing -- which is the correct
+     * reading of a knob whose baseline is zero, not a failure to find one.
+     */
+    if (p->shape == IQ_VECTOR) {
+        for (i = 0; i < p->count; i++) {
+            base = (int32_t)i6c_iq_read(buf, p->manual_off + i * p->width, p->width);
+            if (base > p->mi_max || base < p->mi_floor) {
+                HAL_LOG_WARN("isp: %s field %u reads MI %d, outside its %d..%d range -- not "
+                             "adopting the tuning's run as the neutral, keeping %d throughout",
+                             p->name, i, base, p->mi_floor, p->mi_max, p->mi_unity);
+                p->base_valid = false;
+                p->report = 0;
+                p->unity_stale = false;
+                return;
+            }
+            p->base[i] = (uint16_t)base;
+        }
+
+        p->base_valid = true;
+        p->unity_stale = false;
+        i6c_iq_pick_report_field(p);
+        HAL_LOG_INFO("isp: %s baseline from the tuning is MI %u..%u over %u fields in %d..%d, "
+                     "reporting from field %u (MI %u)",
+                     p->name, p->base[0], p->base[p->count - 1], p->count, p->mi_floor, p->mi_max,
+                     p->report, p->base[p->report]);
+        return;
+    }
 
     /* The cast is the whole of the sign extension, which holds because the one
      * signed field here is four bytes wide. */
@@ -453,6 +623,23 @@ static void i6c_iq_learn_unity(i6c_iq_param_t *p, const uint8_t *buf)
     p->unity_stale = false;
     HAL_LOG_INFO("isp: %s baseline from the tuning is MI %d in %d..%d", p->name, base, p->mi_floor,
                  p->mi_max);
+}
+
+/*
+ * What raptor's 128 means for one field of a row.
+ *
+ * mi_unity for everything that is not a vector, and for a vector whose run
+ * could not be learned -- which is a board with no tuning file, or a header
+ * drop that moved the module. The midpoint is a poor neutral, but it is a knob
+ * that still moves in both directions, which is better than one pinned to a
+ * field that was misread.
+ */
+static int32_t i6c_iq_baseline(const i6c_iq_param_t *p, unsigned int i)
+{
+    if (p->shape != IQ_VECTOR || !p->base_valid)
+        return p->mi_unity;
+
+    return p->base[i];
 }
 
 /*
@@ -506,9 +693,17 @@ static int32_t i6c_iq_scale(int val, int32_t unity, int32_t floor, int32_t max)
         return floor;
     if (val >= 255)
         return max;
-    if (val == I6C_ISP_NEUTRAL || unity >= max)
+    if (val == I6C_ISP_NEUTRAL)
         return unity;
 
+    /*
+     * A baseline sitting on the ceiling needs no special case: the upper branch
+     * below spans max - unity, which is then zero, so every value above neutral
+     * lands on the baseline and the knob simply has no headroom. What it must
+     * not do is give up on the lower half as well, which a `unity >= max` bail
+     * here used to -- and a tuning that asks for full-strength denoise is
+     * exactly the case, since MI's own unity for that field is its maximum.
+     */
     if (val < I6C_ISP_NEUTRAL)
         return floor + (int32_t)(((int64_t)val * (unity - floor)) / I6C_ISP_NEUTRAL);
 
@@ -519,16 +714,24 @@ static int32_t i6c_iq_scale(int val, int32_t unity, int32_t floor, int32_t max)
 /* Inverse of i6c_iq_scale, for the getters. */
 static uint8_t i6c_iq_unscale(int32_t mi, int32_t unity, int32_t floor, int32_t max)
 {
-    if (max == floor || mi >= max)
+    if (max == floor)
         return 255;
-    if (unity >= max)
-        return I6C_ISP_NEUTRAL;
     /*
-     * Ahead of the floor test, which would otherwise swallow it: when the learned
-     * baseline sits on the floor, MI 0 is neutral rather than the bottom.
+     * Ahead of both bound tests, which would otherwise swallow it: a learned
+     * baseline can sit on either end, and there MI's own extreme is neutral
+     * rather than the extreme. Sitting on the floor is the ae_comp case and
+     * makes 0 mean neutral; sitting on the ceiling is the full-strength denoise
+     * case and makes the maximum mean it.
+     *
+     * Which does leave the reading ambiguous at whichever end the baseline is
+     * on -- MI cannot distinguish "asked for neutral" from "asked for the end"
+     * when they are the same number -- and neutral is the better answer, since
+     * it is what the knob was left at rather than what it was driven to.
      */
     if (mi == unity)
         return I6C_ISP_NEUTRAL;
+    if (mi >= max)
+        return 255;
     if (mi <= floor)
         return 0;
 
@@ -580,6 +783,67 @@ static int i6c_iq_apply_scalar(infinity6c_state_t *st, int idx, int val)
 }
 
 /*
+ * Apply one of raptor's 0..255 scalars to a module that has no scalar in it.
+ *
+ * Sharpness and spatial denoise are per-band tables here: six sharpening gains
+ * across three frequencies and two sharpener kinds, two denoise blend weights.
+ * There is no field that means "how much" on its own, and picking one band and
+ * calling it sharpness is what this file spent a release declining to do.
+ *
+ * What there is, in each, is a contiguous run of fields that all mean strength,
+ * and a tuning binary that has already chosen a *shape* for them -- how much
+ * high frequency relative to low, how much directional relative to
+ * undirectional. That shape is the tuner's judgement about this sensor and this
+ * lens, and it is not something a single knob has any business rewriting. So
+ * the knob scales the run, each field about its own baseline, and the shape
+ * survives: raptor's 128 is the tuning untouched, 0 is the module off, 255 is
+ * every field at MI's ceiling, and everything between moves them together.
+ *
+ * The shape does flatten as the knob approaches 255, because the fields run out
+ * of headroom at different distances from their baselines and the ceiling is
+ * shared. That is inherent in "maximum" meaning maximum, and it is the same
+ * thing i6c_iq_scale already does to every scalar row at the top of its range.
+ *
+ * Scaled from the learned baseline and never from what is in the field now --
+ * see base_valid, and i6c_iq_flush_knobs for when a baseline goes stale.
+ */
+static int i6c_iq_apply_vector(infinity6c_state_t *st, int idx, int val)
+{
+    i6c_iq_param_t *p = &g_iq[idx];
+    uint8_t buf[I6C_IQ_PAYLOAD_MAX];
+    unsigned int i;
+    int ret;
+
+    /* Which is also what learns the baseline, on the first fetch after a load. */
+    ret = i6c_iq_fetch(st, idx, buf);
+    if (ret != RSS_OK)
+        return ret;
+
+    if (val == I6C_ISP_NEUTRAL) {
+        i6c_iq_write(buf, I6C_ISP_OPTYPE_OFF, 4, I6C_ISP_OP_AUTO);
+        HAL_LOG_DBG("isp: %s left to the tuning file (auto)", p->name);
+        return i6c_iq_store(st, idx, buf);
+    }
+
+    i6c_iq_write(buf, I6C_ISP_OPTYPE_OFF, 4, I6C_ISP_OP_MANUAL);
+
+    for (i = 0; i < p->count; i++) {
+        int32_t mi_val = i6c_iq_scale(val, i6c_iq_baseline(p, i), p->mi_floor, p->mi_max);
+
+        i6c_iq_write(buf, p->manual_off + i * p->width, p->width, (uint32_t)mi_val);
+    }
+
+    ret = i6c_iq_store(st, idx, buf);
+    if (ret == RSS_OK)
+        HAL_LOG_DBG("isp: %s = %d (%u fields, MI %d..%d in %d..%d)", p->name, val, p->count,
+                    i6c_iq_scale(val, i6c_iq_baseline(p, 0), p->mi_floor, p->mi_max),
+                    i6c_iq_scale(val, i6c_iq_baseline(p, p->count - 1), p->mi_floor, p->mi_max),
+                    p->mi_floor, p->mi_max);
+
+    return ret;
+}
+
+/*
  * Write a field MI defines as an enum or a flag, with no scaling. The row says
  * where and how wide, so an enable row addresses bEnable as the four-byte enum it
  * is -- writing one byte of it would leave the other three as fetched, which is
@@ -602,6 +866,18 @@ static int i6c_iq_apply_raw(infinity6c_state_t *st, int idx, uint32_t raw)
         HAL_LOG_DBG("isp: %s = %u (raw)", p->name, raw);
 
     return ret;
+}
+
+/* The one place a row's shape chooses its apply, so the flush and the direct
+ * path cannot disagree about which one a row gets. */
+static int i6c_iq_apply(infinity6c_state_t *st, int idx, int val, bool raw)
+{
+    if (raw)
+        return i6c_iq_apply_raw(st, idx, (uint32_t)val);
+    if (g_iq[idx].shape == IQ_VECTOR)
+        return i6c_iq_apply_vector(st, idx, val);
+
+    return i6c_iq_apply_scalar(st, idx, val);
 }
 
 /*
@@ -629,7 +905,7 @@ static int i6c_iq_set(void *ctx, int idx, int val, bool raw)
         return RSS_OK;
     }
 
-    return raw ? i6c_iq_apply_raw(st, idx, (uint32_t)val) : i6c_iq_apply_scalar(st, idx, val);
+    return i6c_iq_apply(st, idx, val, raw);
 }
 
 static int i6c_iq_set_scalar(void *ctx, int idx, int val)
@@ -678,13 +954,19 @@ static int i6c_iq_get_scalar(void *ctx, int idx, uint8_t *val)
      * An auto module is reporting the tuning's value, not one of raptor's, and
      * neutral is exactly what raptor calls that.
      */
-    if (p->shape == IQ_AUTOMAN && i6c_iq_read(buf, I6C_ISP_OPTYPE_OFF, 4) == I6C_ISP_OP_AUTO) {
+    if (I6C_IQ_HAS_AUTO(p) && i6c_iq_read(buf, I6C_ISP_OPTYPE_OFF, 4) == I6C_ISP_OP_AUTO) {
         *val = I6C_ISP_NEUTRAL;
         return RSS_OK;
     }
 
-    *val = i6c_iq_unscale((int32_t)i6c_iq_read(buf, p->manual_off, p->width), p->mi_unity,
-                          p->mi_floor, p->mi_max);
+    /*
+     * One field of the run answers for a vector row, and which one was chosen
+     * along with the baseline -- see i6c_iq_pick_report_field. report is 0 for
+     * every other shape, which is what lets this be one expression for all of
+     * them.
+     */
+    *val = i6c_iq_unscale((int32_t)i6c_iq_read(buf, p->manual_off + p->report * p->width, p->width),
+                          i6c_iq_baseline(p, p->report), p->mi_floor, p->mi_max);
     return RSS_OK;
 }
 
@@ -850,8 +1132,16 @@ void i6c_isp_flush_knobs(infinity6c_state_t *st)
      */
     st->isp_knobs_live = true;
 
-    /* Every baseline read out of the tuning is stale now the tuning has just
-     * loaded, and the fetches below are where they are re-read. */
+    /*
+     * Every baseline read out of the tuning is stale now the tuning has just
+     * loaded, and the fetches below are where they are re-read.
+     *
+     * A vector row's base[] is not separately invalidated here, and does not
+     * need to be: every read of it goes through i6c_iq_baseline, every caller
+     * of that has just been through i6c_iq_fetch, and a fetch with unity_stale
+     * set relearns the run before it returns. So the stale values cannot be
+     * reached -- one flag, not two that could disagree.
+     */
     for (i = 0; i < IQ_PARAM_COUNT; i++)
         g_iq[i].unity_stale = g_iq[i].unity_from_tuning;
 
@@ -861,10 +1151,7 @@ void i6c_isp_flush_knobs(infinity6c_state_t *st)
         if (!p->has_pending)
             continue;
 
-        if (p->pending_is_raw)
-            i6c_iq_apply_raw(st, (int)i, (uint32_t)p->pending);
-        else
-            i6c_iq_apply_scalar(st, (int)i, p->pending);
+        i6c_iq_apply(st, (int)i, p->pending, p->pending_is_raw);
     }
 
     i6c_isp_apply_shutter_cap(st);
@@ -918,6 +1205,31 @@ int hal_isp_get_contrast(void *ctx, uint8_t *val)
 int hal_isp_get_saturation(void *ctx, uint8_t *val)
 {
     return i6c_iq_get_scalar(ctx, IQ_SATURATION, val);
+}
+
+/*
+ * Sharpness and spatial denoise, both per-band tables driven as a run; see
+ * i6c_iq_apply_vector for what a single number does to one. raptor's name for
+ * the second is "sinter", MI's is NrLumaAdv, and they are the same module.
+ */
+int hal_isp_set_sharpness(void *ctx, int val)
+{
+    return i6c_iq_set_scalar(ctx, IQ_SHARPNESS, val);
+}
+
+int hal_isp_get_sharpness(void *ctx, uint8_t *val)
+{
+    return i6c_iq_get_scalar(ctx, IQ_SHARPNESS, val);
+}
+
+int hal_isp_set_sinter_strength(void *ctx, int val)
+{
+    return i6c_iq_set_scalar(ctx, IQ_NRLUMAADV, val);
+}
+
+int hal_isp_get_sinter_strength(void *ctx, uint8_t *val)
+{
+    return i6c_iq_get_scalar(ctx, IQ_NRLUMAADV, val);
 }
 
 /*
@@ -1249,9 +1561,10 @@ int hal_isp_get_hvflip(void *ctx, int *hflip, int *vflip)
  * maps onto 0..7, so the knob has eight distinct positions rather than 256 -- which
  * is what the hardware has.
  *
- * There is no sinter counterpart. Spatial luma denoise is a separate module here
- * with the same per-band shape as sharpness, so isp_set_sinter_strength stays
- * absent rather than being aliased onto this one and quietly moving temper.
+ * Sinter is emphatically not this. Spatial luma denoise is its own module,
+ * reached through the tuning API as a vector row, and aliasing the two would
+ * have isp_set_sinter_strength quietly move temper -- which is the sort of
+ * substitution that survives a bench check, because both do reduce noise.
  */
 #define I6C_ISP_NR3D_MAX 7
 

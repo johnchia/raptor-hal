@@ -56,50 +56,50 @@ const rss_hal_caps_t g_hal_caps = {
     /* Permanent false: T23-specific IMP_ISP_MultiCamera_* API. */
     .has_t23_multicam_api = false,
 
-    /*
-     * ISP tuning — phase 3. True only where MI has a control that
-     * genuinely matches the raptor knob:
-     *
-     *   defog          MI_ISP_IQ_SetDefog, a toggle. isp_set_defog is
-     *                  implemented; the *strength* variants are not,
-     *                  because there is no strength to set.
-     *   sinter/temper  MI's spatial (NRLuma) and temporal (NR3D) noise
-     *                  reduction, both 0..255 as raptor expects.
-     *   ae_comp        MI_ISP_AE_SetEVComp.
-     *   max_gain       Both ceilings live in MI's AE exposure-limit
-     *                  struct.
-     *
-     * Left false, with the reasoning spelled out in hal_isp.c's OP
-     * COVERAGE comment: dpc and drc (MI's are a toggle and a curve, not
-     * strengths), bcsh_hue (a 64-entry HSV LUT), highlight_depress and
-     * backlight_comp (WDR curve descriptors), and switch_bin -- a tuning
-     * binary *is* loaded during hal_init, but Ingenic's runtime
-     * bin-switching op has no MI counterpart.
-     *
-     * INFINITY6B0 leaves all five false, and this is the one place the two
-     * families genuinely diverge. Every scalar knob is reached by poking a
-     * field at a hardcoded (payload size, manual offset) pair in an opaque
-     * MI IQ struct -- see g_iq in src/star/hal_isp.c. Those numbers were
-     * read out of an INFINITY6E libmi_isp.so with objdump, and they are
-     * properties of that library build, not of the MI API. Nothing else
-     * here carries that risk: the rest of the backend calls typed entry
-     * points whose ABI divinus already exercises on infinity6b0, whereas
-     * the IQ pokes are raptor's alone and divinus has no equivalent to
-     * corroborate.
-     *
-     * A wrong offset does not fail. Access is read-modify-write, so it
-     * lands a plausible value in the wrong field of a struct nobody has
-     * fully described, and the image quietly degrades with nothing naming
-     * the cause. False here means isp_set_* returns RSS_ERR_NOTSUP and rvd
-     * leaves the tuning binary in charge -- which is the correct image
-     * either way, just not an adjustable one.
-     *
-     * Deriving them needs no board, only the library:
-     *   arm-linux-gnueabihf-objdump -d \
-     *       --disassemble=MI_ISP_IQ_GetBrightness libmi_isp.so
-     * prints the payload size into the size slot. If the five offsets
-     * match INFINITY6E's, this becomes a shared block again.
-     */
+/*
+ * ISP tuning — phase 3. True only where MI has a control that
+ * genuinely matches the raptor knob:
+ *
+ *   defog          MI_ISP_IQ_SetDefog, a toggle. isp_set_defog is
+ *                  implemented; the *strength* variants are not,
+ *                  because there is no strength to set.
+ *   sinter/temper  MI's spatial (NRLuma) and temporal (NR3D) noise
+ *                  reduction, both 0..255 as raptor expects.
+ *   ae_comp        MI_ISP_AE_SetEVComp.
+ *   max_gain       Both ceilings live in MI's AE exposure-limit
+ *                  struct.
+ *
+ * Left false, with the reasoning spelled out in hal_isp.c's OP
+ * COVERAGE comment: dpc and drc (MI's are a toggle and a curve, not
+ * strengths), bcsh_hue (a 64-entry HSV LUT), highlight_depress and
+ * backlight_comp (WDR curve descriptors), and switch_bin -- a tuning
+ * binary *is* loaded during hal_init, but Ingenic's runtime
+ * bin-switching op has no MI counterpart.
+ *
+ * INFINITY6B0 leaves all five false, and this is the one place the two
+ * families genuinely diverge. Every scalar knob is reached by poking a
+ * field at a hardcoded (payload size, manual offset) pair in an opaque
+ * MI IQ struct -- see g_iq in src/star/hal_isp.c. Those numbers were
+ * read out of an INFINITY6E libmi_isp.so with objdump, and they are
+ * properties of that library build, not of the MI API. Nothing else
+ * here carries that risk: the rest of the backend calls typed entry
+ * points whose ABI divinus already exercises on infinity6b0, whereas
+ * the IQ pokes are raptor's alone and divinus has no equivalent to
+ * corroborate.
+ *
+ * A wrong offset does not fail. Access is read-modify-write, so it
+ * lands a plausible value in the wrong field of a struct nobody has
+ * fully described, and the image quietly degrades with nothing naming
+ * the cause. False here means isp_set_* returns RSS_ERR_NOTSUP and rvd
+ * leaves the tuning binary in charge -- which is the correct image
+ * either way, just not an adjustable one.
+ *
+ * Deriving them needs no board, only the library:
+ *   arm-linux-gnueabihf-objdump -d \
+ *       --disassemble=MI_ISP_IQ_GetBrightness libmi_isp.so
+ * prints the payload size into the size slot. If the five offsets
+ * match INFINITY6E's, this becomes a shared block again.
+ */
 #if defined(PLATFORM_INFINITY6E)
     .has_defog = true,
     .has_sinter = true,
@@ -250,12 +250,17 @@ const rss_hal_caps_t g_hal_caps = {
  * both streams at once would be worse than an absent one.
  *
  * The ISP flags that are true are the ones whose ops hal_isp.c publishes:
- * defog, temper and ae_comp. sinter and the rest stay false because their
- * modules are per-frequency-band arrays on maruko with no place for a single
- * scalar -- see i6c_isp.h, which excludes them from the ABI table for the same
- * reason. Nothing in raptor reads these three today, so they are advertising
- * rather than gating; they are set because a wrong advertisement is what sent
- * the last reader looking in the wrong place.
+ * defog, sinter, temper and ae_comp. sinter was false for as long as its
+ * module had no single scalar to set -- it is a per-band table on maruko, as
+ * sharpness is -- and is true now that a knob scales the whole run about the
+ * tuning's own values rather than picking a band out of it. Nothing in raptor
+ * reads these four today, so they are advertising rather than gating; they are
+ * set because a wrong advertisement is what sent the last reader looking in the
+ * wrong place.
+ *
+ * Sharpness has an op here too and no flag to go with it, because
+ * rss_hal_caps_t has never carried one. rvd asks the vtable directly for that
+ * knob, so the absence costs nothing.
  *
  * The permanent falses are the same three as above and for the same
  * reason -- xburst2, the IMP SDK generation and the IMPVI calling
@@ -289,6 +294,7 @@ const rss_hal_caps_t g_hal_caps = {
     /* ISP — only what hal_isp.c publishes an op for; see above for the rest. */
     .has_color2grey = false,
     .has_defog = true,
+    .has_sinter = true,
     .has_temper = true,
     .has_ae_comp = true,
     .max_sensors = 1,
@@ -319,5 +325,6 @@ const rss_hal_caps_t g_hal_caps = {
 };
 
 #else
-#error "No PLATFORM_* defined. Set one of: PLATFORM_T10 T20 T21 T23 T30 T31 T32 T33 T40 T41 INFINITY6E INFINITY6B0 INFINITY6C"
+#error                                                                                             \
+    "No PLATFORM_* defined. Set one of: PLATFORM_T10 T20 T21 T23 T30 T31 T32 T33 T40 T41 INFINITY6E INFINITY6B0 INFINITY6C"
 #endif

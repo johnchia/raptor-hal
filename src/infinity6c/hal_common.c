@@ -128,6 +128,10 @@ int hal_isp_set_contrast(void *ctx, int val);
 int hal_isp_get_contrast(void *ctx, uint8_t *val);
 int hal_isp_set_saturation(void *ctx, int val);
 int hal_isp_get_saturation(void *ctx, uint8_t *val);
+int hal_isp_set_sharpness(void *ctx, int val);
+int hal_isp_get_sharpness(void *ctx, uint8_t *val);
+int hal_isp_set_sinter_strength(void *ctx, int val);
+int hal_isp_get_sinter_strength(void *ctx, uint8_t *val);
 int hal_isp_set_defog(void *ctx, int enable);
 int hal_isp_set_defog_strength(void *ctx, int val);
 int hal_isp_set_defog_strength_adv(void *ctx, const void *defog_attr);
@@ -302,8 +306,7 @@ static int hal_init(void *ctx, const rss_multi_sensor_config_t *cfg)
      * caller that never asks for audio should not hold it open -- and rad reaches
      * audio_init without calling this op at all.
      */
-    HAL_LOG_INFO("infinity6c: %s up, MI_SYS only; MI_AI loads on audio_init",
-                 HAL_PLATFORM_NAME);
+    HAL_LOG_INFO("infinity6c: %s up, MI_SYS only; MI_AI loads on audio_init", HAL_PLATFORM_NAME);
 #endif
     return RSS_OK;
 
@@ -711,13 +714,10 @@ static const rss_hal_ops_t g_ops = {
      * image knobs, the ISP channel's parameter block for orientation and 3DNR,
      * and MI_SNR for the sensor rate; hal_isp.c's header says which is which.
      *
-     * What is absent is absent on purpose. Sharpness and spatial denoise are
-     * per-frequency-band arrays on this generation with no place for a single
-     * scalar, so isp_set_sharpness and isp_set_sinter_strength stay NULL rather
-     * than moving one band and calling it sharpness. Manual white balance, DRC,
-     * DPC, hue, highlight depress and backlight compensation have no counterpart
-     * bound yet. RSS_HAL_CALL answers all of them RSS_ERR_NOTSUP, which rvd
-     * treats as "this SoC does not have it" rather than as a fault.
+     * What is absent is absent on purpose. Manual white balance, DRC, DPC, hue,
+     * highlight depress and backlight compensation have no counterpart bound
+     * yet. RSS_HAL_CALL answers all of them RSS_ERR_NOTSUP, which rvd treats as
+     * "this SoC does not have it" rather than as a fault.
      */
     .isp_set_brightness = hal_isp_set_brightness,
     .isp_get_brightness = hal_isp_get_brightness,
@@ -725,6 +725,17 @@ static const rss_hal_ops_t g_ops = {
     .isp_get_contrast = hal_isp_get_contrast,
     .isp_set_saturation = hal_isp_set_saturation,
     .isp_get_saturation = hal_isp_get_saturation,
+    /*
+     * Sharpness and spatial denoise are per-band tables on this generation
+     * rather than levels, so one knob scales the whole run about the tuning's
+     * own values -- see i6c_iq_apply_vector. They were NULL until that existed,
+     * on the grounds that moving one band and calling it sharpness is worse
+     * than not having the op.
+     */
+    .isp_set_sharpness = hal_isp_set_sharpness,
+    .isp_get_sharpness = hal_isp_get_sharpness,
+    .isp_set_sinter_strength = hal_isp_set_sinter_strength,
+    .isp_get_sinter_strength = hal_isp_get_sinter_strength,
     .isp_set_defog = hal_isp_set_defog,
     .isp_set_defog_strength = hal_isp_set_defog_strength,
     /* The one rvd's [image] block calls; the plain setter serves the ctrl API. */

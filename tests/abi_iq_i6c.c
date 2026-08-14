@@ -50,8 +50,49 @@
                    #row ": manual offset is not offsetof(" #type                                   \
                         ", stManual) -- writes land in stAuto");
 
+/*
+ * A vector row: the same payload shape, but the value is a run of same-width
+ * fields inside stManual rather than one level. Three things have to hold, and
+ * a payload size checks none of them -- where the run starts, how wide each
+ * field is, and that the whole run is still inside the parameter block.
+ *
+ * The last is the one worth spelling out. hal_isp.c writes STRENTGH_NUM fields
+ * from STRENGTH without consulting the vendor type again, so a run that ran off
+ * the end of the parameter block would spill into whatever follows stManual --
+ * which for these two is the end of the payload, so the library would copy from
+ * past the caller's buffer.
+ */
+#define IQ_VECTOR_AT(row, type, param, field, elem)                                                \
+    IQ_MANUAL_AT(row, type)                                                                        \
+    _Static_assert(I6C_ISP_##row##_STRENGTH == offsetof(param, field),                             \
+                   #row ": the strength run does not start at offsetof(" #param ", " #field ")");  \
+    _Static_assert(sizeof(elem) == sizeof(((param *)0)->field[0]),                                 \
+                   #row ": the table's field width is not " #field "'s");                          \
+    _Static_assert(I6C_ISP_##row##_STRENGTH + I6C_ISP_##row##_STRENGTH_NUM * sizeof(elem) <=       \
+                       sizeof(param),                                                              \
+                   #row ": the strength run reaches past the end of " #param);
+
 I6C_ISP_IQ_AUTOMAN_ROWS(IQ_MANUAL_AT)
 I6C_ISP_IQ_FLAT_ROWS(IQ_FITS)
+I6C_ISP_IQ_VECTOR_ROWS(IQ_VECTOR_AT)
+
+/*
+ * Sharpness's run is six fields where the vendor declares two arrays of three,
+ * so the table is right only for as long as u8SharpnessD sits immediately after
+ * u8SharpnessUD. Nothing above catches that: IQ_VECTOR_AT checks the run starts
+ * at u8SharpnessUD and stays inside the block, and a run of six would satisfy
+ * both while spending its second half on u8PreCorUD -- which is a coring
+ * threshold, so the picture would soften as the sharpness knob went up.
+ */
+_Static_assert(offsetof(MI_ISP_IQ_SharpnessParam_t, u8SharpnessD) ==
+                   offsetof(MI_ISP_IQ_SharpnessParam_t, u8SharpnessUD) + SHARPNESS_FREQ_NUM,
+               "u8SharpnessD no longer follows u8SharpnessUD -- the run is not six bytes");
+_Static_assert(I6C_ISP_IQ_SHARPNESS_STRENGTH_NUM == 2 * SHARPNESS_FREQ_NUM,
+               "the run is the undirectional and directional gains, three bands each");
+
+/* The same for the denoise run, which is one array and only needs its length. */
+_Static_assert(I6C_ISP_IQ_NRLUMAADV_STRENGTH_NUM == NRLUMA_ADV_LEVEL_NUM,
+               "the run is u16Strength, one entry per level");
 
 /*
  * The auto array's length is the one number a payload size cannot catch on its
@@ -70,13 +111,15 @@ _Static_assert(sizeof(MI_ISP_IQ_SaturationParam_t) == 24,
                "SAT_LUT_X_NUM 5 and SAT_LUT_Y_NUM 6, plus the strength and coring bytes");
 
 /*
- * The two modules the table deliberately omits. If a future header drop shrinks
- * either to Infinity6E's size, that is a fact worth learning from a build
- * failure rather than from a picture: it would mean the families had converged
- * and a level could be driven the same way on both.
+ * The one module the table still omits. If a future header drop shrinks it to
+ * Infinity6E's size, that is a fact worth learning from a build failure rather
+ * than from a picture: it would mean the families had converged and a level
+ * could be driven the same way on both.
+ *
+ * Sharpness was the other one and no longer is -- it is a vector row above. It
+ * is still not Infinity6E's 1268-byte layout and the check that says so is now
+ * IQ_FITS's, against 6264.
  */
-_Static_assert(sizeof(MI_ISP_IQ_SharpnessType_t) != 1268,
-               "sharpness matches Infinity6E's layout -- it may now belong in the table");
 _Static_assert(sizeof(MI_ISP_IQ_Nr3dType_t) != 1776,
                "3DNR matches Infinity6E's layout -- it may now belong in the table");
 
