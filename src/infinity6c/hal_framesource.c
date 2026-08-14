@@ -358,11 +358,28 @@ static void i6c_isp_resolve_iq(infinity6c_state_t *st)
  * balance is applied -- and a Bayer sensor, about twice as sensitive to green,
  * then reads green. cus3a_enable brings the AE and AWB algorithms up in the
  * engine (a two-step AE-then-AE+AWB bring-up, the order the vendor uses), and
- * enable_3a spawns the worker that runs them and feeds the just-loaded IQ
- * calibration into the algorithm init -- which is why this follows the load.
+ * enable_3a spawns the worker that runs them.
+ *
+ * ARMING COMES BEFORE THE TUNING LOAD, NOT AFTER
+ *
+ * MI_ISP_EnableUserspace3A runs the algorithms' own initialisation, and the AE's
+ * puts the plain long exposure table back to the untuned default -- 6 rows,
+ * 300..14000 us, sensor gain capped at 8x, which is exactly where a board with
+ * no per-sensor binary at all settles -- over whatever the binary just set. The
+ * reset is synchronous, inside that one call: the two MI_ISP_CUS3A_Enable calls
+ * leave the table alone, and a load issued immediately afterwards survives, so
+ * nothing has to be waited for in between. Measured on IMX335, whose binary asks
+ * for 80..100000 us and 64x: armed after the load the sensor sits at gain
+ * register 0x3c (18 dB, 8x) forever, and armed before it at 0x78 (36 dB, 63x) --
+ * the same operating point stock OpenIPC reaches running no CUS3A at all.
+ *
+ * Only the AE envelope is affected. Every module in hal_isp.c's g_iq reads back
+ * byte-identical across the arm, so the load is the only thing that has to
+ * follow it.
  *
  * Runs once per process: MI_ISP_CUS3A_Enable deadlocks its own mutex on a second
- * call, so a pipeline rebuilt in the same process is not re-armed.
+ * call, so a pipeline rebuilt in the same process is not re-armed -- which is
+ * also why a rebuild's reload is not at risk of being reset again.
  */
 static void i6c_isp_arm_3a(infinity6c_state_t *st)
 {
@@ -388,19 +405,27 @@ static void i6c_isp_arm_3a(infinity6c_state_t *st)
 }
 
 /*
- * i6c_isp_note_frame -- the first-frame work, done once. Loads the IQ tuning and
- * then arms the vendor 3A. Both wait for a delivered frame: a tuning load issued
- * at bring-up is silently overwritten by the SDK's own AE init, and the 3A arm
- * has to follow the load so the algorithm picks the calibration up. rvd runs an
- * encoder thread per stream and every one reaches here, so the latch is atomic
- * and exactly one thread does the work. A hot restart tears the pipeline down,
- * which clears the latch, so the tuning is reloaded on the next run (the 3A arm
- * is process-wide and does not repeat -- see i6c_isp_arm_3a).
+ * i6c_isp_note_frame -- the first-frame work, done once. Arms the vendor 3A and
+ * then loads the IQ tuning, in that order and for that reason: the arm resets
+ * the AE's exposure envelope to an untuned default, so a tuning loaded before it
+ * is thrown away and the sensor never leaves 8x gain (see i6c_isp_arm_3a).
+ *
+ * Both wait for a delivered frame. A tuning load issued at bring-up does not
+ * survive either, and the load has to be the last of the two, so the frame gates
+ * the pair.
+ *
+ * rvd runs an encoder thread per stream and every one reaches here, so the latch
+ * is atomic and exactly one thread does the work. A hot restart tears the
+ * pipeline down, which clears the latch, so the tuning is reloaded on the next
+ * run -- and the 3A arm is process-wide and does not repeat, so that reload has
+ * nothing left to reset it.
  */
 void i6c_isp_note_frame(infinity6c_state_t *st)
 {
     if (__atomic_test_and_set(&st->iq_load_started, __ATOMIC_ACQ_REL))
         return;
+
+    i6c_isp_arm_3a(st);
 
     if (st->iq_file[0] && st->isp.load_bin) {
         int ret = st->isp.load_bin(I6C_DEV_ID(I6C_ISP_DEV), I6C_ISP_CHN, st->iq_file,
@@ -413,13 +438,10 @@ void i6c_isp_note_frame(infinity6c_state_t *st)
             HAL_LOG_INFO("infinity6c: ISP tuning %s loaded", st->iq_file);
     }
 
-    i6c_isp_arm_3a(st);
-
     /*
      * Last, and the order is the point: every tuning value rvd asked for during
-     * pipeline setup has been held until now, because the load above and CUS3A's
-     * AE init both write over the API store. This is the first moment a write
-     * survives.
+     * pipeline setup has been held until now, because the load above writes over
+     * the API store. This is the first moment a write survives.
      */
     i6c_isp_flush_knobs(st);
 }

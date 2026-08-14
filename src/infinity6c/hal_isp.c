@@ -30,14 +30,14 @@
  * THE TUNING BINARY OUTRANKS THE CONFIG
  *
  * A value written before the first frame does not survive. The IQ binary loads
- * on that frame and CUS3A initialises its AE there too, and both write over the
- * API store -- so an early write succeeds, does not take effect, and reports
- * nothing. rvd applies its whole [image] block during pipeline construction,
- * which is well before any frame, so every one of those calls would be lost.
+ * on that frame and writes over the API store, so an early write succeeds, does
+ * not take effect, and reports nothing. rvd applies its whole [image] block
+ * during pipeline construction, which is well before any frame, so every one of
+ * those calls would be lost.
  *
  * Hence the queue: a knob asked for before st->isp_knobs_live is recorded and
- * applied by i6c_isp_flush_knobs, which i6c_isp_note_frame calls once the load
- * and the 3A arm are done. Entries are not cleared by the flush, because a
+ * applied by i6c_isp_flush_knobs, which i6c_isp_note_frame calls once the 3A arm
+ * and the load are done. Entries are not cleared by the flush, because a
  * pipeline rebuilt in the same process reloads the tuning and puts every module
  * back to what the binary says -- so the last value asked for is also what a
  * rebuild has to restore.

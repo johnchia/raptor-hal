@@ -495,20 +495,21 @@ typedef struct {
 
     /*
      * ISP tuning. iq_file is the per-sensor IQ bin found on disk when the
-     * pipeline came up, empty if none. CUS3A's AE init runs on a frame interrupt
-     * and writes over a load issued before it, so the load is deferred to the
-     * first delivered frame; iq_load_started latches that one load across the
-     * encoder threads that each call get_frame. See i6c_isp_note_frame.
+     * pipeline came up, empty if none. A load issued during bring-up does not
+     * survive, and arming CUS3A resets the AE envelope over one that has, so the
+     * load waits for the first delivered frame and follows the arm;
+     * iq_load_started latches that one load across the encoder threads that each
+     * call get_frame. See i6c_isp_note_frame.
      */
     char iq_file[128];
     char iq_load_started;
 
     /*
      * Clear until the first frame has been through i6c_isp_note_frame, which is
-     * the earliest moment a tuning value sticks: the IQ load and CUS3A's own AE
-     * initialisation both write over the API store, and both happen there. A knob
-     * set before this is queued in hal_isp.c's table and flushed once it is set.
-     * Cleared with the pipeline, so a hot restart re-queues.
+     * the earliest moment a tuning value sticks: the IQ load writes over the API
+     * store and happens there. A knob set before this is queued in hal_isp.c's
+     * table and flushed once it is set. Cleared with the pipeline, so a hot
+     * restart re-queues.
      */
     bool isp_knobs_live;
 

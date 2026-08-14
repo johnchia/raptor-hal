@@ -61,12 +61,13 @@ typedef struct {
     int (*disable_port)(unsigned int device, unsigned int channel, unsigned int port);
 
     /*
-     * The IQ tuning binary. The ordering is the whole difficulty: CUS3A's AE
-     * initialisation writes over the API-level tuning, so a load issued before the
-     * first frame is silently read back over -- the call succeeds, the tuning does
-     * not take, and nothing anywhere reports it. So the load is gated on the first
-     * delivered frame (i6c_isp_note_frame, from the encoder's get_frame), which is
-     * late enough that it sticks.
+     * The IQ tuning binary. The ordering is the whole difficulty, and it has two
+     * halves. A load issued before the first frame is silently read back over, so
+     * it is gated on the first delivered frame (i6c_isp_note_frame, from the
+     * encoder's get_frame). And enable_3a below resets the AE's exposure envelope
+     * as part of arming the algorithms, so the load has to come after that too --
+     * either way the call succeeds, the tuning does not take, and nothing
+     * anywhere reports it.
      */
     int (*load_bin)(unsigned int device, unsigned int channel, char *path, unsigned int key);
 
@@ -102,10 +103,11 @@ typedef struct {
      * no white balance is applied, which reads as a green cast (a Bayer sensor is
      * about twice as sensitive to green, so unity gains leave the image green).
      * cus3a_enable brings the AE and AWB algorithms up in the engine; enable_3a
-     * spawns the worker that runs them each frame and feeds the loaded IQ
-     * calibration into the algorithm's initialisation. The enable argument is a
-     * Cus3AEnable_t -- three MI_BOOLs {AE, AWB, AF}. Optional, bound by dlsym: a
-     * library without them leaves 3A on whatever the SDK gives by default.
+     * spawns the worker that runs them each frame and runs their initialisation,
+     * which is where the AE's exposure envelope goes back to the untuned default
+     * -- so load_bin has to follow it. The enable argument is a Cus3AEnable_t --
+     * three MI_BOOLs {AE, AWB, AF}. Optional, bound by dlsym: a library without
+     * them leaves 3A on whatever the SDK gives by default.
      */
     int (*cus3a_enable)(unsigned int device, unsigned int channel, const unsigned char *enable);
     int (*enable_3a)(unsigned int device, unsigned int channel);
