@@ -294,7 +294,13 @@ const rss_hal_caps_t g_hal_caps = {
     /* ISP — only what hal_isp.c publishes an op for; see above for the rest. */
     .has_color2grey = false,
     .has_defog = true,
-    .has_sinter = true,
+    /*
+     * has_sinter is false because the op is not published: the only field
+     * NrLumaAdv exposes is a blend weight the shipped tunings already run at
+     * maximum, so the knob's whole usable range was its own default. See the
+     * note in src/infinity6c/hal_isp.c. Temporal denoise is unaffected.
+     */
+    .has_sinter = false,
     .has_temper = true,
     .has_ae_comp = true,
     .max_sensors = 1,

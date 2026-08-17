@@ -44,42 +44,10 @@ static int failures;
         }                                                                                          \
     } while (0)
 
-/* The AE envelope the stubs hand back, and what the last Set wrote. */
-static i6c_isp_exp g_limit;
-static i6c_isp_exp g_limit_set;
-static int g_limit_sets;
-static int g_get_ret;
-static int g_set_ret;
-
 /* What MI_SNR_GetFps answers, and whether it was asked at all. */
 static unsigned int g_fps_reported;
 static int g_fps_gets;
 static int g_fps_get_ret;
-
-static int fake_get_expo_limit(unsigned int device, unsigned int channel, i6c_isp_exp *limit)
-{
-    (void)device;
-    (void)channel;
-    if (g_get_ret)
-        return g_get_ret;
-    *limit = g_limit;
-    return 0;
-}
-
-static int fake_set_expo_limit(unsigned int device, unsigned int channel, i6c_isp_exp *limit)
-{
-    (void)device;
-    (void)channel;
-    g_limit_sets++;
-    g_limit_set = *limit;
-    if (g_set_ret)
-        return g_set_ret;
-    /* MI keeps its own value when a bound is outside the calibrated range; the
-     * readback is the only thing that says which happened, so the stub has to
-     * model the accepting case explicitly. */
-    g_limit = *limit;
-    return 0;
-}
 
 static int fake_get_fps(unsigned int device, unsigned int *fps)
 {
@@ -99,11 +67,9 @@ static int fake_get_fps(unsigned int device, unsigned int *fps)
  * is a write landing outside them.
  */
 #define SHARP_RUN (I6C_ISP_IQ_SHARPNESS_MANUAL + I6C_ISP_IQ_SHARPNESS_STRENGTH)
-#define NR_RUN (I6C_ISP_IQ_NRLUMAADV_MANUAL + I6C_ISP_IQ_NRLUMAADV_STRENGTH)
 
 static uint8_t g_sharp[I6C_ISP_IQ_SHARPNESS_PAYLOAD];
-static uint8_t g_nr[I6C_ISP_IQ_NRLUMAADV_PAYLOAD];
-static int g_sharp_sets, g_nr_sets;
+static int g_sharp_sets;
 static int g_sharp_get_ret, g_sharp_set_ret;
 
 static int fake_get_sharp(unsigned int device, unsigned int channel, void *payload)
@@ -124,23 +90,6 @@ static int fake_set_sharp(unsigned int device, unsigned int channel, void *paylo
     if (g_sharp_set_ret)
         return g_sharp_set_ret;
     memcpy(g_sharp, payload, sizeof(g_sharp));
-    return 0;
-}
-
-static int fake_get_nr(unsigned int device, unsigned int channel, void *payload)
-{
-    (void)device;
-    (void)channel;
-    memcpy(payload, g_nr, sizeof(g_nr));
-    return 0;
-}
-
-static int fake_set_nr(unsigned int device, unsigned int channel, void *payload)
-{
-    (void)device;
-    (void)channel;
-    g_nr_sets++;
-    memcpy(g_nr, payload, sizeof(g_nr));
     return 0;
 }
 
@@ -183,227 +132,18 @@ static uint32_t run_at(const uint8_t *store, unsigned int off, uint8_t width, un
 static void reset(infinity6c_state_t *st)
 {
     memset(st, 0, sizeof(*st));
-    st->isp.get_expo_limit = fake_get_expo_limit;
-    st->isp.set_expo_limit = fake_set_expo_limit;
     st->snr.get_fps = fake_get_fps;
 
     reset_row(IQ_SHARPNESS, fake_get_sharp, fake_set_sharp);
-    reset_row(IQ_NRLUMAADV, fake_get_nr, fake_set_nr);
     memset(g_sharp, 0, sizeof(g_sharp));
-    memset(g_nr, 0, sizeof(g_nr));
-    g_sharp_sets = g_nr_sets = 0;
+    g_sharp_sets = 0;
     g_sharp_get_ret = g_sharp_set_ret = 0;
 
     /* The tuning binary's own envelope on this board: a 100 ms ceiling, which
      * at 8.08 us a line is VMAX 12376 and about 8 fps. */
-    memset(&g_limit, 0, sizeof(g_limit));
-    g_limit.minShutterUs = 30;
-    g_limit.maxShutterUs = 100000;
-    memset(&g_limit_set, 0, sizeof(g_limit_set));
-    g_limit_sets = 0;
-    g_get_ret = g_set_ret = 0;
     g_fps_reported = 0;
     g_fps_gets = 0;
     g_fps_get_ret = 0;
-}
-
-/*
- * The regression this file exists for.
- *
- * The cap must derive the ceiling from the rate the camera is configured to
- * hold, never from the rate the sensor reports, because the sensor's answer
- * comes from the frame length and the frame length is what the AE stretches to
- * buy the very exposure being capped.
- *
- * Observed on an SSC377QE + IMX335, one binary and one config, two restarts:
- * lit scene, the sensor answered 24 and the ceiling came down; dark scene, where
- * the AE had already stretched VMAX towards 100 ms, it answered 9, so 100 ms
- * looked comfortably inside a 111 ms frame and the ceiling stayed up. And it
- * stays up from then on -- the stretch that caused the misread is what the
- * ceiling would have removed.
- */
-static void test_the_cap_holds_the_configured_rate_not_the_delivered_one(void)
-{
-    infinity6c_state_t st;
-
-    reset(&st);
-    st.fps = 25;
-    st.pipeline_up = true;
-    st.isp_knobs_live = true;
-
-    /* The AE has stretched the frame out to 9 fps, which is exactly the state
-     * the ceiling is meant to prevent. */
-    g_fps_reported = 9;
-
-    i6c_isp_apply_shutter_cap(&st);
-
-    CHECK(g_limit_sets == 1, "the ceiling must be written once, got %d", g_limit_sets);
-    CHECK(g_limit_set.maxShutterUs == 40000, "one frame at 25 fps is 40000 us, got %u",
-          g_limit_set.maxShutterUs);
-    CHECK(g_fps_gets == 0, "the sensor's rate must not be consulted at all, asked %d times",
-          g_fps_gets);
-}
-
-/*
- * The trap the cap fell into on its first outing, kept as a test because the
- * obvious simplification -- read st->fps and be done -- reintroduces it. rvd
- * sets the rate while it is still building the pipeline, which on this backend
- * runs before the sensor is enabled, so the request parks in snr_fps_req and
- * st->fps is still 0 when the first frame arrives and the cap runs.
- */
-static void test_a_rate_only_requested_still_caps(void)
-{
-    infinity6c_state_t st;
-
-    reset(&st);
-    st.fps = 0;
-    st.snr_fps_req = 25;
-    st.isp_knobs_live = true;
-
-    i6c_isp_apply_shutter_cap(&st);
-
-    CHECK(g_limit_sets == 1, "a requested-but-unprogrammed rate must still cap, got %d writes",
-          g_limit_sets);
-    CHECK(g_limit_set.maxShutterUs == 40000, "one frame at 25 fps is 40000 us, got %u",
-          g_limit_set.maxShutterUs);
-}
-
-/* The programmed rate outranks the request: it is the one in force. */
-static void test_the_programmed_rate_outranks_the_request(void)
-{
-    infinity6c_state_t st;
-
-    reset(&st);
-    st.fps = 20;
-    st.snr_fps_req = 25;
-    st.isp_knobs_live = true;
-
-    i6c_isp_apply_shutter_cap(&st);
-
-    CHECK(g_limit_set.maxShutterUs == 50000,
-          "one frame at the programmed 20 fps is 50000 us, "
-          "got %u",
-          g_limit_set.maxShutterUs);
-}
-
-/* Nothing to derive a ceiling from is a warning and no write, not a guess. */
-static void test_no_rate_leaves_the_tuning_alone(void)
-{
-    infinity6c_state_t st;
-
-    reset(&st);
-    st.isp_knobs_live = true;
-
-    i6c_isp_apply_shutter_cap(&st);
-
-    CHECK(g_limit_sets == 0, "an unknown rate must not write a ceiling, got %d writes",
-          g_limit_sets);
-    CHECK(g_limit.maxShutterUs == 100000, "the tuning's ceiling must survive, got %u",
-          g_limit.maxShutterUs);
-}
-
-/* A tuning already inside one frame is left exactly as it is. */
-static void test_a_ceiling_already_within_a_frame_is_untouched(void)
-{
-    infinity6c_state_t st;
-
-    reset(&st);
-    st.fps = 25;
-    g_limit.maxShutterUs = 20000;
-
-    i6c_isp_apply_shutter_cap(&st);
-
-    CHECK(g_limit_sets == 0, "a ceiling inside one frame must not be rewritten, got %d writes",
-          g_limit_sets);
-    CHECK(g_limit.maxShutterUs == 20000, "the tuning's ceiling must survive, got %u",
-          g_limit.maxShutterUs);
-}
-
-/*
- * A ceiling below the tuning's own floor is a broken envelope rather than a cap,
- * and MI would take it. At that point the rate asked for is not one this sensor
- * can hold, which is worth saying rather than silently installing.
- */
-static void test_a_frame_shorter_than_the_floor_is_refused(void)
-{
-    infinity6c_state_t st;
-
-    reset(&st);
-    st.fps = 25;
-    g_limit.minShutterUs = 50000; /* a floor longer than a 40 ms frame */
-
-    i6c_isp_apply_shutter_cap(&st);
-
-    CHECK(g_limit_sets == 0, "a ceiling under the floor must be refused, got %d writes",
-          g_limit_sets);
-    CHECK(g_limit.maxShutterUs == 100000, "the tuning's ceiling must survive, got %u",
-          g_limit.maxShutterUs);
-}
-
-/* A library without the pair costs the cap, not the pipeline. */
-static void test_missing_symbols_are_survivable(void)
-{
-    infinity6c_state_t st;
-
-    reset(&st);
-    st.fps = 25;
-    st.isp.set_expo_limit = NULL;
-    i6c_isp_apply_shutter_cap(&st);
-    CHECK(g_limit_sets == 0, "no Set symbol must write nothing, got %d", g_limit_sets);
-
-    reset(&st);
-    st.fps = 25;
-    st.isp.get_expo_limit = NULL;
-    i6c_isp_apply_shutter_cap(&st);
-    CHECK(g_limit_sets == 0, "no Get symbol must write nothing, got %d", g_limit_sets);
-}
-
-/* A failing Get is not a reason to write a ceiling over an envelope we could
- * not read: every other field in the struct would go with it. */
-static void test_a_failing_read_writes_nothing(void)
-{
-    infinity6c_state_t st;
-
-    reset(&st);
-    st.fps = 25;
-    g_get_ret = -1;
-
-    i6c_isp_apply_shutter_cap(&st);
-
-    CHECK(g_limit_sets == 0, "a failed read must not be followed by a write, got %d", g_limit_sets);
-}
-
-/*
- * The rest of the envelope has to survive the cap. The gains and the aperture
- * are the tuning's, and this call is a read-modify-write of one field -- a
- * memset-and-set would quietly zero the AE's gain ceilings, which is the same
- * shape of bug as writing the whole channel parameter block blind.
- */
-static void test_the_cap_moves_only_the_ceiling(void)
-{
-    infinity6c_state_t st;
-
-    reset(&st);
-    st.fps = 25;
-    g_limit.minApertX10 = 14;
-    g_limit.maxApertX10 = 22;
-    g_limit.minSensorGain = 1024;
-    g_limit.minIspGain = 1024;
-    g_limit.maxSensorGain = 64512;
-    g_limit.maxIspGain = 2867;
-
-    i6c_isp_apply_shutter_cap(&st);
-
-    CHECK(g_limit_set.maxShutterUs == 40000, "the ceiling must move, got %u",
-          g_limit_set.maxShutterUs);
-    CHECK(g_limit_set.minShutterUs == 30, "the floor must not, got %u", g_limit_set.minShutterUs);
-    CHECK(g_limit_set.minApertX10 == 14 && g_limit_set.maxApertX10 == 22,
-          "the aperture must not, got %u..%u", g_limit_set.minApertX10, g_limit_set.maxApertX10);
-    CHECK(g_limit_set.minSensorGain == 1024 && g_limit_set.maxSensorGain == 64512,
-          "the sensor gains must not, got %u..%u", g_limit_set.minSensorGain,
-          g_limit_set.maxSensorGain);
-    CHECK(g_limit_set.minIspGain == 1024 && g_limit_set.maxIspGain == 2867,
-          "the ISP gains must not, got %u..%u", g_limit_set.minIspGain, g_limit_set.maxIspGain);
 }
 
 /*
@@ -429,11 +169,6 @@ static void test_reporting_does_not_cache_the_sensors_answer(void)
     CHECK(hal_isp_get_sensor_fps(c, &num, &den) == RSS_OK, "get must succeed");
     CHECK(num == 9 && den == 1, "the sensor's answer is what is reported, got %u/%u", num, den);
     CHECK(st.fps == 25, "st.fps must not follow the reading, got %u", st.fps);
-
-    /* And with that reading cached nowhere, the cap still holds 25. */
-    i6c_isp_apply_shutter_cap(&st);
-    CHECK(g_limit_set.maxShutterUs == 40000, "the cap must still hold 25 fps, got %u",
-          g_limit_set.maxShutterUs);
 }
 
 /* With no sensor to ask, reporting falls back to the configured rate rather
@@ -663,45 +398,14 @@ static void test_a_zero_run_is_a_baseline_not_a_failure(void)
 }
 
 /*
- * The denoise row, which is the sixteen-bit one. Its ceiling is 256 and not
- * 255: MI's unity for a blend weight is a full swap, so the bound is one past
- * what a byte holds -- and a row that wrote it a byte at a time would deliver 0
- * at maximum strength.
- */
-static void test_the_denoise_run_is_sixteen_bit_and_reaches_256(void)
-{
-    static const uint16_t tuned[2] = {200, 180};
-    rss_hal_ctx_t ctx;
-    infinity6c_state_t st;
-
-    reset(&st);
-    memset(&ctx, 0, sizeof(ctx));
-    ctx.platform = &st;
-    st.isp_knobs_live = true;
-    seed_run(g_nr, sizeof(g_nr), NR_RUN, 2, tuned, 2, I6C_ISP_OP_AUTO);
-
-    CHECK(hal_isp_set_sinter_strength(&ctx, 255) == RSS_OK, "set must succeed");
-    CHECK(run_at(g_nr, NR_RUN, 2, 0) == 256, "field 0 must reach 256, got %u",
-          run_at(g_nr, NR_RUN, 2, 0));
-    CHECK(run_at(g_nr, NR_RUN, 2, 1) == 256, "field 1 must reach 256, got %u",
-          run_at(g_nr, NR_RUN, 2, 1));
-
-    seed_run(g_nr, sizeof(g_nr), NR_RUN, 2, tuned, 2, I6C_ISP_OP_AUTO);
-    reset_row(IQ_NRLUMAADV, fake_get_nr, fake_set_nr);
-    CHECK(hal_isp_set_sinter_strength(&ctx, 64) == RSS_OK, "set must succeed");
-    CHECK(run_at(g_nr, NR_RUN, 2, 0) == 100, "want 100, got %u", run_at(g_nr, NR_RUN, 2, 0));
-    CHECK(run_at(g_nr, NR_RUN, 2, 1) == 90, "want 90, got %u", run_at(g_nr, NR_RUN, 2, 1));
-}
-
-/*
- * A tuning is entitled to ask for the maximum, and a baseline sitting on the
- * ceiling used to make the whole knob inert -- i6c_iq_scale bailed out rather
- * than divide a zero span, taking the lower half with it. Full-strength denoise
- * is exactly that case, since MI's unity for the field is its maximum.
+ * A baseline sitting on its module's ceiling. Sharpness's gains bound at 127, so
+ * a tuning that asked for all of one is at unity and at maximum at once -- and
+ * the knob must still work downwards from there. It used to bail on `unity >=
+ * max` and lose the whole lower half.
  */
 static void test_a_baseline_on_the_ceiling_still_scales_down(void)
 {
-    static const uint16_t maxed[2] = {256, 256};
+    static const uint16_t maxed[6] = {127, 127, 127, 127, 127, 127};
     rss_hal_ctx_t ctx;
     infinity6c_state_t st;
     uint8_t val;
@@ -710,18 +414,18 @@ static void test_a_baseline_on_the_ceiling_still_scales_down(void)
     memset(&ctx, 0, sizeof(ctx));
     ctx.platform = &st;
     st.isp_knobs_live = true;
-    seed_run(g_nr, sizeof(g_nr), NR_RUN, 2, maxed, 2, I6C_ISP_OP_AUTO);
+    seed_run(g_sharp, sizeof(g_sharp), SHARP_RUN, 1, maxed, 6, I6C_ISP_OP_AUTO);
 
-    CHECK(hal_isp_set_sinter_strength(&ctx, 64) == RSS_OK, "set must succeed");
-    CHECK(run_at(g_nr, NR_RUN, 2, 0) == 128, "the lower half must still move, got %u",
-          run_at(g_nr, NR_RUN, 2, 0));
+    CHECK(hal_isp_set_sharpness(&ctx, 64) == RSS_OK, "set must succeed");
+    CHECK(run_at(g_sharp, SHARP_RUN, 1, 0) == 63, "the lower half must still move, got %u",
+          run_at(g_sharp, SHARP_RUN, 1, 0));
 
     /* And upward there is simply no headroom, which is not the same as broken. */
-    seed_run(g_nr, sizeof(g_nr), NR_RUN, 2, maxed, 2, I6C_ISP_OP_AUTO);
-    reset_row(IQ_NRLUMAADV, fake_get_nr, fake_set_nr);
-    CHECK(hal_isp_set_sinter_strength(&ctx, 200) == RSS_OK, "set must succeed");
-    CHECK(run_at(g_nr, NR_RUN, 2, 0) == 256, "above neutral must stay at the ceiling, got %u",
-          run_at(g_nr, NR_RUN, 2, 0));
+    seed_run(g_sharp, sizeof(g_sharp), SHARP_RUN, 1, maxed, 6, I6C_ISP_OP_AUTO);
+    reset_row(IQ_SHARPNESS, fake_get_sharp, fake_set_sharp);
+    CHECK(hal_isp_set_sharpness(&ctx, 200) == RSS_OK, "set must succeed");
+    CHECK(run_at(g_sharp, SHARP_RUN, 1, 0) == 127, "above neutral must stay at the ceiling, got %u",
+          run_at(g_sharp, SHARP_RUN, 1, 0));
 
     /*
      * Reading it back is the other half, and the ambiguous one: the field holds
@@ -732,7 +436,7 @@ static void test_a_baseline_on_the_ceiling_still_scales_down(void)
      * a knob nobody has touched.
      */
     val = 0;
-    CHECK(hal_isp_get_sinter_strength(&ctx, &val) == RSS_OK, "get must succeed");
+    CHECK(hal_isp_get_sharpness(&ctx, &val) == RSS_OK, "get must succeed");
     CHECK(val == 128, "a baseline on the ceiling reads as neutral, got %u", val);
 }
 
@@ -1002,15 +706,6 @@ static void test_the_scalar_rows_still_map_the_way_they_did(void)
 
 int main(void)
 {
-    test_the_cap_holds_the_configured_rate_not_the_delivered_one();
-    test_a_rate_only_requested_still_caps();
-    test_the_programmed_rate_outranks_the_request();
-    test_no_rate_leaves_the_tuning_alone();
-    test_a_ceiling_already_within_a_frame_is_untouched();
-    test_a_frame_shorter_than_the_floor_is_refused();
-    test_missing_symbols_are_survivable();
-    test_a_failing_read_writes_nothing();
-    test_the_cap_moves_only_the_ceiling();
     test_reporting_does_not_cache_the_sensors_answer();
     test_reporting_falls_back_to_the_configured_rate();
 
@@ -1020,7 +715,6 @@ int main(void)
     test_a_tuning_load_relearns_the_baseline();
     test_an_out_of_range_run_is_refused_whole();
     test_a_zero_run_is_a_baseline_not_a_failure();
-    test_the_denoise_run_is_sixteen_bit_and_reaches_256();
     test_a_baseline_on_the_ceiling_still_scales_down();
     test_a_vector_write_touches_only_the_run();
     test_a_vector_row_reads_back();

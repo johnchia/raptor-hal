@@ -315,7 +315,6 @@ enum {
     IQ_CONTRAST,
     IQ_SATURATION,
     IQ_SHARPNESS,
-    IQ_NRLUMAADV,
     IQ_DEFOG,
     IQ_DEFOG_EN,
     IQ_GRAY,
@@ -374,25 +373,6 @@ static i6c_iq_param_t g_iq[IQ_PARAM_COUNT] = {
                       I6C_ISP_IQ_SHARPNESS_MANUAL + I6C_ISP_IQ_SHARPNESS_STRENGTH, 1,
                       I6C_ISP_IQ_SHARPNESS_STRENGTH_NUM, IQ_VECTOR,
                       I6C_ISP_IQ_SHARPNESS_STRENGTH_MAX, 63, 0, true, NULL, NULL, 0, false, false,
-                      false},
-    /*
-     * Spatial luma denoise, which raptor calls sinter and MI calls NrLumaAdv.
-     *
-     * Two fields rather than sharpness's six, and they are the module's own
-     * blend weights: how much of the filtered luma replaces the original, per
-     * level. 256 is unity there -- a full swap -- so the field is sixteen bits
-     * and the ceiling is one past what a byte holds, which is worth stating
-     * because 255 would look like the obvious maximum and would be a step short
-     * of the one the vendor documents.
-     *
-     * Not MI_ISP_IQ_SetNRLuma, which is the older module of the same name and
-     * is not what the maruko tuning binaries carry.
-     */
-    [IQ_NRLUMAADV] = {"sinter", "MI_ISP_IQ_GetNrLumaAdv", "MI_ISP_IQ_SetNrLumaAdv",
-                      I6C_ISP_IQ_NRLUMAADV_PAYLOAD,
-                      I6C_ISP_IQ_NRLUMAADV_MANUAL + I6C_ISP_IQ_NRLUMAADV_STRENGTH, 2,
-                      I6C_ISP_IQ_NRLUMAADV_STRENGTH_NUM, IQ_VECTOR,
-                      I6C_ISP_IQ_NRLUMAADV_STRENGTH_MAX, 128, 0, true, NULL, NULL, 0, false, false,
                       false},
     /*
      * Defog is the one module whose Infinity6E counterpart is a bare enable. Here
@@ -996,126 +976,45 @@ static int i6c_iq_get_raw(void *ctx, int idx, uint32_t *raw)
 }
 
 /*
- * The rate the camera is configured to hold, which is the one the shutter
- * ceiling is derived from.
+ * The rate the camera is configured to hold, as distinct from the rate it is
+ * managing right now.
  *
  * Deliberately not the rate the sensor reports. MI_SNR_GetFps answers from the
  * frame length currently programmed, and the frame length is exactly what the AE
- * stretches to buy a longer exposure -- so asking the sensor how fast it is
- * running, in order to decide how long an exposure to permit, closes a loop
- * around the cap's own output.
+ * stretches to buy a longer exposure -- so the sensor's answer moves with the
+ * light, and only these two fields say what was asked for.
  *
- * Measured on an SSC377QE + IMX335, one binary, one config, two restarts.
- * Against a lit scene the sensor answered 24 and the ceiling came down to one
- * frame. Against a dark one, where the AE had already stretched VMAX towards the
- * tuning's 100 ms, it answered 9 -- so 100 ms looked comfortably inside a 111 ms
- * frame and the ceiling was left alone. That is a latch and not a one-off: having
- * declined, the ceiling stays up, so the AE keeps VMAX stretched, so the next
- * tuning load reads the same depressed rate and declines again. Nothing recovers
- * it but the scene getting brighter on its own.
- *
- * Both fields are needed. st->fps is the rate that was programmed and
- * snr_fps_req the rate that was asked for; rvd sets the rate while it is still
- * building the pipeline, which on this backend runs before the sensor is
- * enabled, so early on only the latter has anything in it -- reading st->fps
- * alone is the trap the cap fell into first time out, declining silently on a
- * board whose streams were plainly 25 fps.
+ * Both are needed. st->fps is the rate that was programmed and snr_fps_req the
+ * rate that was asked for; rvd sets the rate while it is still building the
+ * pipeline, which on this backend runs before the sensor is enabled, so early on
+ * only the latter has anything in it.
  *
  * 0 when nothing has asked for a rate yet.
+ *
+ * THERE IS NO SHUTTER CEILING HERE ANY MORE
+ *
+ * This used to feed a cap that held maxShutterUs to one frame period, rewritten
+ * after every tuning load. It is gone: on this camera the exposure is worth more
+ * than the frame rate, because the light it buys is what keeps the AE off the
+ * gain, and gain is where the noise comes from. Denoise cannot be turned up here
+ * to compensate -- see the sinter note further down -- so the lever that is left
+ * is the exposure itself.
+ *
+ * What it costs, measured on an SSC377QE + IMX335 before the removal: the
+ * tuning's own ceiling is 100 ms, and 90 ms of shutter stretches VMAX 4950 ->
+ * 11139, taking 25 fps down to about 11. So a dark scene now runs slow and
+ * blurred instead of fast and noisy. That is the trade, chosen deliberately, and
+ * it is the thing to undo first if the frame rate turns out to matter more.
+ *
+ * Anyone restoring it should read the git history rather than start over: the
+ * cap had to derive its rate from these two fields and not from MI_SNR_GetFps,
+ * because a ceiling decided from a rate the AE had already depressed declines to
+ * cap and then latches -- measured at 9 fps reported against a 111 ms frame,
+ * with nothing to recover it but the scene brightening on its own.
  */
 static unsigned int i6c_isp_nominal_fps(const infinity6c_state_t *st)
 {
     return st->fps ? st->fps : st->snr_fps_req;
-}
-
-/*
- * Hold the frame rate by refusing the AE a shutter longer than one frame.
- *
- * A rolling-shutter sensor buys a longer exposure by stretching VMAX, so an AE
- * free to reach the tuning's own 100 ms ceiling takes the frame rate with it:
- * measured on IMX335 here, 90 ms of shutter is VMAX 4950 -> 11139 and 25 fps ->
- * about 11. The tuning is right that the sensitivity exists; what it cannot know
- * is that this camera would rather have the frame rate. One frame period is the
- * largest exposure that costs none of it.
- *
- * Only the ceiling moves. The AE still regulates freely underneath it, and when
- * it runs out of shutter it goes on to gain, which after the arm-then-load fix
- * reaches 63x sensor and about 2.8x ISP -- so the scene does not simply go dark,
- * it gets noisier instead of blurrier. That is the trade being made here.
- *
- * Written after every tuning load, never once at bring-up: a load reinstalls the
- * binary's own envelope over this, exactly as it does for every knob in g_iq.
- *
- * MI keeps its own value when a bound is outside the calibrated range, so the
- * readback is what decides whether the cap took, and it is logged either way. An
- * exposure ceiling that quietly did not apply looks identical to a camera that
- * is simply dark.
- */
-static void i6c_isp_apply_shutter_cap(infinity6c_state_t *st)
-{
-    i6c_isp_exp limit;
-    unsigned int want;
-    unsigned int fps;
-    int ret;
-
-    if (!st->isp.get_expo_limit || !st->isp.set_expo_limit) {
-        HAL_LOG_WARN("isp: no MI_ISP_AE_{Get,Set}ExposureLimit; the frame rate is not held");
-        return;
-    }
-
-    /*
-     * Warned rather than logged at debug: the cap is derived from the rate, so
-     * without one nothing happens, and "nothing happens" is indistinguishable
-     * from a working cap on a camera that is simply well lit.
-     */
-    fps = i6c_isp_nominal_fps(st);
-    if (!fps) {
-        HAL_LOG_WARN("isp: sensor rate unknown; leaving the tuning's shutter ceiling");
-        return;
-    }
-
-    want = 1000000u / fps;
-
-    memset(&limit, 0, sizeof(limit));
-    ret = st->isp.get_expo_limit(I6C_DEV_ID(I6C_ISP_DEV), I6C_ISP_CHN, &limit);
-    if (ret) {
-        HAL_LOG_WARN("isp: MI_ISP_AE_GetExposureLimit failed: %d", ret);
-        return;
-    }
-
-    if (limit.maxShutterUs && limit.maxShutterUs <= want) {
-        HAL_LOG_INFO("isp: shutter ceiling %u us already within one frame at %u fps (%u us)",
-                     limit.maxShutterUs, fps, want);
-        return;
-    }
-
-    /*
-     * A ceiling below the floor is not a cap, it is a broken envelope, and MI
-     * would take it. Leave the tuning's alone and say so: at that point the frame
-     * rate the operator asked for is not one this sensor can hold.
-     */
-    if (limit.minShutterUs && want < limit.minShutterUs) {
-        HAL_LOG_WARN("isp: one frame at %u fps is %u us, below the tuning's %u us floor; "
-                     "leaving the shutter ceiling at %u us",
-                     fps, want, limit.minShutterUs, limit.maxShutterUs);
-        return;
-    }
-
-    HAL_LOG_INFO("isp: capping shutter %u -> %u us to hold %u fps", limit.maxShutterUs, want, fps);
-    limit.maxShutterUs = want;
-
-    ret = st->isp.set_expo_limit(I6C_DEV_ID(I6C_ISP_DEV), I6C_ISP_CHN, &limit);
-    if (ret) {
-        HAL_LOG_WARN("isp: MI_ISP_AE_SetExposureLimit failed: %d", ret);
-        return;
-    }
-
-    memset(&limit, 0, sizeof(limit));
-    if (st->isp.get_expo_limit(I6C_DEV_ID(I6C_ISP_DEV), I6C_ISP_CHN, &limit) == 0 &&
-        limit.maxShutterUs != want)
-        HAL_LOG_WARN("isp: shutter ceiling read back as %u us, not the %u us asked for; "
-                     "MI kept its own and the frame rate will still fall",
-                     limit.maxShutterUs, want);
 }
 
 void i6c_isp_flush_knobs(infinity6c_state_t *st)
@@ -1153,8 +1052,6 @@ void i6c_isp_flush_knobs(infinity6c_state_t *st)
 
         i6c_iq_apply(st, (int)i, p->pending, p->pending_is_raw);
     }
-
-    i6c_isp_apply_shutter_cap(st);
 }
 
 void i6c_isp_forget_knobs(void)
@@ -1208,9 +1105,39 @@ int hal_isp_get_saturation(void *ctx, uint8_t *val)
 }
 
 /*
- * Sharpness and spatial denoise, both per-band tables driven as a run; see
- * i6c_iq_apply_vector for what a single number does to one. raptor's name for
- * the second is "sinter", MI's is NrLumaAdv, and they are the same module.
+ * Sharpness: a per-band table driven as a run; see i6c_iq_apply_vector for what
+ * a single number does to one.
+ *
+ * NO SINTER HERE, DELIBERATELY
+ *
+ * Spatial luma denoise -- raptor's "sinter", MI's NrLumaAdv -- was published
+ * here as a second vector row and is not any more, because the knob could not
+ * be given a range that means anything on this family.
+ *
+ * The field it reaches is u16Strength[2], the module's blend weight: how much of
+ * the filtered luma replaces the original, per level, out of 256 for a full
+ * swap. That is the only part of a 208-byte parameter block the row could
+ * address, and it is not where the denoising strength lives -- the filter's own
+ * radii and thresholds are, and nothing here moves them.
+ *
+ * What settles it is what the shipped tunings ask for. Read out of the per-sensor
+ * bins in /etc/sensors, every one of the six has the module enabled and in AUTO,
+ * and imx335 -- the sensor this was chased on -- pins its whole 16-entry
+ * gain-indexed table flat at 255 of 256. So the tuner already asked for
+ * essentially the maximum blend at every gain, and raptor's knob had exactly two
+ * positions that were not worse than doing nothing: 128, which restores AUTO,
+ * and 255, which writes 256 and draws level with it. Everything between was a
+ * quiet downgrade -- 192 lands on 129, half the blend the tuning wanted -- and
+ * everything below 128 was off.
+ *
+ * A knob whose whole usable range is its own default is not a knob. The module
+ * keeps running on the tuning's terms, which is what it was doing at 128
+ * anyway, and rvd gets RSS_ERR_NOTSUP for a set. The vendor ABI for it stays in
+ * sigmastar-headers with its assertions in tests/abi_iq_i6c.c, since what is
+ * missing here is a useful range and not the knowledge of where the module is.
+ *
+ * Temporal denoise (temper, MI's 3DNR) is untouched by this: it is a channel
+ * level with eight real positions, and it works.
  */
 int hal_isp_set_sharpness(void *ctx, int val)
 {
@@ -1220,16 +1147,6 @@ int hal_isp_set_sharpness(void *ctx, int val)
 int hal_isp_get_sharpness(void *ctx, uint8_t *val)
 {
     return i6c_iq_get_scalar(ctx, IQ_SHARPNESS, val);
-}
-
-int hal_isp_set_sinter_strength(void *ctx, int val)
-{
-    return i6c_iq_set_scalar(ctx, IQ_NRLUMAADV, val);
-}
-
-int hal_isp_get_sinter_strength(void *ctx, uint8_t *val)
-{
-    return i6c_iq_get_scalar(ctx, IQ_NRLUMAADV, val);
 }
 
 /*
@@ -1669,14 +1586,6 @@ int hal_isp_set_sensor_fps(void *ctx, uint32_t fps_num, uint32_t fps_den)
 
     st->fps = fps;
     HAL_LOG_INFO("isp: sensor rate %u fps", fps);
-
-    /*
-     * The shutter ceiling is one frame period, so a rate change moves it. Only
-     * once the knobs are live: before that there is no tuning in the ISP to cap,
-     * and the load that installs one calls this on its way past.
-     */
-    if (st->isp_knobs_live)
-        i6c_isp_apply_shutter_cap(st);
 
     return RSS_OK;
 }

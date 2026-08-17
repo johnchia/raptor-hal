@@ -130,8 +130,6 @@ int hal_isp_set_saturation(void *ctx, int val);
 int hal_isp_get_saturation(void *ctx, uint8_t *val);
 int hal_isp_set_sharpness(void *ctx, int val);
 int hal_isp_get_sharpness(void *ctx, uint8_t *val);
-int hal_isp_set_sinter_strength(void *ctx, int val);
-int hal_isp_get_sinter_strength(void *ctx, uint8_t *val);
 int hal_isp_set_defog(void *ctx, int enable);
 int hal_isp_set_defog_strength(void *ctx, int val);
 int hal_isp_set_defog_strength_adv(void *ctx, const void *defog_attr);
@@ -734,8 +732,12 @@ static const rss_hal_ops_t g_ops = {
      */
     .isp_set_sharpness = hal_isp_set_sharpness,
     .isp_get_sharpness = hal_isp_get_sharpness,
-    .isp_set_sinter_strength = hal_isp_set_sinter_strength,
-    .isp_get_sinter_strength = hal_isp_get_sinter_strength,
+    /*
+     * No isp_{set,get}_sinter_strength: NrLumaAdv's blend weight is already at
+     * the tuning's maximum on every sensor here, so the knob had no range to
+     * offer. hal_isp.c says it in full. Left absent rather than stubbed, so
+     * RSS_HAL_CALL answers RSS_ERR_NOTSUP and get-isp-caps stops listing it.
+     */
     .isp_set_defog = hal_isp_set_defog,
     .isp_set_defog_strength = hal_isp_set_defog_strength,
     /* The one rvd's [image] block calls; the plain setter serves the ctrl API. */
