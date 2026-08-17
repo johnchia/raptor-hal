@@ -110,25 +110,35 @@ static infinity6c_state_t *i6c_state(void *ctx)
 }
 
 /*
- * The 3A state at the first successful readback, logged once. It is how the
- * colour path is diagnosed without a board in hand: the white-balance gains say
- * where AWB has settled, and whether they move when the illuminant changes says
- * whether it is adapting at all. Gains are 1024-per-unit; the log prints the raw
- * values so the unit can be checked against the scene.
+ * The 3A state at the first successful readback of each, logged once each. It is
+ * how the colour path is diagnosed without a board in hand: the white-balance
+ * gains say where AWB has settled, and whether they move when the illuminant
+ * changes says whether it is adapting at all. Gains are 1024-per-unit; the log
+ * prints the raw values so the unit can be checked against the scene.
+ *
+ * Two latches and not one, which is the whole point of the split. They shared a
+ * single flag, set on the first AE success -- and AE answers before AWB has a
+ * result to give, every time, because the AE loop converges first. So the flag
+ * was always spent on a call where AWB had nothing, and the awb line could never
+ * be printed at all. Measured on an SSC377QE: no isp/awb in a whole boot, while
+ * the very same gains were being reported to ric all along.
  */
-static void i6c_isp_log_3a(const i6c_cus_ae_info *ae, const i6c_cus_awb_info *awb)
+static void i6c_isp_log_ae(const i6c_cus_ae_info *ae)
 {
     HAL_LOG_INFO("isp/ae: shutter=%uus sensorgain=%u ispgain=%u avgY=%u", ae->shutterUs,
                  ae->sensorGain, ae->ispGain, ae->preAvgY);
+}
 
-    if (awb)
-        HAL_LOG_INFO("isp/awb: gains r=%u g=%u b=%u (1024=1x)", awb->rGain, awb->gGain, awb->bGain);
+static void i6c_isp_log_awb(const i6c_cus_awb_info *awb)
+{
+    HAL_LOG_INFO("isp/awb: gains r=%u g=%u b=%u (1024=1x)", awb->rGain, awb->gGain, awb->bGain);
 }
 
 int hal_isp_get_exposure(void *ctx, rss_exposure_t *exposure)
 {
     infinity6c_state_t *st = i6c_state(ctx);
-    static bool diag_logged;
+    static bool ae_logged;
+    static bool awb_logged;
     i6c_cus_awb_info awb;
     i6c_cus_ae_info ae;
     bool have_awb;
@@ -176,12 +186,18 @@ int hal_isp_get_exposure(void *ctx, rss_exposure_t *exposure)
         st->isp.awb_status && st->isp.awb_status(I6C_DEV_ID(I6C_ISP_DEV), I6C_ISP_CHN, &awb) == 0;
     if (have_awb) {
         exposure->wb_rgain = (uint16_t)awb.rGain;
+        exposure->wb_ggain = (uint16_t)awb.gGain;
         exposure->wb_bgain = (uint16_t)awb.bGain;
     }
 
-    if (!diag_logged) {
-        diag_logged = true;
-        i6c_isp_log_3a(&ae, have_awb ? &awb : NULL);
+    if (!ae_logged) {
+        ae_logged = true;
+        i6c_isp_log_ae(&ae);
+    }
+
+    if (have_awb && !awb_logged) {
+        awb_logged = true;
+        i6c_isp_log_awb(&awb);
     }
 
     return RSS_OK;

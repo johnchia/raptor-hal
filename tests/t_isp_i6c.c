@@ -17,19 +17,57 @@
 #include "infinity6c/hal_isp.c"
 
 #include <assert.h>
+#include <stdarg.h>
 #include <stdio.h>
 
 /*
  * A real (silent) logger rather than NULL: HAL_LOG_* call through this without a
  * NULL guard, because rss_hal_init always installs one, and every test here
  * drives at least one warning path.
+ *
+ * It also keeps what was logged. Most of this file asserts on the bytes a module
+ * was handed, which is the right level for a knob -- but a diagnostic's whole
+ * observable behaviour is the line it prints, so the only way to test one is to
+ * read it back.
  */
+static char g_log[8192];
+static size_t g_log_len;
+
 static void quiet_log(int level, const char *file, int line, const char *fmt, ...)
 {
+    size_t room = sizeof(g_log) - g_log_len;
+    va_list ap;
+    int n;
+
     (void)level;
     (void)file;
     (void)line;
-    (void)fmt;
+
+    /* Two bytes: one for the newline, one for the terminator. */
+    if (room < 3)
+        return;
+
+    va_start(ap, fmt);
+    n = vsnprintf(g_log + g_log_len, room - 2, fmt, ap);
+    va_end(ap);
+    if (n < 0)
+        return;
+
+    g_log_len += (size_t)n < room - 2 ? (size_t)n : room - 3;
+    g_log[g_log_len++] = '\n';
+    g_log[g_log_len] = '\0';
+}
+
+/*
+ * Terminating as well as rewinding. vsnprintf's own NUL is overwritten by the
+ * newline above, so a buffer that is only rewound still reads as whatever the
+ * previous test logged -- and an assertion looking for a line it did not expect
+ * would find one and fail on a ghost.
+ */
+static void log_reset(void)
+{
+    g_log_len = 0;
+    g_log[0] = '\0';
 }
 
 rss_hal_log_func_t rss_hal_log_fn = quiet_log;
@@ -704,6 +742,86 @@ static void test_the_scalar_rows_still_map_the_way_they_did(void)
     CHECK(i6c_iq_unscale(0, 0, -20, 20) == 128, "a floor-sitting baseline reads as neutral");
 }
 
+/*
+ * The AWB diagnostic must be able to print at all.
+ *
+ * AE and AWB shared one latch, set on the first AE success -- and AE answers
+ * before AWB has a result, every time, because its loop converges first. So the
+ * latch was always spent on a call where AWB had nothing to say, and
+ * "isp/awb: gains ..." could never be printed. Measured on an SSC377QE: not one
+ * isp/awb line in a whole boot, while ric was being handed r=1604 b=2341
+ * through this very function.
+ *
+ * The latches are function-static, so this runs the whole sequence in one test:
+ * a first call with AWB not yet answering, then one where it does.
+ */
+static int g_awb_ret;
+
+static int fake_ae_status(unsigned int device, unsigned int channel, i6c_cus_ae_info *info)
+{
+    (void)device;
+    (void)channel;
+    memset(info, 0, sizeof(*info));
+    info->shutterUs = 55785;
+    info->sensorGain = 65536;
+    info->ispGain = 2048;
+    info->preAvgY = 70;
+    return 0;
+}
+
+static int fake_awb_status(unsigned int device, unsigned int channel, i6c_cus_awb_info *info)
+{
+    (void)device;
+    (void)channel;
+    if (g_awb_ret)
+        return g_awb_ret;
+    memset(info, 0, sizeof(*info));
+    info->rGain = 1604;
+    info->gGain = 1024;
+    info->bGain = 2341;
+    return 0;
+}
+
+static void test_the_awb_line_survives_ae_winning_the_race(void)
+{
+    rss_hal_ctx_t ctx;
+    infinity6c_state_t st;
+    rss_exposure_t exp;
+
+    reset(&st);
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.platform = &st;
+    st.isp.ae_status = fake_ae_status;
+    st.isp.awb_status = fake_awb_status;
+    st.iq_load_started = 1;
+
+    /* AE first, as it always is, with AWB not answering yet. */
+    log_reset();
+    g_awb_ret = -1;
+    CHECK(hal_isp_get_exposure(&ctx, &exp) == RSS_OK, "the AE readback must succeed");
+    CHECK(strstr(g_log, "isp/ae:") != NULL, "the AE line must be logged");
+    CHECK(strstr(g_log, "isp/awb:") == NULL, "no AWB line before AWB has an answer");
+
+    /* And now AWB answers. This is the line the single latch used to eat. */
+    log_reset();
+    g_awb_ret = 0;
+    CHECK(hal_isp_get_exposure(&ctx, &exp) == RSS_OK, "the readback must succeed");
+    CHECK(strstr(g_log, "isp/awb: gains r=1604 g=1024 b=2341") != NULL,
+          "the AWB line must be logged once AWB answers, got: %s", g_log);
+    CHECK(strstr(g_log, "isp/ae:") == NULL, "the AE line must not repeat");
+
+    /* The gains reach the caller too, green included -- ric and get-isp both
+     * read them from here. */
+    CHECK(exp.wb_rgain == 1604 && exp.wb_ggain == 1024 && exp.wb_bgain == 2341,
+          "the gains must reach the caller, got r=%u g=%u b=%u", exp.wb_rgain, exp.wb_ggain,
+          exp.wb_bgain);
+
+    /* Once each, and no more. */
+    log_reset();
+    CHECK(hal_isp_get_exposure(&ctx, &exp) == RSS_OK, "the readback must succeed");
+    CHECK(g_log_len == 0, "neither line repeats, got: %s", g_log);
+}
+
 int main(void)
 {
     test_reporting_does_not_cache_the_sensors_answer();
@@ -725,6 +843,7 @@ int main(void)
     test_a_run_that_does_not_fit_is_refused();
     test_a_failing_module_writes_nothing();
     test_the_scalar_rows_still_map_the_way_they_did();
+    test_the_awb_line_survives_ae_winning_the_race();
 
     if (failures) {
         printf("t_isp_i6c: %d failure(s)\n", failures);

@@ -507,6 +507,13 @@ typedef struct {
     uint32_t ev;       /* EV from GetEVAttr (T20-T31) */
     uint16_t wb_rgain; /* AWB red gain from GetWB_Statis (T20-T31) */
     uint16_t wb_bgain; /* AWB blue gain from GetWB_Statis (T20-T31) */
+    /*
+     * AWB green gain, where the backend has one. Ingenic reports the two ratios
+     * only and leaves this 0; MI's CUS3A status carries all three, and with
+     * nowhere to put the third the ctrl API was reporting a green gain it had
+     * never been given. 0 means "not reported", as it does for the two above.
+     */
+    uint16_t wb_ggain;
 } rss_exposure_t;
 
 /* White balance mode (matches ISP_CORE_WB_MODE_* from libimp) */
