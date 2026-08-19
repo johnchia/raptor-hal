@@ -102,10 +102,22 @@ const rss_hal_caps_t g_hal_caps = {
  */
 #if defined(PLATFORM_INFINITY6E)
     .has_defog = true,
-    .has_sinter = true,
+    /*
+     * has_sinter and has_max_gain are false because the ops are no longer
+     * published, which is the same answer Infinity6C reached and for
+     * overlapping reasons -- see the OP COVERAGE comment in
+     * src/star/hal_isp.c. Spatial denoise had no usable range once the
+     * shipped tunings were read; the gain ceilings are in MI's x1024 units
+     * and raptor's keys carry Ingenic gain codes, which is not a unit
+     * mismatch a HAL can convert away.
+     *
+     * has_temper stays true and now means the VPE channel's 3DNR level, so
+     * it no longer costs the tuning's own NR3D curve to move it.
+     */
+    .has_sinter = false,
     .has_temper = true,
     .has_ae_comp = true,
-    .has_max_gain = true,
+    .has_max_gain = false,
 #endif
 
     /*

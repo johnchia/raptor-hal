@@ -114,6 +114,26 @@
  *                         own derivation. Deferred rather than guessed.
  *   isp_set_bypass        No MI equivalent; the ISP cannot be bypassed
  *                         while VPE is the only path to the encoder.
+ *   isp_set_sinter_strength / _get
+ *                         Spatial luma denoise. NRLuma's manual block is
+ *                         a blend weight and two filter selects, and the
+ *                         weight is where a scalar would land -- but the
+ *                         shipped tunings run it near its ceiling at every
+ *                         gain, so the knob's usable range was its own
+ *                         default and everything below neutral was a
+ *                         downgrade. Infinity6C withdrew the same op for
+ *                         the same reason; see the note in
+ *                         src/infinity6c/hal_isp.c.
+ *   isp_set_max_again / _dgain, and their getters
+ *                         MI's ceilings are x1024 fixed point against
+ *                         raptor's Ingenic gain codes, and no conversion
+ *                         between the two exists -- rvd's defaults of 160
+ *                         and 80 read as ceilings of 0.16x and 0.08x. MI
+ *                         also refuses any ceiling above the tuning's
+ *                         calibrated one, so the half of the range that
+ *                         parsed as valid mostly did nothing. Offering a
+ *                         control whose units the caller cannot express is
+ *                         worse than not offering it.
  *
  * Copyright (C) 2026 Thingino Project
  * SPDX-License-Identifier: GPL-3.0-or-later
@@ -192,7 +212,7 @@
  */
 #define STAR_ISP_READY_QUICK_MS 400
 
-/* Largest payload the table below touches (NR3D, 1776). Sized generously
+/* Largest payload the table below touches (sharpness, 1268). Sized generously
  * so a future entry does not silently overflow -- star_iq_call refuses
  * anything that does not fit rather than truncating. */
 #define STAR_IQ_PAYLOAD_MAX 2048
@@ -275,8 +295,6 @@ enum {
     IQ_CONTRAST,
     IQ_SATURATION,
     IQ_SHARPNESS,
-    IQ_SINTER,
-    IQ_TEMPER,
     IQ_DEFOG,
     IQ_GRAY,
     IQ_EVCOMP,
@@ -338,14 +356,6 @@ static star_iq_param_t g_iq[IQ_PARAM_COUNT] = {
     [IQ_SHARPNESS] = { "sharpness", "MI_ISP_IQ_GetSharpness", "MI_ISP_IQ_SetSharpness",
                        I6_ISP_IQ_SHARPNESS_PAYLOAD, I6_ISP_IQ_SHARPNESS_MANUAL,
                        1, IQ_AUTOMAN, 255, 128, 0, false, NULL, NULL },
-    /* Spatial (per-frame) luma noise reduction is raptor's "sinter". */
-    [IQ_SINTER] = { "sinter", "MI_ISP_IQ_GetNRLuma", "MI_ISP_IQ_SetNRLuma",
-                    I6_ISP_IQ_NRLUMA_PAYLOAD, I6_ISP_IQ_NRLUMA_MANUAL, 1, IQ_AUTOMAN,
-                    255, 128, 0, false, NULL, NULL },
-    /* Temporal noise reduction is raptor's "temper" -- MI calls it 3D NR. */
-    [IQ_TEMPER] = { "temper", "MI_ISP_IQ_GetNR3D", "MI_ISP_IQ_SetNR3D",
-                    I6_ISP_IQ_NR3D_PAYLOAD, I6_ISP_IQ_NR3D_MANUAL, 1, IQ_AUTOMAN,
-                    255, 128, 0, false, NULL, NULL },
     [IQ_DEFOG] = { "defog", "MI_ISP_IQ_GetDefog", "MI_ISP_IQ_SetDefog",
                    I6_ISP_IQ_DEFOG_PAYLOAD, 0, 4, IQ_BOOL, 1, 0, 0, false, NULL, NULL },
     [IQ_GRAY] = { "gray", "MI_ISP_IQ_GetColorToGray", "MI_ISP_IQ_SetColorToGray",
@@ -614,6 +624,20 @@ static int star_iq_apply_scalar(star_state_t *st, int idx, int val)
             HAL_LOG_DBG("isp: %s left to the tuning file (auto)", p->name);
             return star_iq_store(st, idx, buf);
         }
+        /*
+         * Leaving auto costs the tuning file's per-gain curve for this
+         * module -- MI interpolates stAuto[16] across gain and stManual is
+         * one value for all of it. That is a real loss and not a
+         * hypothetical: across the six shipped Infinity6E tunings,
+         * saturation, sharpness and contrast all vary across gain in every
+         * bin that carries them. Said once per departure rather than per
+         * write, so a config that sets a knob explains itself at startup
+         * without repeating on every re-apply.
+         */
+        if (star_iq_read(buf, STAR_ISP_OPTYPE_OFF, 4) == STAR_ISP_OP_AUTO)
+            HAL_LOG_INFO("isp: %s goes manual, so the tuning's per-gain curve for it stops "
+                         "being used; set %s back to %d to restore it",
+                         p->name, p->name, STAR_ISP_NEUTRAL);
         star_iq_write(buf, STAR_ISP_OPTYPE_OFF, 4, STAR_ISP_OP_MANUAL);
     }
 
@@ -947,10 +971,7 @@ static void star_isp_snapshot_bin_limits(star_state_t *st)
         return;
     }
 
-    st->bin_min_sensor_gain = limit.minSensorGain;
     st->bin_max_sensor_gain = limit.maxSensorGain;
-    st->bin_min_isp_gain = limit.minIspGain;
-    st->bin_max_isp_gain = limit.maxIspGain;
     st->bin_max_shutter_us = limit.maxShutterUs;
 
     /*
@@ -1112,9 +1133,6 @@ void star_isp_bringup(star_state_t *st, const rss_sensor_config_t *cfg)
      * pipeline aborted over a tuning file does not: a wrong-looking image
      * is a defect, not an outage.
      */
-    st->pend_max_again = -1;
-    st->pend_max_dgain = -1;
-
     ret = i6_isp_load(&st->isp);
     if (ret != RSS_OK) {
         HAL_LOG_WARN("isp: MI_ISP unavailable (%d); no tuning or 3A control this run", ret);
@@ -1140,6 +1158,7 @@ void star_isp_bringup(star_state_t *st, const rss_sensor_config_t *cfg)
  */
 static void star_isp_flush_pending(star_state_t *st);
 static void star_isp_reload_if_reset(star_state_t *st, bool force);
+static int star_isp_apply_nr3d_level(star_state_t *st);
 
 static void star_isp_arm_tuning_reads(void)
 {
@@ -1366,14 +1385,46 @@ int hal_isp_set_sharpness(void *ctx, int val)
     return star_iq_set_scalar(ctx, IQ_SHARPNESS, val);
 }
 
-int hal_isp_set_sinter_strength(void *ctx, int val)
-{
-    return star_iq_set_scalar(ctx, IQ_SINTER, val);
-}
+/*
+ * MI bounds the level at 7 (i6_vpe.h), and 1 is what star_vpe_bringup
+ * creates the channel with -- the value both references default it to.
+ * That makes 1 the unity here rather than the midpoint, for the same reason
+ * saturation's unity is 32 of 127: raptor's neutral has to mean "nobody
+ * asked", and on this knob what nobody asking got is level 1. A midpoint
+ * unity would move every default board from 1 to 4 on the first boot after
+ * this change.
+ *
+ * The consequence, which the Infinity6C board test surfaced: a unity of 1 over
+ * a floor of 0 leaves exactly one level below neutral, so every raptor value
+ * under 128 asks for 3DNR off. There is no graded lower half to be had -- the
+ * hardware has eight positions and the default is the second of them.
+ */
+#define STAR_VPE_NR3D_MAX 7
+#define STAR_VPE_NR3D_UNITY 1
 
 int hal_isp_set_temper_strength(void *ctx, int val)
 {
-    return star_iq_set_scalar(ctx, IQ_TEMPER, val);
+    star_state_t *st = star_state(ctx);
+    int prev;
+    int ret;
+
+    if (!st)
+        return RSS_ERR_INVAL;
+    if (val < 0 || val > 255)
+        return RSS_ERR_INVAL;
+
+    prev = st->nr3d_level_req;
+    st->nr3d_level_req = star_iq_scale(val, STAR_VPE_NR3D_UNITY, 0, STAR_VPE_NR3D_MAX);
+
+    ret = star_isp_apply_nr3d_level(st);
+    if (ret != RSS_OK) {
+        st->nr3d_level_req = prev;
+        return ret;
+    }
+
+    HAL_LOG_DBG("isp: temper = %d (3DNR level %d of %d)", val, st->nr3d_level_req,
+                STAR_VPE_NR3D_MAX);
+    return RSS_OK;
 }
 
 int hal_isp_set_ae_comp(void *ctx, int val)
@@ -1406,14 +1457,26 @@ int hal_isp_get_sharpness(void *ctx, uint8_t *val)
     return star_iq_get_scalar(ctx, IQ_SHARPNESS, val);
 }
 
-int hal_isp_get_sinter_strength(void *ctx, uint8_t *val)
-{
-    return star_iq_get_scalar(ctx, IQ_SINTER, val);
-}
-
 int hal_isp_get_temper_strength(void *ctx, uint8_t *val)
 {
-    return star_iq_get_scalar(ctx, IQ_TEMPER, val);
+    star_state_t *st = star_state(ctx);
+    i6e_vpe_para para;
+
+    if (!st || !val)
+        return RSS_ERR_INVAL;
+
+    /*
+     * The channel outranks the request when there is one: MI clamps the
+     * level to the per-chip maximum, so what it took is not always what was
+     * asked for, and a reader wants the former.
+     */
+    memset(&para, 0, sizeof(para));
+    if (st->vpe_chn_created && st->vpe.fnGetChannelParam &&
+        !st->vpe.fnGetChannelParam(STAR_VPE_CHN, (i6_vpe_para *)&para) && para.level3DNR >= 0)
+        st->nr3d_level_req = para.level3DNR;
+
+    *val = star_iq_unscale(st->nr3d_level_req, STAR_VPE_NR3D_UNITY, 0, STAR_VPE_NR3D_MAX);
+    return RSS_OK;
 }
 
 int hal_isp_get_ae_comp(void *ctx, int *val)
@@ -1495,162 +1558,6 @@ int hal_isp_get_antiflicker(void *ctx, rss_antiflicker_t *mode)
 }
 
 /*
- * Gain ceilings.
- *
- * MI keeps both in the AE exposure-limit struct, so each setter is a
- * read-modify-write of the same 32 bytes star_isp_cap_exposure uses --
- * which is the point: writing the struct wholesale here would undo that
- * shutter cap.
- *
- * The units are MI's own and are not raptor's 0..255: they are x1024
- * fixed point, 1024 being unity. rvd's defaults (max_again 160, max_dgain
- * 80) are Ingenic gain codes, and rvd applies them whether or not the
- * config mentions the keys, so passing them straight through would write
- * sub-unity ceilings on every boot. Values below unity are refused and
- * values above the tuning's calibrated ceiling clamped to it -- see the
- * reasoning inside. Treat these two keys as MI-native on this platform.
- */
-static int star_isp_apply_gain_limit(star_state_t *st, bool sensor_gain, int gain)
-{
-    i6_isp_exp limit;
-    int ret;
-
-    /* Guarded like every other vendor pointer in this file. i6_isp_load
-     * refuses to report success without these two, so a live pipeline
-     * always has them -- but this is reachable from the flush, and calling
-     * through a null pointer is a worse answer than NOTSUP. */
-    if (!st->isp.fnGetExposureLimit || !st->isp.fnSetExposureLimit)
-        return RSS_ERR_NOTSUP;
-
-    memset(&limit, 0, sizeof(limit));
-    ret = st->isp.fnGetExposureLimit(STAR_ISP_CHN, &limit);
-    if (ret) {
-        HAL_LOG_WARN("isp: MI_ISP_AE_GetExposureLimit failed: %d", ret);
-        return RSS_ERR_IO;
-    }
-
-    {
-        unsigned int want = (unsigned int)gain;
-        unsigned int bin_min = sensor_gain ? st->bin_min_sensor_gain : st->bin_min_isp_gain;
-        unsigned int bin_max = sensor_gain ? st->bin_max_sensor_gain : st->bin_max_isp_gain;
-        const char *which = sensor_gain ? "sensor" : "isp";
-
-        /*
-         * MI's ceilings are x1024 fixed point: 1024 is unity, and the
-         * vendor's own constant for a 32x cap is 32768 (waybeam's
-         * AE_GAIN_MAX_DEFAULT, "32x sensor cap"). raptor's max_again and
-         * max_dgain keys are Ingenic gain codes, and rvd applies its
-         * Ingenic defaults -- 160 and 80 -- on every platform whether or
-         * not the config mentions them. Written through unscaled those are
-         * ceilings of 0.16x and 0.08x: below unity, so not gain ceilings
-         * at all. maxIspGain = 80 is the damaging one, because it pins the
-         * ISP's digital gain at its floor and so removes all the headroom
-         * above the sensor's own ceiling -- which is why total_gain on
-         * this board stopped dead at 8192 (8x, the tuning's own
-         * maxSensorGain) instead of climbing through it as the light went.
-         *
-         * Refused rather than scaled: no conversion turns an Ingenic gain
-         * code into an MI one, so the only honest answer is to leave the
-         * tuning's calibrated ceiling alone and say why, once per load.
-         */
-        if (want < 1024u) {
-            HAL_LOG_WARN("isp: ignoring max %s gain %u -- MI wants x1024 units, so that "
-                         "reads as %u.%02ux, a ceiling below unity. The tuning's own limit "
-                         "stands. Set max_again/max_dgain in x1024 (1024 = 1.0x).",
-                         which, want, want / 1024u, (want % 1024u) * 100u / 1024u);
-            return RSS_ERR_INVAL;
-        }
-
-        /*
-         * MI validates against the calibrated range and quietly keeps its
-         * own value when a ceiling is out of it, so clamping here is only
-         * about the log: an unexplained ceiling that did not take is much
-         * harder to spot than one that says it was clamped. waybeam found
-         * the same wall -- gainMax 32000 against a bin ceiling of 8192.
-         */
-        if (bin_max && want > bin_max) {
-            HAL_LOG_INFO("isp: max %s gain %u is above the tuning's calibrated ceiling %u; "
-                         "clamping, because MI does not honour a higher one",
-                         which, want, bin_max);
-            want = bin_max;
-        }
-        if (bin_min && want < bin_min) {
-            HAL_LOG_INFO("isp: max %s gain %u is below the tuning's floor %u; raising to it",
-                         which, want, bin_min);
-            want = bin_min;
-        }
-
-        if (sensor_gain)
-            limit.maxSensorGain = want;
-        else
-            limit.maxIspGain = want;
-    }
-
-    ret = st->isp.fnSetExposureLimit(STAR_ISP_CHN, &limit);
-    if (ret) {
-        HAL_LOG_WARN("isp: MI_ISP_AE_SetExposureLimit failed: %d", ret);
-        return RSS_ERR_IO;
-    }
-
-    HAL_LOG_DBG("isp: max %s gain = %d", sensor_gain ? "sensor" : "isp", gain);
-    return RSS_OK;
-}
-
-static int star_isp_get_gain_limit(void *ctx, bool sensor_gain, uint32_t *gain)
-{
-    star_state_t *st = star_state(ctx);
-    i6_isp_exp limit;
-    int ret;
-
-    if (!st || !st->isp_loaded)
-        return RSS_ERR_NOENT;
-    if (!gain)
-        return RSS_ERR_INVAL;
-
-    if (!st->isp_tuned) {
-        int pend = sensor_gain ? st->pend_max_again : st->pend_max_dgain;
-
-        *gain = pend >= 0 ? (uint32_t)pend : 0u;
-        return RSS_OK;
-    }
-
-    memset(&limit, 0, sizeof(limit));
-    ret = st->isp.fnGetExposureLimit(STAR_ISP_CHN, &limit);
-    if (ret) {
-        HAL_LOG_WARN("isp: MI_ISP_AE_GetExposureLimit failed: %d", ret);
-        return RSS_ERR_IO;
-    }
-
-    *gain = sensor_gain ? limit.maxSensorGain : limit.maxIspGain;
-    return RSS_OK;
-}
-
-static int star_isp_set_gain_limit(void *ctx, bool sensor_gain, int gain)
-{
-    star_state_t *st = star_state(ctx);
-
-    if (!st || !st->isp_loaded)
-        return RSS_ERR_NOENT;
-    if (gain < 0)
-        return RSS_ERR_INVAL;
-
-    /* Recorded like the IQ knobs, and for the same two reasons: the ISP
-     * may not be up yet, and a later tuning load will need it back. */
-    if (sensor_gain)
-        st->pend_max_again = gain;
-    else
-        st->pend_max_dgain = gain;
-
-    if (!st->isp_tuned) {
-        HAL_LOG_DBG("isp: max %s gain = %d queued until the ISP is up",
-                    sensor_gain ? "sensor" : "isp", gain);
-        return RSS_OK;
-    }
-
-    return star_isp_apply_gain_limit(st, sensor_gain, gain);
-}
-
-/*
  * Re-apply everything that has been asked for.
  *
  * Called from star_isp_tune_when_ready *after* the tuning binary has
@@ -1677,32 +1584,6 @@ static void star_isp_flush_pending(star_state_t *st)
         else
             (void)star_iq_apply_scalar(st, (int)i, p->pending);
     }
-
-    if (st->pend_max_again >= 0)
-        (void)star_isp_apply_gain_limit(st, true, st->pend_max_again);
-    if (st->pend_max_dgain >= 0)
-        (void)star_isp_apply_gain_limit(st, false, st->pend_max_dgain);
-
-}
-
-int hal_isp_set_max_again(void *ctx, int gain)
-{
-    return star_isp_set_gain_limit(ctx, true, gain);
-}
-
-int hal_isp_set_max_dgain(void *ctx, int gain)
-{
-    return star_isp_set_gain_limit(ctx, false, gain);
-}
-
-int hal_isp_get_max_again(void *ctx, uint32_t *gain)
-{
-    return star_isp_get_gain_limit(ctx, true, gain);
-}
-
-int hal_isp_get_max_dgain(void *ctx, uint32_t *gain)
-{
-    return star_isp_get_gain_limit(ctx, false, gain);
 }
 
 /*
@@ -1907,69 +1788,6 @@ static uint32_t star_ae_scene_luma(star_state_t *st, const i6_isp_ae_status *ae)
 #define STAR_LIMIT_REASSERT_S 2
 
 /*
- * What the AE's ceilings should currently read: whatever the config asked
- * for, clamped the same way star_isp_apply_gain_limit clamps it, and zero
- * for "this config says nothing, so the tuning's own value stands".
- *
- * Shared by the two functions below because they have to agree. They ask
- * opposite questions of the same numbers -- one wants to know whether a
- * configured ceiling has been lost, the other whether the tuning itself
- * has -- and a ceiling one of them considered legitimate while the other
- * read it as a wiped ISP would have them undoing each other every couple
- * of seconds.
- */
-static unsigned int star_isp_wanted_gain(const star_state_t *st)
-{
-    unsigned int want = st->pend_max_again >= 1024 ? (unsigned int)st->pend_max_again : 0u;
-
-    if (want && st->bin_max_sensor_gain && want > st->bin_max_sensor_gain)
-        want = st->bin_max_sensor_gain;
-
-    return want;
-}
-
-static void star_isp_reassert_limits(star_state_t *st)
-{
-    i6_isp_exp limit;
-    static time_t last;
-    static bool reported;
-    struct timespec now;
-    unsigned int want_gain;
-
-    if (st->pend_max_again < 1024)
-        return;
-    if (!st->isp.fnGetExposureLimit || !st->isp.fnSetExposureLimit)
-        return;
-
-    if (clock_gettime(CLOCK_MONOTONIC, &now))
-        return;
-    if (last && now.tv_sec - last < STAR_LIMIT_REASSERT_S)
-        return;
-    last = now.tv_sec;
-
-    memset(&limit, 0, sizeof(limit));
-    if (st->isp.fnGetExposureLimit(STAR_ISP_CHN, &limit))
-        return;
-
-    want_gain = star_isp_wanted_gain(st);
-    if (!want_gain || limit.maxSensorGain == want_gain)
-        return;
-
-    if (!reported) {
-        reported = true;
-        HAL_LOG_INFO("isp: AE narrowed its sensor gain ceiling to ..%u; restoring the "
-                     "configured ..%u and holding it",
-                     limit.maxSensorGain, want_gain);
-    }
-
-    limit.maxSensorGain = want_gain;
-    if (limit.minSensorGain > want_gain)
-        limit.minSensorGain = want_gain;
-
-    (void)st->isp.fnSetExposureLimit(STAR_ISP_CHN, &limit);
-}
-
-/*
  * Reload the tuning binary when the ISP is found back on its defaults.
  *
  * Loading the api bin plainly works: two different bins produce two
@@ -2020,7 +1838,8 @@ static void star_isp_reassert_limits(star_state_t *st)
  *
  * A reload restores the tuning's own state, config knobs and all, which
  * is exactly what star_isp_flush_pending exists to put back; without that
- * call a repair would silently drop a configured ceiling. Bounded,
+ * call a repair would silently drop every knob the operator had set.
+ * Bounded,
  * because a reload that does not stick must not turn into a loop -- and
  * if the bound is reached, the log says so, which is a better failure
  * than silence.
@@ -2032,7 +1851,6 @@ static void star_isp_reload_if_reset(star_state_t *st, bool force)
     i6_isp_exp limit;
     static time_t last;
     struct timespec now;
-    unsigned int want_gain;
 
     if (!st->iq_file[0] || !st->bin_max_sensor_gain)
         return;
@@ -2056,21 +1874,15 @@ static void star_isp_reload_if_reset(star_state_t *st, bool force)
         return;
 
     /*
-     * Either reading means the tuning is in effect: the value it published,
-     * or the narrower one this config deliberately asked for. Treating a
-     * configured ceiling as evidence of a reset would have this reload on
-     * every poll; ignoring it turns setting max_again into a way to switch
-     * the repair off.
-     *
-     * The blind spot is a max_again that happens to equal the untuned
-     * default, 8192 on this board: a reset then looks like the config
-     * being honoured. Left alone rather than special-cased, because the
-     * tuning's ceiling is the one worth having here and the config says to
-     * leave max_again unset.
+     * The tuning's own published ceiling is now the only reading that means
+     * it is still in effect: with max_again and max_dgain withdrawn on this
+     * family nothing else writes these limits, so there is no configured
+     * ceiling to mistake for a reset. That also retires the blind spot this
+     * had while there was one -- a configured ceiling equal to the untuned
+     * default, 8192 on this board, made a wipe look like the config being
+     * honoured.
      */
-    want_gain = star_isp_wanted_gain(st);
-    if (limit.maxSensorGain == st->bin_max_sensor_gain ||
-        (want_gain && limit.maxSensorGain == want_gain))
+    if (limit.maxSensorGain == st->bin_max_sensor_gain)
         return;
 
     if (st->iq_reloads >= STAR_IQ_RELOAD_MAX) {
@@ -2148,7 +1960,6 @@ int hal_isp_get_exposure(void *ctx, rss_exposure_t *exposure)
     exposure->ae_luma = star_ae_scene_luma(st, &ae);
 
     star_isp_reload_if_reset(st, false);
-    star_isp_reassert_limits(st);
 
     return RSS_OK;
 }
@@ -2251,6 +2062,65 @@ static int star_isp_apply_orien(star_state_t *st, int mirror, int flip)
     }
 
     HAL_LOG_DBG("isp: orientation mirror=%d flip=%d", para.mirror, para.flip);
+    return RSS_OK;
+}
+
+/*
+ * Temporal denoise, as the VPE channel's own 3DNR level.
+ *
+ * Not MI_ISP_IQ_SetNR3D, which is what this was until the tuning work in
+ * FEASIBILITY-iq-temporal-nr-transplant.md. NR3D's manual block is
+ * thresholds and per-band curves with no field that means "how much", so
+ * the only scalar a row could reach was MdThd -- the motion threshold --
+ * and writing it means setting enOpType to manual, which discards the
+ * sixteen-entry gain-indexed curve the tuning binary spent its effort on.
+ * Reading the shipped bins says how much that costs: imx335's NR3D varies
+ * across gain in eight of its twelve fields. Eight coarse positions that
+ * leave the tuning alone is the better trade.
+ *
+ * Infinity6C reaches temper the same way and for the same reason. The
+ * difference is which call carries it: there it rides MI_ISP_SetChnParam,
+ * which a running channel refuses, so the level is creation-time only.
+ * MI_VPE_SetChannelParam takes it whenever, so here it is live.
+ *
+ * Get-then-set, for the reason star_isp_apply_orien gives: the SDK mutates
+ * what it is handed, and this is the field it clamps.
+ */
+static int star_isp_apply_nr3d_level(star_state_t *st)
+{
+    i6e_vpe_para para;
+    int ret;
+
+    if (!st->vpe.fnGetChannelParam || !st->vpe.fnSetChannelParam)
+        return RSS_ERR_NOTSUP;
+    /*
+     * Held rather than refused: star_vpe_bringup reads nr3d_level_req when
+     * it creates the channel, so a request that arrives first still lands.
+     * Orientation cannot do this -- its two fields are in rss_hal_ctx_t and
+     * the creation path writes them as zero -- which is why that one returns
+     * NOENT here and this one does not.
+     */
+    if (!st->vpe_chn_created)
+        return RSS_OK;
+
+    memset(&para, 0, sizeof(para));
+    ret = st->vpe.fnGetChannelParam(STAR_VPE_CHN, (i6_vpe_para *)&para);
+    if (ret) {
+        HAL_LOG_WARN("isp: MI_VPE_GetChannelParam failed: %d", ret);
+        return RSS_ERR_IO;
+    }
+
+    if (para.level3DNR == st->nr3d_level_req)
+        return RSS_OK;
+
+    para.level3DNR = st->nr3d_level_req;
+
+    ret = st->vpe.fnSetChannelParam(STAR_VPE_CHN, (i6_vpe_para *)&para);
+    if (ret) {
+        HAL_LOG_WARN("isp: MI_VPE_SetChannelParam(3dnr=%d) failed: %d", para.level3DNR, ret);
+        return RSS_ERR_IO;
+    }
+
     return RSS_OK;
 }
 

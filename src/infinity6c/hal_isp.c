@@ -763,6 +763,18 @@ static int i6c_iq_apply_scalar(infinity6c_state_t *st, int idx, int val)
             HAL_LOG_DBG("isp: %s left to the tuning file (auto)", p->name);
             return i6c_iq_store(st, idx, buf);
         }
+        /*
+         * Leaving auto costs the tuning file's per-gain curve for this
+         * module: MI interpolates stAuto[16] across gain, and stManual is
+         * one value for all of it. Real rather than hypothetical -- every
+         * one of the six shipped Infinity6C tunings varies saturation and
+         * sharpness across gain. Said once per departure rather than per
+         * write, so re-applying the same value does not repeat it.
+         */
+        if (i6c_iq_read(buf, I6C_ISP_OPTYPE_OFF, 4) == I6C_ISP_OP_AUTO)
+            HAL_LOG_INFO("isp: %s goes manual, so the tuning's per-gain curve for it stops "
+                         "being used; set %s back to %d to restore it",
+                         p->name, p->name, I6C_ISP_NEUTRAL);
         i6c_iq_write(buf, I6C_ISP_OPTYPE_OFF, 4, I6C_ISP_OP_MANUAL);
     }
 
@@ -821,6 +833,12 @@ static int i6c_iq_apply_vector(infinity6c_state_t *st, int idx, int val)
         return i6c_iq_store(st, idx, buf);
     }
 
+    /* As in i6c_iq_apply_scalar: the band shape inside the manual block
+     * survives a vector write, but the per-gain curve does not. */
+    if (i6c_iq_read(buf, I6C_ISP_OPTYPE_OFF, 4) == I6C_ISP_OP_AUTO)
+        HAL_LOG_INFO("isp: %s goes manual, so the tuning's per-gain curve for it stops being "
+                     "used; set %s back to %d to restore it",
+                     p->name, p->name, I6C_ISP_NEUTRAL);
     i6c_iq_write(buf, I6C_ISP_OPTYPE_OFF, 4, I6C_ISP_OP_MANUAL);
 
     for (i = 0; i < p->count; i++) {
@@ -1494,12 +1512,33 @@ int hal_isp_get_hvflip(void *ctx, int *hflip, int *vflip)
  * maps onto 0..7, so the knob has eight distinct positions rather than 256 -- which
  * is what the hardware has.
  *
+ * Neutral is level 1, not the midpoint. It has to be the level the pipeline comes
+ * up on -- the one hal_init seeds -- because rvd applies temper on every start
+ * whether or not the config names the key. Same unity as Infinity6E's, and the
+ * same reasoning as saturation's 32-of-127: raptor's neutral means "nobody asked",
+ * which can only be whatever the platform was already doing.
+ *
+ * The old map sent neutral to 4 and got away with it only by failing: rvd's
+ * temper arrives after the channel is up, the running channel refuses the
+ * write, and the setter rolls back to the seed. So a board measured at level 1
+ * while reporting 36, and the mapping and the hardware now agree instead.
+ *
+ * Two consequences, both measured on an SSC377QE rather than reasoned about.
+ * A unity of 1 over a floor of 0 leaves exactly one level below neutral, so
+ * every raptor value under 128 asks for 3DNR off -- there is no graded lower
+ * half to be had, because the hardware has eight positions and the default is
+ * the second of them. And a config carrying a temper written by an older build
+ * reads differently now: that build encoded level 1 as 36, so a stored 36 used
+ * to mean the default and now means off. Configs that round-tripped through
+ * get-isp are the ones to look at.
+ *
  * Sinter is emphatically not this. Spatial luma denoise is its own module,
  * reached through the tuning API as a vector row, and aliasing the two would
  * have isp_set_sinter_strength quietly move temper -- which is the sort of
  * substitution that survives a bench check, because both do reduce noise.
  */
 #define I6C_ISP_NR3D_MAX 7
+#define I6C_ISP_NR3D_UNITY 1
 
 int hal_isp_set_temper_strength(void *ctx, int val)
 {
@@ -1513,9 +1552,7 @@ int hal_isp_set_temper_strength(void *ctx, int val)
         return RSS_ERR_INVAL;
 
     prev = st->isp_nr3d_req;
-    /* Rounded rather than truncated, so 255 reaches 7 and the midpoint lands
-     * mid-range instead of one step low. */
-    st->isp_nr3d_req = (val * I6C_ISP_NR3D_MAX + 127) / 255;
+    st->isp_nr3d_req = i6c_iq_scale(val, I6C_ISP_NR3D_UNITY, 0, I6C_ISP_NR3D_MAX);
 
     ret = i6c_isp_apply_chn_param(st);
     if (ret != RSS_OK) {
@@ -1548,7 +1585,7 @@ int hal_isp_get_temper_strength(void *ctx, uint8_t *val)
     if (level > I6C_ISP_NR3D_MAX)
         level = I6C_ISP_NR3D_MAX;
 
-    *val = (uint8_t)((level * 255 + I6C_ISP_NR3D_MAX / 2) / I6C_ISP_NR3D_MAX);
+    *val = i6c_iq_unscale(level, I6C_ISP_NR3D_UNITY, 0, I6C_ISP_NR3D_MAX);
     return RSS_OK;
 }
 

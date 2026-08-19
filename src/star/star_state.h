@@ -491,13 +491,6 @@ typedef struct {
      */
     bool isp_frame_seen;
 
-    /* Gain ceilings requested before the ISP would accept them; -1 for
-     * "nothing asked". Not in the IQ table because MI keeps both in the
-     * AE exposure-limit struct rather than in a per-module payload. */
-    int pend_max_again;
-    int pend_max_dgain;
-
-
     /*
      * The AE's own gain ceilings, snapshotted from whichever tuning is in
      * effect before any config knob overwrites them. These are the
@@ -508,10 +501,7 @@ typedef struct {
      * a requested ceiling has to be judged against rather than a hint.
      * Zero for "the AE never published them".
      */
-    unsigned int bin_min_sensor_gain;
     unsigned int bin_max_sensor_gain;
-    unsigned int bin_min_isp_gain;
-    unsigned int bin_max_isp_gain;
 
     /*
      * The tuning's shutter ceiling, kept for the same reason and read at
@@ -625,6 +615,16 @@ typedef struct {
     bool snr_enabled;
     bool vif_dev_enabled;
     bool vif_port_enabled;
+    /*
+     * Temporal denoise, as a VPE channel level rather than an IQ module --
+     * see hal_isp_set_temper_strength. Held here because the channel is
+     * created before rvd applies its [image] block, so the creation in
+     * star_vpe_bringup reads it and a later set writes through to the live
+     * channel. 1 is the vendor default both references use, and raptor's
+     * neutral 128 maps onto it.
+     */
+    int nr3d_level_req;
+
     bool vpe_chn_created;
     bool vpe_chn_started;
     bool vif_vpe_bound;
@@ -777,13 +777,10 @@ int hal_isp_set_brightness(void *ctx, int val);
 int hal_isp_set_contrast(void *ctx, int val);
 int hal_isp_set_saturation(void *ctx, int val);
 int hal_isp_set_sharpness(void *ctx, int val);
-int hal_isp_set_sinter_strength(void *ctx, int val);
 int hal_isp_set_temper_strength(void *ctx, int val);
 int hal_isp_set_ae_comp(void *ctx, int val);
 int hal_isp_set_defog(void *ctx, int enable);
 int hal_isp_set_antiflicker(void *ctx, rss_antiflicker_t mode);
-int hal_isp_set_max_again(void *ctx, int gain);
-int hal_isp_set_max_dgain(void *ctx, int gain);
 int hal_isp_set_running_mode(void *ctx, rss_isp_mode_t mode);
 int hal_isp_set_hflip(void *ctx, int enable);
 int hal_isp_set_vflip(void *ctx, int enable);
@@ -794,12 +791,9 @@ int hal_isp_get_brightness(void *ctx, uint8_t *val);
 int hal_isp_get_contrast(void *ctx, uint8_t *val);
 int hal_isp_get_saturation(void *ctx, uint8_t *val);
 int hal_isp_get_sharpness(void *ctx, uint8_t *val);
-int hal_isp_get_sinter_strength(void *ctx, uint8_t *val);
 int hal_isp_get_temper_strength(void *ctx, uint8_t *val);
 int hal_isp_get_ae_comp(void *ctx, int *val);
 int hal_isp_get_antiflicker(void *ctx, rss_antiflicker_t *mode);
-int hal_isp_get_max_again(void *ctx, uint32_t *gain);
-int hal_isp_get_max_dgain(void *ctx, uint32_t *gain);
 int hal_isp_get_running_mode(void *ctx, rss_isp_mode_t *mode);
 int hal_isp_get_hvflip(void *ctx, int *hflip, int *vflip);
 int hal_isp_get_exposure(void *ctx, rss_exposure_t *exposure);

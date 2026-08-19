@@ -127,8 +127,6 @@ static void test_table_matches_disassembly(void)
     CHECK(g_iq[IQ_SATURATION].payload == 416 && g_iq[IQ_SATURATION].manual_off == 392,
           "saturation");
     CHECK(g_iq[IQ_SHARPNESS].payload == 1268 && g_iq[IQ_SHARPNESS].manual_off == 1192, "sharpness");
-    CHECK(g_iq[IQ_SINTER].payload == 112 && g_iq[IQ_SINTER].manual_off == 104, "sinter");
-    CHECK(g_iq[IQ_TEMPER].payload == 1776 && g_iq[IQ_TEMPER].manual_off == 1672, "temper");
     CHECK(g_iq[IQ_DEFOG].payload == 28, "defog");
     CHECK(g_iq[IQ_GRAY].payload == 4, "gray");
     CHECK(g_iq[IQ_EVCOMP].payload == 8, "evcomp");
@@ -508,7 +506,6 @@ static void test_pending_queue(void)
     star_state_t st;
     void *c = &ctx;
     uint8_t v8;
-    uint32_t v32;
     int vi;
 
     memset(&ctx, 0, sizeof(ctx));
@@ -516,8 +513,6 @@ static void test_pending_queue(void)
     ctx.platform = &st;
     st.isp_loaded = true;
     st.isp_tuned = false; /* ISP not answering yet */
-    st.pend_max_again = -1;
-    st.pend_max_dgain = -1;
 
     /* A set before the ISP is up must succeed and be remembered, not
      * fail -- rvd applies the whole [image] block at this point. */
@@ -545,16 +540,6 @@ static void test_pending_queue(void)
 
     CHECK(hal_isp_set_defog(c, 1) == RSS_OK, "set_defog queues");
     CHECK(g_iq[IQ_DEFOG].has_pending && g_iq[IQ_DEFOG].pending == 1, "defog queued as 1");
-
-    /* Gain ceilings live outside the table and queue in star_state. */
-    CHECK(hal_isp_set_max_again(c, 160) == RSS_OK, "set_max_again queues");
-    CHECK(st.pend_max_again == 160, "max_again queued, got %d", st.pend_max_again);
-    CHECK(hal_isp_set_max_dgain(c, 80) == RSS_OK, "set_max_dgain queues");
-    CHECK(st.pend_max_dgain == 80, "max_dgain queued, got %d", st.pend_max_dgain);
-
-    v32 = 0;
-    CHECK(hal_isp_get_max_again(c, &v32) == RSS_OK, "get_max_again succeeds while queued");
-    CHECK(v32 == 160, "queued max_again reads back, got %u", v32);
 
     vi = 0;
     CHECK(hal_isp_set_ae_comp(c, 140) == RSS_OK, "set_ae_comp queues");
@@ -674,6 +659,97 @@ static void test_orientation_carries_both_axes(void)
 }
 
 /*
+ * Temper is the VPE channel's 3DNR level, not an IQ module.
+ *
+ * The property worth pinning is what raptor's neutral means. It has to land
+ * on the level star_vpe_bringup creates the channel with, because rvd applies
+ * temper=128 on every start whether the config mentions the key or not -- a
+ * midpoint unity would move every board from level 1 to level 4 on the first
+ * boot after this changed. The rest is the get-then-set contract orientation
+ * already has, on the same struct.
+ */
+static void test_temper_is_a_channel_level(void)
+{
+    rss_hal_ctx_t ctx;
+    star_state_t st;
+    void *c = &ctx;
+    uint8_t v8;
+    size_t i;
+
+    memset(&ctx, 0, sizeof(ctx));
+    memset(&st, 0, sizeof(st));
+    memset(&g_vpe_para, 0, sizeof(g_vpe_para));
+    ctx.platform = &st;
+    st.vpe.fnGetChannelParam = fake_get_chn_param;
+    st.vpe.fnSetChannelParam = fake_set_chn_param;
+    st.vpe_chn_created = true;
+    st.nr3d_level_req = 1;
+    g_vpe_para.level3DNR = 1;
+    g_vpe_para.mirror = 1; /* orientation already in effect */
+    vpe_para_set_calls = 0;
+    vpe_para_get_ret = vpe_para_set_ret = 0;
+    for (i = 0; i < IQ_PARAM_COUNT; i++)
+        g_iq[i].has_pending = false;
+
+    /* Neutral is the vendor default, and costs no write when already there. */
+    CHECK(hal_isp_set_temper_strength(c, STAR_ISP_NEUTRAL) == RSS_OK, "neutral temper succeeds");
+    CHECK(st.nr3d_level_req == 1, "neutral must map to level 1, got %d", st.nr3d_level_req);
+    CHECK(vpe_para_set_calls == 0, "a redundant level must not write, got %u", vpe_para_set_calls);
+
+    /* The ends of raptor's range are the ends of MI's. */
+    CHECK(hal_isp_set_temper_strength(c, 255) == RSS_OK, "max temper succeeds");
+    CHECK(g_vpe_para.level3DNR == 7, "255 must reach level 7, got %d", g_vpe_para.level3DNR);
+    CHECK(g_vpe_para.mirror == 1, "the rest of the param must survive the write, mirror got %d",
+          g_vpe_para.mirror);
+
+    CHECK(hal_isp_set_temper_strength(c, 0) == RSS_OK, "min temper succeeds");
+    CHECK(g_vpe_para.level3DNR == 0, "0 must reach level 0, got %d", g_vpe_para.level3DNR);
+
+    /* Read back through the same scale, and from the channel rather than the
+     * request: MI clamps the level to the per-chip maximum, so what it took is
+     * not always what was asked for. */
+    g_vpe_para.level3DNR = 1;
+    v8 = 0;
+    CHECK(hal_isp_get_temper_strength(c, &v8) == RSS_OK, "get_temper succeeds");
+    CHECK(v8 == STAR_ISP_NEUTRAL, "level 1 must read back as neutral, got %u", v8);
+
+    /* No IQ row is touched by any of it, which is the whole point of the
+     * move: writing NR3D's manual block sets enOpType to manual and discards
+     * the tuning's sixteen-entry gain curve. */
+    for (i = 0; i < IQ_PARAM_COUNT; i++)
+        CHECK(!g_iq[i].has_pending, "temper must not queue an IQ row (%s)", g_iq[i].name);
+
+    /* A failed write must not leave the request claiming a level the channel
+     * never took, or the next read would report a lie. */
+    g_vpe_para.level3DNR = 1;
+    st.nr3d_level_req = 1;
+    vpe_para_set_ret = -1;
+    CHECK(hal_isp_set_temper_strength(c, 255) != RSS_OK, "a failing write is reported");
+    CHECK(st.nr3d_level_req == 1, "a failed set must roll back, got %d", st.nr3d_level_req);
+
+    /*
+     * Before the channel exists the request is held rather than refused --
+     * star_vpe_bringup reads nr3d_level_req when it creates the channel. This
+     * is where temper and orientation differ: orientation answers NOENT,
+     * because the creation path writes its two fields as zero.
+     */
+    vpe_para_set_ret = 0;
+    st.vpe_chn_created = false;
+    vpe_para_set_calls = 0;
+    CHECK(hal_isp_set_temper_strength(c, 255) == RSS_OK, "a set before the channel is held");
+    CHECK(st.nr3d_level_req == 7, "the held level is recorded, got %d", st.nr3d_level_req);
+    CHECK(vpe_para_set_calls == 0, "nothing may be written yet, got %u", vpe_para_set_calls);
+
+    /* Out of range is rejected rather than clamped. */
+    CHECK(hal_isp_set_temper_strength(c, 256) == RSS_ERR_INVAL, "256 is rejected");
+    CHECK(hal_isp_set_temper_strength(NULL, 128) == RSS_ERR_INVAL, "NULL ctx rejected");
+
+    st.vpe_chn_created = true;
+    st.vpe.fnSetChannelParam = NULL;
+    CHECK(hal_isp_set_temper_strength(c, 200) == RSS_ERR_NOTSUP, "a missing symbol is NOTSUP");
+}
+
+/*
  * Sensor framerate. The mode's range is the sensor's, not the config's, so a
  * request outside it is clamped rather than refused -- and the unit MI takes
  * depends on whether the request is a whole number of frames.
@@ -782,13 +858,10 @@ static void test_recorded_values_survive_a_reload(void)
     ctx.platform = &st;
     st.isp_loaded = true;
     st.isp_tuned = false;
-    st.pend_max_again = -1;
-    st.pend_max_dgain = -1;
     for (i = 0; i < IQ_PARAM_COUNT; i++)
         g_iq[i].has_pending = false;
 
     CHECK(hal_isp_set_saturation(c, 200) == RSS_OK, "saturation is recorded");
-    CHECK(hal_isp_set_max_again(c, 160) == RSS_OK, "max_again is recorded");
 
     /* No MI handle here, so the applies inside fail; what this test is
      * about is the state of the record afterwards. */
@@ -796,8 +869,6 @@ static void test_recorded_values_survive_a_reload(void)
 
     CHECK(g_iq[IQ_SATURATION].has_pending, "the flush must not consume the record");
     CHECK(g_iq[IQ_SATURATION].pending == 200, "nor alter it, got %d", g_iq[IQ_SATURATION].pending);
-    CHECK(st.pend_max_again == 160, "the gain ceiling survives the flush too, got %d",
-          st.pend_max_again);
 
     /* A value set while the ISP *is* up must be recorded just the same, or
      * the reload after the next restart loses it. */
@@ -850,8 +921,6 @@ static void tune_setup(star_state_t *st)
     memset(st, 0, sizeof(*st));
     st->isp_loaded = true;
     st->isp_tuned = false;
-    st->pend_max_again = -1;
-    st->pend_max_dgain = -1;
     st->fps = 30;
     snprintf(st->iq_file, sizeof(st->iq_file), "/etc/sensors/gc4653.bin");
     st->isp.fnGetParaInitStatus = fake_parainit_ready;
@@ -1277,8 +1346,6 @@ static void limit_setup(rss_hal_ctx_t *ctx, star_state_t *st)
     ctx->platform = st;
     st->isp_loaded = true;
     st->isp_tuned = true;
-    st->pend_max_again = -1;
-    st->pend_max_dgain = -1;
     st->fps = 30;
     st->isp.fnGetExposureLimit = fake_get_exposure_limit;
     st->isp.fnSetExposureLimit = fake_set_exposure_limit;
@@ -1302,11 +1369,8 @@ static void test_bin_limits_snapshot_records_the_tuning(void)
     limit_setup(&ctx, &st);
     star_isp_snapshot_bin_limits(&st);
 
-    CHECK(st.bin_min_sensor_gain == 1024, "sensor floor should be 1024, got %u",
-          st.bin_min_sensor_gain);
     CHECK(st.bin_max_sensor_gain == 8192, "sensor ceiling should be 8192, got %u",
           st.bin_max_sensor_gain);
-    CHECK(st.bin_max_isp_gain == 1024, "isp ceiling should be 1024, got %u", st.bin_max_isp_gain);
     CHECK(g_limit_set_calls == 0, "a snapshot must only read, got %u writes", g_limit_set_calls);
 
     /* An AE that has not published yet answers all zeros. Recording that
@@ -1317,64 +1381,6 @@ static void test_bin_limits_snapshot_records_the_tuning(void)
     star_isp_snapshot_bin_limits(&st);
     CHECK(st.bin_max_sensor_gain == 0, "an unpublished ceiling must not be recorded, got %u",
           st.bin_max_sensor_gain);
-}
-
-static void test_gain_ceiling_refuses_ingenic_units(void)
-{
-    rss_hal_ctx_t ctx;
-    star_state_t st;
-
-    limit_setup(&ctx, &st);
-    star_isp_snapshot_bin_limits(&st);
-    g_limit_set_calls = 0;
-
-    /*
-     * rvd's Ingenic defaults, which it applies on every platform whether
-     * or not the config mentions the keys. In MI's x1024 units 160 is
-     * 0.16x and 80 is 0.08x -- ceilings below unity, so not ceilings.
-     */
-    CHECK(star_isp_apply_gain_limit(&st, true, 160) == RSS_ERR_INVAL,
-          "an Ingenic max_again must be refused");
-    CHECK(star_isp_apply_gain_limit(&st, false, 80) == RSS_ERR_INVAL,
-          "an Ingenic max_dgain must be refused");
-    CHECK(g_limit_set_calls == 0, "a refused ceiling must not be written, got %u writes",
-          g_limit_set_calls);
-    CHECK(g_limit.maxSensorGain == 8192, "the tuning's sensor ceiling must stand, got %u",
-          g_limit.maxSensorGain);
-    CHECK(g_limit.maxIspGain == 1024,
-          "the tuning's isp ceiling must stand -- writing 80 here is what pinned digital gain "
-          "and capped total_gain at the sensor's 8192, got %u",
-          g_limit.maxIspGain);
-}
-
-static void test_gain_ceiling_clamps_to_the_tuning(void)
-{
-    rss_hal_ctx_t ctx;
-    star_state_t st;
-
-    limit_setup(&ctx, &st);
-    star_isp_snapshot_bin_limits(&st);
-
-    /* waybeam's wall: gainMax 32000 against a bin ceiling of 8192, which
-     * MI silently declines. Clamping makes it visible instead. */
-    CHECK(star_isp_apply_gain_limit(&st, true, 32000) == RSS_OK, "a high ceiling must apply");
-    CHECK(g_limit.maxSensorGain == 8192, "32000 must clamp to 8192, got %u",
-          g_limit.maxSensorGain);
-
-    CHECK(star_isp_apply_gain_limit(&st, true, 4096) == RSS_OK, "an in-range ceiling must apply");
-    CHECK(g_limit.maxSensorGain == 4096, "4096 must pass through, got %u", g_limit.maxSensorGain);
-
-    /* The gain writes share their struct with the shutter cap, which is
-     * why they are read-modify-write. */
-    CHECK(g_limit.maxShutterUs == 40000, "the shutter cap must survive a gain write, got %u",
-          g_limit.maxShutterUs);
-
-    /* A ceiling under the tuning's own floor is raised to it rather than
-     * written as a maximum below the AE's minimum. */
-    st.bin_min_sensor_gain = 2048;
-    CHECK(star_isp_apply_gain_limit(&st, true, 1024) == RSS_OK, "a low ceiling must apply");
-    CHECK(g_limit.maxSensorGain == 2048, "1024 must rise to the 2048 floor, got %u",
-          g_limit.maxSensorGain);
 }
 
 static void test_shutter_cap_holds_the_frame_period(void)
@@ -1401,42 +1407,6 @@ static void test_shutter_cap_holds_the_frame_period(void)
     CHECK(star_isp_cap_exposure(&st, 25) == RSS_ERR_IO, "a failed limit read must report io");
 }
 
-static void test_limits_are_reasserted_when_configured(void)
-{
-    rss_hal_ctx_t ctx;
-    star_state_t st;
-
-    /*
-     * Nothing configured: CUS3A narrowing its own window is its business,
-     * and fighting an algorithm over values nobody asked for is how you
-     * get an AE that oscillates. Must be checked first -- the unconfigured
-     * path returns before the re-assert interval is armed.
-     */
-    limit_setup(&ctx, &st);
-    g_limit.maxSensorGain = 4096;
-    star_isp_reassert_limits(&st);
-    CHECK(g_limit_set_calls == 0, "an unconfigured ceiling must not be re-asserted, got %u writes",
-          g_limit_set_calls);
-    CHECK(g_limit.maxSensorGain == 4096, "the AE's own window must stand, got %u",
-          g_limit.maxSensorGain);
-
-    /*
-     * Configured and then narrowed behind our back, which is the board's
-     * actual failure: the ceiling written at tuning load, a narrower one
-     * live ninety seconds later with the AE pinned on it.
-     */
-    limit_setup(&ctx, &st);
-    st.pend_max_again = 8192;
-    st.bin_max_sensor_gain = 8192;
-    g_limit.maxSensorGain = 4096;
-    g_limit.minSensorGain = 1024;
-    star_isp_reassert_limits(&st);
-    CHECK(g_limit.maxSensorGain == 8192, "a configured ceiling must be restored, got %u",
-          g_limit.maxSensorGain);
-    CHECK(g_limit.maxShutterUs == 40000, "restoring the gain must not touch the shutter, got %u",
-          g_limit.maxShutterUs);
-}
-
 /*
  * The tear-down repair: something puts this ISP back on its defaults after
  * the tuning loads, and the AE's own ceilings are the witness.
@@ -1452,10 +1422,7 @@ static void reload_setup(rss_hal_ctx_t *ctx, star_state_t *st)
     limit_setup(ctx, st);
     snprintf(st->iq_file, sizeof(st->iq_file), "/etc/sensors/gc4653.bin");
     st->isp.fnLoadChannelConfig = fake_loadcfg;
-    st->bin_min_sensor_gain = 1024;
     st->bin_max_sensor_gain = 131072;
-    st->bin_min_isp_gain = 1024;
-    st->bin_max_isp_gain = 1024;
     g_limit.maxSensorGain = 131072;
     loadcfg_calls = 0;
 
@@ -1482,28 +1449,16 @@ static void test_the_tuning_is_reloaded_when_the_isp_resets(void)
     CHECK(st.iq_reloads == 1, "the attempt must be counted, got %d", st.iq_reloads);
 
     /*
-     * A configured ceiling is a legitimate reading, not evidence of a
-     * reset. The first version of this bailed out entirely whenever one
-     * was set, which quietly turned max_again into a switch that disabled
-     * the repair -- while the config was recommending max_again be set.
+     * Any ceiling that is not the tuning's own now reads as a reset, because
+     * with max_again withdrawn nothing else writes these limits. That is
+     * what retires the old blind spot: a configured 8192 used to be
+     * indistinguishable from the untuned default.
      */
     reload_setup(&ctx, &st);
-    st.pend_max_again = 32768;
     g_limit.maxSensorGain = 32768;
     star_isp_reload_if_reset(&st, true);
-    CHECK(loadcfg_calls == 0, "a configured ceiling must not read as a reset, got %u",
+    CHECK(loadcfg_calls == 1, "a ceiling that is not the tuning's reads as a reset, got %u",
           loadcfg_calls);
-
-    /* ...and with one configured, a reset is still repaired, and the
-     * ceiling the load just wiped goes back on. */
-    reload_setup(&ctx, &st);
-    st.pend_max_again = 32768;
-    g_limit.maxSensorGain = 8192;
-    star_isp_reload_if_reset(&st, true);
-    CHECK(loadcfg_calls == 1, "a reset must be repaired even with a ceiling set, got %u",
-          loadcfg_calls);
-    CHECK(g_limit.maxSensorGain == 32768, "the reload must re-apply the configured ceiling, got %u",
-          g_limit.maxSensorGain);
 
     /* No snapshot means no witness, so no reload -- guessing would reload
      * the binary on every poll of an AE that never published limits. */
@@ -1639,6 +1594,7 @@ int main(void)
     test_antiflicker_translates_the_mains_frequency();
     test_pending_queue();
     test_orientation_carries_both_axes();
+    test_temper_is_a_channel_level();
     test_sensor_fps_clamps_to_the_mode();
     test_recorded_values_survive_a_reload();
     test_tuning_load_leaves_3a_alone();
@@ -1649,10 +1605,7 @@ int main(void)
     test_exposure_luma_covers_only_the_live_grid();
     test_exposure_refuses_a_grid_that_disagrees();
     test_bin_limits_snapshot_records_the_tuning();
-    test_gain_ceiling_refuses_ingenic_units();
-    test_gain_ceiling_clamps_to_the_tuning();
     test_shutter_cap_holds_the_frame_period();
-    test_limits_are_reasserted_when_configured();
     test_the_tuning_is_reloaded_when_the_isp_resets();
     test_iq_file_search_order();
 

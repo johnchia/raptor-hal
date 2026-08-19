@@ -561,9 +561,11 @@ static int star_vpe_bringup(star_state_t *st)
 
     memset(&param, 0, sizeof(param));
     param.hdr = I6_HDR_OFF;
-    /* 3DNR level 1, as both references default it. The range is 0-7;
-     * raptor's own temper knob goes through MI_ISP_IQ_SetNR3D instead. */
-    param.level3DNR = 1;
+    /* 3DNR level, which is raptor's temper knob -- see
+     * hal_isp_set_temper_strength. Seeded to 1 in star_open, as both
+     * references default it, and carried here so a temper set before the
+     * channel existed still lands. The range is 0-7. */
+    param.level3DNR = st->nr3d_level_req;
     /*
      * Orientation starts unrotated and arrives through isp_set_hflip /
      * isp_set_vflip, which reach these same two fields (see
@@ -675,6 +677,11 @@ static int hal_init(void *ctx, const rss_multi_sensor_config_t *cfg)
     if (!st)
         return RSS_ERR_NOMEM;
     c->platform = st;
+
+    /* The vendor default, and raptor's neutral temper. Seeded here rather
+     * than in star_isp_bringup because the VPE channel is created before
+     * that runs, and the creation is what reads it. */
+    st->nr3d_level_req = 1;
 
     /* -1, not the 0 calloc left behind: 0 is a legitimate file
      * descriptor, so "never opened" has to be distinguishable from
@@ -1190,13 +1197,10 @@ static const rss_hal_ops_t g_ops = {
     .isp_set_contrast = hal_isp_set_contrast,
     .isp_set_saturation = hal_isp_set_saturation,
     .isp_set_sharpness = hal_isp_set_sharpness,
-    .isp_set_sinter_strength = hal_isp_set_sinter_strength,
     .isp_set_temper_strength = hal_isp_set_temper_strength,
     .isp_set_ae_comp = hal_isp_set_ae_comp,
     .isp_set_defog = hal_isp_set_defog,
     .isp_set_antiflicker = hal_isp_set_antiflicker,
-    .isp_set_max_again = hal_isp_set_max_again,
-    .isp_set_max_dgain = hal_isp_set_max_dgain,
     .isp_set_running_mode = hal_isp_set_running_mode,
     .isp_set_hflip = hal_isp_set_hflip,
     .isp_set_vflip = hal_isp_set_vflip,
@@ -1206,12 +1210,9 @@ static const rss_hal_ops_t g_ops = {
     .isp_get_contrast = hal_isp_get_contrast,
     .isp_get_saturation = hal_isp_get_saturation,
     .isp_get_sharpness = hal_isp_get_sharpness,
-    .isp_get_sinter_strength = hal_isp_get_sinter_strength,
     .isp_get_temper_strength = hal_isp_get_temper_strength,
     .isp_get_ae_comp = hal_isp_get_ae_comp,
     .isp_get_antiflicker = hal_isp_get_antiflicker,
-    .isp_get_max_again = hal_isp_get_max_again,
-    .isp_get_max_dgain = hal_isp_get_max_dgain,
     .isp_get_running_mode = hal_isp_get_running_mode,
     .isp_get_hvflip = hal_isp_get_hvflip,
     .isp_get_sensor_fps = hal_isp_get_sensor_fps,

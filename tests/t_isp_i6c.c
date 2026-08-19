@@ -822,6 +822,61 @@ static void test_the_awb_line_survives_ae_winning_the_race(void)
     CHECK(g_log_len == 0, "neither line repeats, got: %s", g_log);
 }
 
+/*
+ * Temper is the ISP channel's 3DNR level, and raptor's neutral has to land on
+ * the level hal_init seeds the state with. rvd applies temper on every start
+ * whether or not the config names the key, so a midpoint neutral would have a
+ * default config quietly asking for level 4. Infinity6E's temper carries the
+ * same unity for the same reason.
+ *
+ * pipeline_up stays false throughout: before there is a channel the level is
+ * held rather than written, which is what lets the mapping be checked without
+ * mocking MI at all.
+ */
+static void test_temper_neutral_is_the_level_the_pipeline_comes_up_on(void)
+{
+    rss_hal_ctx_t ctx;
+    infinity6c_state_t st;
+    void *c = &ctx;
+    uint8_t v = 0;
+
+    reset(&st);
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.platform = &st;
+    st.isp_nr3d_req = 1;
+
+    CHECK(hal_isp_set_temper_strength(c, I6C_ISP_NEUTRAL) == RSS_OK, "neutral temper succeeds");
+    CHECK(st.isp_nr3d_req == 1, "neutral must be level 1, got %d", st.isp_nr3d_req);
+
+    CHECK(hal_isp_set_temper_strength(c, 255) == RSS_OK, "max temper succeeds");
+    CHECK(st.isp_nr3d_req == 7, "255 must be level 7, got %d", st.isp_nr3d_req);
+
+    CHECK(hal_isp_set_temper_strength(c, 0) == RSS_OK, "min temper succeeds");
+    CHECK(st.isp_nr3d_req == 0, "0 must be level 0, got %d", st.isp_nr3d_req);
+
+    /* The upper half spans six levels over 127 steps, so it has to move --
+     * a unity of 1 must not flatten everything above neutral onto 1 or 7. */
+    CHECK(hal_isp_set_temper_strength(c, 200) == RSS_OK, "an upper-half temper succeeds");
+    CHECK(st.isp_nr3d_req > 1 && st.isp_nr3d_req < 7,
+          "200 must land between neutral and the top, got %d", st.isp_nr3d_req);
+
+    /* And the lower half has one level to reach, so it must reach it. */
+    CHECK(hal_isp_set_temper_strength(c, 60) == RSS_OK, "a lower-half temper succeeds");
+    CHECK(st.isp_nr3d_req == 0, "60 must land below neutral, got %d", st.isp_nr3d_req);
+
+    /* Round trip. With no channel to ask, the getter reports the request. */
+    st.isp_nr3d_req = 1;
+    CHECK(hal_isp_get_temper_strength(c, &v) == RSS_OK, "get succeeds");
+    CHECK(v == I6C_ISP_NEUTRAL, "level 1 must read back as neutral, got %u", v);
+
+    st.isp_nr3d_req = 7;
+    CHECK(hal_isp_get_temper_strength(c, &v) == RSS_OK, "get succeeds at the top");
+    CHECK(v == 255, "level 7 must read back as 255, got %u", v);
+
+    CHECK(hal_isp_set_temper_strength(c, 256) == RSS_ERR_INVAL, "out of range is refused");
+    CHECK(hal_isp_set_temper_strength(NULL, 128) == RSS_ERR_INVAL, "NULL ctx is refused");
+}
+
 int main(void)
 {
     test_reporting_does_not_cache_the_sensors_answer();
@@ -844,6 +899,7 @@ int main(void)
     test_a_failing_module_writes_nothing();
     test_the_scalar_rows_still_map_the_way_they_did();
     test_the_awb_line_survives_ae_winning_the_race();
+    test_temper_neutral_is_the_level_the_pipeline_comes_up_on();
 
     if (failures) {
         printf("t_isp_i6c: %d failure(s)\n", failures);
