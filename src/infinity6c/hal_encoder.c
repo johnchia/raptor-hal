@@ -463,6 +463,92 @@ static int i6c_enc_pool_slot(unsigned int device)
  * ================================================================ */
 
 /*
+ * i6c_enc_detach_cascade_subs -- unhook every sub that hangs off this channel.
+ *
+ * A sub is fed by the main's VENC ring, so the main cannot be destroyed while a
+ * sub is still bound to it. Left bound, the sub points at a channel that no
+ * longer exists: it is created, started and receiving nothing, and no later bind
+ * repairs it, because i6c_bind_scl_to_venc returns early on a channel that is
+ * already bound. The stale bind is therefore permanent, and only a full pipeline
+ * teardown clears it.
+ *
+ * That is what a live set-resolution or set-codec on the main stream used to do
+ * to the sub stream: rvd destroys and recreates the one channel it was asked
+ * about, the sub was never mentioned, and ten seconds later rvd's frame loop
+ * reported the sub polling ETIMEDOUT until the daemon was restarted.
+ *
+ * The sub is stopped and unbound rather than destroyed. It is rvd's stream and
+ * rvd did not ask for it to go away, so its channel keeps its geometry and its
+ * configuration; cascade_pending records that it is now a stream without a
+ * source, and i6c_enc_recascade_subs hands it the next main.
+ *
+ * Stop receiving before unbinding, which is the order i6c_teardown_all's own
+ * pre-pass uses and for the same reason: an encoder left receiving across the
+ * unbind strands a task that the kernel flush then waits on forever.
+ */
+static void i6c_enc_detach_cascade_subs(infinity6c_state_t *st, int main_chn)
+{
+    int i;
+
+    for (i = 0; i < I6C_MAX_CHN; i++) {
+        infinity6c_venc_chn_t *sub = &st->enc[i];
+
+        if (!sub->created || !sub->cascade || sub->cascade_src != main_chn)
+            continue;
+
+        if (sub->receiving) {
+            st->venc.stop_recv(sub->device, (unsigned int)i);
+            sub->receiving = false;
+        }
+        i6c_unbind_scl_from_venc(st, i);
+        sub->cascade_pending = true;
+
+        HAL_LOG_INFO("infinity6c: venc chn %d unhooked from main chn %d, which is going away", i,
+                     main_chn);
+    }
+}
+
+/*
+ * i6c_enc_recascade_subs -- give a waiting sub the new main.
+ *
+ * Called from the ring bind, once the new main is bound and receiving -- the
+ * state a cascade source has to be in before anything hangs off it. Only the
+ * ring holder can be one, so there is no other place this belongs.
+ *
+ * The bind is replayed with dst_fps zero, the pipeline rate, because that is what
+ * hal_bind passes and a cascade sub only ever arrives through hal_bind: JPEG
+ * never rings and so never cascades, and a sub's own frame rate is the main's by
+ * construction.
+ *
+ * A failure is logged and does not fail the caller. The caller is a main stream
+ * that has just come up correctly, and losing the sub is not a reason to lose it
+ * too -- the sub is no worse off than it was before this function existed. It
+ * also stays pending, so the next main to come up tries again rather than the
+ * sub being written off on one refusal.
+ */
+static void i6c_enc_recascade_subs(infinity6c_state_t *st, int main_chn)
+{
+    int i;
+
+    for (i = 0; i < I6C_MAX_CHN; i++) {
+        infinity6c_venc_chn_t *sub = &st->enc[i];
+
+        if (!sub->created || !sub->cascade_pending)
+            continue;
+
+        if (i6c_bind_scl_to_venc(st, i, i, 0) != RSS_OK) {
+            HAL_LOG_ERR("venc chn %d: no cascade off the new main chn %d -- that stream stays "
+                        "dark until it is restarted",
+                        i, main_chn);
+            continue;
+        }
+        sub->cascade_pending = false;
+
+        HAL_LOG_INFO("infinity6c: venc chn %d re-cascaded off new main chn %d", i, main_chn);
+    }
+}
+
+/*
  * i6c_bind_scl_to_venc -- feed one encoder channel from an SCL port.
  *
  * The port is an argument rather than the channel index reused. They are equal
@@ -514,6 +600,24 @@ int i6c_bind_scl_to_venc(infinity6c_state_t *st, int port, int chn, unsigned int
             HAL_LOG_ERR("venc chn %d: no main H.26x channel holds the ring to cascade from", chn);
             return RSS_ERR_INVAL;
         }
+
+        /*
+         * The cascade reduces the main's frame to this channel's size, and only
+         * reduces: a sub larger than its main is a bind MI accepts and then does
+         * not honour. Board-measured on an SSC377QE -- main set to 320x240 under a
+         * 640x480 sub binds clean, logs nothing, and the sub polls ETIMEDOUT until
+         * the main is grown again, at which point it recovers by itself.
+         *
+         * So it warns rather than refusing. The state is legal, transient and
+         * self-healing, and the caller is rvd doing what it was asked; what was
+         * missing was any word of why a stream had gone quiet.
+         */
+        if (enc->width > st->enc[main_chn].width || enc->height > st->enc[main_chn].height)
+            HAL_LOG_WARN("venc chn %d is %ux%u and cascades off chn %d at %ux%u -- the VENC "
+                         "cascade only scales down, so this stream will deliver nothing until "
+                         "the main is at least as large",
+                         chn, enc->width, enc->height, main_chn, st->enc[main_chn].width,
+                         st->enc[main_chn].height);
 
         if (!enc->receiving) {
             if ((ret = st->venc.start_recv(enc->device, (unsigned int)chn)) != 0) {
@@ -634,6 +738,14 @@ int i6c_bind_scl_to_venc(infinity6c_state_t *st, int port, int chn, unsigned int
     HAL_LOG_DBG("infinity6c: SCL port %d -> venc dev %u chn %d bound, %s at %u fps", port,
                 enc->device, chn, link == I6C_SYS_LINK_RING ? "ring" : "frame-base",
                 dst_fps ? dst_fps : st->fps);
+
+    /*
+     * A sub left waiting when the previous main was destroyed gets this one. Last,
+     * because a sub's cascade needs its source bound, receiving and holding the
+     * ring, which is exactly what the lines above have just finished making true.
+     */
+    if (enc->uses_ring)
+        i6c_enc_recascade_subs(st, chn);
 
     return RSS_OK;
 }
@@ -1093,6 +1205,14 @@ int hal_enc_destroy_channel(void *ctx, int chn)
     if (!enc->created)
         return RSS_OK;
 
+    /*
+     * Subs before anything of this channel's own: they consume its VENC ring, so a
+     * sub still bound when this channel goes is a sub bound to nothing. i6c_teardown_all
+     * makes the same pre-pass before its own destroy loop; this is the single-channel
+     * path, which is the one rvd takes for set-resolution and set-codec.
+     */
+    i6c_enc_detach_cascade_subs(st, chn);
+
     if (enc->frame_held)
         st->venc.release_stream(enc->device, (unsigned int)chn, &enc->strm);
     if (enc->receiving)
@@ -1501,18 +1621,15 @@ void i6c_teardown_all(infinity6c_state_t *st)
      * Unbind the cascade subs before the loop below destroys any channel: a sub
      * consumes the main's VENC ring, so destroying the main while a sub is still
      * bound to it would strand the sub. Their own destroy happens in the loop.
+     *
+     * Through the same helper the single-channel destroy uses, rather than a
+     * second copy of the rule: this invariant held here and not there, and that
+     * asymmetry is what cost the sub stream on every live set-resolution. The
+     * cascade_pending it leaves behind is meaningless on this path -- nothing is
+     * coming back -- and the memset below clears it.
      */
-    for (i = 0; i < I6C_MAX_CHN; i++) {
-        infinity6c_venc_chn_t *enc = &st->enc[i];
-
-        if (!enc->created || !enc->cascade)
-            continue;
-        if (enc->receiving) {
-            st->venc.stop_recv(enc->device, (unsigned int)i);
-            enc->receiving = false;
-        }
-        i6c_unbind_scl_from_venc(st, i);
-    }
+    for (i = 0; i < I6C_MAX_CHN; i++)
+        i6c_enc_detach_cascade_subs(st, i);
 
     for (i = 0; i < I6C_MAX_CHN; i++) {
         infinity6c_venc_chn_t *enc = &st->enc[i];

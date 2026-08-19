@@ -316,6 +316,16 @@ typedef struct {
     int cascade_src;
 
     /*
+     * Set on a sub whose main was destroyed under it. The sub is stopped and
+     * unbound at that point rather than destroyed -- rvd never asked for it to go
+     * away, and a live set-resolution or set-codec on the main stream destroys and
+     * recreates only the main -- so this is what remembers that it is a stream
+     * waiting for a source. The next channel to take the ring picks it up. See
+     * i6c_enc_detach_cascade_subs.
+     */
+    bool cascade_pending;
+
+    /*
      * Set when this channel brought up an SCL output port of its own rather than
      * being handed one by rvd's bind chain -- a JPEG snapshot channel, which rvd
      * feeds by group membership instead. Only such a channel releases its port

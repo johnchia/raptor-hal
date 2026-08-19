@@ -42,14 +42,17 @@ LDFLAGS = -fsanitize=$(SAN) -lpthread
 # rests on it and its behaviour is which file gets written in what order,
 # which a host can check once the sysfs root is redirected.
 SUITES = osd isp audio gpio
-BINS = $(addprefix t_,$(SUITES)) t_isp_i6c
+BINS = $(addprefix t_,$(SUITES)) t_isp_i6c t_enc_i6c
 
-test: $(addprefix test-,$(SUITES)) test-isp_i6c
+test: $(addprefix test-,$(SUITES)) test-isp_i6c test-enc_i6c
 
 $(addprefix test-,$(SUITES)): test-%: t_%
 	@./$<
 
 test-isp_i6c: t_isp_i6c
+	@./$<
+
+test-enc_i6c: t_enc_i6c
 	@./$<
 
 # The suites #include the sources they test, so those are prerequisites --
@@ -78,7 +81,7 @@ I6C_CFLAGS = -Wall -Wextra -std=c11 -D_GNU_SOURCE -g -fsanitize=$(SAN) \
 I6C_DEPS = $(wildcard ../src/infinity6c/*.c ../src/infinity6c/*.h ../src/*.c ../src/*.h \
 		      ../include/*.h ../../raptor-common/include/*.h)
 
-t_isp_i6c: t_isp_i6c.c $(I6C_DEPS)
+t_isp_i6c t_enc_i6c: t_%: t_%.c $(I6C_DEPS)
 	$(CC) $(I6C_CFLAGS) -o $@ $< $(LDFLAGS)
 
 # ABI conformance against SigmaStar's own headers. Opt-in: the vendor
@@ -127,4 +130,5 @@ endif
 clean:
 	rm -f $(BINS)
 
-.PHONY: test clean abi-check abi-check-i6c test-isp_i6c $(addprefix test-,$(SUITES))
+.PHONY: test clean abi-check abi-check-i6c test-isp_i6c test-enc_i6c \
+	$(addprefix test-,$(SUITES))

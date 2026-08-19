@@ -8,3 +8,4 @@ tests/t_isp
 tests/t_audio
 tests/t_gpio
 tests/t_isp_i6c
+tests/t_enc_i6c
