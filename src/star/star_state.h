@@ -760,6 +760,8 @@ int hal_isp_set_saturation(void *ctx, int val);
 int hal_isp_set_sharpness(void *ctx, int val);
 int hal_isp_set_temper_strength(void *ctx, int val);
 int hal_isp_set_ae_comp(void *ctx, int val);
+int hal_isp_set_drc_strength(void *ctx, int val);
+int hal_isp_get_drc_strength(void *ctx, uint8_t *val);
 int hal_isp_set_defog(void *ctx, int enable);
 int hal_isp_set_antiflicker(void *ctx, rss_antiflicker_t mode);
 int hal_isp_set_running_mode(void *ctx, rss_isp_mode_t mode);

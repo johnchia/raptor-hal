@@ -98,12 +98,20 @@
  *   isp_set_defog_strength / _adv
  *                         Same: MI's Defog is a toggle. The plain
  *                         isp_set_defog *is* implemented.
- *   isp_set_drc_strength, isp_set_highlight_depress,
- *   isp_set_backlight_comp
- *                         These live in WDR/HDR modules whose manual
- *                         blocks are multi-field curve descriptors, not
- *                         single strengths. Mapping one scalar onto a
- *                         curve is a tuning decision, not a HAL one.
+ *   isp_set_highlight_depress, isp_set_backlight_comp
+ *                         These live in HDR modules whose manual blocks
+ *                         are multi-field curve descriptors, not single
+ *                         strengths. Mapping one scalar onto a curve is a
+ *                         tuning decision, not a HAL one.
+ *                         isp_set_drc_strength was in this list and is
+ *                         not any more: WDR does carry a single Strength
+ *                         byte, so the mapping is exact rather than
+ *                         invented. It still spends the module's own
+ *                         per-gain curve when it leaves auto, which is
+ *                         the cost saturation was withdrawn for -- taken
+ *                         here because there is no other way to offer the
+ *                         control, and because majestic has offered it on
+ *                         precisely these bytes for years.
  *   isp_set_hue           MI's hue control is a 64-entry HSV LUT
  *                         (manual@3096); a scalar rotation would mean
  *                         synthesising the whole table.
@@ -218,6 +226,7 @@
 
 /* Offset of enOpType within an auto/manual payload -- always after the
  * leading bEnable, per the layout convention. */
+#define STAR_ISP_ENABLE_OFF 0u
 #define STAR_ISP_OPTYPE_OFF 4u
 
 /*
@@ -326,6 +335,7 @@ enum {
     IQ_SATURATION,
     IQ_SHARPNESS,
     IQ_DEFOG,
+    IQ_DRC,
     IQ_GRAY,
     IQ_EVCOMP,
     IQ_FLICKER,
@@ -388,6 +398,28 @@ static star_iq_param_t g_iq[IQ_PARAM_COUNT] = {
                        1, IQ_AUTOMAN, 255, 128, 0, false, NULL, NULL },
     [IQ_DEFOG] = { "defog", "MI_ISP_IQ_GetDefog", "MI_ISP_IQ_SetDefog",
                    I6_ISP_IQ_DEFOG_PAYLOAD, 0, 4, IQ_BOOL, 1, 0, 0, false, NULL, NULL },
+    /*
+     * DRC -- MI's WDR module, and the level is one byte of it.
+     *
+     * Unity 128 against a 0..255 field makes star_iq_scale the identity, so
+     * drc=100 writes Strength 100 and drc=200 writes 200. Deliberately the
+     * numbers majestic's overrideWdr has always used, so a value carried over
+     * from a majestic config means the same picture. Neutral 128 is auto and
+     * is the one level the knob cannot ask for.
+     *
+     * The layout is this family's own -- a 52-byte entry with the level at
+     * +43, against Infinity6C's 112 and +34 -- and even the symbol differs in
+     * case: MI_ISP_IQ_GetWDR here, MI_ISP_IQ_GetWdr there.
+     *
+     * The enable bit is left alone, which matters more here than on 6C:
+     * imx307.bin and imx335.bin ship this module disabled, so on those two
+     * sensors a set is stored and does nothing until something turns WDR on.
+     * That is the tuner's call rather than this layer's; the apply path logs
+     * it so it does not read as a broken knob.
+     */
+    [IQ_DRC] = { "drc", "MI_ISP_IQ_GetWDR", "MI_ISP_IQ_SetWDR",
+                 I6_ISP_IQ_WDR_PAYLOAD, I6_ISP_IQ_WDR_MANUAL + I6_ISP_IQ_WDR_STRENGTH,
+                 1, IQ_AUTOMAN, 255, 128, 0, false, NULL, NULL },
     [IQ_GRAY] = { "gray", "MI_ISP_IQ_GetColorToGray", "MI_ISP_IQ_SetColorToGray",
                   I6_ISP_IQ_GRAY_PAYLOAD, 0, 4, IQ_BOOL, 1, 0, 0, false, NULL, NULL },
     /*
@@ -668,6 +700,15 @@ static int star_iq_apply_scalar(star_state_t *st, int idx, int val)
             HAL_LOG_INFO("isp: %s goes manual, so the tuning's per-gain curve for it stops "
                          "being used; set %s back to %d to restore it",
                          p->name, p->name, STAR_ISP_NEUTRAL);
+        /*
+         * A module the tuning switched off takes the write and ignores it.
+         * Two of the six shipped tunings here ship WDR that way, so this is a
+         * real state rather than a defensive check.
+         */
+        if (!star_iq_read(buf, STAR_ISP_ENABLE_OFF, 4))
+            HAL_LOG_INFO("isp: %s is disabled in this sensor's tuning, so the value is stored "
+                         "and has no effect until something enables the module",
+                         p->name);
         star_iq_write(buf, STAR_ISP_OPTYPE_OFF, 4, STAR_ISP_OP_MANUAL);
     }
 
@@ -1444,6 +1485,16 @@ int hal_isp_set_temper_strength(void *ctx, int val)
 int hal_isp_set_ae_comp(void *ctx, int val)
 {
     return star_iq_set_scalar(ctx, IQ_EVCOMP, val);
+}
+
+int hal_isp_set_drc_strength(void *ctx, int val)
+{
+    return star_iq_set_scalar(ctx, IQ_DRC, val);
+}
+
+int hal_isp_get_drc_strength(void *ctx, uint8_t *val)
+{
+    return star_iq_get_scalar(ctx, IQ_DRC, val);
 }
 
 int hal_isp_set_defog(void *ctx, int enable)

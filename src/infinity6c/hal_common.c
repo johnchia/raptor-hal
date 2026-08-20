@@ -128,6 +128,8 @@ int hal_isp_set_contrast(void *ctx, int val);
 int hal_isp_get_contrast(void *ctx, uint8_t *val);
 int hal_isp_set_saturation(void *ctx, int val);
 int hal_isp_get_saturation(void *ctx, uint8_t *val);
+int hal_isp_set_drc_strength(void *ctx, int val);
+int hal_isp_get_drc_strength(void *ctx, uint8_t *val);
 int hal_isp_set_sharpness(void *ctx, int val);
 int hal_isp_get_sharpness(void *ctx, uint8_t *val);
 int hal_isp_set_defog(void *ctx, int enable);
@@ -712,7 +714,7 @@ static const rss_hal_ops_t g_ops = {
      * image knobs, the ISP channel's parameter block for orientation and 3DNR,
      * and MI_SNR for the sensor rate; hal_isp.c's header says which is which.
      *
-     * What is absent is absent on purpose. Manual white balance, DRC, DPC, hue,
+     * What is absent is absent on purpose. Manual white balance, DPC, hue,
      * highlight depress and backlight compensation have no counterpart bound
      * yet. RSS_HAL_CALL answers all of them RSS_ERR_NOTSUP, which rvd treats as
      * "this SoC does not have it" rather than as a fault.
@@ -738,6 +740,19 @@ static const rss_hal_ops_t g_ops = {
      */
     .isp_set_sharpness = hal_isp_set_sharpness,
     .isp_get_sharpness = hal_isp_get_sharpness,
+    /*
+     * DRC is MI's WDR module. It is published where saturation is not, and the
+     * difference is which way the trade falls: WDR's level is one byte the knob
+     * can carry the majestic scale onto exactly, and the module is enabled and
+     * in auto in all six shipped tunings here, so the knob has somewhere to go.
+     * It does spend the per-gain curve when it leaves auto -- WDR's Strength
+     * varies across gain in every bin -- which is the same cost saturation was
+     * withdrawn for, taken deliberately this time because there is no other way
+     * to offer the control at all and majestic has offered it this way for
+     * years. Neutral 128 hands the curve back.
+     */
+    .isp_set_drc_strength = hal_isp_set_drc_strength,
+    .isp_get_drc_strength = hal_isp_get_drc_strength,
     /*
      * No isp_{set,get}_sinter_strength: NrLumaAdv's blend weight is already at
      * the tuning's maximum on every sensor here, so the knob had no range to

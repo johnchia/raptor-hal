@@ -115,6 +115,7 @@ const rss_hal_caps_t g_hal_caps = {
      * it no longer costs the tuning's own NR3D curve to move it.
      */
     .has_sinter = false,
+    .has_drc = true,
     .has_temper = true,
     .has_ae_comp = true,
     .has_max_gain = false,
@@ -313,6 +314,7 @@ const rss_hal_caps_t g_hal_caps = {
      * note in src/infinity6c/hal_isp.c. Temporal denoise is unaffected.
      */
     .has_sinter = false,
+    .has_drc = true,
     .has_temper = true,
     .has_ae_comp = true,
     .max_sensors = 1,

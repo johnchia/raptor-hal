@@ -131,6 +131,38 @@ static int fake_set_sharp(unsigned int device, unsigned int channel, void *paylo
     return 0;
 }
 
+/*
+ * WDR, the module raptor's DRC knob drives. Same byte-store shape as sharpness
+ * above, and for the same reason: the claim under test is where a write lands
+ * inside a payload the code cannot describe.
+ */
+#define DRC_OFF (I6C_ISP_IQ_WDR_MANUAL + I6C_ISP_IQ_WDR_STRENGTH)
+
+static uint8_t g_wdr[I6C_ISP_IQ_WDR_PAYLOAD];
+static int g_wdr_sets;
+static int g_wdr_get_ret, g_wdr_set_ret;
+
+static int fake_get_wdr(unsigned int device, unsigned int channel, void *payload)
+{
+    (void)device;
+    (void)channel;
+    if (g_wdr_get_ret)
+        return g_wdr_get_ret;
+    memcpy(payload, g_wdr, sizeof(g_wdr));
+    return 0;
+}
+
+static int fake_set_wdr(unsigned int device, unsigned int channel, void *payload)
+{
+    (void)device;
+    (void)channel;
+    g_wdr_sets++;
+    if (g_wdr_set_ret)
+        return g_wdr_set_ret;
+    memcpy(g_wdr, payload, sizeof(g_wdr));
+    return 0;
+}
+
 /* g_iq is file-static and outlives a test, so each one puts its rows back. */
 static void reset_row(int idx, i6c_isp_cmd_fn get, i6c_isp_cmd_fn set)
 {
@@ -176,6 +208,11 @@ static void reset(infinity6c_state_t *st)
     memset(g_sharp, 0, sizeof(g_sharp));
     g_sharp_sets = 0;
     g_sharp_get_ret = g_sharp_set_ret = 0;
+
+    reset_row(IQ_DRC, fake_get_wdr, fake_set_wdr);
+    memset(g_wdr, 0, sizeof(g_wdr));
+    g_wdr_sets = 0;
+    g_wdr_get_ret = g_wdr_set_ret = 0;
 
     /* The tuning binary's own envelope on this board: a 100 ms ceiling, which
      * at 8.08 us a line is VMAX 12376 and about 8 fps. */
@@ -743,6 +780,107 @@ static void test_the_scalar_rows_still_map_the_way_they_did(void)
 }
 
 /*
+ * DRC has to mean on raptor what it meant on majestic, because that is where
+ * the numbers in people's configs come from: overrideWdr wrote its value
+ * straight into WDR's manual Strength byte, so 100 is 100 and 200 is 200. The
+ * unity-128-on-a-0..255-field row makes i6c_iq_scale the identity, and this is
+ * what pins that down -- a plausible-looking unity of, say, 127 would put every
+ * value one off and nobody would notice from the picture.
+ */
+static void test_drc_carries_the_majestic_scale_onto_wdr(void)
+{
+    static const uint16_t tuned[1] = {30}; /* imx335's own auto Strength at gain 0 */
+    rss_hal_ctx_t ctx;
+    infinity6c_state_t st;
+
+    arm(&ctx, &st);
+    seed_run(g_wdr, sizeof(g_wdr), DRC_OFF, 1, tuned, 1, I6C_ISP_OP_AUTO);
+    i6c_iq_write(g_wdr, I6C_ISP_ENABLE_OFF, 4, 1);
+
+    CHECK(hal_isp_set_drc_strength(&ctx, 100) == RSS_OK, "a mid-scale drc must take");
+    CHECK(run_at(g_wdr, DRC_OFF, 1, 0) == 100, "drc 100 must write Strength 100, got %u",
+          run_at(g_wdr, DRC_OFF, 1, 0));
+    CHECK(i6c_iq_read(g_wdr, I6C_ISP_OPTYPE_OFF, 4) == I6C_ISP_OP_MANUAL,
+          "a level has to leave auto to take effect");
+
+    CHECK(hal_isp_set_drc_strength(&ctx, 200) == RSS_OK, "a strong drc must take");
+    CHECK(run_at(g_wdr, DRC_OFF, 1, 0) == 200, "drc 200 must write Strength 200, got %u",
+          run_at(g_wdr, DRC_OFF, 1, 0));
+
+    /* The ends are the field's own ends rather than anything scaled. */
+    CHECK(hal_isp_set_drc_strength(&ctx, 0) == RSS_OK, "drc 0 must take");
+    CHECK(run_at(g_wdr, DRC_OFF, 1, 0) == 0, "drc 0 is Strength 0, got %u",
+          run_at(g_wdr, DRC_OFF, 1, 0));
+    CHECK(hal_isp_set_drc_strength(&ctx, 255) == RSS_OK, "drc 255 must take");
+    CHECK(run_at(g_wdr, DRC_OFF, 1, 0) == 255, "drc 255 is Strength 255, got %u",
+          run_at(g_wdr, DRC_OFF, 1, 0));
+
+    /* Neutral hands the module back to the tuning and leaves the byte alone --
+     * the curve is what takes over, so whatever sits in manual stops mattering. */
+    CHECK(hal_isp_set_drc_strength(&ctx, 128) == RSS_OK, "neutral must take");
+    CHECK(i6c_iq_read(g_wdr, I6C_ISP_OPTYPE_OFF, 4) == I6C_ISP_OP_AUTO,
+          "neutral must put WDR back into auto");
+    CHECK(run_at(g_wdr, DRC_OFF, 1, 0) == 255, "neutral must not rewrite the level, got %u",
+          run_at(g_wdr, DRC_OFF, 1, 0));
+}
+
+/*
+ * majestic forces bEnable on with every write. This must not, and the
+ * difference is visible only on a sensor whose tuner switched WDR off --
+ * Infinity6E ships two. Turning it on there would be this layer overruling a
+ * tuning decision it has no basis to overrule, so the write goes in and the
+ * module stays off.
+ */
+static void test_drc_does_not_switch_a_disabled_module_on(void)
+{
+    static const uint16_t tuned[1] = {0};
+    rss_hal_ctx_t ctx;
+    infinity6c_state_t st;
+
+    arm(&ctx, &st);
+    seed_run(g_wdr, sizeof(g_wdr), DRC_OFF, 1, tuned, 1, I6C_ISP_OP_AUTO);
+    i6c_iq_write(g_wdr, I6C_ISP_ENABLE_OFF, 4, 0);
+
+    CHECK(hal_isp_set_drc_strength(&ctx, 200) == RSS_OK,
+          "a set on a disabled module is not an error");
+    CHECK(i6c_iq_read(g_wdr, I6C_ISP_ENABLE_OFF, 4) == 0,
+          "the tuning's disable must survive a drc write");
+    CHECK(run_at(g_wdr, DRC_OFF, 1, 0) == 200, "the level is still stored, got %u",
+          run_at(g_wdr, DRC_OFF, 1, 0));
+}
+
+/* A drc write must touch the level and the mode word and nothing else: the
+ * payload it read back carries the whole module, including a 33-entry curve
+ * either side of the byte. */
+static void test_a_drc_write_touches_only_the_level(void)
+{
+    rss_hal_ctx_t ctx;
+    infinity6c_state_t st;
+    uint8_t before[I6C_ISP_IQ_WDR_PAYLOAD];
+    size_t i, differ = 0;
+
+    arm(&ctx, &st);
+    for (i = 0; i < sizeof(g_wdr); i++)
+        g_wdr[i] = (uint8_t)(i * 7 + 3);
+    i6c_iq_write(g_wdr, I6C_ISP_OPTYPE_OFF, 4, I6C_ISP_OP_AUTO);
+    i6c_iq_write(g_wdr, I6C_ISP_ENABLE_OFF, 4, 1);
+    memcpy(before, g_wdr, sizeof(before));
+
+    CHECK(hal_isp_set_drc_strength(&ctx, 77) == RSS_OK, "the write must take");
+    for (i = 0; i < sizeof(g_wdr); i++)
+        if (g_wdr[i] != before[i]) {
+            differ++;
+            /* Two, and named rather than counted: the level, and the low byte
+             * of the mode word going 0 -> 1. Counting alone would pass just as
+             * happily if the write had landed two bytes further along. */
+            CHECK(i == DRC_OFF || i == I6C_ISP_OPTYPE_OFF, "byte %zu moved and should not have", i);
+        }
+    CHECK(differ == 2, "only the level and the mode byte may move, %zu bytes moved", differ);
+    CHECK(run_at(g_wdr, DRC_OFF, 1, 0) == 77, "and the level is the one asked for, got %u",
+          run_at(g_wdr, DRC_OFF, 1, 0));
+}
+
+/*
  * The AWB diagnostic must be able to print at all.
  *
  * AE and AWB shared one latch, set on the first AE success -- and AE answers
@@ -898,6 +1036,9 @@ int main(void)
     test_a_run_that_does_not_fit_is_refused();
     test_a_failing_module_writes_nothing();
     test_the_scalar_rows_still_map_the_way_they_did();
+    test_drc_carries_the_majestic_scale_onto_wdr();
+    test_drc_does_not_switch_a_disabled_module_on();
+    test_a_drc_write_touches_only_the_level();
     test_the_awb_line_survives_ae_winning_the_race();
     test_temper_neutral_is_the_level_the_pipeline_comes_up_on();
 

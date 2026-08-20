@@ -333,6 +333,7 @@ enum {
     IQ_SHARPNESS,
     IQ_DEFOG,
     IQ_DEFOG_EN,
+    IQ_DRC,
     IQ_GRAY,
     AE_EVCOMP,
     AE_FLICKER,
@@ -407,6 +408,26 @@ static i6c_iq_param_t g_iq[IQ_PARAM_COUNT] = {
     [IQ_DEFOG_EN] = {"defog enable", "MI_ISP_IQ_GetDefog", "MI_ISP_IQ_SetDefog",
                      I6C_ISP_IQ_DEFOG_PAYLOAD, I6C_ISP_ENABLE_OFF, 4, 1, IQ_BOOL, 1, 0, 0, false,
                      NULL, NULL, 0, false, false, false},
+    /*
+     * DRC -- MI's WDR module, and the level is one byte of it.
+     *
+     * Neutral is 128 and means auto, as everywhere else here. Above and below
+     * it the map is the identity: unity 128 against a 0..255 field makes
+     * i6c_iq_scale return its own argument, so drc=100 writes Strength 100 and
+     * drc=200 writes 200. That is deliberate rather than convenient -- it is
+     * the same scale majestic's overrideWdr has used on this SoC for years, so
+     * a number carried over from a majestic config means the same picture.
+     * The one value it cannot express is 128 itself, which is spent on auto.
+     *
+     * The enable bit is NOT forced. majestic sets it on every write; this does
+     * not, because a tuner that shipped WDR disabled was saying this sensor
+     * does not want it -- Infinity6E's imx307 and imx335 do exactly that. On a
+     * disabled module the write lands and does nothing, so i6c_iq_apply_scalar
+     * says so rather than leaving it a mystery.
+     */
+    [IQ_DRC] = {"drc", "MI_ISP_IQ_GetWdr", "MI_ISP_IQ_SetWdr", I6C_ISP_IQ_WDR_PAYLOAD,
+                I6C_ISP_IQ_WDR_MANUAL + I6C_ISP_IQ_WDR_STRENGTH, 1, 1, IQ_AUTOMAN, 255, 128, 0,
+                false, NULL, NULL, 0, false, false, false},
     [IQ_GRAY] = {"gray", "MI_ISP_IQ_GetColorToGray", "MI_ISP_IQ_SetColorToGray",
                  I6C_ISP_IQ_GRAY_PAYLOAD, 0, 4, 1, IQ_BOOL, 1, 0, 0, false, NULL, NULL, 0, false,
                  false, false},
@@ -775,6 +796,15 @@ static int i6c_iq_apply_scalar(infinity6c_state_t *st, int idx, int val)
             HAL_LOG_INFO("isp: %s goes manual, so the tuning's per-gain curve for it stops "
                          "being used; set %s back to %d to restore it",
                          p->name, p->name, I6C_ISP_NEUTRAL);
+        /*
+         * A module the tuning switched off takes the write and ignores it.
+         * Worth a word: the alternative is a knob that reads back exactly what
+         * was asked for and changes nothing on screen.
+         */
+        if (!i6c_iq_read(buf, I6C_ISP_ENABLE_OFF, 4))
+            HAL_LOG_INFO("isp: %s is disabled in this sensor's tuning, so the value is stored "
+                         "and has no effect until something enables the module",
+                         p->name);
         i6c_iq_write(buf, I6C_ISP_OPTYPE_OFF, 4, I6C_ISP_OP_MANUAL);
     }
 
@@ -1203,6 +1233,16 @@ int hal_isp_get_saturation(void *ctx, uint8_t *val)
  * Temporal denoise (temper, MI's 3DNR) is untouched by this: it is a channel
  * level with eight real positions, and it works.
  */
+int hal_isp_set_drc_strength(void *ctx, int val)
+{
+    return i6c_iq_set_scalar(ctx, IQ_DRC, val);
+}
+
+int hal_isp_get_drc_strength(void *ctx, uint8_t *val)
+{
+    return i6c_iq_get_scalar(ctx, IQ_DRC, val);
+}
+
 int hal_isp_set_sharpness(void *ctx, int val)
 {
     return i6c_iq_set_scalar(ctx, IQ_SHARPNESS, val);

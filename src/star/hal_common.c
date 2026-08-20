@@ -1204,6 +1204,17 @@ static const rss_hal_ops_t g_ops = {
     .isp_set_temper_strength = hal_isp_set_temper_strength,
     .isp_set_ae_comp = hal_isp_set_ae_comp,
     .isp_set_defog = hal_isp_set_defog,
+    /*
+     * DRC is MI's WDR module, and it is published where brightness, contrast,
+     * saturation and sharpness are not. The difference is that WDR's level is
+     * a single Strength byte the knob maps onto exactly -- and on the same
+     * scale majestic's overrideWdr uses, so a number carried over from a
+     * majestic config means the same picture. It costs the module's per-gain
+     * curve on the way out of auto, the same cost the four withdrawn knobs
+     * were withdrawn for, accepted here because there is no other way to offer
+     * the control at all. Neutral 128 hands the curve back.
+     */
+    .isp_set_drc_strength = hal_isp_set_drc_strength,
     .isp_set_antiflicker = hal_isp_set_antiflicker,
     .isp_set_running_mode = hal_isp_set_running_mode,
     .isp_set_hflip = hal_isp_set_hflip,
@@ -1211,6 +1222,7 @@ static const rss_hal_ops_t g_ops = {
     .isp_set_sensor_fps = hal_isp_set_sensor_fps,
 
     .isp_get_temper_strength = hal_isp_get_temper_strength,
+    .isp_get_drc_strength = hal_isp_get_drc_strength,
     .isp_get_ae_comp = hal_isp_get_ae_comp,
     .isp_get_antiflicker = hal_isp_get_antiflicker,
     .isp_get_running_mode = hal_isp_get_running_mode,

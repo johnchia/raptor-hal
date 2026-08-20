@@ -98,18 +98,36 @@ static void test_table_bounds(void)
          * 1368-byte payload beside the 1776 the row also claimed.
          */
         if (p->shape == IQ_AUTOMAN) {
-            unsigned int block = (p->manual_off - 8) / 16;
-            unsigned int implied = (8 + 17 * block + 3) & ~3u;
+            unsigned int block = 0, b;
 
+            /*
+             * Derived from the payload rather than from the offset, because
+             * the offset is no longer obliged to sit at the start of the
+             * manual block: drc writes one Strength byte 43 into WDR's entry.
+             * So find the block size the payload implies, then require the
+             * offset to land inside the manual entry rather than on its front
+             * edge. Still catches what the older form caught -- temper's old
+             * 1288 against a 1776 payload gives block 104 and a manual entry
+             * of [1672, 1776), which 1288 is nowhere near.
+             */
             CHECK(p->manual_off >= 8, "%s: AUTOMAN manual offset %u below the 8-byte header",
                   p->name, p->manual_off);
-            CHECK((p->manual_off - 8) % 16 == 0,
-                  "%s: manual offset %u is not 8 plus 16 whole auto blocks", p->name,
-                  p->manual_off);
-            CHECK(p->payload == implied,
-                  "%s: a manual offset of %u implies a %u-byte block and a %u-byte payload, "
-                  "not %u",
-                  p->name, p->manual_off, block, implied, p->payload);
+            for (b = 1; b < p->payload; b++)
+                if (((8 + 17 * b + 3) & ~3u) == p->payload) {
+                    block = b;
+                    break;
+                }
+            CHECK(block != 0, "%s: payload %u is not 8 + 17 blocks for any block size", p->name,
+                  p->payload);
+            if (block) {
+                CHECK(p->manual_off >= 8 + 16 * block && p->manual_off < 8 + 17 * block,
+                      "%s: manual offset %u is outside the manual entry [%u, %u) that a "
+                      "%u-byte payload implies -- a level written there lands in stAuto",
+                      p->name, p->manual_off, 8 + 16 * block, 8 + 17 * block, p->payload);
+                CHECK(p->manual_off + p->width <= p->payload,
+                      "%s: a %u-byte field at %u runs past the %u-byte payload", p->name, p->width,
+                      p->manual_off, p->payload);
+            }
         } else
             CHECK(p->manual_off == 0, "%s: FLAT/BOOL must live at offset 0, not %u", p->name,
                   p->manual_off);
@@ -127,6 +145,18 @@ static void test_table_matches_disassembly(void)
     CHECK(g_iq[IQ_SATURATION].payload == 416 && g_iq[IQ_SATURATION].manual_off == 392,
           "saturation");
     CHECK(g_iq[IQ_SHARPNESS].payload == 1268 && g_iq[IQ_SHARPNESS].manual_off == 1192, "sharpness");
+    /*
+     * WDR, and the only row whose level is not the front of its manual entry.
+     * 892 is what the wrapper declares (mov.w r3, #892 at 0x84d4 in
+     * libmi_isp.so's MI_ISP_IQ_GetWDR) and what every shipped bin's block
+     * measures; 883 is 8 + 16*52 + 43, the Strength byte inside the manual
+     * entry. Restated here because a transcription slip in either number is a
+     * write into a neighbouring field that no picture would obviously show.
+     */
+    CHECK(g_iq[IQ_DRC].payload == 892 && g_iq[IQ_DRC].manual_off == 883, "drc");
+    CHECK(g_iq[IQ_DRC].mi_unity == 128 && g_iq[IQ_DRC].mi_max == 255 && g_iq[IQ_DRC].mi_floor == 0,
+          "drc must map 1:1, which is what makes a majestic overrideWdr value mean the same "
+          "thing here");
     CHECK(g_iq[IQ_DEFOG].payload == 28, "defog");
     CHECK(g_iq[IQ_GRAY].payload == 4, "gray");
     CHECK(g_iq[IQ_EVCOMP].payload == 8, "evcomp");
