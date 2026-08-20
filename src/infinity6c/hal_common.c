@@ -716,13 +716,19 @@ static const rss_hal_ops_t g_ops = {
      * highlight depress and backlight compensation have no counterpart bound
      * yet. RSS_HAL_CALL answers all of them RSS_ERR_NOTSUP, which rvd treats as
      * "this SoC does not have it" rather than as a fault.
+     *
+     * Saturation is absent for a different reason: it has a counterpart and
+     * the counterpart costs too much. Every shipped tuning here varies it
+     * across gain, and enOpType has no state between auto and manual, so the
+     * knob could only trade that curve for a constant. See the note above
+     * hal_isp_set_saturation. Brightness, contrast, sharpness and defog stay --
+     * their curves are either flat in every bin or preserved by the vector
+     * write -- so this is one row, not the family-wide withdrawal 6E took.
      */
     .isp_set_brightness = hal_isp_set_brightness,
     .isp_get_brightness = hal_isp_get_brightness,
     .isp_set_contrast = hal_isp_set_contrast,
     .isp_get_contrast = hal_isp_get_contrast,
-    .isp_set_saturation = hal_isp_set_saturation,
-    .isp_get_saturation = hal_isp_get_saturation,
     /*
      * Sharpness and spatial denoise are per-band tables on this generation
      * rather than levels, so one knob scales the whole run about the tuning's

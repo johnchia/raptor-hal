@@ -1118,6 +1118,36 @@ int hal_isp_set_contrast(void *ctx, int val)
     return i6c_iq_set_scalar(ctx, IQ_CONTRAST, val);
 }
 
+/*
+ * NO SATURATION HERE, DELIBERATELY
+ *
+ * Saturation is an auto/manual module and MI's enOpType has exactly two
+ * states, so any value but the neutral 128 replaces the tuner's per-gain curve
+ * with one constant for the whole gain range. That is not an adjustment, it is
+ * a discard, and here it discards something real: ALLSTR varies across the
+ * sixteen gain entries in all six shipped tunings -- 28..40 on gc4653, 28..36
+ * on imx335, 30..45 on imx415 -- which is the tuner pulling colour back as
+ * gain climbs so that amplified chroma noise does not come with it. Pinning
+ * one value spends exactly that.
+ *
+ * Sharpness stays, and the difference is the mechanism rather than the
+ * principle: its op scales a run of band gains about the tuning's own values,
+ * so the shape the tuner chose survives inside the manual block. Brightness
+ * and defog stay because their curves are flat in every shipped bin, so
+ * leaving auto costs nothing measurable. Saturation is the one row on this
+ * family where the knob and the tuning cannot both have it.
+ *
+ * The function and its table row stay defined -- they drive the same
+ * read-modify-write path the remaining knobs use, and tests/t_isp_i6c.c
+ * exercises the scaling through saturation's own numbers. What is withdrawn is
+ * the vtable entry, which is the whole mechanism: rvd reports the key
+ * unsettable, rcd marks it unavailable, and a stale non-neutral saturation in
+ * an existing config simply stops being applied and the curve comes back.
+ *
+ * Infinity6E withdrew this one along with brightness, contrast and sharpness,
+ * for the same reason applied to a family where all four curves carry
+ * something. This is the saturation half of that, not the whole of it.
+ */
 int hal_isp_set_saturation(void *ctx, int val)
 {
     return i6c_iq_set_scalar(ctx, IQ_SATURATION, val);
