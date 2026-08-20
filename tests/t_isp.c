@@ -358,18 +358,18 @@ static void test_evcomp_neutral_comes_from_the_tuning(void)
     g_iq[IQ_EVCOMP].fn_set = unity_probe_get;
 
     CHECK(g_iq[IQ_EVCOMP].unity_from_tuning, "ae_comp must be marked as learning its neutral");
-    CHECK(!g_iq[IQ_EVCOMP].unity_stale, "and must not learn before a tuning load arms it");
+    CHECK(!g_iq[IQ_EVCOMP].tuning_stale, "and must not learn before a tuning load arms it");
 
     g_unity_probe_value = 20;
     CHECK(star_iq_fetch(&st, IQ_EVCOMP, buf) == RSS_OK, "unarmed fetch succeeds");
     CHECK(g_iq[IQ_EVCOMP].mi_unity == saved.mi_unity, "an unarmed fetch must not adopt a baseline");
 
     star_isp_arm_tuning_reads();
-    CHECK(g_iq[IQ_EVCOMP].unity_stale, "a tuning load arms the read");
+    CHECK(g_iq[IQ_EVCOMP].tuning_stale, "a tuning load arms the read");
     CHECK(star_iq_fetch(&st, IQ_EVCOMP, buf) == RSS_OK, "armed fetch succeeds");
     CHECK(g_iq[IQ_EVCOMP].mi_unity == 20, "the tuning's value becomes the neutral, got %u",
           g_iq[IQ_EVCOMP].mi_unity);
-    CHECK(!g_iq[IQ_EVCOMP].unity_stale, "and is read once, not on every fetch");
+    CHECK(!g_iq[IQ_EVCOMP].tuning_stale, "and is read once, not on every fetch");
 
     /* The point of the exercise: the learned value is what the caps report
      * as neutral, so a client centres its control where the tuner did. */
@@ -393,7 +393,7 @@ static void test_evcomp_neutral_comes_from_the_tuning(void)
     CHECK(star_iq_fetch(&st, IQ_EVCOMP, buf) == RSS_OK, "an out-of-range fetch still succeeds");
     CHECK(g_iq[IQ_EVCOMP].mi_unity == 20, "an impossible baseline is refused, got %d",
           g_iq[IQ_EVCOMP].mi_unity);
-    CHECK(!g_iq[IQ_EVCOMP].unity_stale, "and is not retried every frame");
+    CHECK(!g_iq[IQ_EVCOMP].tuning_stale, "and is not retried every frame");
 
     /* And a negative baseline is legitimate for this row, where it would be
      * a misread for any other. */

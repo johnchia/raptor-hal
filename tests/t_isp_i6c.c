@@ -163,6 +163,28 @@ static int fake_set_wdr(unsigned int device, unsigned int channel, void *payload
     return 0;
 }
 
+/*
+ * Defog, the one module raptor drives through two rows: a strength and a
+ * switch, both landing in the same payload through the same pair of symbols.
+ */
+static uint8_t g_defog[I6C_ISP_IQ_DEFOG_PAYLOAD];
+
+static int fake_get_defog(unsigned int device, unsigned int channel, void *payload)
+{
+    (void)device;
+    (void)channel;
+    memcpy(payload, g_defog, sizeof(g_defog));
+    return 0;
+}
+
+static int fake_set_defog(unsigned int device, unsigned int channel, void *payload)
+{
+    (void)device;
+    (void)channel;
+    memcpy(g_defog, payload, sizeof(g_defog));
+    return 0;
+}
+
 /* g_iq is file-static and outlives a test, so each one puts its rows back. */
 static void reset_row(int idx, i6c_isp_cmd_fn get, i6c_isp_cmd_fn set)
 {
@@ -175,9 +197,11 @@ static void reset_row(int idx, i6c_isp_cmd_fn get, i6c_isp_cmd_fn set)
     p->pending_is_raw = false;
     p->base_valid = false;
     p->report = 0;
-    /* As i6c_isp_flush_knobs leaves it: a baseline is owed, and the first fetch
-     * is what pays it. */
-    p->unity_stale = true;
+    /* As i6c_isp_flush_knobs leaves it: the tuning's own state is owed, and the
+     * first fetch is what pays it. */
+    p->tuning_stale = true;
+    p->tuned_on = false;
+    p->tuned_on_valid = false;
     memset(p->base, 0, sizeof(p->base));
 }
 
@@ -213,6 +237,10 @@ static void reset(infinity6c_state_t *st)
     memset(g_wdr, 0, sizeof(g_wdr));
     g_wdr_sets = 0;
     g_wdr_get_ret = g_wdr_set_ret = 0;
+
+    reset_row(IQ_DEFOG, fake_get_defog, fake_set_defog);
+    reset_row(IQ_DEFOG_EN, fake_get_defog, fake_set_defog);
+    memset(g_defog, 0, sizeof(g_defog));
 
     /* The tuning binary's own envelope on this board: a 100 ms ceiling, which
      * at 8.08 us a line is VMAX 12376 and about 8 fps. */
@@ -678,7 +706,7 @@ static void test_a_refused_baseline_resets_the_reported_field(void)
 
     /* A reload whose run this port cannot read: one field out of range. */
     seed_run(g_sharp, sizeof(g_sharp), SHARP_RUN, 1, bad, 6, I6C_ISP_OP_MANUAL);
-    g_iq[IQ_SHARPNESS].unity_stale = true;
+    g_iq[IQ_SHARPNESS].tuning_stale = true;
 
     CHECK(hal_isp_get_sharpness(&ctx, &val) == RSS_OK, "get must succeed");
     CHECK(!g_iq[IQ_SHARPNESS].base_valid, "the bad run must be refused");
@@ -899,7 +927,16 @@ static void test_drc_carries_the_majestic_scale_onto_wdr(void)
  * tuning decision it has no basis to overrule, so the write goes in and the
  * module stays off.
  */
-static void test_drc_does_not_switch_a_disabled_module_on(void)
+/*
+ * Naming a value switches the module on.
+ *
+ * The alternative, and what this did until the IMX335 board made the cost
+ * plain: a knob that accepts the write, reads back exactly what was asked for,
+ * and changes nothing on screen. Brightness ships disabled in that sensor's
+ * tuning, so `brightness = 60` was inert and nothing said so anywhere an
+ * operator would look.
+ */
+static void test_a_value_switches_on_a_module_the_tuning_disabled(void)
 {
     static const uint16_t tuned[1] = {0};
     rss_hal_ctx_t ctx;
@@ -909,12 +946,128 @@ static void test_drc_does_not_switch_a_disabled_module_on(void)
     seed_run(g_wdr, sizeof(g_wdr), DRC_OFF, 1, tuned, 1, I6C_ISP_OP_AUTO);
     i6c_iq_write(g_wdr, I6C_ISP_ENABLE_OFF, 4, 0);
 
-    CHECK(hal_isp_set_drc_strength(&ctx, 200) == RSS_OK,
-          "a set on a disabled module is not an error");
-    CHECK(i6c_iq_read(g_wdr, I6C_ISP_ENABLE_OFF, 4) == 0,
-          "the tuning's disable must survive a drc write");
-    CHECK(run_at(g_wdr, DRC_OFF, 1, 0) == 200, "the level is still stored, got %u",
+    CHECK(hal_isp_set_drc_strength(&ctx, 200) == RSS_OK, "the set must take");
+    CHECK(i6c_iq_read(g_wdr, I6C_ISP_ENABLE_OFF, 4) == 1,
+          "the module must be switched on, enable reads %u",
+          i6c_iq_read(g_wdr, I6C_ISP_ENABLE_OFF, 4));
+    CHECK(run_at(g_wdr, DRC_OFF, 1, 0) == 200, "and carry the level, got %u",
           run_at(g_wdr, DRC_OFF, 1, 0));
+    CHECK(i6c_iq_read(g_wdr, I6C_ISP_OPTYPE_OFF, 4) == I6C_ISP_OP_MANUAL, "and be in manual");
+}
+
+/*
+ * And auto hands the switch back, so the tuner's own state is recoverable at
+ * runtime rather than only by reloading the binary. Without this the first
+ * write would be one-way: the module would stay on for the rest of the boot,
+ * running the tuning's auto curve for a module the tuner had turned off.
+ */
+static void test_auto_hands_the_tuners_switch_back(void)
+{
+    static const uint16_t tuned[1] = {0};
+    rss_hal_ctx_t ctx;
+    infinity6c_state_t st;
+
+    arm(&ctx, &st);
+    seed_run(g_wdr, sizeof(g_wdr), DRC_OFF, 1, tuned, 1, I6C_ISP_OP_AUTO);
+    i6c_iq_write(g_wdr, I6C_ISP_ENABLE_OFF, 4, 0);
+
+    CHECK(hal_isp_set_drc_strength(&ctx, 200) == RSS_OK, "the set must take");
+    CHECK(i6c_iq_read(g_wdr, I6C_ISP_ENABLE_OFF, 4) == 1, "on, as above");
+
+    CHECK(hal_isp_set_drc_strength(&ctx, RSS_ISP_AUTO) == RSS_OK, "auto must take");
+    CHECK(i6c_iq_read(g_wdr, I6C_ISP_ENABLE_OFF, 4) == 0,
+          "auto must put the tuning's switch back, enable reads %u",
+          i6c_iq_read(g_wdr, I6C_ISP_ENABLE_OFF, 4));
+    CHECK(i6c_iq_read(g_wdr, I6C_ISP_OPTYPE_OFF, 4) == I6C_ISP_OP_AUTO, "and the mode with it");
+}
+
+/* A module the tuner left on stays on, and auto does not switch it off. The
+ * switch that is put back is the tuning's, not a constant. */
+static void test_a_module_the_tuning_enabled_is_left_enabled(void)
+{
+    static const uint16_t tuned[1] = {90};
+    rss_hal_ctx_t ctx;
+    infinity6c_state_t st;
+
+    arm(&ctx, &st);
+    seed_run(g_wdr, sizeof(g_wdr), DRC_OFF, 1, tuned, 1, I6C_ISP_OP_AUTO);
+    i6c_iq_write(g_wdr, I6C_ISP_ENABLE_OFF, 4, 1);
+
+    CHECK(hal_isp_set_drc_strength(&ctx, 200) == RSS_OK, "the set must take");
+    CHECK(i6c_iq_read(g_wdr, I6C_ISP_ENABLE_OFF, 4) == 1, "still on");
+    CHECK(hal_isp_set_drc_strength(&ctx, RSS_ISP_AUTO) == RSS_OK, "auto must take");
+    CHECK(i6c_iq_read(g_wdr, I6C_ISP_ENABLE_OFF, 4) == 1,
+          "auto must not switch off a module the tuning had on, enable reads %u",
+          i6c_iq_read(g_wdr, I6C_ISP_ENABLE_OFF, 4));
+}
+
+/* A tuning load re-reads the switch, so a second sensor's opinion is the one
+ * that gets handed back -- not the first sensor's, cached. */
+static void test_a_tuning_load_relearns_the_switch(void)
+{
+    static const uint16_t tuned[1] = {0};
+    rss_hal_ctx_t ctx;
+    infinity6c_state_t st;
+
+    arm(&ctx, &st);
+    seed_run(g_wdr, sizeof(g_wdr), DRC_OFF, 1, tuned, 1, I6C_ISP_OP_AUTO);
+    i6c_iq_write(g_wdr, I6C_ISP_ENABLE_OFF, 4, 0);
+    CHECK(hal_isp_set_drc_strength(&ctx, 200) == RSS_OK, "the set must take");
+
+    /* A new tuning, which has this module on. */
+    seed_run(g_wdr, sizeof(g_wdr), DRC_OFF, 1, tuned, 1, I6C_ISP_OP_AUTO);
+    i6c_iq_write(g_wdr, I6C_ISP_ENABLE_OFF, 4, 1);
+    i6c_isp_flush_knobs(&st);
+
+    CHECK(hal_isp_set_drc_strength(&ctx, RSS_ISP_AUTO) == RSS_OK, "auto must take");
+    CHECK(i6c_iq_read(g_wdr, I6C_ISP_ENABLE_OFF, 4) == 1,
+          "the new tuning's switch is the one to hand back, enable reads %u",
+          i6c_iq_read(g_wdr, I6C_ISP_ENABLE_OFF, 4));
+}
+
+/* The vector shape has the same header and gets the same treatment. */
+static void test_a_vector_value_switches_its_module_on_too(void)
+{
+    rss_hal_ctx_t ctx;
+    infinity6c_state_t st;
+
+    arm(&ctx, &st);
+    i6c_iq_write(g_sharp, I6C_ISP_ENABLE_OFF, 4, 0);
+
+    CHECK(hal_isp_set_sharpness(&ctx, 100) == RSS_OK, "the set must take");
+    CHECK(i6c_iq_read(g_sharp, I6C_ISP_ENABLE_OFF, 4) == 1,
+          "a vector row must switch its module on, enable reads %u",
+          i6c_iq_read(g_sharp, I6C_ISP_ENABLE_OFF, 4));
+
+    CHECK(hal_isp_set_sharpness(&ctx, RSS_ISP_AUTO) == RSS_OK, "auto must take");
+    CHECK(i6c_iq_read(g_sharp, I6C_ISP_ENABLE_OFF, 4) == 0, "and hand the switch back");
+}
+
+/*
+ * Defog is the exception, because raptor already publishes its switch: two rows
+ * address one module, so a strength write that switched it on would countermand
+ * an operator who had just turned defog off -- and, worse, do it from the
+ * config every startup, since rvd writes both before the first frame.
+ */
+static void test_defog_strength_leaves_defogs_own_switch_alone(void)
+{
+    rss_hal_ctx_t ctx;
+    infinity6c_state_t st;
+
+    arm(&ctx, &st);
+    i6c_iq_write(g_defog, I6C_ISP_ENABLE_OFF, 4, 0);
+    i6c_iq_write(g_defog, I6C_ISP_OPTYPE_OFF, 4, I6C_ISP_OP_AUTO);
+
+    CHECK(hal_isp_set_defog_strength(&ctx, 200) == RSS_OK, "the set must take");
+    CHECK(i6c_iq_read(g_defog, I6C_ISP_ENABLE_OFF, 4) == 0,
+          "defog's own switch must survive a strength write, enable reads %u",
+          i6c_iq_read(g_defog, I6C_ISP_ENABLE_OFF, 4));
+    CHECK(i6c_iq_read(g_defog, I6C_ISP_IQ_DEFOG_MANUAL, 1) == 200, "the level still lands, got %u",
+          i6c_iq_read(g_defog, I6C_ISP_IQ_DEFOG_MANUAL, 1));
+
+    /* And the switch is still the operator's to throw. */
+    CHECK(hal_isp_set_defog(&ctx, true) == RSS_OK, "the switch must take");
+    CHECK(i6c_iq_read(g_defog, I6C_ISP_ENABLE_OFF, 4) == 1, "and be what turns the module on");
 }
 
 /* A drc write must touch the level and the mode word and nothing else: the
@@ -1112,7 +1265,12 @@ int main(void)
     test_a_failing_module_writes_nothing();
     test_the_remap_is_the_identity_at_the_pivot();
     test_drc_carries_the_majestic_scale_onto_wdr();
-    test_drc_does_not_switch_a_disabled_module_on();
+    test_a_value_switches_on_a_module_the_tuning_disabled();
+    test_auto_hands_the_tuners_switch_back();
+    test_a_module_the_tuning_enabled_is_left_enabled();
+    test_a_tuning_load_relearns_the_switch();
+    test_a_vector_value_switches_its_module_on_too();
+    test_defog_strength_leaves_defogs_own_switch_alone();
     test_a_drc_write_touches_only_the_level();
     test_the_awb_line_survives_ae_winning_the_race();
     test_temper_is_a_level_and_says_so();

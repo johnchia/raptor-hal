@@ -301,9 +301,21 @@ typedef struct {
     bool has_pending;
     bool pending_is_raw;
 
-    /* Armed by each tuning load, cleared by the fetch that reads the baseline
-     * back out. Only meaningful with unity_from_tuning. */
-    bool unity_stale;
+    /*
+     * Armed by each tuning load and cleared by the first fetch after it, which
+     * is the one that reads the tuning's own values back out -- before anything
+     * of ours has been written over them.
+     */
+    bool tuning_stale;
+
+    /*
+     * The module's bEnable as the tuning binary left it, and whether that has
+     * been read yet. Naming a value switches a disabled module on, so this is
+     * what auto puts back; without it the tuner's switch would be lost at the
+     * first write and unrecoverable short of reloading the tuning.
+     */
+    bool tuned_on;
+    bool tuned_on_valid;
 
     /*
      * A vector row's baseline: the tuning's own value for each field of the
@@ -553,11 +565,13 @@ static int i6c_iq_resolve(infinity6c_state_t *st, i6c_iq_param_t *p)
 }
 
 /*
- * Adopt the tuning binary's own value as the neutral raptor's 128 maps to.
+ * Read out of the tuning binary the two things only it can say: where a vector
+ * row's bands sit, and whether the module is switched on.
  *
- * Gated on unity_stale, which each tuning load re-arms and the flush's first
- * fetch clears -- so what it reads is the binary's value and not one of ours.
- * Without it the sub-neutral half of the knob is measured from a guess.
+ * Gated on tuning_stale, which each tuning load re-arms and the flush's first
+ * fetch clears -- so what it reads is the binary's own state and not one of
+ * ours. Without it a baseline is measured from a value we wrote, and the
+ * tuner's switch is read back after a write has already turned it on.
  */
 /*
  * Which field of a run the getter should read back from.
@@ -599,13 +613,30 @@ static void i6c_iq_pick_report_field(i6c_iq_param_t *p)
     }
 }
 
-static void i6c_iq_learn_unity(i6c_iq_param_t *p, const uint8_t *buf)
+static void i6c_iq_learn_from_tuning(i6c_iq_param_t *p, const uint8_t *buf)
 {
     int32_t base;
     unsigned int i;
 
-    if (!p->unity_from_tuning || !p->unity_stale)
+    if (!p->tuning_stale)
         return;
+
+    /*
+     * The switch first, and for every row that has one, because a value written
+     * later turns it on and this is the only chance to see what it was. Rows
+     * without a { bEnable, enOpType } header have nothing to read here: offset 0
+     * is the value itself on a flat row, which is why caps does not read it
+     * either.
+     */
+    if (I6C_IQ_HAS_AUTO(p)) {
+        p->tuned_on = i6c_iq_read(buf, I6C_ISP_ENABLE_OFF, 4) != 0;
+        p->tuned_on_valid = true;
+    }
+
+    if (!p->unity_from_tuning) {
+        p->tuning_stale = false;
+        return;
+    }
 
     /*
      * A vector row learns the whole run at once, and all or nothing: one field
@@ -627,14 +658,14 @@ static void i6c_iq_learn_unity(i6c_iq_param_t *p, const uint8_t *buf)
                              p->name, i, base, p->mi_floor, p->mi_max, p->mi_unity);
                 p->base_valid = false;
                 p->report = 0;
-                p->unity_stale = false;
+                p->tuning_stale = false;
                 return;
             }
             p->base[i] = (uint16_t)base;
         }
 
         p->base_valid = true;
-        p->unity_stale = false;
+        p->tuning_stale = false;
         i6c_iq_pick_report_field(p);
         HAL_LOG_INFO("isp: %s baseline from the tuning is MI %u..%u over %u fields in %d..%d, "
                      "reporting from field %u (MI %u)",
@@ -652,12 +683,12 @@ static void i6c_iq_learn_unity(i6c_iq_param_t *p, const uint8_t *buf)
         HAL_LOG_WARN("isp: %s reads MI %d, outside its %d..%d range -- not adopting it as the "
                      "neutral, keeping %d",
                      p->name, base, p->mi_floor, p->mi_max, p->mi_unity);
-        p->unity_stale = false;
+        p->tuning_stale = false;
         return;
     }
 
     p->mi_unity = base;
-    p->unity_stale = false;
+    p->tuning_stale = false;
     HAL_LOG_INFO("isp: %s baseline from the tuning is MI %d in %d..%d", p->name, base, p->mi_floor,
                  p->mi_max);
 }
@@ -699,7 +730,7 @@ static int i6c_iq_fetch(infinity6c_state_t *st, int idx, uint8_t *buf)
         return RSS_ERR_IO;
     }
 
-    i6c_iq_learn_unity(p, buf);
+    i6c_iq_learn_from_tuning(p, buf);
     return RSS_OK;
 }
 
@@ -763,6 +794,50 @@ static int32_t i6c_iq_reband(int val, int32_t from, int32_t to, int32_t floor, i
 }
 
 /*
+ * Switch a module on because someone named a value for it.
+ *
+ * A module the tuning turned off takes the write and ignores it, so without
+ * this the knob reads back exactly what was asked for and changes nothing on
+ * screen -- which is the worse of the two answers. The tuner's switch is not
+ * lost by it: auto puts it back, see i6c_iq_restore_switch.
+ *
+ * Free on this hardware rather than only reversible, which is why it is done
+ * silently for the value's sake instead of being left to an explicit enable.
+ * Measured on the IMX335 board: every shipped Infinity6C tuning that ships
+ * brightness disabled also leaves its auto array flat at unity, so a module
+ * switched on and sitting at auto is within noise of a disabled one, and the AE
+ * does not react to it at all -- identical exposure and gain across the sweep.
+ * The costs only appear where the operator drives the knob away from unity,
+ * which is the thing they asked for.
+ */
+static void i6c_iq_switch_on(const i6c_iq_param_t *p, uint8_t *buf)
+{
+    if (i6c_iq_read(buf, I6C_ISP_ENABLE_OFF, 4))
+        return;
+
+    HAL_LOG_INFO("isp: %s is disabled in this sensor's tuning and is being switched on so the "
+                 "value has an effect; set %s back to auto to hand the switch back",
+                 p->name, p->name);
+    i6c_iq_write(buf, I6C_ISP_ENABLE_OFF, 4, 1);
+}
+
+/*
+ * Hand the module back to the tuning, switch included.
+ *
+ * Auto means the tuning owns this knob, and the tuning's opinion of a module it
+ * disabled is that it should be off. Skipped when the switch was never read --
+ * a fetch before the first flush, which cannot have written a value either, so
+ * there is nothing to undo.
+ */
+static void i6c_iq_restore_switch(const i6c_iq_param_t *p, uint8_t *buf)
+{
+    if (!p->tuned_on_valid)
+        return;
+
+    i6c_iq_write(buf, I6C_ISP_ENABLE_OFF, 4, p->tuned_on ? 1u : 0u);
+}
+
+/*
  * Apply a scalar knob, in MI's own units.
  *
  * RSS_ISP_AUTO restores auto and leaves the manual field alone -- see THE
@@ -786,6 +861,8 @@ static int i6c_iq_apply_scalar(infinity6c_state_t *st, int idx, int val)
     if (p->shape == IQ_AUTOMAN) {
         if (val == RSS_ISP_AUTO) {
             i6c_iq_write(buf, I6C_ISP_OPTYPE_OFF, 4, I6C_ISP_OP_AUTO);
+            if (idx != IQ_DEFOG)
+                i6c_iq_restore_switch(p, buf);
             HAL_LOG_DBG("isp: %s left to the tuning file (auto)", p->name);
             return i6c_iq_store(st, idx, buf);
         }
@@ -802,14 +879,13 @@ static int i6c_iq_apply_scalar(infinity6c_state_t *st, int idx, int val)
                          "being used; set %s back to auto to restore it",
                          p->name, p->name);
         /*
-         * A module the tuning switched off takes the write and ignores it.
-         * Worth a word: the alternative is a knob that reads back exactly what
-         * was asked for and changes nothing on screen.
+         * Defog is the exception, because its switch is already a knob of its
+         * own: IQ_DEFOG_EN addresses the same module's bEnable through the same
+         * pair of symbols, so a strength write that switched the module on
+         * would quietly countermand an operator who had just turned defog off.
          */
-        if (!i6c_iq_read(buf, I6C_ISP_ENABLE_OFF, 4))
-            HAL_LOG_INFO("isp: %s is disabled in this sensor's tuning, so the value is stored "
-                         "and has no effect until something enables the module",
-                         p->name);
+        if (idx != IQ_DEFOG)
+            i6c_iq_switch_on(p, buf);
         i6c_iq_write(buf, I6C_ISP_OPTYPE_OFF, 4, I6C_ISP_OP_MANUAL);
     }
 
@@ -862,6 +938,7 @@ static int i6c_iq_apply_vector(infinity6c_state_t *st, int idx, int val)
 
     if (val == RSS_ISP_AUTO) {
         i6c_iq_write(buf, I6C_ISP_OPTYPE_OFF, 4, I6C_ISP_OP_AUTO);
+        i6c_iq_restore_switch(p, buf);
         HAL_LOG_DBG("isp: %s left to the tuning file (auto)", p->name);
         return i6c_iq_store(st, idx, buf);
     }
@@ -872,6 +949,7 @@ static int i6c_iq_apply_vector(infinity6c_state_t *st, int idx, int val)
         HAL_LOG_INFO("isp: %s goes manual, so the tuning's per-gain curve for it stops being "
                      "used; set %s back to auto to restore it",
                      p->name, p->name);
+    i6c_iq_switch_on(p, buf);
     i6c_iq_write(buf, I6C_ISP_OPTYPE_OFF, 4, I6C_ISP_OP_MANUAL);
 
     pivot = i6c_iq_baseline(p, p->report);
@@ -1121,17 +1199,19 @@ void i6c_isp_flush_knobs(infinity6c_state_t *st)
     st->isp_knobs_live = true;
 
     /*
-     * Every baseline read out of the tuning is stale now the tuning has just
-     * loaded, and the fetches below are where they are re-read.
+     * Everything read out of the tuning is stale now the tuning has just
+     * loaded, and the fetches below are where it is re-read. Every row, not
+     * just the ones that learn a baseline: a module's switch has to be re-read
+     * too, and a tuning load is exactly when it can have changed.
      *
      * A vector row's base[] is not separately invalidated here, and does not
      * need to be: every read of it goes through i6c_iq_baseline, every caller
-     * of that has just been through i6c_iq_fetch, and a fetch with unity_stale
+     * of that has just been through i6c_iq_fetch, and a fetch with tuning_stale
      * set relearns the run before it returns. So the stale values cannot be
      * reached -- one flag, not two that could disagree.
      */
     for (i = 0; i < IQ_PARAM_COUNT; i++)
-        g_iq[i].unity_stale = g_iq[i].unity_from_tuning;
+        g_iq[i].tuning_stale = true;
 
     for (i = 0; i < IQ_PARAM_COUNT; i++) {
         i6c_iq_param_t *p = &g_iq[i];
@@ -1155,7 +1235,7 @@ void i6c_isp_forget_knobs(void)
     for (i = 0; i < IQ_PARAM_COUNT; i++) {
         g_iq[i].fn_get = NULL;
         g_iq[i].fn_set = NULL;
-        g_iq[i].unity_stale = false;
+        g_iq[i].tuning_stale = false;
     }
 }
 
@@ -1761,6 +1841,10 @@ int hal_isp_get_knob_caps(void *ctx, const char *name, rss_isp_knob_t *caps)
         return RSS_OK;
 
     /*
+     * The live switch, not the tuning's: a knob given a value switches its
+     * module on, so a client that sets one sees enabled go true, and auto
+     * hands the switch back and can put it false again.
+     *
      * Only where there is one to read. The { bEnable, enOpType, auto[16],
      * manual } shape belongs to the IQ modules; a flat row like EV
      * compensation is a bare value, and offset zero there is the value itself

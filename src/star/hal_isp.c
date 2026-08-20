@@ -319,7 +319,21 @@ typedef struct {
 
     /* Armed by every tuning load, cleared by the fetch that reads the
      * baseline back out. Only meaningful with unity_from_tuning. */
-    bool unity_stale;
+    /*
+     * Armed by each tuning load and cleared by the first fetch after it, which
+     * is the one that reads the tuning's own state back out -- before anything
+     * of ours has been written over it.
+     */
+    bool tuning_stale;
+
+    /*
+     * The module's bEnable as the tuning binary left it, and whether that has
+     * been read yet. Naming a value switches a disabled module on, so this is
+     * what auto puts back; without it the tuner's switch would be lost at the
+     * first write and unrecoverable short of reloading the tuning.
+     */
+    bool tuned_on;
+    bool tuned_on_valid;
 } star_iq_param_t;
 
 enum {
@@ -404,11 +418,11 @@ static star_iq_param_t g_iq[IQ_PARAM_COUNT] = {
      * +43, against Infinity6C's 112 and +34 -- and even the symbol differs in
      * case: MI_ISP_IQ_GetWDR here, MI_ISP_IQ_GetWdr there.
      *
-     * The enable bit is left alone, which matters more here than on 6C:
-     * imx307.bin and imx335.bin ship this module disabled, so on those two
-     * sensors a set is stored and does nothing until something turns WDR on.
-     * That is the tuner's call rather than this layer's; the apply path logs
-     * it so it does not read as a broken knob.
+     * Naming a value switches the module on, which matters more here than on
+     * 6C: imx307.bin and imx335.bin ship WDR disabled, so on those two sensors
+     * a set used to be stored and do nothing. The tuner's switch is not lost by
+     * it -- auto puts it back -- and this row has no separate enable knob that
+     * such a write could countermand.
      */
     [IQ_DRC] = { "drc", "MI_ISP_IQ_GetWDR", "MI_ISP_IQ_SetWDR",
                  I6_ISP_IQ_WDR_PAYLOAD, I6_ISP_IQ_WDR_MANUAL + I6_ISP_IQ_WDR_STRENGTH,
@@ -509,7 +523,7 @@ static int star_iq_resolve(star_state_t *st, star_iq_param_t *p)
 /*
  * Adopt the tuning binary's own value as the neutral raptor's 128 maps to.
  *
- * Called on every fetch and gated on unity_stale, which each tuning load
+ * Called on every fetch and gated on tuning_stale, which each tuning load
  * re-arms, so what it reads is the binary's value and not one of ours: the
  * knob queue is flushed after the load, and this runs on the fetch that
  * flush performs.
@@ -532,12 +546,27 @@ static int32_t star_iq_read_field(const star_iq_param_t *p, const uint8_t *buf)
     return (int32_t)star_iq_read(buf, p->manual_off, p->width);
 }
 
-static void star_iq_learn_unity(star_iq_param_t *p, const uint8_t *buf)
+static void star_iq_learn_from_tuning(star_iq_param_t *p, const uint8_t *buf)
 {
     int32_t base;
 
-    if (!p->unity_from_tuning || !p->unity_stale)
+    if (!p->tuning_stale)
         return;
+
+    /*
+     * The switch first, and for every row that has one, because a value written
+     * later turns it on and this is the only chance to see what it was. A flat
+     * row has no { bEnable, enOpType } header to read: offset 0 is its value.
+     */
+    if (p->shape == IQ_AUTOMAN) {
+        p->tuned_on = star_iq_read(buf, STAR_ISP_ENABLE_OFF, 4) != 0;
+        p->tuned_on_valid = true;
+    }
+
+    if (!p->unity_from_tuning) {
+        p->tuning_stale = false;
+        return;
+    }
 
     base = star_iq_read_field(p, buf);
     if (base > p->mi_max || base < p->mi_floor) {
@@ -546,15 +575,14 @@ static void star_iq_learn_unity(star_iq_param_t *p, const uint8_t *buf)
         HAL_LOG_WARN("isp: %s reads MI %d, outside its %d..%d range -- not adopting it as the "
                      "neutral, keeping %d",
                      p->name, base, p->mi_floor, p->mi_max, p->mi_unity);
-        p->unity_stale = false;
+        p->tuning_stale = false;
         return;
     }
 
     p->mi_unity = base;
-    p->unity_stale = false;
-    HAL_LOG_INFO("isp: %s baseline from the tuning is MI %d in %d..%d -- raptor 128 maps here, "
-                 "so 0..127 reaches down to %d and 129..255 up to %d",
-                 p->name, base, p->mi_floor, p->mi_max, p->mi_floor, p->mi_max);
+    p->tuning_stale = false;
+    HAL_LOG_INFO("isp: %s baseline from the tuning is MI %d in %d..%d", p->name, base, p->mi_floor,
+                 p->mi_max);
 }
 
 /* Re-arm every baseline that is read out of the tuning rather than assumed.
@@ -582,7 +610,7 @@ static int star_iq_fetch(star_state_t *st, int idx, uint8_t *buf)
         return RSS_ERR_IO;
     }
 
-    star_iq_learn_unity(p, buf);
+    star_iq_learn_from_tuning(p, buf);
     return RSS_OK;
 }
 
@@ -612,6 +640,43 @@ static int star_iq_store(star_state_t *st, int idx, uint8_t *buf)
  * bEnable is never touched: if the tuning binary disabled a module,
  * re-enabling it behind the tuner's back is not this layer's call.
  */
+/*
+ * Switch a module on because someone named a value for it.
+ *
+ * A module the tuning turned off takes the write and ignores it -- two of the
+ * six shipped Infinity6E tunings ship WDR that way, so this is a real state and
+ * not a defensive check. Without this the knob would read back exactly what was
+ * asked for and change nothing on screen, which is the worse of the two
+ * answers. The tuner's switch is not lost by it: auto puts it back, see
+ * star_iq_restore_switch.
+ */
+static void star_iq_switch_on(const star_iq_param_t *p, uint8_t *buf)
+{
+    if (star_iq_read(buf, STAR_ISP_ENABLE_OFF, 4))
+        return;
+
+    HAL_LOG_INFO("isp: %s is disabled in this sensor's tuning and is being switched on so the "
+                 "value has an effect; set %s back to auto to hand the switch back",
+                 p->name, p->name);
+    star_iq_write(buf, STAR_ISP_ENABLE_OFF, 4, 1);
+}
+
+/*
+ * Hand the module back to the tuning, switch included.
+ *
+ * Auto means the tuning owns this knob, and the tuning's opinion of a module it
+ * disabled is that it should be off. Skipped when the switch was never read --
+ * a fetch before the first flush, which cannot have written a value either, so
+ * there is nothing to undo.
+ */
+static void star_iq_restore_switch(const star_iq_param_t *p, uint8_t *buf)
+{
+    if (!p->tuned_on_valid)
+        return;
+
+    star_iq_write(buf, STAR_ISP_ENABLE_OFF, 4, p->tuned_on ? 1u : 0u);
+}
+
 static int star_iq_apply_scalar(star_state_t *st, int idx, int val)
 {
     star_iq_param_t *p = &g_iq[idx];
@@ -625,6 +690,7 @@ static int star_iq_apply_scalar(star_state_t *st, int idx, int val)
     if (p->shape == IQ_AUTOMAN) {
         if (val == RSS_ISP_AUTO) {
             star_iq_write(buf, STAR_ISP_OPTYPE_OFF, 4, STAR_ISP_OP_AUTO);
+            star_iq_restore_switch(p, buf);
             HAL_LOG_DBG("isp: %s left to the tuning file (auto)", p->name);
             return star_iq_store(st, idx, buf);
         }
@@ -642,15 +708,7 @@ static int star_iq_apply_scalar(star_state_t *st, int idx, int val)
             HAL_LOG_INFO("isp: %s goes manual, so the tuning's per-gain curve for it stops "
                          "being used; set %s back to auto to restore it",
                          p->name, p->name);
-        /*
-         * A module the tuning switched off takes the write and ignores it.
-         * Two of the six shipped tunings here ship WDR that way, so this is a
-         * real state rather than a defensive check.
-         */
-        if (!star_iq_read(buf, STAR_ISP_ENABLE_OFF, 4))
-            HAL_LOG_INFO("isp: %s is disabled in this sensor's tuning, so the value is stored "
-                         "and has no effect until something enables the module",
-                         p->name);
+        star_iq_switch_on(p, buf);
         star_iq_write(buf, STAR_ISP_OPTYPE_OFF, 4, STAR_ISP_OP_MANUAL);
     }
 
@@ -1172,9 +1230,12 @@ static void star_isp_arm_tuning_reads(void)
 {
     size_t i;
 
+    /*
+     * Every row, not just the ones that learn a baseline: a module's switch has
+     * to be re-read too, and a tuning load is exactly when it can have changed.
+     */
     for (i = 0; i < IQ_PARAM_COUNT; i++)
-        if (g_iq[i].unity_from_tuning)
-            g_iq[i].unity_stale = true;
+        g_iq[i].tuning_stale = true;
 }
 
 void star_isp_tune_when_ready(star_state_t *st, bool verbose)
@@ -1357,7 +1418,7 @@ void star_isp_teardown(star_state_t *st)
         g_iq[i].fn_get = NULL;
         g_iq[i].fn_set = NULL;
         g_iq[i].has_pending = false;
-        g_iq[i].unity_stale = false;
+        g_iq[i].tuning_stale = false;
     }
 
     i6_isp_unload(&st->isp);
