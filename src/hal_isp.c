@@ -20,6 +20,36 @@
 /* Per-SoC caps (defined in hal_caps.c) */
 extern const rss_hal_caps_t g_hal_caps;
 
+/*
+ * Refuse "hand this knob back to the tuning file".
+ *
+ * IMP has no auto/manual op_type on any of these modules -- a tuning value is
+ * simply the value -- so there is no curve to hand back and nothing for
+ * RSS_ISP_AUTO to mean. hal_isp_get_knob_caps says so, reporting has_auto false
+ * for every row, and this is what makes that answer true rather than advisory:
+ * the same layer that publishes the capability enforces it.
+ *
+ * The alternative is not "the request is ignored". RSS_ISP_AUTO is INT_MIN, and
+ * every setter here starts by clamping, so without this the sentinel arrives as
+ * a perfectly ordinary 0 -- `set-saturation auto` returning ok and producing a
+ * greyscale image, which rvd then writes back to the config as `saturation =
+ * auto` so it survives the reboot. ae_comp was worse: it takes a bare int and
+ * handed INT_MIN straight to the SDK.
+ *
+ * RSS_ERR_INVAL rather than NOTSUP so the answer matches SigmaStar's for the
+ * same question -- see i6c_iq_set_scalar, which refuses auto on a knob that has
+ * no auto mode. A caller asking "does this knob take the word" should get one
+ * answer across the family, and it should come from caps rather than from a
+ * failed write either way.
+ *
+ * Expands to a return, hence the shouting name.
+ */
+#define HAL_ISP_REFUSE_AUTO(val)                                                                   \
+    do {                                                                                           \
+        if ((val) == RSS_ISP_AUTO)                                                                 \
+            return RSS_ERR_INVAL;                                                                  \
+    } while (0)
+
 /* ================================================================
  * BASIC IMAGE CONTROLS: brightness, contrast, saturation, sharpness
  *
@@ -30,6 +60,7 @@ extern const rss_hal_caps_t g_hal_caps;
 int hal_isp_set_brightness(void *ctx, int val)
 {
     (void)ctx;
+    HAL_ISP_REFUSE_AUTO(val);
     uint8_t v = hal_clamp_u8(val);
 #if defined(HAL_ISP_PTR_ARGS)
     return IMP_ISP_Tuning_SetBrightness(IMPVI_MAIN, &v);
@@ -41,6 +72,7 @@ int hal_isp_set_brightness(void *ctx, int val)
 int hal_isp_set_contrast(void *ctx, int val)
 {
     (void)ctx;
+    HAL_ISP_REFUSE_AUTO(val);
     uint8_t v = hal_clamp_u8(val);
 #if defined(HAL_ISP_PTR_ARGS)
     return IMP_ISP_Tuning_SetContrast(IMPVI_MAIN, &v);
@@ -52,6 +84,7 @@ int hal_isp_set_contrast(void *ctx, int val)
 int hal_isp_set_saturation(void *ctx, int val)
 {
     (void)ctx;
+    HAL_ISP_REFUSE_AUTO(val);
     uint8_t v = hal_clamp_u8(val);
 #if defined(HAL_ISP_PTR_ARGS)
     return IMP_ISP_Tuning_SetSaturation(IMPVI_MAIN, &v);
@@ -63,6 +96,7 @@ int hal_isp_set_saturation(void *ctx, int val)
 int hal_isp_set_sharpness(void *ctx, int val)
 {
     (void)ctx;
+    HAL_ISP_REFUSE_AUTO(val);
     uint8_t v = hal_clamp_u8(val);
 #if defined(HAL_ISP_PTR_ARGS)
     return IMP_ISP_Tuning_SetSharpness(IMPVI_MAIN, &v);
@@ -81,6 +115,7 @@ int hal_isp_set_sharpness(void *ctx, int val)
 int hal_isp_set_hue(void *ctx, int val)
 {
     (void)ctx;
+    HAL_ISP_REFUSE_AUTO(val);
     uint8_t v = hal_clamp_u8(val);
 #if defined(HAL_ISP_PTR_ARGS)
     /* Gen3: T32/T40/T41 */
@@ -528,6 +563,7 @@ int hal_isp_get_exposure(void *ctx, rss_exposure_t *exposure)
 int hal_isp_set_sinter_strength(void *ctx, int val)
 {
     (void)ctx;
+    HAL_ISP_REFUSE_AUTO(val);
     uint8_t v = hal_clamp_u8(val);
 
     if (!g_hal_caps.has_sinter)
@@ -552,6 +588,7 @@ int hal_isp_set_sinter_strength(void *ctx, int val)
 int hal_isp_set_temper_strength(void *ctx, int val)
 {
     (void)ctx;
+    HAL_ISP_REFUSE_AUTO(val);
     uint8_t v = hal_clamp_u8(val);
 
     if (!g_hal_caps.has_temper)
@@ -601,6 +638,7 @@ int hal_isp_set_defog(void *ctx, int enable)
 int hal_isp_set_dpc_strength(void *ctx, int val)
 {
     (void)ctx;
+    HAL_ISP_REFUSE_AUTO(val);
     uint8_t v = hal_clamp_u8(val);
 
     if (!g_hal_caps.has_dpc)
@@ -624,6 +662,7 @@ int hal_isp_set_dpc_strength(void *ctx, int val)
 int hal_isp_set_drc_strength(void *ctx, int val)
 {
     (void)ctx;
+    HAL_ISP_REFUSE_AUTO(val);
     uint8_t v = hal_clamp_u8(val);
 
     if (!g_hal_caps.has_drc)
@@ -648,6 +687,7 @@ int hal_isp_set_drc_strength(void *ctx, int val)
 int hal_isp_set_ae_comp(void *ctx, int val)
 {
     (void)ctx;
+    HAL_ISP_REFUSE_AUTO(val);
 
 #if defined(PLATFORM_T20) || defined(PLATFORM_T23) || defined(PLATFORM_T30) || defined(PLATFORM_T31)
     return IMP_ISP_Tuning_SetAeComp(val);
@@ -712,6 +752,7 @@ int hal_isp_set_max_dgain(void *ctx, int gain)
 int hal_isp_set_highlight_depress(void *ctx, int val)
 {
     (void)ctx;
+    HAL_ISP_REFUSE_AUTO(val);
     uint8_t v = hal_clamp_u8(val);
 
 #if defined(PLATFORM_T20) || defined(PLATFORM_T21) || defined(PLATFORM_T23) ||                     \
@@ -1315,6 +1356,7 @@ int hal_isp_get_defog_strength(void *ctx, int *val)
 int hal_isp_set_defog_strength(void *ctx, int val)
 {
     (void)ctx;
+    HAL_ISP_REFUSE_AUTO(val);
     uint8_t v = hal_clamp_u8(val);
 
     if (!g_hal_caps.has_defog)
@@ -2741,6 +2783,7 @@ int hal_isp_set_awb_ct_trend(void *ctx, const void *trend)
 int hal_isp_set_backlight_comp(void *ctx, int strength)
 {
     (void)ctx;
+    HAL_ISP_REFUSE_AUTO(strength);
     uint32_t s = hal_clamp_u32(strength);
 
 #if defined(PLATFORM_T23) || defined(PLATFORM_T31)
@@ -3251,6 +3294,7 @@ int hal_isp_set_scaler_lv(void *ctx, int chn, int level)
 int hal_isp_set_brightness_n(void *ctx, int sensor_idx, int val)
 {
     (void)ctx;
+    HAL_ISP_REFUSE_AUTO(val);
     uint8_t v = hal_clamp_u8(val);
 #if defined(HAL_ISP_PTR_ARGS)
     return IMP_ISP_Tuning_SetBrightness((IMPVI_NUM)sensor_idx, &v);
@@ -3266,6 +3310,7 @@ int hal_isp_set_brightness_n(void *ctx, int sensor_idx, int val)
 int hal_isp_set_contrast_n(void *ctx, int sensor_idx, int val)
 {
     (void)ctx;
+    HAL_ISP_REFUSE_AUTO(val);
     uint8_t v = hal_clamp_u8(val);
 #if defined(HAL_ISP_PTR_ARGS)
     return IMP_ISP_Tuning_SetContrast((IMPVI_NUM)sensor_idx, &v);
@@ -3281,6 +3326,7 @@ int hal_isp_set_contrast_n(void *ctx, int sensor_idx, int val)
 int hal_isp_set_saturation_n(void *ctx, int sensor_idx, int val)
 {
     (void)ctx;
+    HAL_ISP_REFUSE_AUTO(val);
     uint8_t v = hal_clamp_u8(val);
 #if defined(HAL_ISP_PTR_ARGS)
     return IMP_ISP_Tuning_SetSaturation((IMPVI_NUM)sensor_idx, &v);
@@ -3296,6 +3342,7 @@ int hal_isp_set_saturation_n(void *ctx, int sensor_idx, int val)
 int hal_isp_set_sharpness_n(void *ctx, int sensor_idx, int val)
 {
     (void)ctx;
+    HAL_ISP_REFUSE_AUTO(val);
     uint8_t v = hal_clamp_u8(val);
 #if defined(HAL_ISP_PTR_ARGS)
     return IMP_ISP_Tuning_SetSharpness((IMPVI_NUM)sensor_idx, &v);
@@ -3311,6 +3358,7 @@ int hal_isp_set_sharpness_n(void *ctx, int sensor_idx, int val)
 int hal_isp_set_hue_n(void *ctx, int sensor_idx, int val)
 {
     (void)ctx;
+    HAL_ISP_REFUSE_AUTO(val);
     uint8_t v = hal_clamp_u8(val);
 #if defined(HAL_ISP_PTR_ARGS)
     return IMP_ISP_Tuning_SetBcshHue((IMPVI_NUM)sensor_idx, &v);
@@ -3490,6 +3538,7 @@ int hal_isp_set_antiflicker_n(void *ctx, int sensor_idx, rss_antiflicker_t mode)
 int hal_isp_set_sinter_strength_n(void *ctx, int sensor_idx, int val)
 {
     (void)ctx;
+    HAL_ISP_REFUSE_AUTO(val);
     uint8_t v = hal_clamp_u8(val);
     /* Sinter only on T20-T31; T32/T40/T41 use SetModule_Ratio instead */
 #if defined(HAL_T23_MULTICAM)
@@ -3509,6 +3558,7 @@ int hal_isp_set_sinter_strength_n(void *ctx, int sensor_idx, int val)
 int hal_isp_set_temper_strength_n(void *ctx, int sensor_idx, int val)
 {
     (void)ctx;
+    HAL_ISP_REFUSE_AUTO(val);
     uint8_t v = hal_clamp_u8(val);
     /* Temper only on T20-T31; T32/T40/T41 use SetModule_Ratio instead */
 #if defined(HAL_T23_MULTICAM)
@@ -3528,6 +3578,7 @@ int hal_isp_set_temper_strength_n(void *ctx, int sensor_idx, int val)
 int hal_isp_set_ae_comp_n(void *ctx, int sensor_idx, int val)
 {
     (void)ctx;
+    HAL_ISP_REFUSE_AUTO(val);
     /* AeComp only on T20/T23/T30/T31; not on T32/T40/T41 */
 #if defined(HAL_T23_MULTICAM)
     return IMP_ISP_MultiCamera_Tuning_SetAeComp((IMPVI_NUM)sensor_idx, val);

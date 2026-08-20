@@ -635,10 +635,21 @@ typedef struct {
     /* Accepts RSS_ISP_AUTO. False for a knob with no auto/manual mode, where
      * the tuning has no curve to hand back. */
     bool has_auto;
-    /* The tuning has this module switched on. A write to a disabled module is
-     * stored and changes nothing, so a client can say why rather than offering
-     * a control that does nothing -- Infinity6C's imx335 tuning ships
-     * Brightness disabled, and its imx415 tuning ships Contrast disabled too. */
+    /*
+     * The module is switched on right now -- the live state, not the tuning
+     * file's.
+     *
+     * A tuning is entitled to ship a module off, and they do: Infinity6C's
+     * imx335 ships Brightness that way, its imx415 ships Contrast, and two of
+     * the six Infinity6E tunings ship WDR. On the SigmaStar backends, naming a
+     * value for such a knob switches its module on so the value has an effect,
+     * and RSS_ISP_AUTO hands the tuner's own switch back -- so a client that
+     * sets one sees this go true, and can put it false again. Defog is the
+     * exception, its switch being published as a knob of its own.
+     *
+     * Always true where the hardware has no per-module enable for a tuning to
+     * clear, which is every Ingenic row.
+     */
     bool enabled;
 } rss_isp_knob_t;
 

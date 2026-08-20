@@ -42,9 +42,9 @@ LDFLAGS = -fsanitize=$(SAN) -lpthread
 # rests on it and its behaviour is which file gets written in what order,
 # which a host can check once the sysfs root is redirected.
 SUITES = osd isp audio gpio
-BINS = $(addprefix t_,$(SUITES)) t_isp_i6c t_enc_i6c
+BINS = $(addprefix t_,$(SUITES)) t_isp_i6c t_enc_i6c t_isp_imp
 
-test: $(addprefix test-,$(SUITES)) test-isp_i6c test-enc_i6c
+test: $(addprefix test-,$(SUITES)) test-isp_i6c test-enc_i6c test-isp_imp
 
 $(addprefix test-,$(SUITES)): test-%: t_%
 	@./$<
@@ -83,6 +83,38 @@ I6C_DEPS = $(wildcard ../src/infinity6c/*.c ../src/infinity6c/*.h ../src/*.c ../
 
 t_isp_i6c t_enc_i6c: t_%: t_%.c $(I6C_DEPS)
 	$(CC) $(I6C_CFLAGS) -o $@ $< $(LDFLAGS)
+
+# Ingenic, which needs neither of the above: a third PLATFORM_ define, the
+# vendor's own headers out of ingenic-headers, and -- unlike the SigmaStar
+# backends -- a link against the SDK, because src/hal_isp.c calls IMP_* by name
+# rather than through a dlopen'd pointer. imp_stubs.c is what stands in for it.
+#
+# Built for T31 only. The file is compiled for ten platforms by the ARM build,
+# which is what checks that each generation's #ifdef branch still compiles; what
+# is tested here is the logic above those branches, and that is the same code on
+# all ten.
+#
+# INGENIC_HEADERS mirrors the top-level Makefile's variable. The suite is
+# skipped rather than failed when the tree is absent, since it is a submodule
+# and a SigmaStar-only checkout has no reason to populate it.
+INGENIC_HEADERS ?= ../ingenic-headers
+IMP_HEADERS = $(INGENIC_HEADERS)/T31/1.1.6/en
+
+IMP_CFLAGS = -Wall -Wextra -std=c11 -D_GNU_SOURCE -g -fsanitize=$(SAN) \
+	     -DPLATFORM_T31=1 -DHAL_MODULE_VIDEO=1 \
+	     -I../src -I../include -I../../raptor-common/include -I$(IMP_HEADERS)
+
+IMP_DEPS = $(wildcard ../src/*.c ../src/*.h ../include/*.h ../../raptor-common/include/*.h)
+
+t_isp_imp: t_isp_imp.c imp_stubs.c $(IMP_DEPS)
+	@if [ -d "$(IMP_HEADERS)" ]; then \
+		$(CC) $(IMP_CFLAGS) -o $@ t_isp_imp.c imp_stubs.c $(LDFLAGS); \
+	else \
+		echo "t_isp_imp: skipped, no $(IMP_HEADERS)"; \
+	fi
+
+test-isp_imp: t_isp_imp
+	@if [ -x ./t_isp_imp ]; then ./t_isp_imp; fi
 
 # ABI conformance against SigmaStar's own headers. Opt-in: the vendor
 # headers are not redistributable and are not in the repo, so this is
