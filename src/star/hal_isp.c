@@ -114,6 +114,36 @@
  *                         own derivation. Deferred rather than guessed.
  *   isp_set_bypass        No MI equivalent; the ISP cannot be bypassed
  *                         while VPE is the only path to the encoder.
+ *   isp_set_brightness, isp_set_contrast, isp_set_saturation,
+ *   isp_set_sharpness, and their getters
+ *                         Each is an auto/manual IQ module whose auto
+ *                         side is MI_ISP_AUTO_NUM entries the 3A
+ *                         interpolates across gain, and enOpType has
+ *                         exactly two states with no blend between them.
+ *                         So a scalar does not adjust the tuned curve, it
+ *                         replaces the curve with one constant for the
+ *                         whole gain range -- and on this family the
+ *                         curve is carrying something: saturation varies
+ *                         across gain in every shipped tuning, contrast
+ *                         in five of six, brightness in three.
+ *                         Adjusting without discarding would mean writing
+ *                         all of stAuto, each entry about its own tuned
+ *                         baseline. That is a tuning decision rather than
+ *                         a HAL one, and it first needs proof on hardware
+ *                         that CUS3A re-reads a written auto array and
+ *                         that the array survives a tuning reload.
+ *                         MI publishes no single knob that does it for
+ *                         us. The VPE channel's PQ block does carry a
+ *                         contrast and six edge gains, but the vendor
+ *                         marks it DVR-only and the channel is created in
+ *                         REALTIME mode with bContrastEn and bEdgeEn
+ *                         clear. temper is the counter-example and stays:
+ *                         it is the VPE channel's own 3DNR level, one
+ *                         value on the channel, and costs no curve.
+ *                         Infinity6C keeps all four -- its sharpness op
+ *                         scales a run of band gains and its brightness
+ *                         is flat in every shipped bin -- so this is a
+ *                         6E/6B0 withdrawal, not a family-wide one.
  *   isp_set_sinter_strength / _get
  *                         Spatial luma denoise. NRLuma's manual block is
  *                         a blend weight and two filter selects, and the
@@ -1365,6 +1395,14 @@ void star_isp_teardown(star_state_t *st)
  * OPS
  * ================================================================ */
 
+/*
+ * The four scalars below are not in the ops table, and re-publishing one
+ * needs a reason beyond it compiling: each replaces the tuning's per-gain
+ * curve for its module with a single value, which is what withdrew them.
+ * See the OP COVERAGE comment at the top of this file. They stay defined
+ * because the read-modify-write path they exercise is shared with the
+ * knobs that remain, and tests/t_isp.c drives it through them.
+ */
 int hal_isp_set_brightness(void *ctx, int val)
 {
     return star_iq_set_scalar(ctx, IQ_BRIGHTNESS, val);

@@ -1187,16 +1187,20 @@ static const rss_hal_ops_t g_ops = {
      * structs, and they yield to that tuning binary: a knob left at its
      * neutral 128 puts its module back into *auto* rather than pinning a
      * midpoint over the tuned curve. That matters because rvd applies
-     * the whole [image] block on every start, defaults included. The
-     * ops MI cannot honour are listed, with reasons, in the OP COVERAGE
-     * comment in that file.
+     * the whole [image] block on every start, defaults included.
+     *
+     * brightness, contrast, saturation and sharpness are absent by
+     * decision, not by omission: on this family each is an auto/manual
+     * module whose auto side is a per-gain curve, and MI's enOpType has
+     * no third state, so any value but the neutral trades the tuner's
+     * curve for one constant. Publishing no op is what makes rvd report
+     * them unsettable and rcd hide them, rather than offering a control
+     * that quietly costs the tuning. The ops MI cannot honour, and the
+     * ones it can but should not, are listed with reasons in the OP
+     * COVERAGE comment in that file.
      */
     .isp_get_sensor_attr = hal_isp_get_sensor_attr,
 
-    .isp_set_brightness = hal_isp_set_brightness,
-    .isp_set_contrast = hal_isp_set_contrast,
-    .isp_set_saturation = hal_isp_set_saturation,
-    .isp_set_sharpness = hal_isp_set_sharpness,
     .isp_set_temper_strength = hal_isp_set_temper_strength,
     .isp_set_ae_comp = hal_isp_set_ae_comp,
     .isp_set_defog = hal_isp_set_defog,
@@ -1206,10 +1210,6 @@ static const rss_hal_ops_t g_ops = {
     .isp_set_vflip = hal_isp_set_vflip,
     .isp_set_sensor_fps = hal_isp_set_sensor_fps,
 
-    .isp_get_brightness = hal_isp_get_brightness,
-    .isp_get_contrast = hal_isp_get_contrast,
-    .isp_get_saturation = hal_isp_get_saturation,
-    .isp_get_sharpness = hal_isp_get_sharpness,
     .isp_get_temper_strength = hal_isp_get_temper_strength,
     .isp_get_ae_comp = hal_isp_get_ae_comp,
     .isp_get_antiflicker = hal_isp_get_antiflicker,
