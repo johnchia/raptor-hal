@@ -303,21 +303,27 @@ static void arm(rss_hal_ctx_t *ctx, infinity6c_state_t *st)
  */
 static void test_a_vector_knob_scales_every_field_about_its_own_baseline(void)
 {
-    /* 40 + (200-128)*(127-40)/127 and so on, field by field. */
-    static const uint16_t up[6] = {89, 84, 80, 97, 93, 91};
+    /*
+     * The run reports from field 3, whose baseline of 60 is the furthest from
+     * both bounds, so 60 is the pivot: ask for 100 and field 3 becomes exactly
+     * 100, while the others move about their own baselines by the same
+     * fraction of their own headroom -- 40 + (100-60)*(127-40)/(127-60), and
+     * so on. Asking for 30 halves the pivot, so every field halves.
+     */
+    static const uint16_t up[6] = {91, 87, 83, 100, 95, 93};
     static const uint16_t down[6] = {20, 15, 10, 30, 25, 22};
     rss_hal_ctx_t ctx;
     infinity6c_state_t st;
     unsigned int i;
 
     arm(&ctx, &st);
-    CHECK(hal_isp_set_sharpness(&ctx, 200) == RSS_OK, "set must succeed");
+    CHECK(hal_isp_set_sharpness(&ctx, 100) == RSS_OK, "set must succeed");
     for (i = 0; i < 6; i++)
         CHECK(run_at(g_sharp, SHARP_RUN, 1, i) == up[i], "field %u: want %u, got %u", i, up[i],
               run_at(g_sharp, SHARP_RUN, 1, i));
 
     arm(&ctx, &st);
-    CHECK(hal_isp_set_sharpness(&ctx, 64) == RSS_OK, "set must succeed");
+    CHECK(hal_isp_set_sharpness(&ctx, 30) == RSS_OK, "set must succeed");
     for (i = 0; i < 6; i++)
         CHECK(run_at(g_sharp, SHARP_RUN, 1, i) == down[i], "field %u: want %u, got %u", i, down[i],
               run_at(g_sharp, SHARP_RUN, 1, i));
@@ -325,7 +331,8 @@ static void test_a_vector_knob_scales_every_field_about_its_own_baseline(void)
     /* The ends are MI's, not the tuning's: 255 is every field at the ceiling
      * and 0 is the module contributing nothing. */
     arm(&ctx, &st);
-    CHECK(hal_isp_set_sharpness(&ctx, 255) == RSS_OK, "set must succeed");
+    CHECK(hal_isp_set_sharpness(&ctx, I6C_ISP_IQ_SHARPNESS_STRENGTH_MAX) == RSS_OK,
+          "set must succeed");
     for (i = 0; i < 6; i++)
         CHECK(run_at(g_sharp, SHARP_RUN, 1, i) == I6C_ISP_IQ_SHARPNESS_STRENGTH_MAX,
               "field %u must reach the ceiling, got %u", i, run_at(g_sharp, SHARP_RUN, 1, i));
@@ -353,7 +360,7 @@ static void test_neutral_returns_a_vector_row_to_auto_untouched(void)
     /* Manual, as a previous non-neutral set would have left it. */
     i6c_iq_write(g_sharp, I6C_ISP_OPTYPE_OFF, 4, I6C_ISP_OP_MANUAL);
 
-    CHECK(hal_isp_set_sharpness(&ctx, 128) == RSS_OK, "set must succeed");
+    CHECK(hal_isp_set_sharpness(&ctx, RSS_ISP_AUTO) == RSS_OK, "set must succeed");
     CHECK(i6c_iq_read(g_sharp, I6C_ISP_OPTYPE_OFF, 4) == I6C_ISP_OP_AUTO,
           "neutral must select auto");
     for (i = 0; i < 6; i++)
@@ -376,14 +383,14 @@ static void test_a_vector_knob_does_not_compound(void)
     unsigned int i;
 
     arm(&ctx, &st);
-    hal_isp_set_sharpness(&ctx, 200);
-    hal_isp_set_sharpness(&ctx, 200);
-    hal_isp_set_sharpness(&ctx, 160);
+    hal_isp_set_sharpness(&ctx, 100);
+    hal_isp_set_sharpness(&ctx, 100);
+    hal_isp_set_sharpness(&ctx, 80);
     memcpy(twice, g_sharp, sizeof(twice));
 
     /* The same knob reached in one step from the pristine tuning. */
     arm(&ctx, &st);
-    hal_isp_set_sharpness(&ctx, 160);
+    hal_isp_set_sharpness(&ctx, 80);
 
     for (i = 0; i < 6; i++)
         CHECK(run_at(twice, SHARP_RUN, 1, i) == run_at(g_sharp, SHARP_RUN, 1, i),
@@ -404,7 +411,7 @@ static void test_a_tuning_load_relearns_the_baseline(void)
     unsigned int i;
 
     arm(&ctx, &st);
-    hal_isp_set_sharpness(&ctx, 200);
+    hal_isp_set_sharpness(&ctx, 100);
 
     /* A second load: the module reads back as the new binary wrote it. */
     seed_run(g_sharp, sizeof(g_sharp), SHARP_RUN, 1, retuned, 6, I6C_ISP_OP_AUTO);
@@ -416,8 +423,12 @@ static void test_a_tuning_load_relearns_the_baseline(void)
               "baseline %u must come from the new tuning: want %u, got %u", i, retuned[i],
               g_iq[IQ_SHARPNESS].base[i]);
 
-    /* And the pending 200 was re-applied against it, not against the old one. */
-    CHECK(run_at(g_sharp, SHARP_RUN, 1, 0) == 80 + 72 * (127 - 80) / 127,
+    /*
+     * And the pending 100 was re-applied against it, not against the old one.
+     * The new run's best-conditioned field is 1, whose baseline is 60, so the
+     * pivot is 60 again and field 0 lands at 80 + (100-60)*(127-80)/(127-60).
+     */
+    CHECK(run_at(g_sharp, SHARP_RUN, 1, 0) == 80 + 40 * (127 - 80) / 67,
           "the re-applied knob must scale about the new baseline, got %u",
           run_at(g_sharp, SHARP_RUN, 1, 0));
 }
@@ -437,10 +448,12 @@ static void test_an_out_of_range_run_is_refused_whole(void)
     arm(&ctx, &st);
     seed_run(g_sharp, sizeof(g_sharp), SHARP_RUN, 1, bad, 6, I6C_ISP_OP_AUTO);
 
-    CHECK(hal_isp_set_sharpness(&ctx, 200) == RSS_OK, "the knob still works");
+    CHECK(hal_isp_set_sharpness(&ctx, 100) == RSS_OK, "the knob still works");
     CHECK(!g_iq[IQ_SHARPNESS].base_valid, "a bad run must not be adopted");
-    /* Every field falls back to the row's constant neutral, 63. */
-    CHECK(run_at(g_sharp, SHARP_RUN, 1, 0) == 63 + 72 * (127 - 63) / 127,
+    /* Every field falls back to the row's constant neutral, 63, which is then
+     * both the pivot and every field's baseline -- so the run goes flat at
+     * whatever was asked for. */
+    CHECK(run_at(g_sharp, SHARP_RUN, 1, 0) == 100,
           "field 0 must scale about the fallback neutral, got %u",
           run_at(g_sharp, SHARP_RUN, 1, 0));
     CHECK(run_at(g_sharp, SHARP_RUN, 1, 0) == run_at(g_sharp, SHARP_RUN, 1, 3),
@@ -460,15 +473,17 @@ static void test_a_zero_run_is_a_baseline_not_a_failure(void)
     arm(&ctx, &st);
     seed_run(g_sharp, sizeof(g_sharp), SHARP_RUN, 1, off, 6, I6C_ISP_OP_AUTO);
 
-    CHECK(hal_isp_set_sharpness(&ctx, 200) == RSS_OK, "set must succeed");
+    CHECK(hal_isp_set_sharpness(&ctx, 100) == RSS_OK, "set must succeed");
     CHECK(g_iq[IQ_SHARPNESS].base_valid, "zero is in range and must be adopted");
-    CHECK(run_at(g_sharp, SHARP_RUN, 1, 0) == 72, "must scale up from nothing, got %u",
+    /* With every baseline at zero the pivot is zero too, so the whole knob is
+     * upward from nothing and the field simply becomes what was asked for. */
+    CHECK(run_at(g_sharp, SHARP_RUN, 1, 0) == 100, "must scale up from nothing, got %u",
           run_at(g_sharp, SHARP_RUN, 1, 0));
 
     arm(&ctx, &st);
     seed_run(g_sharp, sizeof(g_sharp), SHARP_RUN, 1, off, 6, I6C_ISP_OP_AUTO);
-    CHECK(hal_isp_set_sharpness(&ctx, 64) == RSS_OK, "set must succeed");
-    CHECK(run_at(g_sharp, SHARP_RUN, 1, 0) == 0, "below a zero baseline is still zero, got %u",
+    CHECK(hal_isp_set_sharpness(&ctx, 30) == RSS_OK, "set must succeed");
+    CHECK(run_at(g_sharp, SHARP_RUN, 1, 0) == 30, "a smaller ask is still just the ask, got %u",
           run_at(g_sharp, SHARP_RUN, 1, 0));
 }
 
@@ -483,7 +498,7 @@ static void test_a_baseline_on_the_ceiling_still_scales_down(void)
     static const uint16_t maxed[6] = {127, 127, 127, 127, 127, 127};
     rss_hal_ctx_t ctx;
     infinity6c_state_t st;
-    uint8_t val;
+    int val;
 
     reset(&st);
     memset(&ctx, 0, sizeof(ctx));
@@ -491,28 +506,30 @@ static void test_a_baseline_on_the_ceiling_still_scales_down(void)
     st.isp_knobs_live = true;
     seed_run(g_sharp, sizeof(g_sharp), SHARP_RUN, 1, maxed, 6, I6C_ISP_OP_AUTO);
 
-    CHECK(hal_isp_set_sharpness(&ctx, 64) == RSS_OK, "set must succeed");
-    CHECK(run_at(g_sharp, SHARP_RUN, 1, 0) == 63, "the lower half must still move, got %u",
+    CHECK(hal_isp_set_sharpness(&ctx, 30) == RSS_OK, "set must succeed");
+    CHECK(run_at(g_sharp, SHARP_RUN, 1, 0) == 30, "the lower half must still move, got %u",
           run_at(g_sharp, SHARP_RUN, 1, 0));
 
     /* And upward there is simply no headroom, which is not the same as broken. */
     seed_run(g_sharp, sizeof(g_sharp), SHARP_RUN, 1, maxed, 6, I6C_ISP_OP_AUTO);
     reset_row(IQ_SHARPNESS, fake_get_sharp, fake_set_sharp);
-    CHECK(hal_isp_set_sharpness(&ctx, 200) == RSS_OK, "set must succeed");
-    CHECK(run_at(g_sharp, SHARP_RUN, 1, 0) == 127, "above neutral must stay at the ceiling, got %u",
+    /* And with the pivot itself on the ceiling the whole range is below it, so
+     * every value the field can hold is now askable -- where the abstract
+     * scale had no headroom above neutral and lost that half entirely. */
+    CHECK(hal_isp_set_sharpness(&ctx, 100) == RSS_OK, "set must succeed");
+    CHECK(run_at(g_sharp, SHARP_RUN, 1, 0) == 100, "and the upper half too, got %u",
           run_at(g_sharp, SHARP_RUN, 1, 0));
 
     /*
-     * Reading it back is the other half, and the ambiguous one: the field holds
-     * MI's maximum and so does the baseline, so it is both "at the ceiling" and
-     * "where the tuning left it". Neutral is the answer, because that is what
-     * the knob was left at -- and the ordering inside i6c_iq_unscale is the
-     * whole of the difference, since a ceiling test placed first reports 255 for
-     * a knob nobody has touched.
+     * Reading it back used to be the ambiguous half: the field held MI's
+     * maximum and so did the baseline, so it was both "at the ceiling" and
+     * "where the tuning left it", and the getter had to choose. It reports the
+     * field now, and the mode says which of the two it is -- so there is
+     * nothing left to disambiguate.
      */
     val = 0;
     CHECK(hal_isp_get_sharpness(&ctx, &val) == RSS_OK, "get must succeed");
-    CHECK(val == 128, "a baseline on the ceiling reads as neutral, got %u", val);
+    CHECK(val == 100, "the field reports itself, got %d", val);
 }
 
 /* Everything outside the run is the tuning's and stays byte-identical. The
@@ -532,7 +549,7 @@ static void test_a_vector_write_touches_only_the_run(void)
         i6c_iq_write(g_sharp, SHARP_RUN + i, 1, g_tuned_sharp[i]);
     memcpy(before, g_sharp, sizeof(before));
 
-    CHECK(hal_isp_set_sharpness(&ctx, 200) == RSS_OK, "set must succeed");
+    CHECK(hal_isp_set_sharpness(&ctx, 100) == RSS_OK, "set must succeed");
 
     CHECK(memcmp(before, g_sharp, I6C_ISP_OPTYPE_OFF) == 0, "bEnable must not move");
     CHECK(memcmp(before + I6C_ISP_OPTYPE_OFF + 4, g_sharp + I6C_ISP_OPTYPE_OFF + 4,
@@ -552,39 +569,38 @@ static void test_a_vector_row_reads_back(void)
 {
     rss_hal_ctx_t ctx;
     infinity6c_state_t st;
-    uint8_t val = 0;
+    int val = 0;
 
     arm(&ctx, &st);
     CHECK(hal_isp_get_sharpness(&ctx, &val) == RSS_OK, "get must succeed");
-    CHECK(val == 128, "an auto module reads as neutral, got %u", val);
+    CHECK(val == RSS_ISP_AUTO, "an auto module reads as auto, got %d", val);
 
-    CHECK(hal_isp_set_sharpness(&ctx, 200) == RSS_OK, "set must succeed");
+    CHECK(hal_isp_set_sharpness(&ctx, 100) == RSS_OK, "set must succeed");
     CHECK(hal_isp_get_sharpness(&ctx, &val) == RSS_OK, "get must succeed");
     /*
-     * 198 and not 200. The row reports from field 3, whose baseline of 60 is
-     * the furthest from both bounds of the six; it holds 97, and 128 +
-     * 37 * 127 / 67 truncates twice on the way there. One step of raptor's 255
-     * is finer than one step of MI's field, so a round trip is within a step or
-     * two by construction -- which is worth pinning exactly, because "close
-     * enough" is how an off-by-one in the scaling would hide.
+     * Exactly 100, not near it. The row reports from field 3, whose baseline
+     * of 60 is the furthest from both bounds of the six, and that field is the
+     * one the value is expressed on -- so what was asked for is what comes
+     * back. This assertion used to read 198 for a knob set to 200, because the
+     * value crossed a 0..255 scale twice and truncated on each pass.
      */
     CHECK(g_iq[IQ_SHARPNESS].report == 3, "field 3 is the best conditioned, picked %u",
           g_iq[IQ_SHARPNESS].report);
-    CHECK(val == 198, "want the value back within a step, got %u", val);
+    CHECK(val == 100, "the value comes back exactly, got %d", val);
 
     /*
-     * Back to neutral, which is where the mode matters and nothing else does.
-     * The module goes to auto and its manual run keeps the 89 the last set left
-     * there -- so a reader that unscaled the run regardless of the mode would
-     * answer 199 for a knob that is once again the tuning's. Only the check on
+     * Back to auto, which is where the mode matters and nothing else does.
+     * The module goes to auto and its manual run keeps the 91 the last set left
+     * there -- so a reader that reported the run regardless of the mode would
+     * answer 91 for a knob that is once again the tuning's. Only the check on
      * enOpType separates them, and only for vector rows does it have to reach
      * past IQ_AUTOMAN to do it.
      */
-    CHECK(hal_isp_set_sharpness(&ctx, 128) == RSS_OK, "set must succeed");
-    CHECK(run_at(g_sharp, SHARP_RUN, 1, 0) == 89, "neutral leaves the run where it was, got %u",
+    CHECK(hal_isp_set_sharpness(&ctx, RSS_ISP_AUTO) == RSS_OK, "set must succeed");
+    CHECK(run_at(g_sharp, SHARP_RUN, 1, 0) == 91, "auto leaves the run where it was, got %u",
           run_at(g_sharp, SHARP_RUN, 1, 0));
     CHECK(hal_isp_get_sharpness(&ctx, &val) == RSS_OK, "get must succeed");
-    CHECK(val == 128, "a module handed back to the tuning reads as neutral, got %u", val);
+    CHECK(val == RSS_ISP_AUTO, "a module handed back to the tuning reads as auto, got %d", val);
 
     /* Before the tuning has loaded there is nothing to ask, and the queue is a
      * better answer than the hardware's. */
@@ -594,7 +610,7 @@ static void test_a_vector_row_reads_back(void)
     CHECK(hal_isp_set_sharpness(&ctx, 77) == RSS_OK, "set must be queued");
     CHECK(g_sharp_sets == 0, "a queued knob must not reach MI, reached it %d times", g_sharp_sets);
     CHECK(hal_isp_get_sharpness(&ctx, &val) == RSS_OK, "get must answer from the queue");
-    CHECK(val == 77, "the queued value is the answer, got %u", val);
+    CHECK(val == 77, "the queued value is the answer, got %d", val);
 }
 
 /*
@@ -613,19 +629,19 @@ static void test_the_reported_field_avoids_a_baseline_on_a_bound(void)
     static const uint16_t tuned[6] = {0, 20, 45, 60, 80, 100};
     rss_hal_ctx_t ctx;
     infinity6c_state_t st;
-    uint8_t val = 0;
+    int val = 0;
 
     arm(&ctx, &st);
     seed_run(g_sharp, sizeof(g_sharp), SHARP_RUN, 1, tuned, 6, I6C_ISP_OP_AUTO);
 
-    CHECK(hal_isp_set_sharpness(&ctx, 64) == RSS_OK, "set must succeed");
+    CHECK(hal_isp_set_sharpness(&ctx, 30) == RSS_OK, "set must succeed");
     /* min(base, 127 - base) is largest at 60, which is field 3. */
     CHECK(g_iq[IQ_SHARPNESS].report == 3,
           "must report from the field furthest from both bounds, "
           "picked %u",
           g_iq[IQ_SHARPNESS].report);
     CHECK(hal_isp_get_sharpness(&ctx, &val) == RSS_OK, "get must succeed");
-    CHECK(val == 64, "the lower half must read back, got %u", val);
+    CHECK(val == 30, "the reported field answers with the value asked for, got %d", val);
 
     /* Field 0 did move; it is only useless to read from. */
     CHECK(run_at(g_sharp, SHARP_RUN, 1, 0) == 0, "field 0 scales to its floor");
@@ -652,11 +668,11 @@ static void test_a_refused_baseline_resets_the_reported_field(void)
     static const uint16_t bad[6] = {10, 20, 45, 90, 80, 200};
     rss_hal_ctx_t ctx;
     infinity6c_state_t st;
-    uint8_t val = 0;
+    int val = 0;
 
     arm(&ctx, &st);
     seed_run(g_sharp, sizeof(g_sharp), SHARP_RUN, 1, good, 6, I6C_ISP_OP_AUTO);
-    CHECK(hal_isp_set_sharpness(&ctx, 200) == RSS_OK, "set must succeed");
+    CHECK(hal_isp_set_sharpness(&ctx, 100) == RSS_OK, "set must succeed");
     CHECK(g_iq[IQ_SHARPNESS].report == 3, "the good run picks field 3, picked %u",
           g_iq[IQ_SHARPNESS].report);
 
@@ -668,27 +684,33 @@ static void test_a_refused_baseline_resets_the_reported_field(void)
     CHECK(!g_iq[IQ_SHARPNESS].base_valid, "the bad run must be refused");
     CHECK(g_iq[IQ_SHARPNESS].report == 0, "and the reported field must go back to 0, is %u",
           g_iq[IQ_SHARPNESS].report);
-    /* Field 0 holds 10 against the fallback neutral of 63: 10 * 128 / 63. */
-    CHECK(val == 20, "must read field 0 against the fallback neutral, got %u", val);
+    /* Field 0 holds 10, and reports it. */
+    CHECK(val == 10, "must read field 0 as it stands, got %d", val);
 }
 
-/* A run that is entirely on a bound has no field that can answer, and neutral
- * is the honest reading: a tuning that turned the module off has made "off" and
- * "as the tuning left it" the same picture. */
-static void test_a_run_entirely_on_a_bound_reports_neutral(void)
+/*
+ * A run entirely on a bound. There is no best-conditioned field to pick, so
+ * field 0 answers -- and it answers with the value that was asked for, because
+ * the pivot and the baselines coincide there and the remap is the identity.
+ *
+ * This used to be the awkward case: with an abstract scale, a tuning that had
+ * turned the module off made "off" and "as the tuning left it" the same
+ * number, and the getter had to pick one. Nothing to pick between now.
+ */
+static void test_a_run_entirely_on_a_bound_reports_the_field(void)
 {
     static const uint16_t off[6] = {0, 0, 0, 0, 0, 0};
     rss_hal_ctx_t ctx;
     infinity6c_state_t st;
-    uint8_t val = 0;
+    int val = 0;
 
     arm(&ctx, &st);
     seed_run(g_sharp, sizeof(g_sharp), SHARP_RUN, 1, off, 6, I6C_ISP_OP_AUTO);
 
-    CHECK(hal_isp_set_sharpness(&ctx, 64) == RSS_OK, "set must succeed");
+    CHECK(hal_isp_set_sharpness(&ctx, 30) == RSS_OK, "set must succeed");
     CHECK(g_iq[IQ_SHARPNESS].report == 0, "with nothing to choose between, field 0");
     CHECK(hal_isp_get_sharpness(&ctx, &val) == RSS_OK, "get must succeed");
-    CHECK(val == 128, "an off module reads as neutral, got %u", val);
+    CHECK(val == 30, "an off module still reports its field, got %d", val);
 }
 
 /* A queued knob is applied by the flush, and against the baseline the load that
@@ -701,12 +723,12 @@ static void test_a_vector_knob_queued_before_the_load_is_flushed(void)
     arm(&ctx, &st);
     st.isp_knobs_live = false;
 
-    CHECK(hal_isp_set_sharpness(&ctx, 200) == RSS_OK, "set must be queued");
+    CHECK(hal_isp_set_sharpness(&ctx, 100) == RSS_OK, "set must be queued");
     CHECK(g_sharp_sets == 0, "nothing may reach MI yet");
 
     i6c_isp_flush_knobs(&st);
     CHECK(g_sharp_sets == 1, "the flush must apply it once, applied %d", g_sharp_sets);
-    CHECK(run_at(g_sharp, SHARP_RUN, 1, 0) == 89, "want 89, got %u",
+    CHECK(run_at(g_sharp, SHARP_RUN, 1, 0) == 91, "want 91, got %u",
           run_at(g_sharp, SHARP_RUN, 1, 0));
 }
 
@@ -728,11 +750,11 @@ static void test_a_run_that_does_not_fit_is_refused(void)
     st.isp.lib = (void *)(uintptr_t)1;
 
     p->count = I6C_IQ_VECTOR_MAX + 1;
-    CHECK(hal_isp_set_sharpness(&ctx, 200) == RSS_ERR_INVAL, "a run longer than base[] is refused");
+    CHECK(hal_isp_set_sharpness(&ctx, 100) == RSS_ERR_INVAL, "a run longer than base[] is refused");
 
     p->count = saved_count;
     p->manual_off = (uint16_t)(p->payload - 2);
-    CHECK(hal_isp_set_sharpness(&ctx, 200) == RSS_ERR_INVAL,
+    CHECK(hal_isp_set_sharpness(&ctx, 100) == RSS_ERR_INVAL,
           "a run reaching past the payload is refused");
 
     p->count = saved_count;
@@ -749,43 +771,81 @@ static void test_a_failing_module_writes_nothing(void)
 
     arm(&ctx, &st);
     g_sharp_get_ret = -1;
-    CHECK(hal_isp_set_sharpness(&ctx, 200) == RSS_ERR_IO, "a failing read is IO");
+    CHECK(hal_isp_set_sharpness(&ctx, 100) == RSS_ERR_IO, "a failing read is IO");
     CHECK(g_sharp_sets == 0, "nothing may be written, wrote %d", g_sharp_sets);
     CHECK(!g_iq[IQ_SHARPNESS].base_valid, "and no baseline may be adopted");
 
     arm(&ctx, &st);
     g_sharp_set_ret = -1;
-    CHECK(hal_isp_set_sharpness(&ctx, 200) == RSS_ERR_IO, "a failing write is IO");
+    CHECK(hal_isp_set_sharpness(&ctx, 100) == RSS_ERR_IO, "a failing write is IO");
 }
 
-/* The scalar rows must be unaffected by all of the above: they share the scale,
- * the fetch and the store. */
-static void test_the_scalar_rows_still_map_the_way_they_did(void)
+/*
+ * The remap that replaced the scalar scale, on its own terms.
+ *
+ * There used to be an abstract 0..255 in front of every row and a pair of
+ * functions mapping to and from MI's range, and this test pinned that pair.
+ * The mapping could not round-trip -- 256 inputs onto a range of 101 or 41 --
+ * so brightness 140 read back 138. Scalar rows now go to the field unchanged
+ * and the remap survives only for the vector rows, where one number has to
+ * drive six fields and there is no single field for it to be.
+ *
+ * The pivot is the reported field's baseline, so the identity that matters is
+ * that asking for the pivot puts every field back exactly where the tuning had
+ * it -- for any baselines at all, not just this test's.
+ */
+static void test_the_remap_is_the_identity_at_the_pivot(void)
 {
-    /* saturation: 0..127 with unity 32, which is where a linear map would
-     * double colour at neutral. */
-    CHECK(i6c_iq_scale(128, 32, 0, 127) == 32, "neutral is unity");
-    CHECK(i6c_iq_scale(255, 32, 0, 127) == 127, "255 is the ceiling");
-    CHECK(i6c_iq_scale(0, 32, 0, 127) == 0, "0 is the floor");
-    CHECK(i6c_iq_scale(64, 32, 0, 127) == 16, "half of neutral is half of unity");
-    CHECK(i6c_iq_unscale(32, 32, 0, 127) == 128, "unity reads as neutral");
-    CHECK(i6c_iq_unscale(127, 32, 0, 127) == 255, "the ceiling reads as 255");
-    CHECK(i6c_iq_unscale(0, 32, 0, 127) == 0, "the floor reads as 0");
+    static const int32_t base[6] = {40, 30, 20, 60, 50, 45};
+    unsigned int i;
 
-    /* ae_comp: signed, and its learned baseline sits on the floor, so MI 0 has
-     * to read as neutral rather than as the bottom. */
-    CHECK(i6c_iq_scale(128, 0, -20, 20) == 0, "neutral is the tuning's own value");
-    CHECK(i6c_iq_scale(0, 0, -20, 20) == -20, "0 is the floor");
-    CHECK(i6c_iq_unscale(0, 0, -20, 20) == 128, "a floor-sitting baseline reads as neutral");
+    for (i = 0; i < 6; i++)
+        CHECK(i6c_iq_reband(60, 60, base[i], 0, 127) == base[i],
+              "field %u must return to its baseline %d, got %d", i, base[i],
+              i6c_iq_reband(60, 60, base[i], 0, 127));
+
+    /* The ends are MI's own, whatever the pivot. */
+    CHECK(i6c_iq_reband(0, 60, 40, 0, 127) == 0, "the floor is the floor");
+    CHECK(i6c_iq_reband(127, 60, 40, 0, 127) == 127, "the ceiling is the ceiling");
+
+    /* Monotonic across the join, so a knob never doubles back on itself. */
+    {
+        int32_t prev = i6c_iq_reband(0, 60, 40, 0, 127);
+        int v;
+
+        for (v = 1; v <= 127; v++) {
+            int32_t got = i6c_iq_reband(v, 60, 40, 0, 127);
+
+            CHECK(got >= prev, "remap must be monotonic: %d gave %d after %d", v, got, prev);
+            prev = got;
+        }
+    }
+
+    /*
+     * A pivot on either bound. The half with no span is unreachable rather
+     * than dangerous -- the clamps and the equality test take every value that
+     * would land there -- and the other half interpolates normally, so the
+     * knob keeps its whole range instead of collapsing. A tuning that asks for
+     * full sharpening gain puts the pivot on the ceiling exactly like this,
+     * and the old scale lost everything above neutral when it did.
+     */
+    CHECK(i6c_iq_reband(10, 0, 40, 0, 127) == 40 + 10 * (127 - 40) / 127,
+          "a pivot on the floor still interpolates upward, got %d",
+          i6c_iq_reband(10, 0, 40, 0, 127));
+    CHECK(i6c_iq_reband(100, 127, 40, 0, 127) == 100 * 40 / 127,
+          "a pivot on the ceiling still interpolates downward, got %d",
+          i6c_iq_reband(100, 127, 40, 0, 127));
+    CHECK(i6c_iq_reband(0, 127, 40, 0, 127) == 0, "and still reaches the floor");
 }
 
 /*
  * DRC has to mean on raptor what it meant on majestic, because that is where
  * the numbers in people's configs come from: overrideWdr wrote its value
  * straight into WDR's manual Strength byte, so 100 is 100 and 200 is 200. The
- * unity-128-on-a-0..255-field row makes i6c_iq_scale the identity, and this is
- * what pins that down -- a plausible-looking unity of, say, 127 would put every
- * value one off and nobody would notice from the picture.
+ * value goes to the field unchanged, which is now true of every scalar row
+ * rather than an accident of this one's unity -- and this is what pins it down.
+ * The one thing that has changed for the better: 128 was the one strength the
+ * knob could not ask for, because it was spent on auto. It is reachable now.
  */
 static void test_drc_carries_the_majestic_scale_onto_wdr(void)
 {
@@ -815,12 +875,20 @@ static void test_drc_carries_the_majestic_scale_onto_wdr(void)
     CHECK(run_at(g_wdr, DRC_OFF, 1, 0) == 255, "drc 255 is Strength 255, got %u",
           run_at(g_wdr, DRC_OFF, 1, 0));
 
-    /* Neutral hands the module back to the tuning and leaves the byte alone --
+    /*
+     * 128 is now just a strength like any other -- it used to be the one value
+     * this knob could not ask for, because it was spent on meaning auto.
+     */
+    CHECK(hal_isp_set_drc_strength(&ctx, 128) == RSS_OK, "drc 128 must take");
+    CHECK(run_at(g_wdr, DRC_OFF, 1, 0) == 128, "drc 128 is Strength 128, got %u",
+          run_at(g_wdr, DRC_OFF, 1, 0));
+
+    /* Auto hands the module back to the tuning and leaves the byte alone --
      * the curve is what takes over, so whatever sits in manual stops mattering. */
-    CHECK(hal_isp_set_drc_strength(&ctx, 128) == RSS_OK, "neutral must take");
+    CHECK(hal_isp_set_drc_strength(&ctx, RSS_ISP_AUTO) == RSS_OK, "auto must take");
     CHECK(i6c_iq_read(g_wdr, I6C_ISP_OPTYPE_OFF, 4) == I6C_ISP_OP_AUTO,
-          "neutral must put WDR back into auto");
-    CHECK(run_at(g_wdr, DRC_OFF, 1, 0) == 255, "neutral must not rewrite the level, got %u",
+          "auto must put WDR back into auto");
+    CHECK(run_at(g_wdr, DRC_OFF, 1, 0) == 128, "auto must not rewrite the level, got %u",
           run_at(g_wdr, DRC_OFF, 1, 0));
 }
 
@@ -971,48 +1039,55 @@ static void test_the_awb_line_survives_ae_winning_the_race(void)
  * held rather than written, which is what lets the mapping be checked without
  * mocking MI at all.
  */
-static void test_temper_neutral_is_the_level_the_pipeline_comes_up_on(void)
+static void test_temper_is_a_level_and_says_so(void)
 {
     rss_hal_ctx_t ctx;
     infinity6c_state_t st;
+    rss_isp_knob_t caps;
     void *c = &ctx;
-    uint8_t v = 0;
+    int v = 0;
+    int lvl;
 
     reset(&st);
     memset(&ctx, 0, sizeof(ctx));
     ctx.platform = &st;
     st.isp_nr3d_req = 1;
 
-    CHECK(hal_isp_set_temper_strength(c, I6C_ISP_NEUTRAL) == RSS_OK, "neutral temper succeeds");
-    CHECK(st.isp_nr3d_req == 1, "neutral must be level 1, got %d", st.isp_nr3d_req);
-
-    CHECK(hal_isp_set_temper_strength(c, 255) == RSS_OK, "max temper succeeds");
-    CHECK(st.isp_nr3d_req == 7, "255 must be level 7, got %d", st.isp_nr3d_req);
-
-    CHECK(hal_isp_set_temper_strength(c, 0) == RSS_OK, "min temper succeeds");
-    CHECK(st.isp_nr3d_req == 0, "0 must be level 0, got %d", st.isp_nr3d_req);
-
-    /* The upper half spans six levels over 127 steps, so it has to move --
-     * a unity of 1 must not flatten everything above neutral onto 1 or 7. */
-    CHECK(hal_isp_set_temper_strength(c, 200) == RSS_OK, "an upper-half temper succeeds");
-    CHECK(st.isp_nr3d_req > 1 && st.isp_nr3d_req < 7,
-          "200 must land between neutral and the top, got %d", st.isp_nr3d_req);
-
-    /* And the lower half has one level to reach, so it must reach it. */
-    CHECK(hal_isp_set_temper_strength(c, 60) == RSS_OK, "a lower-half temper succeeds");
-    CHECK(st.isp_nr3d_req == 0, "60 must land below neutral, got %d", st.isp_nr3d_req);
+    /*
+     * Every level the channel has, reachable and reported as itself. Under
+     * the abstract scale only two of the eight were reachable below neutral:
+     * the pipeline comes up on level 1, so a unity of 1 over a floor of 0 left
+     * exactly one level under neutral and raptor 1..127 all asked for level 0.
+     * Seven eighths of the bottom half of the knob meant "off", and a config
+     * that had round-tripped through get-isp carried 36 for what used to be
+     * the default -- which then meant off.
+     */
+    for (lvl = 0; lvl <= 7; lvl++) {
+        CHECK(hal_isp_set_temper_strength(c, lvl) == RSS_OK, "level %d succeeds", lvl);
+        CHECK(st.isp_nr3d_req == lvl, "level %d must be held as itself, got %d", lvl,
+              st.isp_nr3d_req);
+    }
 
     /* Round trip. With no channel to ask, the getter reports the request. */
     st.isp_nr3d_req = 1;
     CHECK(hal_isp_get_temper_strength(c, &v) == RSS_OK, "get succeeds");
-    CHECK(v == I6C_ISP_NEUTRAL, "level 1 must read back as neutral, got %u", v);
+    CHECK(v == 1, "level 1 must read back as 1, got %d", v);
 
     st.isp_nr3d_req = 7;
     CHECK(hal_isp_get_temper_strength(c, &v) == RSS_OK, "get succeeds at the top");
-    CHECK(v == 255, "level 7 must read back as 255, got %u", v);
+    CHECK(v == 7, "level 7 must read back as 7, got %d", v);
 
-    CHECK(hal_isp_set_temper_strength(c, 256) == RSS_ERR_INVAL, "out of range is refused");
-    CHECK(hal_isp_set_temper_strength(NULL, 128) == RSS_ERR_INVAL, "NULL ctx is refused");
+    /* And the caps say all of that rather than leaving a client to guess a
+     * 0..255 slider over eight positions. */
+    CHECK(hal_isp_get_knob_caps(c, "temper", &caps) == RSS_OK, "temper publishes caps");
+    CHECK(caps.min == 0 && caps.max == 7, "the channel's levels, got %d..%d", caps.min, caps.max);
+    CHECK(caps.neutral == 1, "the level the pipeline comes up on, got %d", caps.neutral);
+    CHECK(!caps.has_auto, "a channel level has no tuning curve to hand back");
+
+    CHECK(hal_isp_set_temper_strength(c, 8) == RSS_ERR_INVAL, "out of range is refused");
+    CHECK(hal_isp_set_temper_strength(c, RSS_ISP_AUTO) == RSS_ERR_INVAL,
+          "and so is auto, which this knob does not have");
+    CHECK(hal_isp_set_temper_strength(NULL, 1) == RSS_ERR_INVAL, "NULL ctx is refused");
 }
 
 int main(void)
@@ -1031,16 +1106,16 @@ int main(void)
     test_a_vector_row_reads_back();
     test_the_reported_field_avoids_a_baseline_on_a_bound();
     test_a_refused_baseline_resets_the_reported_field();
-    test_a_run_entirely_on_a_bound_reports_neutral();
+    test_a_run_entirely_on_a_bound_reports_the_field();
     test_a_vector_knob_queued_before_the_load_is_flushed();
     test_a_run_that_does_not_fit_is_refused();
     test_a_failing_module_writes_nothing();
-    test_the_scalar_rows_still_map_the_way_they_did();
+    test_the_remap_is_the_identity_at_the_pivot();
     test_drc_carries_the_majestic_scale_onto_wdr();
     test_drc_does_not_switch_a_disabled_module_on();
     test_a_drc_write_touches_only_the_level();
     test_the_awb_line_survives_ae_winning_the_race();
-    test_temper_neutral_is_the_level_the_pipeline_comes_up_on();
+    test_temper_is_a_level_and_says_so();
 
     if (failures) {
         printf("t_isp_i6c: %d failure(s)\n", failures);

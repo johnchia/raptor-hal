@@ -123,19 +123,19 @@ int hal_enc_query(void *ctx, int chn, bool *busy);
 int hal_isp_get_exposure(void *ctx, rss_exposure_t *exposure);
 int hal_isp_get_sensor_attr(void *ctx, uint32_t *width, uint32_t *height);
 int hal_isp_set_brightness(void *ctx, int val);
-int hal_isp_get_brightness(void *ctx, uint8_t *val);
+int hal_isp_get_brightness(void *ctx, int *val);
 int hal_isp_set_contrast(void *ctx, int val);
-int hal_isp_get_contrast(void *ctx, uint8_t *val);
+int hal_isp_get_contrast(void *ctx, int *val);
 int hal_isp_set_saturation(void *ctx, int val);
-int hal_isp_get_saturation(void *ctx, uint8_t *val);
+int hal_isp_get_saturation(void *ctx, int *val);
 int hal_isp_set_drc_strength(void *ctx, int val);
-int hal_isp_get_drc_strength(void *ctx, uint8_t *val);
+int hal_isp_get_drc_strength(void *ctx, int *val);
 int hal_isp_set_sharpness(void *ctx, int val);
-int hal_isp_get_sharpness(void *ctx, uint8_t *val);
+int hal_isp_get_sharpness(void *ctx, int *val);
 int hal_isp_set_defog(void *ctx, int enable);
 int hal_isp_set_defog_strength(void *ctx, int val);
 int hal_isp_set_defog_strength_adv(void *ctx, const void *defog_attr);
-int hal_isp_get_defog_strength(void *ctx, uint8_t *val);
+int hal_isp_get_defog_strength(void *ctx, int *val);
 int hal_isp_set_ae_comp(void *ctx, int val);
 int hal_isp_get_ae_comp(void *ctx, int *val);
 int hal_isp_set_antiflicker(void *ctx, rss_antiflicker_t mode);
@@ -146,7 +146,8 @@ int hal_isp_set_hflip(void *ctx, int enable);
 int hal_isp_set_vflip(void *ctx, int enable);
 int hal_isp_get_hvflip(void *ctx, int *hflip, int *vflip);
 int hal_isp_set_temper_strength(void *ctx, int val);
-int hal_isp_get_temper_strength(void *ctx, uint8_t *val);
+int hal_isp_get_temper_strength(void *ctx, int *val);
+int hal_isp_get_knob_caps(void *ctx, const char *name, rss_isp_knob_t *caps);
 int hal_isp_set_sensor_fps(void *ctx, uint32_t fps_num, uint32_t fps_den);
 int hal_isp_get_sensor_fps(void *ctx, uint32_t *fps_num, uint32_t *fps_den);
 
@@ -729,6 +730,7 @@ static const rss_hal_ops_t g_ops = {
      */
     .isp_set_brightness = hal_isp_set_brightness,
     .isp_get_brightness = hal_isp_get_brightness,
+    .isp_get_knob_caps = hal_isp_get_knob_caps,
     .isp_set_contrast = hal_isp_set_contrast,
     .isp_get_contrast = hal_isp_get_contrast,
     /*

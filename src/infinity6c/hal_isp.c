@@ -48,9 +48,6 @@
 
 #include "infinity6c_state.h"
 
-/* raptor's scale is 0..255 with 128 meaning "leave it where the tuning put it". */
-#define I6C_ISP_NEUTRAL 128
-
 /* Offsets and values inside a { bEnable, enOpType, stAuto[16], stManual } payload. */
 #define I6C_ISP_ENABLE_OFF 0u
 #define I6C_ISP_OPTYPE_OFF 4u
@@ -474,6 +471,29 @@ static uint32_t i6c_iq_read(const uint8_t *buf, uint16_t off, uint8_t width)
     return v;
 }
 
+/*
+ * Read a field back as a number rather than a bit pattern.
+ *
+ * `signed_field` comes from the row having a negative floor, which on this SoC
+ * is ae_comp and nothing else. Its field is four bytes wide so the cast alone
+ * would do, but a row is a row: a two-byte signed field added later would
+ * otherwise come back as a large positive number and nothing would say why.
+ */
+static int i6c_iq_sign_extend(uint32_t v, uint8_t width, bool signed_field)
+{
+    if (!signed_field)
+        return (int)v;
+
+    switch (width) {
+    case 1:
+        return (int8_t)v;
+    case 2:
+        return (int16_t)v;
+    default:
+        return (int32_t)v;
+    }
+}
+
 static void i6c_iq_write(uint8_t *buf, uint16_t off, uint8_t width, uint32_t val)
 {
     switch (width) {
@@ -699,79 +719,64 @@ static int i6c_iq_store(infinity6c_state_t *st, int idx, uint8_t *buf)
 }
 
 /*
- * Map raptor's 0..255 onto MI's range, piecewise so neutral lands exactly on
- * MI's own unity value. A single linear map would not: with saturation's unity at
- * 32 of 127, linear scaling puts raptor's neutral at 64 -- twice unity gain -- and
- * every default config would boost colour.
+ * Re-express a value given on one band's scale onto another band's, each about
+ * its own tuned baseline.
+ *
+ * Only the vector rows need this. A scalar knob is now written straight to its
+ * field -- the number the operator gave is the number MI gets, which is the
+ * whole point of speaking the hardware's units.
+ *
+ * A vector row has no single field to be, though: sharpness is six band gains
+ * and the tuning has already chosen how much high frequency to run relative to
+ * low. That shape is the tuner's judgement about this sensor and lens and is
+ * not something one knob should rewrite, so the knob names what the *reported*
+ * band should become and the rest follow proportionally about their own
+ * baselines. Piecewise about the pivot rather than one straight line, so
+ * asking for exactly the tuning's own value returns exactly the tuning.
+ *
+ * The shape does flatten near the ceiling, because the bands run out of
+ * headroom at different distances from their baselines and the ceiling is
+ * shared. That is inherent in "maximum" meaning maximum.
  */
-static int32_t i6c_iq_scale(int val, int32_t unity, int32_t floor, int32_t max)
+static int32_t i6c_iq_reband(int val, int32_t from, int32_t to, int32_t floor, int32_t max)
 {
-    if (val <= 0)
+    if (val <= floor)
         return floor;
-    if (val >= 255)
+    if (val >= max)
         return max;
-    if (val == I6C_ISP_NEUTRAL)
-        return unity;
+    if (val == from)
+        return to;
 
     /*
-     * A baseline sitting on the ceiling needs no special case: the upper branch
-     * below spans max - unity, which is then zero, so every value above neutral
-     * lands on the baseline and the knob simply has no headroom. What it must
-     * not do is give up on the lower half as well, which a `unity >= max` bail
-     * here used to -- and a tuning that asks for full-strength denoise is
-     * exactly the case, since MI's own unity for that field is its maximum.
+     * A pivot on one of the bounds needs no special case, and it is worth
+     * saying why: reaching either branch means val is strictly between the
+     * pivot and that bound, so the span being divided by is at least one. A
+     * pivot on the floor cannot reach the lower branch, because everything at
+     * or below the floor was clamped and everything equal to the pivot
+     * returned; a pivot on the ceiling cannot reach the upper one. Sharpness
+     * tunings that ask for full gain put the pivot exactly there.
      */
-    if (val < I6C_ISP_NEUTRAL)
-        return floor + (int32_t)(((int64_t)val * (unity - floor)) / I6C_ISP_NEUTRAL);
+    if (val < from)
+        return floor + (int32_t)(((int64_t)(val - floor) * (to - floor)) / (from - floor));
 
-    return unity +
-           (int32_t)(((int64_t)(val - I6C_ISP_NEUTRAL) * (max - unity)) / (255 - I6C_ISP_NEUTRAL));
-}
-
-/* Inverse of i6c_iq_scale, for the getters. */
-static uint8_t i6c_iq_unscale(int32_t mi, int32_t unity, int32_t floor, int32_t max)
-{
-    if (max == floor)
-        return 255;
-    /*
-     * Ahead of both bound tests, which would otherwise swallow it: a learned
-     * baseline can sit on either end, and there MI's own extreme is neutral
-     * rather than the extreme. Sitting on the floor is the ae_comp case and
-     * makes 0 mean neutral; sitting on the ceiling is the full-strength denoise
-     * case and makes the maximum mean it.
-     *
-     * Which does leave the reading ambiguous at whichever end the baseline is
-     * on -- MI cannot distinguish "asked for neutral" from "asked for the end"
-     * when they are the same number -- and neutral is the better answer, since
-     * it is what the knob was left at rather than what it was driven to.
-     */
-    if (mi == unity)
-        return I6C_ISP_NEUTRAL;
-    if (mi >= max)
-        return 255;
-    if (mi <= floor)
-        return 0;
-
-    if (mi < unity)
-        return (uint8_t)(((int64_t)(mi - floor) * I6C_ISP_NEUTRAL) / (unity - floor));
-
-    return (uint8_t)(I6C_ISP_NEUTRAL +
-                     ((int64_t)(mi - unity) * (255 - I6C_ISP_NEUTRAL)) / (max - unity));
+    return to + (int32_t)(((int64_t)(val - from) * (max - to)) / (max - from));
 }
 
 /*
- * Apply one of raptor's 0..255 scalars.
+ * Apply a scalar knob, in MI's own units.
  *
- * Neutral restores auto and leaves the manual field alone -- see THE TUNING
- * BINARY OUTRANKS THE CONFIG. bEnable is never touched here: if the tuning
- * disabled a module, re-enabling it behind the tuner's back is not this layer's
- * call.
+ * RSS_ISP_AUTO restores auto and leaves the manual field alone -- see THE
+ * TUNING BINARY OUTRANKS THE CONFIG. Any other value is written to the field
+ * unchanged; there is no scale in the way any more, so what the operator asked
+ * for is what MI is given and what a read gives back.
+ *
+ * bEnable is never touched here: if the tuning disabled a module, re-enabling
+ * it behind the tuner's back is not this layer's call.
  */
 static int i6c_iq_apply_scalar(infinity6c_state_t *st, int idx, int val)
 {
     i6c_iq_param_t *p = &g_iq[idx];
     uint8_t buf[I6C_IQ_PAYLOAD_MAX];
-    int32_t mi_val;
     int ret;
 
     ret = i6c_iq_fetch(st, idx, buf);
@@ -779,7 +784,7 @@ static int i6c_iq_apply_scalar(infinity6c_state_t *st, int idx, int val)
         return ret;
 
     if (p->shape == IQ_AUTOMAN) {
-        if (val == I6C_ISP_NEUTRAL) {
+        if (val == RSS_ISP_AUTO) {
             i6c_iq_write(buf, I6C_ISP_OPTYPE_OFF, 4, I6C_ISP_OP_AUTO);
             HAL_LOG_DBG("isp: %s left to the tuning file (auto)", p->name);
             return i6c_iq_store(st, idx, buf);
@@ -794,8 +799,8 @@ static int i6c_iq_apply_scalar(infinity6c_state_t *st, int idx, int val)
          */
         if (i6c_iq_read(buf, I6C_ISP_OPTYPE_OFF, 4) == I6C_ISP_OP_AUTO)
             HAL_LOG_INFO("isp: %s goes manual, so the tuning's per-gain curve for it stops "
-                         "being used; set %s back to %d to restore it",
-                         p->name, p->name, I6C_ISP_NEUTRAL);
+                         "being used; set %s back to auto to restore it",
+                         p->name, p->name);
         /*
          * A module the tuning switched off takes the write and ignores it.
          * Worth a word: the alternative is a knob that reads back exactly what
@@ -808,20 +813,19 @@ static int i6c_iq_apply_scalar(infinity6c_state_t *st, int idx, int val)
         i6c_iq_write(buf, I6C_ISP_OPTYPE_OFF, 4, I6C_ISP_OP_MANUAL);
     }
 
-    mi_val = i6c_iq_scale(val, p->mi_unity, p->mi_floor, p->mi_max);
     /* The cast is the two's-complement pattern MI wants for a negative field,
      * and a no-op for every other row. */
-    i6c_iq_write(buf, p->manual_off, p->width, (uint32_t)mi_val);
+    i6c_iq_write(buf, p->manual_off, p->width, (uint32_t)val);
 
     ret = i6c_iq_store(st, idx, buf);
     if (ret == RSS_OK)
-        HAL_LOG_DBG("isp: %s = %d (MI %d in %d..%d)", p->name, val, mi_val, p->mi_floor, p->mi_max);
+        HAL_LOG_DBG("isp: %s = %d (in %d..%d)", p->name, val, p->mi_floor, p->mi_max);
 
     return ret;
 }
 
 /*
- * Apply one of raptor's 0..255 scalars to a module that has no scalar in it.
+ * Apply a knob to a module that has no single field meaning "how much".
  *
  * Sharpness and spatial denoise are per-band tables here: six sharpening gains
  * across three frequencies and two sharpener kinds, two denoise blend weights.
@@ -832,15 +836,13 @@ static int i6c_iq_apply_scalar(infinity6c_state_t *st, int idx, int val)
  * and a tuning binary that has already chosen a *shape* for them -- how much
  * high frequency relative to low, how much directional relative to
  * undirectional. That shape is the tuner's judgement about this sensor and this
- * lens, and it is not something a single knob has any business rewriting. So
- * the knob scales the run, each field about its own baseline, and the shape
- * survives: raptor's 128 is the tuning untouched, 0 is the module off, 255 is
- * every field at MI's ceiling, and everything between moves them together.
+ * lens, and it is not something a single knob has any business rewriting.
  *
- * The shape does flatten as the knob approaches 255, because the fields run out
- * of headroom at different distances from their baselines and the ceiling is
- * shared. That is inherent in "maximum" meaning maximum, and it is the same
- * thing i6c_iq_scale already does to every scalar row at the top of its range.
+ * So the value names what the *reported* band should become, on that band's own
+ * scale, and the rest follow proportionally about their own baselines -- see
+ * i6c_iq_reband. Asking for the reported band's tuned baseline therefore puts
+ * every band back exactly where the tuning had it, the floor turns the module
+ * off and the ceiling pins every band at MI's maximum.
  *
  * Scaled from the learned baseline and never from what is in the field now --
  * see base_valid, and i6c_iq_flush_knobs for when a baseline goes stale.
@@ -849,6 +851,7 @@ static int i6c_iq_apply_vector(infinity6c_state_t *st, int idx, int val)
 {
     i6c_iq_param_t *p = &g_iq[idx];
     uint8_t buf[I6C_IQ_PAYLOAD_MAX];
+    int32_t pivot;
     unsigned int i;
     int ret;
 
@@ -857,7 +860,7 @@ static int i6c_iq_apply_vector(infinity6c_state_t *st, int idx, int val)
     if (ret != RSS_OK)
         return ret;
 
-    if (val == I6C_ISP_NEUTRAL) {
+    if (val == RSS_ISP_AUTO) {
         i6c_iq_write(buf, I6C_ISP_OPTYPE_OFF, 4, I6C_ISP_OP_AUTO);
         HAL_LOG_DBG("isp: %s left to the tuning file (auto)", p->name);
         return i6c_iq_store(st, idx, buf);
@@ -867,22 +870,24 @@ static int i6c_iq_apply_vector(infinity6c_state_t *st, int idx, int val)
      * survives a vector write, but the per-gain curve does not. */
     if (i6c_iq_read(buf, I6C_ISP_OPTYPE_OFF, 4) == I6C_ISP_OP_AUTO)
         HAL_LOG_INFO("isp: %s goes manual, so the tuning's per-gain curve for it stops being "
-                     "used; set %s back to %d to restore it",
-                     p->name, p->name, I6C_ISP_NEUTRAL);
+                     "used; set %s back to auto to restore it",
+                     p->name, p->name);
     i6c_iq_write(buf, I6C_ISP_OPTYPE_OFF, 4, I6C_ISP_OP_MANUAL);
 
+    pivot = i6c_iq_baseline(p, p->report);
     for (i = 0; i < p->count; i++) {
-        int32_t mi_val = i6c_iq_scale(val, i6c_iq_baseline(p, i), p->mi_floor, p->mi_max);
+        int32_t mi_val = i6c_iq_reband(val, pivot, i6c_iq_baseline(p, i), p->mi_floor, p->mi_max);
 
         i6c_iq_write(buf, p->manual_off + i * p->width, p->width, (uint32_t)mi_val);
     }
 
     ret = i6c_iq_store(st, idx, buf);
     if (ret == RSS_OK)
-        HAL_LOG_DBG("isp: %s = %d (%u fields, MI %d..%d in %d..%d)", p->name, val, p->count,
-                    i6c_iq_scale(val, i6c_iq_baseline(p, 0), p->mi_floor, p->mi_max),
-                    i6c_iq_scale(val, i6c_iq_baseline(p, p->count - 1), p->mi_floor, p->mi_max),
-                    p->mi_floor, p->mi_max);
+        HAL_LOG_DBG(
+            "isp: %s = %d (%u fields, MI %d..%d in %d..%d)", p->name, val, p->count,
+            i6c_iq_reband(val, pivot, i6c_iq_baseline(p, 0), p->mi_floor, p->mi_max),
+            i6c_iq_reband(val, pivot, i6c_iq_baseline(p, p->count - 1), p->mi_floor, p->mi_max),
+            p->mi_floor, p->mi_max);
 
     return ret;
 }
@@ -952,9 +957,22 @@ static int i6c_iq_set(void *ctx, int idx, int val, bool raw)
     return i6c_iq_apply(st, idx, val, raw);
 }
 
+/*
+ * The gate for a knob written in MI's units: either the request to hand the
+ * module back to the tuning, or a value the field can actually hold.
+ *
+ * Range-checking here rather than at the caller is what makes the daemon's
+ * published caps and the accepted values the same thing by construction --
+ * hal_isp_get_knob_caps reports these very fields.
+ */
 static int i6c_iq_set_scalar(void *ctx, int idx, int val)
 {
-    if (val < 0 || val > 255)
+    i6c_iq_param_t *p = &g_iq[idx];
+
+    if (val == RSS_ISP_AUTO)
+        return I6C_IQ_HAS_AUTO(p) ? i6c_iq_set(ctx, idx, val, false) : RSS_ERR_INVAL;
+
+    if (val < p->mi_floor || val > p->mi_max)
         return RSS_ERR_INVAL;
 
     return i6c_iq_set(ctx, idx, val, false);
@@ -973,7 +991,7 @@ static int i6c_iq_set_raw(void *ctx, int idx, uint32_t raw)
  * module still holds the tuning's value and the queued one is what the operator
  * set, so the queue is the better answer there.
  */
-static int i6c_iq_get_scalar(void *ctx, int idx, uint8_t *val)
+static int i6c_iq_get_scalar(void *ctx, int idx, int *val)
 {
     infinity6c_state_t *st = i6c_state(ctx);
     i6c_iq_param_t *p = &g_iq[idx];
@@ -986,7 +1004,7 @@ static int i6c_iq_get_scalar(void *ctx, int idx, uint8_t *val)
     if (!st->isp_knobs_live) {
         if (!p->has_pending || p->pending_is_raw)
             return RSS_ERR_BUSY;
-        *val = (uint8_t)p->pending;
+        *val = p->pending;
         return RSS_OK;
     }
 
@@ -995,11 +1013,14 @@ static int i6c_iq_get_scalar(void *ctx, int idx, uint8_t *val)
         return ret;
 
     /*
-     * An auto module is reporting the tuning's value, not one of raptor's, and
-     * neutral is exactly what raptor calls that.
+     * A module in auto is not holding a value of raptor's at all -- the manual
+     * field it would report is stale, whatever was there before the module was
+     * handed back. So say auto, rather than quoting a number that is not in
+     * use. This used to answer with the neutral 128, which was the same claim
+     * made in a way the caller could not distinguish from a real setting.
      */
     if (I6C_IQ_HAS_AUTO(p) && i6c_iq_read(buf, I6C_ISP_OPTYPE_OFF, 4) == I6C_ISP_OP_AUTO) {
-        *val = I6C_ISP_NEUTRAL;
+        *val = RSS_ISP_AUTO;
         return RSS_OK;
     }
 
@@ -1008,9 +1029,13 @@ static int i6c_iq_get_scalar(void *ctx, int idx, uint8_t *val)
      * along with the baseline -- see i6c_iq_pick_report_field. report is 0 for
      * every other shape, which is what lets this be one expression for all of
      * them.
+     *
+     * Returned as it sits, with nothing to undo: the value written was on this
+     * field's own scale, so this is the same number the setter was given. The
+     * sign extension is for ae_comp, the one row whose MI field is signed.
      */
-    *val = i6c_iq_unscale((int32_t)i6c_iq_read(buf, p->manual_off + p->report * p->width, p->width),
-                          i6c_iq_baseline(p, p->report), p->mi_floor, p->mi_max);
+    *val = i6c_iq_sign_extend(i6c_iq_read(buf, p->manual_off + p->report * p->width, p->width),
+                              p->width, p->mi_floor < 0);
     return RSS_OK;
 }
 
@@ -1183,17 +1208,17 @@ int hal_isp_set_saturation(void *ctx, int val)
     return i6c_iq_set_scalar(ctx, IQ_SATURATION, val);
 }
 
-int hal_isp_get_brightness(void *ctx, uint8_t *val)
+int hal_isp_get_brightness(void *ctx, int *val)
 {
     return i6c_iq_get_scalar(ctx, IQ_BRIGHTNESS, val);
 }
 
-int hal_isp_get_contrast(void *ctx, uint8_t *val)
+int hal_isp_get_contrast(void *ctx, int *val)
 {
     return i6c_iq_get_scalar(ctx, IQ_CONTRAST, val);
 }
 
-int hal_isp_get_saturation(void *ctx, uint8_t *val)
+int hal_isp_get_saturation(void *ctx, int *val)
 {
     return i6c_iq_get_scalar(ctx, IQ_SATURATION, val);
 }
@@ -1238,7 +1263,7 @@ int hal_isp_set_drc_strength(void *ctx, int val)
     return i6c_iq_set_scalar(ctx, IQ_DRC, val);
 }
 
-int hal_isp_get_drc_strength(void *ctx, uint8_t *val)
+int hal_isp_get_drc_strength(void *ctx, int *val)
 {
     return i6c_iq_get_scalar(ctx, IQ_DRC, val);
 }
@@ -1248,7 +1273,7 @@ int hal_isp_set_sharpness(void *ctx, int val)
     return i6c_iq_set_scalar(ctx, IQ_SHARPNESS, val);
 }
 
-int hal_isp_get_sharpness(void *ctx, uint8_t *val)
+int hal_isp_get_sharpness(void *ctx, int *val)
 {
     return i6c_iq_get_scalar(ctx, IQ_SHARPNESS, val);
 }
@@ -1283,7 +1308,7 @@ int hal_isp_set_defog_strength_adv(void *ctx, const void *defog_attr)
     return i6c_iq_set_scalar(ctx, IQ_DEFOG, *(const uint8_t *)defog_attr);
 }
 
-int hal_isp_get_defog_strength(void *ctx, uint8_t *val)
+int hal_isp_get_defog_strength(void *ctx, int *val)
 {
     return i6c_iq_get_scalar(ctx, IQ_DEFOG, val);
 }
@@ -1293,19 +1318,14 @@ int hal_isp_set_ae_comp(void *ctx, int val)
     return i6c_iq_set_scalar(ctx, AE_EVCOMP, val);
 }
 
+/*
+ * The one row whose MI field is signed, and now the only getter with nothing
+ * to undo on the way out: EV compensation is reported in MI's own EV steps,
+ * which is what the caller asked for in.
+ */
 int hal_isp_get_ae_comp(void *ctx, int *val)
 {
-    uint8_t v;
-    int ret;
-
-    if (!val)
-        return RSS_ERR_INVAL;
-
-    ret = i6c_iq_get_scalar(ctx, AE_EVCOMP, &v);
-    if (ret == RSS_OK)
-        *val = v;
-
-    return ret;
+    return i6c_iq_get_scalar(ctx, AE_EVCOMP, val);
 }
 
 int hal_isp_set_antiflicker(void *ctx, rss_antiflicker_t mode)
@@ -1618,11 +1638,18 @@ int hal_isp_set_temper_strength(void *ctx, int val)
 
     if (!st)
         return RSS_ERR_INVAL;
-    if (val < 0 || val > 255)
+    /*
+     * Eight positions, said as eight. The old abstract 0..255 had to squeeze
+     * them into a scale with a neutral in the middle, and since the default is
+     * level 1 -- the second of the eight -- that left exactly one level below
+     * neutral and put raptor 1..127 all on level 0. Seven-eighths of the lower
+     * half of the knob meant "off". Here the number is the level.
+     */
+    if (val < 0 || val > I6C_ISP_NR3D_MAX)
         return RSS_ERR_INVAL;
 
     prev = st->isp_nr3d_req;
-    st->isp_nr3d_req = i6c_iq_scale(val, I6C_ISP_NR3D_UNITY, 0, I6C_ISP_NR3D_MAX);
+    st->isp_nr3d_req = val;
 
     ret = i6c_isp_apply_chn_param(st);
     if (ret != RSS_OK) {
@@ -1634,7 +1661,7 @@ int hal_isp_set_temper_strength(void *ctx, int val)
     return RSS_OK;
 }
 
-int hal_isp_get_temper_strength(void *ctx, uint8_t *val)
+int hal_isp_get_temper_strength(void *ctx, int *val)
 {
     infinity6c_state_t *st = i6c_state(ctx);
     i6c_isp_para para;
@@ -1655,7 +1682,96 @@ int hal_isp_get_temper_strength(void *ctx, uint8_t *val)
     if (level > I6C_ISP_NR3D_MAX)
         level = I6C_ISP_NR3D_MAX;
 
-    *val = i6c_iq_unscale(level, I6C_ISP_NR3D_UNITY, 0, I6C_ISP_NR3D_MAX);
+    *val = level;
+    return RSS_OK;
+}
+
+/* ================================================================
+ * KNOB CAPABILITIES
+ * ================================================================ */
+
+/*
+ * The daemon's key name for each row it publishes.
+ *
+ * Kept separate from i6c_iq_param_t::name because the two are not the same
+ * vocabulary and pretending otherwise would be a quiet lie: the table calls
+ * the WDR module "drc" and the Defog module "defog", where the config and the
+ * control protocol call them "drc_strength" and "defog_strength". Only the
+ * rows named here answer, which keeps the caps reply and hal_common.c's ops
+ * table describing the same set -- a row this platform declines to publish,
+ * like saturation, is absent from both.
+ */
+static const struct {
+    const char *key;
+    int idx;
+} i6c_knob_keys[] = {
+    {"brightness", IQ_BRIGHTNESS}, {"contrast", IQ_CONTRAST}, {"sharpness", IQ_SHARPNESS},
+    {"defog_strength", IQ_DEFOG},  {"drc_strength", IQ_DRC},  {"ae_comp", AE_EVCOMP},
+};
+
+int hal_isp_get_knob_caps(void *ctx, const char *name, rss_isp_knob_t *caps)
+{
+    infinity6c_state_t *st = i6c_state(ctx);
+    uint8_t buf[I6C_IQ_PAYLOAD_MAX];
+    i6c_iq_param_t *p;
+    size_t i;
+
+    if (!st || !name || !caps)
+        return RSS_ERR_INVAL;
+
+    /*
+     * Not an IQ module at all: 3DNR is a VPE channel parameter, so it has a
+     * level rather than a curve and there is no auto to hand it back to.
+     */
+    if (strcmp(name, "temper") == 0) {
+        caps->min = 0;
+        caps->max = I6C_ISP_NR3D_MAX;
+        caps->neutral = I6C_ISP_NR3D_UNITY;
+        caps->has_auto = false;
+        caps->enabled = true;
+        return RSS_OK;
+    }
+
+    for (i = 0; i < sizeof(i6c_knob_keys) / sizeof(i6c_knob_keys[0]); i++)
+        if (strcmp(i6c_knob_keys[i].key, name) == 0)
+            break;
+    if (i == sizeof(i6c_knob_keys) / sizeof(i6c_knob_keys[0]))
+        return RSS_ERR_NOTSUP;
+
+    p = &g_iq[i6c_knob_keys[i].idx];
+    caps->min = p->mi_floor;
+    caps->max = p->mi_max;
+    caps->neutral = p->mi_unity;
+    caps->has_auto = I6C_IQ_HAS_AUTO(p);
+    caps->enabled = true;
+
+    /*
+     * Two of the five fields are properties of the loaded tuning rather than of
+     * the SoC, so they can only be answered once there is a tuning to read: a
+     * row whose neutral is learned does not know it yet, and whether the module
+     * is switched on is the binary's business entirely. Before the first frame
+     * the static row is the best available answer and enabled is assumed --
+     * which is the optimistic direction, so a client draws the control and the
+     * later reply corrects it, rather than hiding a control that does work.
+     */
+    if (!st->isp_knobs_live)
+        return RSS_OK;
+
+    if (i6c_iq_fetch(st, i6c_knob_keys[i].idx, buf) != RSS_OK)
+        return RSS_OK;
+
+    /*
+     * Only where there is one to read. The { bEnable, enOpType, auto[16],
+     * manual } shape belongs to the IQ modules; a flat row like EV
+     * compensation is a bare value, and offset zero there is the value itself
+     * -- read as an enable it says "disabled" for every tuning that leaves EV
+     * at 0, which is all of them.
+     */
+    if (I6C_IQ_HAS_AUTO(p))
+        caps->enabled = i6c_iq_read(buf, I6C_ISP_ENABLE_OFF, 4) != 0;
+    if (p->unity_from_tuning)
+        caps->neutral = i6c_iq_baseline(p, p->report);
+
     return RSS_OK;
 }
 

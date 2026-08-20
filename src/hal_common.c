@@ -202,11 +202,12 @@ extern int hal_isp_set_highlight_depress(void *ctx, int val);
 extern int hal_isp_set_defog_strength(void *ctx, int val);
 
 /* ISP getters and advanced tuning (hal_isp.c) */
-extern int hal_isp_get_brightness(void *ctx, uint8_t *val);
-extern int hal_isp_get_contrast(void *ctx, uint8_t *val);
-extern int hal_isp_get_saturation(void *ctx, uint8_t *val);
-extern int hal_isp_get_sharpness(void *ctx, uint8_t *val);
-extern int hal_isp_get_hue(void *ctx, uint8_t *val);
+extern int hal_isp_get_brightness(void *ctx, int *val);
+extern int hal_isp_get_knob_caps(void *ctx, const char *name, rss_isp_knob_t *caps);
+extern int hal_isp_get_contrast(void *ctx, int *val);
+extern int hal_isp_get_saturation(void *ctx, int *val);
+extern int hal_isp_get_sharpness(void *ctx, int *val);
+extern int hal_isp_get_hue(void *ctx, int *val);
 extern int hal_isp_get_hvflip(void *ctx, int *hflip, int *vflip);
 extern int hal_isp_get_running_mode(void *ctx, rss_isp_mode_t *mode);
 extern int hal_isp_get_sensor_fps(void *ctx, uint32_t *fps_num, uint32_t *fps_den);
@@ -217,13 +218,13 @@ extern int hal_isp_get_max_dgain(void *ctx, uint32_t *gain);
 extern int hal_isp_get_sensor_attr(void *ctx, uint32_t *width, uint32_t *height);
 extern int hal_isp_get_ae_comp(void *ctx, int *val);
 extern int hal_isp_get_module_control(void *ctx, uint32_t *modules);
-extern int hal_isp_get_sinter_strength(void *ctx, uint8_t *val);
-extern int hal_isp_get_temper_strength(void *ctx, uint8_t *val);
-extern int hal_isp_get_defog_strength(void *ctx, uint8_t *val);
-extern int hal_isp_get_dpc_strength(void *ctx, uint8_t *val);
-extern int hal_isp_get_drc_strength(void *ctx, uint8_t *val);
-extern int hal_isp_get_highlight_depress(void *ctx, uint8_t *val);
-extern int hal_isp_get_backlight_comp(void *ctx, uint8_t *val);
+extern int hal_isp_get_sinter_strength(void *ctx, int *val);
+extern int hal_isp_get_temper_strength(void *ctx, int *val);
+extern int hal_isp_get_defog_strength(void *ctx, int *val);
+extern int hal_isp_get_dpc_strength(void *ctx, int *val);
+extern int hal_isp_get_drc_strength(void *ctx, int *val);
+extern int hal_isp_get_highlight_depress(void *ctx, int *val);
+extern int hal_isp_get_backlight_comp(void *ctx, int *val);
 extern int hal_isp_set_ae_weight(void *ctx, const uint8_t weight[15][15]);
 extern int hal_isp_get_ae_weight(void *ctx, uint8_t weight[15][15]);
 extern int hal_isp_get_ae_zone(void *ctx, uint32_t zone[15][15]);
@@ -818,6 +819,7 @@ static const rss_hal_ops_t g_ops = {
 
     /* ISP getters */
     .isp_get_brightness = hal_isp_get_brightness,
+    .isp_get_knob_caps = hal_isp_get_knob_caps,
     .isp_get_contrast = hal_isp_get_contrast,
     .isp_get_saturation = hal_isp_get_saturation,
     .isp_get_sharpness = hal_isp_get_sharpness,

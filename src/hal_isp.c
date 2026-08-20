@@ -733,64 +733,80 @@ int hal_isp_set_highlight_depress(void *ctx, int val)
  * adds IMPVI_NUM as the first parameter.
  * ================================================================ */
 
-int hal_isp_get_brightness(void *ctx, uint8_t *val)
+int hal_isp_get_brightness(void *ctx, int *val)
 {
     (void)ctx;
     if (!val)
         return RSS_ERR_INVAL;
-#if defined(HAL_ISP_PTR_ARGS)
-    return IMP_ISP_Tuning_GetBrightness(IMPVI_MAIN, val);
-#else
+    /* IMP reports these as one byte; the HAL publishes an int so that a
+     * knob with a signed or wider native range can use the same shape. */
     unsigned char v;
-    int ret = IMP_ISP_Tuning_GetBrightness(&v);
-    *val = v;
-    return ret;
+    int ret;
+#if defined(HAL_ISP_PTR_ARGS)
+    ret = IMP_ISP_Tuning_GetBrightness(IMPVI_MAIN, &v);
+#else
+    ret = IMP_ISP_Tuning_GetBrightness(&v);
 #endif
+    if (ret == 0)
+        *val = v;
+    return ret;
 }
 
-int hal_isp_get_contrast(void *ctx, uint8_t *val)
+int hal_isp_get_contrast(void *ctx, int *val)
 {
     (void)ctx;
     if (!val)
         return RSS_ERR_INVAL;
-#if defined(HAL_ISP_PTR_ARGS)
-    return IMP_ISP_Tuning_GetContrast(IMPVI_MAIN, val);
-#else
+    /* IMP reports these as one byte; the HAL publishes an int so that a
+     * knob with a signed or wider native range can use the same shape. */
     unsigned char v;
-    int ret = IMP_ISP_Tuning_GetContrast(&v);
-    *val = v;
-    return ret;
+    int ret;
+#if defined(HAL_ISP_PTR_ARGS)
+    ret = IMP_ISP_Tuning_GetContrast(IMPVI_MAIN, &v);
+#else
+    ret = IMP_ISP_Tuning_GetContrast(&v);
 #endif
+    if (ret == 0)
+        *val = v;
+    return ret;
 }
 
-int hal_isp_get_saturation(void *ctx, uint8_t *val)
+int hal_isp_get_saturation(void *ctx, int *val)
 {
     (void)ctx;
     if (!val)
         return RSS_ERR_INVAL;
-#if defined(HAL_ISP_PTR_ARGS)
-    return IMP_ISP_Tuning_GetSaturation(IMPVI_MAIN, val);
-#else
+    /* IMP reports these as one byte; the HAL publishes an int so that a
+     * knob with a signed or wider native range can use the same shape. */
     unsigned char v;
-    int ret = IMP_ISP_Tuning_GetSaturation(&v);
-    *val = v;
-    return ret;
+    int ret;
+#if defined(HAL_ISP_PTR_ARGS)
+    ret = IMP_ISP_Tuning_GetSaturation(IMPVI_MAIN, &v);
+#else
+    ret = IMP_ISP_Tuning_GetSaturation(&v);
 #endif
+    if (ret == 0)
+        *val = v;
+    return ret;
 }
 
-int hal_isp_get_sharpness(void *ctx, uint8_t *val)
+int hal_isp_get_sharpness(void *ctx, int *val)
 {
     (void)ctx;
     if (!val)
         return RSS_ERR_INVAL;
-#if defined(HAL_ISP_PTR_ARGS)
-    return IMP_ISP_Tuning_GetSharpness(IMPVI_MAIN, val);
-#else
+    /* IMP reports these as one byte; the HAL publishes an int so that a
+     * knob with a signed or wider native range can use the same shape. */
     unsigned char v;
-    int ret = IMP_ISP_Tuning_GetSharpness(&v);
-    *val = v;
-    return ret;
+    int ret;
+#if defined(HAL_ISP_PTR_ARGS)
+    ret = IMP_ISP_Tuning_GetSharpness(IMPVI_MAIN, &v);
+#else
+    ret = IMP_ISP_Tuning_GetSharpness(&v);
 #endif
+    if (ret == 0)
+        *val = v;
+    return ret;
 }
 
 /* ================================================================
@@ -799,22 +815,104 @@ int hal_isp_get_sharpness(void *ctx, uint8_t *val)
  * Only present on T23, T31, T32, T40, T41.
  * ================================================================ */
 
-int hal_isp_get_hue(void *ctx, uint8_t *val)
+int hal_isp_get_hue(void *ctx, int *val)
 {
     (void)ctx;
     if (!val)
         return RSS_ERR_INVAL;
-#if defined(HAL_ISP_PTR_ARGS)
-    return IMP_ISP_Tuning_GetBcshHue(IMPVI_MAIN, val);
-#elif defined(PLATFORM_T23) || defined(PLATFORM_T31)
+#if defined(HAL_ISP_PTR_ARGS) || defined(PLATFORM_T23) || defined(PLATFORM_T31)
+    /* IMP reports this as one byte; the HAL publishes an int so that a knob
+     * with a signed or wider native range can use the same shape. */
     unsigned char v;
-    int ret = IMP_ISP_Tuning_GetBcshHue(&v);
-    *val = v;
+    int ret;
+#if defined(HAL_ISP_PTR_ARGS)
+    ret = IMP_ISP_Tuning_GetBcshHue(IMPVI_MAIN, &v);
+#else
+    ret = IMP_ISP_Tuning_GetBcshHue(&v);
+#endif
+    if (ret == 0)
+        *val = v;
     return ret;
 #else
     (void)val;
     return RSS_ERR_NOTSUP;
 #endif
+}
+
+/* ================================================================
+ * KNOB CAPABILITIES
+ * ================================================================ */
+
+/*
+ * What each knob accepts on this family, in IMP's own units.
+ *
+ * Which is 0..255 with 128 as the neutral for nearly all of them -- IMP takes
+ * an unsigned char and hal_clamp_u8 is the gate -- so on Ingenic the numbers a
+ * config carries mean exactly what they always did. The SigmaStar backends had
+ * a scale in the way and no longer do; here there never was one. Publishing the
+ * range anyway is the point: a client should not have to know which SoC it is
+ * talking to in order to draw the right control.
+ *
+ * Three rows are not 0..255 and it matters:
+ *
+ *  - highlight_depress and backlight_comp are strengths whose neutral is off
+ *    rather than the midpoint, so a client that centres its control on the
+ *    neutral gets these right only if told.
+ *  - backlight_comp is 0..10. Nothing in IMP enforces that -- the setter
+ *    clamps to a full uint32 -- but the vendor documents the range and
+ *    raptor's schema has always said 0..10, so it stays the published answer
+ *    rather than being widened by accident on the way through here.
+ *
+ * ae_comp is absent: IMP_ISP_Tuning_SetAeComp takes a bare int with no
+ * documented bound, and inventing one here would be a guess wearing the
+ * clothes of a capability.
+ */
+static const struct {
+    const char *key;
+    int min, max, neutral;
+} imp_knob_caps[] = {
+    {"brightness", 0, 255, 128},
+    {"contrast", 0, 255, 128},
+    {"saturation", 0, 255, 128},
+    {"sharpness", 0, 255, 128},
+    {"hue", 0, 255, 128},
+    {"sinter", 0, 255, 128},
+    {"temper", 0, 255, 128},
+    {"dpc_strength", 0, 255, 128},
+    {"drc_strength", 0, 255, 128},
+    {"defog_strength", 0, 255, 128},
+    {"highlight_depress", 0, 255, 0},
+    {"backlight_comp", 0, 10, 0},
+};
+
+int hal_isp_get_knob_caps(void *ctx, const char *name, rss_isp_knob_t *caps)
+{
+    size_t i;
+
+    (void)ctx;
+    if (!name || !caps)
+        return RSS_ERR_INVAL;
+
+    for (i = 0; i < sizeof(imp_knob_caps) / sizeof(imp_knob_caps[0]); i++) {
+        if (strcmp(imp_knob_caps[i].key, name) != 0)
+            continue;
+
+        caps->min = imp_knob_caps[i].min;
+        caps->max = imp_knob_caps[i].max;
+        caps->neutral = imp_knob_caps[i].neutral;
+        /*
+         * IMP has no auto/manual op_type on any of these: a tuning value is
+         * simply the value. So there is no curve to hand back and nothing for
+         * RSS_ISP_AUTO to mean -- which is a real difference from SigmaStar
+         * and one a client is better off being told than inferring.
+         */
+        caps->has_auto = false;
+        /* Nor a per-module enable that a tuning file can clear. */
+        caps->enabled = true;
+        return RSS_OK;
+    }
+
+    return RSS_ERR_NOTSUP;
 }
 
 /* ================================================================
@@ -1169,7 +1267,7 @@ int hal_isp_set_module_control(void *ctx, uint32_t modules)
  * Gen3 uses GetModule_Ratio instead.
  * ================================================================ */
 
-int hal_isp_get_sinter_strength(void *ctx, uint8_t *val)
+int hal_isp_get_sinter_strength(void *ctx, int *val)
 {
     (void)ctx;
     if (!val)
@@ -1180,7 +1278,7 @@ int hal_isp_get_sinter_strength(void *ctx, uint8_t *val)
     return RSS_ERR_NOTSUP;
 }
 
-int hal_isp_get_temper_strength(void *ctx, uint8_t *val)
+int hal_isp_get_temper_strength(void *ctx, int *val)
 {
     (void)ctx;
     if (!val)
@@ -1191,7 +1289,7 @@ int hal_isp_get_temper_strength(void *ctx, uint8_t *val)
     return RSS_ERR_NOTSUP;
 }
 
-int hal_isp_get_defog_strength(void *ctx, uint8_t *val)
+int hal_isp_get_defog_strength(void *ctx, int *val)
 {
     (void)ctx;
     if (!val)
@@ -1201,7 +1299,13 @@ int hal_isp_get_defog_strength(void *ctx, uint8_t *val)
         return RSS_ERR_NOTSUP;
 
 #if defined(PLATFORM_T23) || defined(PLATFORM_T31)
-    return IMP_ISP_Tuning_GetDefog_Strength(val);
+    {
+        uint8_t v;
+        int ret = IMP_ISP_Tuning_GetDefog_Strength(&v);
+        if (ret == 0)
+            *val = v;
+        return ret;
+    }
 #else
     (void)val;
     return RSS_ERR_NOTSUP;
@@ -1224,7 +1328,7 @@ int hal_isp_set_defog_strength(void *ctx, int val)
 #endif
 }
 
-int hal_isp_get_dpc_strength(void *ctx, uint8_t *val)
+int hal_isp_get_dpc_strength(void *ctx, int *val)
 {
     (void)ctx;
     if (!val)
@@ -1235,7 +1339,7 @@ int hal_isp_get_dpc_strength(void *ctx, uint8_t *val)
     int ret = IMP_ISP_Tuning_GetDPC_Strength(&ratio);
     if (ret != 0)
         return ret;
-    *val = (uint8_t)ratio;
+    *val = (int)ratio;
     return RSS_OK;
 #else
     (void)val;
@@ -1243,7 +1347,7 @@ int hal_isp_get_dpc_strength(void *ctx, uint8_t *val)
 #endif
 }
 
-int hal_isp_get_drc_strength(void *ctx, uint8_t *val)
+int hal_isp_get_drc_strength(void *ctx, int *val)
 {
     (void)ctx;
     if (!val)
@@ -1254,7 +1358,7 @@ int hal_isp_get_drc_strength(void *ctx, uint8_t *val)
     int ret = IMP_ISP_Tuning_GetDRC_Strength(&ratio);
     if (ret != 0)
         return ret;
-    *val = (uint8_t)ratio;
+    *val = (int)ratio;
     return RSS_OK;
 #else
     (void)val;
@@ -1269,7 +1373,7 @@ int hal_isp_get_drc_strength(void *ctx, uint8_t *val)
  * Signature: GetHiLightDepress(uint32_t*)
  * ================================================================ */
 
-int hal_isp_get_highlight_depress(void *ctx, uint8_t *val)
+int hal_isp_get_highlight_depress(void *ctx, int *val)
 {
     (void)ctx;
     if (!val)
@@ -1280,7 +1384,7 @@ int hal_isp_get_highlight_depress(void *ctx, uint8_t *val)
     int ret = IMP_ISP_Tuning_GetHiLightDepress(&strength);
     if (ret != 0)
         return ret;
-    *val = (uint8_t)strength;
+    *val = (int)strength;
     return RSS_OK;
 #else
     (void)val;
@@ -1295,7 +1399,7 @@ int hal_isp_get_highlight_depress(void *ctx, uint8_t *val)
  * Signature: GetBacklightComp(uint32_t*)
  * ================================================================ */
 
-int hal_isp_get_backlight_comp(void *ctx, uint8_t *val)
+int hal_isp_get_backlight_comp(void *ctx, int *val)
 {
     (void)ctx;
     if (!val)
@@ -1306,7 +1410,7 @@ int hal_isp_get_backlight_comp(void *ctx, uint8_t *val)
     int ret = IMP_ISP_Tuning_GetBacklightComp(&strength);
     if (ret != 0)
         return ret;
-    *val = (uint8_t)strength;
+    *val = (int)strength;
     return RSS_OK;
 #else
     (void)val;

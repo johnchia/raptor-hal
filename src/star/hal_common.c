@@ -1222,6 +1222,7 @@ static const rss_hal_ops_t g_ops = {
     .isp_set_sensor_fps = hal_isp_set_sensor_fps,
 
     .isp_get_temper_strength = hal_isp_get_temper_strength,
+    .isp_get_knob_caps = hal_isp_get_knob_caps,
     .isp_get_drc_strength = hal_isp_get_drc_strength,
     .isp_get_ae_comp = hal_isp_get_ae_comp,
     .isp_get_antiflicker = hal_isp_get_antiflicker,

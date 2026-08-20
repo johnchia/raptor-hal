@@ -208,13 +208,6 @@
  */
 
 /*
- * raptor's scalar ISP knobs are 0..255 with 128 as neutral. Named
- * because the neutral value carries the auto/manual meaning described
- * above, so it is a protocol constant rather than a magic midpoint.
- */
-#define STAR_ISP_NEUTRAL 128
-
-/*
  * enOpType values. The vendor enum is E_MI_ISP_OP_TYPE_{AUTO,MANUAL},
  * auto first -- the same ordering every MI-family SDK uses for this
  * field. Not independently verified on hardware: a swap would show up
@@ -401,11 +394,11 @@ static star_iq_param_t g_iq[IQ_PARAM_COUNT] = {
     /*
      * DRC -- MI's WDR module, and the level is one byte of it.
      *
-     * Unity 128 against a 0..255 field makes star_iq_scale the identity, so
-     * drc=100 writes Strength 100 and drc=200 writes 200. Deliberately the
-     * numbers majestic's overrideWdr has always used, so a value carried over
-     * from a majestic config means the same picture. Neutral 128 is auto and
-     * is the one level the knob cannot ask for.
+     * The field is 0..255, so drc=100 writes Strength 100 and drc=200 writes
+     * 200 -- deliberately the numbers majestic's overrideWdr has always used,
+     * so a value carried over from a majestic config means the same picture.
+     * Every one of them is now reachable: auto is asked for by name rather
+     * than by spending the value 128 on it.
      *
      * The layout is this family's own -- a 52-byte entry with the level at
      * +43, against Infinity6C's 112 and +34 -- and even the symbol differs in
@@ -609,71 +602,20 @@ static int star_iq_store(star_state_t *st, int idx, uint8_t *buf)
 }
 
 /*
- * Map raptor's 0..255 onto MI's range, piecewise so that neutral lands
- * exactly on MI's own unity value. A single linear map would not: with
- * saturation's unity at 32 of 127, linear scaling puts raptor's neutral
- * at 64 -- twice unity gain -- and every default config would boost
- * colour.
+ * Apply a scalar knob, in MI's own units.
  *
- * The two halves are separately linear between floor..unity and
- * unity..max. For the unsigned modules floor is 0, which is what it has
- * always been, and the arithmetic below reduces to what it was.
- */
-static int32_t star_iq_scale(int val, int32_t unity, int32_t floor, int32_t max)
-{
-    if (val <= 0)
-        return floor;
-    if (val >= 255)
-        return max;
-    if (val == STAR_ISP_NEUTRAL || unity >= max)
-        return unity;
-
-    if (val < STAR_ISP_NEUTRAL)
-        return floor + (int32_t)(((int64_t)val * (unity - floor)) / STAR_ISP_NEUTRAL);
-
-    return unity + (int32_t)(((int64_t)(val - STAR_ISP_NEUTRAL) * (max - unity)) /
-                             (255 - STAR_ISP_NEUTRAL));
-}
-
-/* Inverse of star_iq_scale, for the getters. */
-static uint8_t star_iq_unscale(int32_t mi, int32_t unity, int32_t floor, int32_t max)
-{
-    if (max == floor || mi >= max)
-        return 255;
-    if (unity >= max)
-        return STAR_ISP_NEUTRAL;
-    /*
-     * Ahead of the floor test, which would otherwise swallow it: when the
-     * learned baseline sits on the floor -- an unsigned row whose tuning
-     * left the field at 0 -- MI 0 is neutral, not the bottom of the scale.
-     */
-    if (mi == unity)
-        return STAR_ISP_NEUTRAL;
-    if (mi <= floor)
-        return 0;
-
-    /* unity is necessarily above floor on this branch, so both divides are
-     * safe. */
-    if (mi < unity)
-        return (uint8_t)(((int64_t)(mi - floor) * STAR_ISP_NEUTRAL) / (unity - floor));
-
-    return (uint8_t)(STAR_ISP_NEUTRAL +
-                     ((int64_t)(mi - unity) * (255 - STAR_ISP_NEUTRAL)) / (max - unity));
-}
-
-/*
- * Apply one of raptor's 0..255 scalars.
+ * RSS_ISP_AUTO restores auto and leaves the manual field alone -- see THE
+ * TUNING BINARY OUTRANKS THE CONFIG. Any other value is written to the
+ * field unchanged, so what the operator asked for is what MI is given and
+ * what a read gives back.
  *
- * Neutral restores auto and leaves the manual field alone -- see THE
- * TUNING BINARY OUTRANKS THE CONFIG. bEnable is never touched: if the
- * tuning binary disabled a module, re-enabling it behind the tuner's
- * back is not this layer's call.
+ * bEnable is never touched: if the tuning binary disabled a module,
+ * re-enabling it behind the tuner's back is not this layer's call.
  */
 static int star_iq_apply_scalar(star_state_t *st, int idx, int val)
 {
     star_iq_param_t *p = &g_iq[idx];
     uint8_t buf[STAR_IQ_PAYLOAD_MAX];
-    int32_t mi_val;
     int ret;
 
     ret = star_iq_fetch(st, idx, buf);
@@ -681,7 +623,7 @@ static int star_iq_apply_scalar(star_state_t *st, int idx, int val)
         return ret;
 
     if (p->shape == IQ_AUTOMAN) {
-        if (val == STAR_ISP_NEUTRAL) {
+        if (val == RSS_ISP_AUTO) {
             star_iq_write(buf, STAR_ISP_OPTYPE_OFF, 4, STAR_ISP_OP_AUTO);
             HAL_LOG_DBG("isp: %s left to the tuning file (auto)", p->name);
             return star_iq_store(st, idx, buf);
@@ -698,8 +640,8 @@ static int star_iq_apply_scalar(star_state_t *st, int idx, int val)
          */
         if (star_iq_read(buf, STAR_ISP_OPTYPE_OFF, 4) == STAR_ISP_OP_AUTO)
             HAL_LOG_INFO("isp: %s goes manual, so the tuning's per-gain curve for it stops "
-                         "being used; set %s back to %d to restore it",
-                         p->name, p->name, STAR_ISP_NEUTRAL);
+                         "being used; set %s back to auto to restore it",
+                         p->name, p->name);
         /*
          * A module the tuning switched off takes the write and ignores it.
          * Two of the six shipped tunings here ship WDR that way, so this is a
@@ -712,15 +654,13 @@ static int star_iq_apply_scalar(star_state_t *st, int idx, int val)
         star_iq_write(buf, STAR_ISP_OPTYPE_OFF, 4, STAR_ISP_OP_MANUAL);
     }
 
-    mi_val = star_iq_scale(val, p->mi_unity, p->mi_floor, p->mi_max);
     /* The cast is the two's-complement bit pattern MI wants for a negative
      * field, and a no-op for every other row. */
-    star_iq_write(buf, p->manual_off, p->width, (uint32_t)mi_val);
+    star_iq_write(buf, p->manual_off, p->width, (uint32_t)val);
 
     ret = star_iq_store(st, idx, buf);
     if (ret == RSS_OK)
-        HAL_LOG_DBG("isp: %s = %d (MI %d in %d..%d)", p->name, val, mi_val, p->mi_floor,
-                    p->mi_max);
+        HAL_LOG_DBG("isp: %s = %d (in %d..%d)", p->name, val, p->mi_floor, p->mi_max);
 
     return ret;
 }
@@ -738,6 +678,19 @@ static int star_iq_set_scalar(void *ctx, int idx, int val)
     if (!st)
         return RSS_ERR_INVAL;
 
+    /*
+     * Either the request to hand the module back to the tuning, or a value
+     * the field can hold. Checked here rather than at the caller so that
+     * what hal_isp_get_knob_caps publishes and what this accepts are the
+     * same two numbers by construction.
+     */
+    if (val == RSS_ISP_AUTO) {
+        if (p->shape != IQ_AUTOMAN)
+            return RSS_ERR_INVAL;
+    } else if (val < p->mi_floor || val > p->mi_max) {
+        return RSS_ERR_INVAL;
+    }
+
     /* Recorded first and unconditionally, so a re-tune can put it back
      * whether or not it reached MI on this attempt. */
     p->pending = val;
@@ -752,7 +705,7 @@ static int star_iq_set_scalar(void *ctx, int idx, int val)
     return star_iq_apply_scalar(st, idx, val);
 }
 
-static int star_iq_get_scalar(void *ctx, int idx, uint8_t *out)
+static int star_iq_get_scalar(void *ctx, int idx, int *out)
 {
     star_state_t *st = star_state(ctx);
     star_iq_param_t *p = &g_iq[idx];
@@ -763,9 +716,12 @@ static int star_iq_get_scalar(void *ctx, int idx, uint8_t *out)
         return RSS_ERR_INVAL;
 
     /* Report what was asked for while the ISP cannot be read, so a
-     * set/get pair is consistent even before the pipeline runs. */
+     * set/get pair is consistent even before the pipeline runs. Nothing
+     * asked for means the tuning still owns the module, which for a row
+     * with an auto mode is auto and otherwise is its tuned neutral. */
     if (!st->isp_tuned) {
-        *out = p->has_pending ? (uint8_t)p->pending : (uint8_t)STAR_ISP_NEUTRAL;
+        *out = p->has_pending ? p->pending
+                              : (p->shape == IQ_AUTOMAN ? RSS_ISP_AUTO : p->mi_unity);
         return RSS_OK;
     }
 
@@ -774,18 +730,21 @@ static int star_iq_get_scalar(void *ctx, int idx, uint8_t *out)
         return ret;
 
     /*
-     * A module in auto mode has no single value to report, and its
-     * manual field holds whatever was last written there. Neutral is
-     * the honest answer, and it round-trips: it is also the value that
-     * puts the module back into auto.
+     * A module in auto mode has no single value to report: its manual
+     * field holds whatever was last written there, which is not what the
+     * ISP is doing. Say auto. This used to answer with the neutral 128 --
+     * the same claim, made in a way the caller could not tell apart from
+     * a real setting that happened to equal neutral.
      */
     if (p->shape == IQ_AUTOMAN &&
         star_iq_read(buf, STAR_ISP_OPTYPE_OFF, 4) == STAR_ISP_OP_AUTO) {
-        *out = STAR_ISP_NEUTRAL;
+        *out = RSS_ISP_AUTO;
         return RSS_OK;
     }
 
-    *out = star_iq_unscale(star_iq_read_field(p, buf), p->mi_unity, p->mi_floor, p->mi_max);
+    /* As it sits: the value written was in MI's units, so this is the
+     * number the setter was given. */
+    *out = star_iq_read_field(p, buf);
     return RSS_OK;
 }
 
@@ -1465,11 +1424,18 @@ int hal_isp_set_temper_strength(void *ctx, int val)
 
     if (!st)
         return RSS_ERR_INVAL;
-    if (val < 0 || val > 255)
+    /*
+     * The levels the VPE channel has, said as themselves. The old abstract
+     * 0..255 had to fit them around a neutral in the middle, and since the
+     * default is level 1 that left one level below neutral and mapped the
+     * whole of raptor 1..127 onto level 0 -- most of the lower half of the
+     * knob meaning "off".
+     */
+    if (val < 0 || val > STAR_VPE_NR3D_MAX)
         return RSS_ERR_INVAL;
 
     prev = st->nr3d_level_req;
-    st->nr3d_level_req = star_iq_scale(val, STAR_VPE_NR3D_UNITY, 0, STAR_VPE_NR3D_MAX);
+    st->nr3d_level_req = val;
 
     ret = star_isp_apply_nr3d_level(st);
     if (ret != RSS_OK) {
@@ -1492,7 +1458,7 @@ int hal_isp_set_drc_strength(void *ctx, int val)
     return star_iq_set_scalar(ctx, IQ_DRC, val);
 }
 
-int hal_isp_get_drc_strength(void *ctx, uint8_t *val)
+int hal_isp_get_drc_strength(void *ctx, int *val)
 {
     return star_iq_get_scalar(ctx, IQ_DRC, val);
 }
@@ -1502,27 +1468,27 @@ int hal_isp_set_defog(void *ctx, int enable)
     return star_iq_set_raw(ctx, IQ_DEFOG, enable ? 1u : 0u);
 }
 
-int hal_isp_get_brightness(void *ctx, uint8_t *val)
+int hal_isp_get_brightness(void *ctx, int *val)
 {
     return star_iq_get_scalar(ctx, IQ_BRIGHTNESS, val);
 }
 
-int hal_isp_get_contrast(void *ctx, uint8_t *val)
+int hal_isp_get_contrast(void *ctx, int *val)
 {
     return star_iq_get_scalar(ctx, IQ_CONTRAST, val);
 }
 
-int hal_isp_get_saturation(void *ctx, uint8_t *val)
+int hal_isp_get_saturation(void *ctx, int *val)
 {
     return star_iq_get_scalar(ctx, IQ_SATURATION, val);
 }
 
-int hal_isp_get_sharpness(void *ctx, uint8_t *val)
+int hal_isp_get_sharpness(void *ctx, int *val)
 {
     return star_iq_get_scalar(ctx, IQ_SHARPNESS, val);
 }
 
-int hal_isp_get_temper_strength(void *ctx, uint8_t *val)
+int hal_isp_get_temper_strength(void *ctx, int *val)
 {
     star_state_t *st = star_state(ctx);
     i6e_vpe_para para;
@@ -1540,13 +1506,90 @@ int hal_isp_get_temper_strength(void *ctx, uint8_t *val)
         !st->vpe.fnGetChannelParam(STAR_VPE_CHN, (i6_vpe_para *)&para) && para.level3DNR >= 0)
         st->nr3d_level_req = para.level3DNR;
 
-    *val = star_iq_unscale(st->nr3d_level_req, STAR_VPE_NR3D_UNITY, 0, STAR_VPE_NR3D_MAX);
+    *val = st->nr3d_level_req;
+    return RSS_OK;
+}
+
+/*
+ * The daemon's key name for each row this platform publishes.
+ *
+ * Deliberately short, and it matches star/hal_common.c's ops table rather
+ * than g_iq: brightness, contrast, saturation and sharpness all still have
+ * rows here, but this SoC declines to publish them because every shipped
+ * Infinity6E tuning varies them across gain and there is no way to move one
+ * without discarding that curve. A knob that is not offered has no caps to
+ * report, so the two lists stay the same list.
+ *
+ * The names differ from the row names where the module is named after MI's
+ * struct rather than after what an operator calls it -- "drc" is the WDR
+ * module, "defog" is Defog.
+ */
+static const struct {
+    const char *key;
+    int idx;
+} star_knob_keys[] = {
+    {"drc_strength", IQ_DRC},
+    {"ae_comp", IQ_EVCOMP},
+};
+
+int hal_isp_get_knob_caps(void *ctx, const char *name, rss_isp_knob_t *caps)
+{
+    star_state_t *st = star_state(ctx);
+    uint8_t buf[STAR_IQ_PAYLOAD_MAX];
+    star_iq_param_t *p;
+    size_t i;
+
+    if (!st || !name || !caps)
+        return RSS_ERR_INVAL;
+
+    /* Not an IQ module: 3DNR is a VPE channel level, so there is no curve
+     * behind it and no auto to hand it back to. */
+    if (strcmp(name, "temper") == 0) {
+        caps->min = 0;
+        caps->max = STAR_VPE_NR3D_MAX;
+        caps->neutral = STAR_VPE_NR3D_UNITY;
+        caps->has_auto = false;
+        caps->enabled = true;
+        return RSS_OK;
+    }
+
+    for (i = 0; i < sizeof(star_knob_keys) / sizeof(star_knob_keys[0]); i++)
+        if (strcmp(star_knob_keys[i].key, name) == 0)
+            break;
+    if (i == sizeof(star_knob_keys) / sizeof(star_knob_keys[0]))
+        return RSS_ERR_NOTSUP;
+
+    p = &g_iq[star_knob_keys[i].idx];
+    caps->min = p->mi_floor;
+    caps->max = p->mi_max;
+    caps->neutral = p->mi_unity;
+    caps->has_auto = p->shape == IQ_AUTOMAN;
+    caps->enabled = true;
+
+    /*
+     * Whether the module is switched on belongs to the loaded tuning, so it
+     * can only be answered once there is one. Before that, assumed on: the
+     * optimistic direction, where a client draws the control and a later
+     * reply corrects it, rather than hiding one that does work. Two of the
+     * six shipped tunings here ship WDR disabled, so this is a real state.
+     */
+    /*
+     * Only for a row that has one. The { bEnable, enOpType, auto[16], manual }
+     * shape belongs to the IQ modules; a flat row like EV compensation is a
+     * bare value, and offset zero there is the value rather than an enable --
+     * read as one it reports "disabled" for every tuning that leaves EV at 0,
+     * which is all of them.
+     */
+    if (p->shape == IQ_AUTOMAN && st->isp_tuned &&
+        star_iq_fetch(st, star_knob_keys[i].idx, buf) == RSS_OK)
+        caps->enabled = star_iq_read(buf, STAR_ISP_ENABLE_OFF, 4) != 0;
+
     return RSS_OK;
 }
 
 int hal_isp_get_ae_comp(void *ctx, int *val)
 {
-    uint8_t v;
+    int v;
     int ret;
 
     if (!val)

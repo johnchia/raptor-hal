@@ -17,6 +17,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <errno.h>
+#include <limits.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -591,6 +592,56 @@ typedef enum {
     RSS_ANTIFLICKER_60HZ = 2,
 } rss_antiflicker_t;
 
+/*
+ * "Hand this knob back to the tuning file."
+ *
+ * A module with an auto mode interpolates the tuner's curve across gain;
+ * writing a number replaces that curve with one constant. Both are things an
+ * operator may want, so both are sayable, and neither is spelled as a
+ * magnitude. It used to be: the neutral value 128 doubled as the request for
+ * auto, which meant the knob could not express "manual at whatever the tuner
+ * considered neutral", and -- worse -- a caller who had no opinion at all had
+ * no way to say so that differed from asking for auto.
+ *
+ * Out of band on purpose. A knob's range is the hardware's, and every one of
+ * them is a small non-negative span or a symmetric EV range, so no legal value
+ * can collide with this.
+ */
+#define RSS_ISP_AUTO INT_MIN
+
+/*
+ * What one ISP knob accepts, in the units the hardware itself uses.
+ *
+ * These were published on an abstract 0..255 with 128 as neutral, scaled into
+ * the hardware's own range underneath. That reached every hardware value but
+ * could not round-trip, because 256 inputs do not map one-to-one onto a range
+ * of 101 or 41: brightness set to 140 read back 138, ae_comp set to 140 read
+ * back 134. Anything that reads a value and stores it -- a config save, a
+ * slider, a home-automation entity -- therefore drifted away from what the
+ * operator actually typed, a little more on each pass.
+ *
+ * So a knob now speaks native units and states them. The range also stops
+ * being duplicated: it used to be written down once in the daemon's schema,
+ * again in the MQTT discovery table and again in the HAL, with only the HAL
+ * in a position to know.
+ */
+typedef struct {
+    int min;
+    int max;
+    /* The value meaning "as the tuning file left it". Not necessarily the
+     * midpoint: MI's own unity for a saturation field is 32 of 0..127, and for
+     * full-strength denoise it is the maximum. */
+    int neutral;
+    /* Accepts RSS_ISP_AUTO. False for a knob with no auto/manual mode, where
+     * the tuning has no curve to hand back. */
+    bool has_auto;
+    /* The tuning has this module switched on. A write to a disabled module is
+     * stored and changes nothing, so a client can say why rather than offering
+     * a control that does nothing -- Infinity6C's imx335 tuning ships
+     * Brightness disabled, and its imx415 tuning ships Contrast disabled too. */
+    bool enabled;
+} rss_isp_knob_t;
+
 /* ================================================================
  * Capability Struct
  * ================================================================ */
@@ -904,11 +955,11 @@ typedef struct rss_hal_ops {
     int (*isp_set_defog_strength)(void *ctx, int val);
 
     /* ISP getters (mirrors of existing setters) */
-    int (*isp_get_brightness)(void *ctx, uint8_t *val);
-    int (*isp_get_contrast)(void *ctx, uint8_t *val);
-    int (*isp_get_saturation)(void *ctx, uint8_t *val);
-    int (*isp_get_sharpness)(void *ctx, uint8_t *val);
-    int (*isp_get_hue)(void *ctx, uint8_t *val);
+    int (*isp_get_brightness)(void *ctx, int *val);
+    int (*isp_get_contrast)(void *ctx, int *val);
+    int (*isp_get_saturation)(void *ctx, int *val);
+    int (*isp_get_sharpness)(void *ctx, int *val);
+    int (*isp_get_hue)(void *ctx, int *val);
     int (*isp_get_hvflip)(void *ctx, int *hflip, int *vflip);
     int (*isp_get_running_mode)(void *ctx, rss_isp_mode_t *mode);
     int (*isp_get_sensor_fps)(void *ctx, uint32_t *fps_num, uint32_t *fps_den);
@@ -919,13 +970,25 @@ typedef struct rss_hal_ops {
     int (*isp_get_sensor_attr)(void *ctx, uint32_t *width, uint32_t *height);
     int (*isp_get_ae_comp)(void *ctx, int *val);
     int (*isp_get_module_control)(void *ctx, uint32_t *modules);
-    int (*isp_get_sinter_strength)(void *ctx, uint8_t *val);
-    int (*isp_get_temper_strength)(void *ctx, uint8_t *val);
-    int (*isp_get_defog_strength)(void *ctx, uint8_t *val);
-    int (*isp_get_dpc_strength)(void *ctx, uint8_t *val);
-    int (*isp_get_drc_strength)(void *ctx, uint8_t *val);
-    int (*isp_get_highlight_depress)(void *ctx, uint8_t *val);
-    int (*isp_get_backlight_comp)(void *ctx, uint8_t *val);
+    int (*isp_get_sinter_strength)(void *ctx, int *val);
+    int (*isp_get_temper_strength)(void *ctx, int *val);
+    int (*isp_get_defog_strength)(void *ctx, int *val);
+    int (*isp_get_dpc_strength)(void *ctx, int *val);
+    int (*isp_get_drc_strength)(void *ctx, int *val);
+    int (*isp_get_highlight_depress)(void *ctx, int *val);
+    int (*isp_get_backlight_comp)(void *ctx, int *val);
+
+    /*
+     * What `name` will accept on this hardware and this tuning. Keyed by the
+     * name the daemon already publishes in its settable list rather than by an
+     * enum, because that list is what a client asks about and the backends
+     * carry the name on the row anyway.
+     *
+     * RSS_ERR_NOTSUP for a knob this platform does not have, which is how a
+     * caller learns the difference between "unsupported" and "supported and
+     * currently pinned to one value".
+     */
+    int (*isp_get_knob_caps)(void *ctx, const char *name, rss_isp_knob_t *caps);
 
     /* ISP AE advanced */
     int (*isp_set_ae_weight)(void *ctx, const uint8_t weight[15][15]);

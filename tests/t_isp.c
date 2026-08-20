@@ -213,123 +213,122 @@ static void test_field_access_is_surgical(void)
 }
 
 /*
- * The scaling trap this test exists for: raptor's neutral must land on
- * MI's unity, not on the middle of MI's range. Saturation is the case
- * where those differ sharply -- unity is 32 of 127, so a linear map
- * would put neutral at 64 and double the colour on every default config.
+ * The property that replaced the scaler, and the reason it was worth
+ * replacing: a value written is the value read back, exactly, for every value
+ * a knob accepts.
+ *
+ * There used to be an abstract 0..255 in front of MI's range and a pair of
+ * functions mapping between them, and this file used to test that pair hard --
+ * that neutral landed on unity rather than the midpoint, that the halves were
+ * monotonic, that degenerate unities did not divide by zero. All of that was
+ * careful work in service of a mapping that could not round-trip, because 256
+ * inputs do not fit one-to-one onto a range of 101 or 41. Set brightness to
+ * 140 and it read back 138; set ae_comp to 140 and it read back 134.
+ *
+ * The knobs now speak MI's units, so the mapping is gone and so are its
+ * tests. What is left to check is that nothing crept back in.
  */
-static void test_scale_neutral_is_unity(void)
+static void test_a_written_value_reads_back_unchanged(void)
 {
     size_t i;
 
     for (i = 0; i < IQ_PARAM_COUNT; i++) {
         const star_iq_param_t *p = &g_iq[i];
-
-        if (p->mi_unity == 0 || p->mi_unity >= p->mi_max)
-            continue; /* bool/enum entries have no scale */
-
-        CHECK(star_iq_scale(STAR_ISP_NEUTRAL, p->mi_unity, 0, p->mi_max) == p->mi_unity,
-              "%s: neutral 128 -> %u, expected unity %u", p->name,
-              star_iq_scale(STAR_ISP_NEUTRAL, p->mi_unity, 0, p->mi_max), p->mi_unity);
-    }
-
-    CHECK(star_iq_scale(128, 32, 0, 127) == 32, "saturation neutral must be unity gain (32), not 64");
-    CHECK(star_iq_scale(128, 50, 0, 100) == 50, "brightness neutral");
-    CHECK(star_iq_scale(128, 100, 0, 200) == 100, "ev comp neutral means no compensation");
-}
-
-static void test_scale_endpoints_and_monotonicity(void)
-{
-    size_t i;
-
-    for (i = 0; i < IQ_PARAM_COUNT; i++) {
-        const star_iq_param_t *p = &g_iq[i];
-        int32_t prev;
         int v;
 
-        if (p->mi_unity == 0 || p->mi_unity >= p->mi_max)
+        if (p->shape != IQ_AUTOMAN && p->shape != IQ_FLAT)
             continue;
 
-        CHECK(star_iq_scale(0, p->mi_unity, 0, p->mi_max) == 0, "%s: 0 -> 0", p->name);
-        CHECK(star_iq_scale(255, p->mi_unity, 0, p->mi_max) == p->mi_max, "%s: 255 -> max", p->name);
+        for (v = p->mi_floor; v <= p->mi_max; v++) {
+            uint8_t buf[STAR_IQ_PAYLOAD_MAX];
+            int back;
 
-        /* Never decreasing, and never out of range. */
-        prev = 0;
-        for (v = 0; v <= 255; v++) {
-            int32_t got = star_iq_scale(v, p->mi_unity, 0, p->mi_max);
-
-            CHECK(got >= prev, "%s: not monotonic at %d (%d after %d)", p->name, v, got, prev);
-            CHECK(got <= p->mi_max, "%s: %d -> %d exceeds max %d", p->name, v, got, p->mi_max);
-            prev = got;
+            memset(buf, 0, sizeof(buf));
+            star_iq_write(buf, p->manual_off, p->width, (uint32_t)v);
+            back = (int)star_iq_read_field(p, buf);
+            /* Signed rows come back as the two's-complement pattern; the
+             * field is what MI reads, so compare on that footing. */
+            if (p->mi_floor < 0 && p->width == 4)
+                back = (int32_t)back;
+            CHECK(back == v, "%s: wrote %d, field holds %d", p->name, v, back);
         }
     }
-
-    /* Out-of-range input is clamped rather than wrapped. */
-    CHECK(star_iq_scale(-40, 32, 0, 127) == 0, "negative clamps to 0");
-    CHECK(star_iq_scale(9999, 32, 0, 127) == 127, "over-range clamps to max");
 }
 
 /*
- * Round-tripping matters because rvd can read a value back and write it
- * again. Exact identity is impossible where MI's range is coarser than
- * raptor's (brightness has 101 steps against 256), so the requirement is
- * that a scale/unscale round trip stays close and that the neutral point
- * is exact.
+ * Auto has to be sayable and distinguishable, which is the other half of the
+ * change. Reporting a module in auto as "128" was a claim about the picture
+ * that a caller could not tell apart from a knob deliberately set to 128 --
+ * and once 128 stopped being special, it could not be spelled at all.
  */
-static void test_unscale_round_trip(void)
+static void test_auto_is_out_of_band(void)
 {
     size_t i;
 
     for (i = 0; i < IQ_PARAM_COUNT; i++) {
         const star_iq_param_t *p = &g_iq[i];
-        int v;
 
-        if (p->mi_unity == 0 || p->mi_unity >= p->mi_max)
-            continue;
-
-        CHECK(star_iq_unscale(p->mi_unity, p->mi_unity, 0, p->mi_max) == STAR_ISP_NEUTRAL,
-              "%s: unity must read back as neutral", p->name);
-        CHECK(star_iq_unscale(0, p->mi_unity, 0, p->mi_max) == 0, "%s: 0 reads back as 0", p->name);
-        CHECK(star_iq_unscale(p->mi_max, p->mi_unity, 0, p->mi_max) == 255, "%s: max reads back as 255",
-              p->name);
-
-        for (v = 0; v <= 255; v += 5) {
-            uint32_t mi = star_iq_scale(v, p->mi_unity, 0, p->mi_max);
-            int back = star_iq_unscale(mi, p->mi_unity, 0, p->mi_max);
-            int drift = back > v ? back - v : v - back;
-            /* One MI step is worth 255/mi_max raptor steps; allow that
-             * plus a rounding unit. */
-            int tolerance = (int)(255 / p->mi_max) + 2;
-
-            CHECK(drift <= tolerance, "%s: %d -> MI %u -> %d (drift %d > %d)", p->name, v, mi, back,
-                  drift, tolerance);
-        }
+        CHECK(RSS_ISP_AUTO < p->mi_floor,
+              "%s: RSS_ISP_AUTO must not collide with a value the field accepts", p->name);
     }
 }
 
-/* Degenerate table entries must not divide by zero or misreport. */
-static void test_scale_degenerate_inputs(void)
+/*
+ * The caps a client is given and the values the setter takes are the same two
+ * numbers, and they have to stay that way: a control drawn from caps that the
+ * daemon then rejects is worse than no control at all.
+ *
+ *   asked for                 set_scalar   caps say
+ *   ------------------------  -----------  ---------------------
+ *   mi_floor                  accepted     min
+ *   mi_max                    accepted     max
+ *   mi_floor - 1              refused      below min
+ *   mi_max + 1                refused      above max
+ *   RSS_ISP_AUTO, has auto    accepted     has_auto true
+ *   RSS_ISP_AUTO, no auto     refused      has_auto false
+ */
+static void test_caps_describe_what_the_setter_accepts(void)
 {
-    CHECK(star_iq_scale(200, 5, 0, 5) == 5, "unity == max short-circuits");
-    CHECK(star_iq_unscale(0, 0, 0, 0) == 255, "max 0 saturates rather than dividing by zero");
-    /* In-range mi with a degenerate unity: falls back to neutral. An mi
-     * at or above max saturates first, which is why this uses 5 not 99. */
-    CHECK(star_iq_unscale(5, 10, 0, 10) == STAR_ISP_NEUTRAL, "unity >= max reads back neutral");
-    CHECK(star_iq_unscale(99, 10, 0, 10) == 255, "mi above max saturates");
+    rss_hal_ctx_t ctx;
+    star_state_t st;
+    void *c = &ctx;
+    rss_isp_knob_t caps;
+    const star_iq_param_t *p = &g_iq[IQ_DRC];
 
-    /*
-     * A unity of 0 is not degenerate -- it is what a learned baseline looks
-     * like when the tuning sits at the bottom of MI's range. Neutral has to
-     * still mean 0, the half below it collapse onto 0 because there is
-     * nowhere lower, and the half above it must still reach max.
-     */
-    CHECK(star_iq_scale(STAR_ISP_NEUTRAL, 0, 0, 200) == 0, "unity 0: neutral is 0");
-    CHECK(star_iq_scale(64, 0, 0, 200) == 0, "unity 0: below neutral collapses onto 0");
-    CHECK(star_iq_scale(255, 0, 0, 200) == 200, "unity 0: the top still reaches max");
-    CHECK(star_iq_scale(192, 0, 0, 200) > 0, "unity 0: above neutral still brightens");
-    CHECK(star_iq_unscale(0, 0, 0, 200) == STAR_ISP_NEUTRAL, "unity 0: MI 0 reads back neutral");
-    CHECK(star_iq_unscale(100, 0, 0, 200) > STAR_ISP_NEUTRAL,
-          "unity 0: anything above it reads back above neutral");
+    memset(&ctx, 0, sizeof(ctx));
+    memset(&st, 0, sizeof(st));
+    ctx.platform = &st;
+    st.isp_loaded = true;
+    st.isp_tuned = false; /* queue rather than call MI */
+
+    CHECK(hal_isp_get_knob_caps(c, "drc_strength", &caps) == RSS_OK, "drc_strength has caps");
+    CHECK(caps.min == p->mi_floor && caps.max == p->mi_max, "caps carry the field's own range");
+    CHECK(caps.has_auto, "drc is an auto/manual module");
+
+    CHECK(hal_isp_set_drc_strength(c, caps.min) == RSS_OK, "the published minimum is accepted");
+    CHECK(hal_isp_set_drc_strength(c, caps.max) == RSS_OK, "the published maximum is accepted");
+    CHECK(hal_isp_set_drc_strength(c, caps.min - 1) == RSS_ERR_INVAL, "below the minimum refused");
+    CHECK(hal_isp_set_drc_strength(c, caps.max + 1) == RSS_ERR_INVAL, "above the maximum refused");
+    CHECK(hal_isp_set_drc_strength(c, RSS_ISP_AUTO) == RSS_OK, "auto accepted where caps allow it");
+
+    /* A knob with no auto mode says so, and refuses it. 3DNR is a channel
+     * level rather than an IQ module, so there is no curve to hand back. */
+    CHECK(hal_isp_get_knob_caps(c, "temper", &caps) == RSS_OK, "temper has caps");
+    CHECK(!caps.has_auto, "temper has no auto mode");
+    CHECK(caps.max == STAR_VPE_NR3D_MAX, "temper publishes the levels the channel has");
+    CHECK(hal_isp_set_temper_strength(c, caps.max + 1) == RSS_ERR_INVAL,
+          "a level the channel does not have is refused");
+
+    /* A knob this platform does not publish has no caps rather than
+     * invented ones -- 6E withdrew these because every shipped tuning
+     * varies them across gain. */
+    CHECK(hal_isp_get_knob_caps(c, "saturation", &caps) == RSS_ERR_NOTSUP,
+          "an unpublished knob reports no caps");
+    CHECK(hal_isp_get_knob_caps(c, "nonsense", &caps) == RSS_ERR_NOTSUP, "an unknown name too");
+
+    memset(&st, 0, sizeof(st));
+    for (size_t i = 0; i < IQ_PARAM_COUNT; i++)
+        g_iq[i].has_pending = false;
 }
 
 /*
@@ -372,13 +371,20 @@ static void test_evcomp_neutral_comes_from_the_tuning(void)
           g_iq[IQ_EVCOMP].mi_unity);
     CHECK(!g_iq[IQ_EVCOMP].unity_stale, "and is read once, not on every fetch");
 
-    /* The point of the exercise: neutral writes the tuning's own value
-     * straight back, and the range is symmetric about it rather than
-     * anchored to a guess. */
-    CHECK(star_iq_scale(STAR_ISP_NEUTRAL, 20, -20, 20) == 20,
-          "neutral writes the tuning's value straight back");
-    CHECK(star_iq_scale(0, 20, -20, 20) == -20, "0 reaches the floor");
-    CHECK(star_iq_scale(255, 20, -20, 20) == 20, "255 reaches the ceiling");
+    /* The point of the exercise: the learned value is what the caps report
+     * as neutral, so a client centres its control where the tuner did. */
+    {
+        rss_hal_ctx_t caps_ctx;
+        rss_isp_knob_t caps;
+
+        memset(&caps_ctx, 0, sizeof(caps_ctx));
+        caps_ctx.platform = &st;
+        CHECK(hal_isp_get_knob_caps(&caps_ctx, "ae_comp", &caps) == RSS_OK, "ae_comp has caps");
+        CHECK(caps.neutral == 20, "the learned baseline is the published neutral, got %d",
+              caps.neutral);
+        CHECK(caps.min < 0 && caps.min == -caps.max,
+              "and the range stays symmetric about it, got %d..%d", caps.min, caps.max);
+    }
 
     /* A reading outside the field's range means the offset or the width is
      * wrong, and adopting it would hide that for the rest of the run. */
@@ -404,62 +410,58 @@ static void test_evcomp_neutral_comes_from_the_tuning(void)
  * ae_comp is the one knob whose MI field is signed, and the whole of its
  * lower half depended on that being expressed.
  *
- * The tuning binaries we ship leave s32EV at 0, so the learned baseline is
- * 0 -- and with an unsigned range that put raptor's 0..127 onto MI's 0..0.
- * On the board, ae_comp 0 and 64 were indistinguishable from 128: half the
- * knob did nothing, and the HAL's own log line said so without anyone
- * reading it. The fix is the floor, not a special case in the setter.
+ * Under the old abstract scale this was subtle. The tunings we ship leave
+ * s32EV at 0, so the learned baseline was 0, and with an unsigned range that
+ * mapped raptor's whole 0..127 onto MI's 0..0 -- on the board, ae_comp 0 and
+ * 64 were indistinguishable from 128. Half the knob did nothing. The fix then
+ * was to give the row a negative floor so the mapping had somewhere to go.
  *
- * The span is measured (see STAR_AE_EV_SPAN): the AE's target clips a
- * little under EV 20, so 255 lands on saturation instead of nine tenths
- * past it.
+ * In MI's own units the failure cannot be expressed: -20 is -20. What is
+ * still worth pinning is that the row is signed and symmetric, that the
+ * signed field survives the write/read round trip as a negative number, and
+ * that the published range says so -- because a client drawing a 0-based
+ * slider over EV compensation is the same bug wearing a different hat.
  */
-static void test_ae_comp_reaches_below_neutral(void)
+static void test_ae_comp_is_signed_end_to_end(void)
 {
     const star_iq_param_t *p = &g_iq[IQ_EVCOMP];
-    int32_t at_zero, at_neutral, at_max;
+    uint8_t buf[STAR_IQ_PAYLOAD_MAX];
+    rss_hal_ctx_t ctx;
+    star_state_t st;
+    rss_isp_knob_t caps;
+    int v;
 
-    /* The row has to be signed for any of this to hold. */
+    memset(&ctx, 0, sizeof(ctx));
+    memset(&st, 0, sizeof(st));
+    ctx.platform = &st;
+
     CHECK(p->mi_floor < 0, "ae_comp's floor must be negative, got %d", p->mi_floor);
     CHECK(p->mi_floor == -p->mi_max, "and symmetric about the baseline, got %d..%d", p->mi_floor,
           p->mi_max);
     CHECK(p->unity_from_tuning, "with the baseline still learned from the tuning");
 
-    /* With the shipped baseline of 0: neutral is no compensation, and the
-     * two halves reach opposite signs. This is the assertion that fails if
-     * anyone puts the floor back to 0. */
-    at_zero = star_iq_scale(0, 0, p->mi_floor, p->mi_max);
-    at_neutral = star_iq_scale(STAR_ISP_NEUTRAL, 0, p->mi_floor, p->mi_max);
-    at_max = star_iq_scale(255, 0, p->mi_floor, p->mi_max);
-    CHECK(at_neutral == 0, "neutral is no compensation, got %d", at_neutral);
-    CHECK(at_zero == p->mi_floor, "ae_comp 0 must reach the floor, got %d", at_zero);
-    CHECK(at_zero < 0, "which is negative EV -- the whole point, got %d", at_zero);
-    CHECK(at_max == p->mi_max, "ae_comp 255 must reach the ceiling, got %d", at_max);
+    CHECK(hal_isp_get_knob_caps(&ctx, "ae_comp", &caps) == RSS_OK, "ae_comp publishes caps");
+    CHECK(caps.min == p->mi_floor && caps.max == p->mi_max,
+          "the published range is the field's, got %d..%d", caps.min, caps.max);
+    CHECK(caps.min < 0, "and reaches below zero -- the whole point");
+    CHECK(!caps.has_auto, "EV compensation is not an auto/manual module");
+    /*
+     * And it is not reported as a switched-off module. A flat row has no
+     * bEnable to read: offset zero holds the value, and every tuning we ship
+     * leaves EV at 0, so reading it as an enable would call the knob disabled
+     * on every camera.
+     */
+    CHECK(caps.enabled, "a flat row has no enable bit to be false");
 
-    /* Monotonic across the join, and every step distinguishable somewhere:
-     * the old mapping collapsed 0..127 onto one value. */
-    int32_t prev = star_iq_scale(0, 0, p->mi_floor, p->mi_max);
-    int distinct = 1;
-    for (int v = 1; v <= 255; v++) {
-        int32_t got = star_iq_scale(v, 0, p->mi_floor, p->mi_max);
+    /* Every EV step, negative ones included, survives the field intact. */
+    for (v = p->mi_floor; v <= p->mi_max; v++) {
+        int back;
 
-        CHECK(got >= prev, "ae_comp must be monotonic: %d gave %d after %d", v, got, prev);
-        if (got != prev)
-            distinct++;
-        prev = got;
+        memset(buf, 0, sizeof(buf));
+        star_iq_write(buf, p->manual_off, p->width, (uint32_t)v);
+        back = (int32_t)star_iq_read_field(p, buf);
+        CHECK(back == v, "EV %d must survive the field, got %d", v, back);
     }
-    CHECK(distinct >= 2 * p->mi_max, "the range should be reachable step by step, got %d values",
-          distinct);
-
-    /* A round trip through the getter's inverse has to come back to the
-     * same half of the scale. */
-    CHECK(star_iq_unscale(p->mi_floor, 0, p->mi_floor, p->mi_max) == 0, "the floor reads back as 0");
-    CHECK(star_iq_unscale(0, 0, p->mi_floor, p->mi_max) == STAR_ISP_NEUTRAL,
-          "the baseline reads back as neutral");
-    CHECK(star_iq_unscale(p->mi_max, 0, p->mi_floor, p->mi_max) == 255,
-          "the ceiling reads back as 255");
-    CHECK(star_iq_unscale(-p->mi_max / 2, 0, p->mi_floor, p->mi_max) < STAR_ISP_NEUTRAL,
-          "negative EV reads back below neutral");
 }
 
 /*
@@ -535,7 +537,7 @@ static void test_pending_queue(void)
     rss_hal_ctx_t ctx;
     star_state_t st;
     void *c = &ctx;
-    uint8_t v8;
+    int v8;
     int vi;
 
     memset(&ctx, 0, sizeof(ctx));
@@ -546,20 +548,21 @@ static void test_pending_queue(void)
 
     /* A set before the ISP is up must succeed and be remembered, not
      * fail -- rvd applies the whole [image] block at this point. */
-    CHECK(hal_isp_set_saturation(c, 200) == RSS_OK, "set_saturation should queue, not fail");
+    CHECK(hal_isp_set_saturation(c, 100) == RSS_OK, "set_saturation should queue, not fail");
     CHECK(g_iq[IQ_SATURATION].has_pending, "saturation should be queued");
-    CHECK(g_iq[IQ_SATURATION].pending == 200, "queued value should be 200");
+    CHECK(g_iq[IQ_SATURATION].pending == 100, "queued value should be 100");
     CHECK(!g_iq[IQ_SATURATION].pending_is_raw, "saturation queues as a scalar");
 
     /* And reading it back must agree with what was asked for. */
     v8 = 0;
     CHECK(hal_isp_get_saturation(c, &v8) == RSS_OK, "get_saturation should succeed while queued");
-    CHECK(v8 == 200, "queued saturation should read back as 200, got %u", v8);
+    CHECK(v8 == 100, "queued saturation should read back as 100, got %d", v8);
 
-    /* An untouched knob reads as neutral rather than failing. */
+    /* An untouched auto/manual knob reads as auto rather than failing, and
+     * rather than quoting a number nobody asked for. */
     v8 = 0;
     CHECK(hal_isp_get_brightness(c, &v8) == RSS_OK, "get_brightness should succeed");
-    CHECK(v8 == STAR_ISP_NEUTRAL, "untouched brightness should read neutral, got %u", v8);
+    CHECK(v8 == RSS_ISP_AUTO, "untouched brightness should read auto, got %d", v8);
 
     /* Raw-valued params take the raw path. MI orders 60 Hz before 50 Hz,
      * so what gets queued is the translated value, not raptor's. */
@@ -571,10 +574,13 @@ static void test_pending_queue(void)
     CHECK(hal_isp_set_defog(c, 1) == RSS_OK, "set_defog queues");
     CHECK(g_iq[IQ_DEFOG].has_pending && g_iq[IQ_DEFOG].pending == 1, "defog queued as 1");
 
+    /* In EV steps now, so a value that used to be legal on the abstract
+     * scale is not one here -- and that is the check worth having. */
     vi = 0;
-    CHECK(hal_isp_set_ae_comp(c, 140) == RSS_OK, "set_ae_comp queues");
+    CHECK(hal_isp_set_ae_comp(c, 6) == RSS_OK, "set_ae_comp queues");
     CHECK(hal_isp_get_ae_comp(c, &vi) == RSS_OK, "get_ae_comp succeeds while queued");
-    CHECK(vi == 140, "queued ae_comp reads back, got %d", vi);
+    CHECK(vi == 6, "queued ae_comp reads back, got %d", vi);
+    CHECK(hal_isp_set_ae_comp(c, 140) == RSS_ERR_INVAL, "140 is not an EV step this row holds");
 
     /* Flip goes to the sensor, not the ISP, so it is tracked regardless
      * of ISP readiness -- but with no MI_SNR loaded it must not crash. */
@@ -582,7 +588,7 @@ static void test_pending_queue(void)
     CHECK(vi == 0, "flip defaults off");
 
     /* A NULL context must be rejected rather than dereferenced. */
-    CHECK(hal_isp_set_saturation(NULL, 200) == RSS_ERR_INVAL, "NULL ctx rejected");
+    CHECK(hal_isp_set_saturation(NULL, 100) == RSS_ERR_INVAL, "NULL ctx rejected");
 
     /* Leave the table clean for any later test. */
     memset(&st, 0, sizeof(st));
@@ -703,7 +709,7 @@ static void test_temper_is_a_channel_level(void)
     rss_hal_ctx_t ctx;
     star_state_t st;
     void *c = &ctx;
-    uint8_t v8;
+    int v8;
     size_t i;
 
     memset(&ctx, 0, sizeof(ctx));
@@ -721,27 +727,39 @@ static void test_temper_is_a_channel_level(void)
     for (i = 0; i < IQ_PARAM_COUNT; i++)
         g_iq[i].has_pending = false;
 
-    /* Neutral is the vendor default, and costs no write when already there. */
-    CHECK(hal_isp_set_temper_strength(c, STAR_ISP_NEUTRAL) == RSS_OK, "neutral temper succeeds");
-    CHECK(st.nr3d_level_req == 1, "neutral must map to level 1, got %d", st.nr3d_level_req);
+    /* Level 1 is the vendor default, and costs no write when already there. */
+    CHECK(hal_isp_set_temper_strength(c, STAR_VPE_NR3D_UNITY) == RSS_OK, "level 1 succeeds");
+    CHECK(st.nr3d_level_req == 1, "and is taken as level 1, got %d", st.nr3d_level_req);
     CHECK(vpe_para_set_calls == 0, "a redundant level must not write, got %u", vpe_para_set_calls);
 
-    /* The ends of raptor's range are the ends of MI's. */
-    CHECK(hal_isp_set_temper_strength(c, 255) == RSS_OK, "max temper succeeds");
-    CHECK(g_vpe_para.level3DNR == 7, "255 must reach level 7, got %d", g_vpe_para.level3DNR);
+    /*
+     * Every level the channel has is now reachable by name. Under the old
+     * abstract scale only two of the eight were, below neutral: the default
+     * is level 1, so raptor 1..127 all landed on level 0.
+     */
+    for (int lvl = 0; lvl <= STAR_VPE_NR3D_MAX; lvl++) {
+        CHECK(hal_isp_set_temper_strength(c, lvl) == RSS_OK, "level %d succeeds", lvl);
+        CHECK(g_vpe_para.level3DNR == lvl, "level %d must reach the channel, got %d", lvl,
+              g_vpe_para.level3DNR);
+    }
+    CHECK(hal_isp_set_temper_strength(c, STAR_VPE_NR3D_MAX + 1) == RSS_ERR_INVAL,
+          "a level the channel does not have is refused");
+
+    CHECK(hal_isp_set_temper_strength(c, STAR_VPE_NR3D_MAX) == RSS_OK, "max temper succeeds");
+    CHECK(g_vpe_para.level3DNR == 7, "the maximum is level 7, got %d", g_vpe_para.level3DNR);
     CHECK(g_vpe_para.mirror == 1, "the rest of the param must survive the write, mirror got %d",
           g_vpe_para.mirror);
 
     CHECK(hal_isp_set_temper_strength(c, 0) == RSS_OK, "min temper succeeds");
     CHECK(g_vpe_para.level3DNR == 0, "0 must reach level 0, got %d", g_vpe_para.level3DNR);
 
-    /* Read back through the same scale, and from the channel rather than the
-     * request: MI clamps the level to the per-chip maximum, so what it took is
-     * not always what was asked for. */
+    /* Read from the channel rather than the request: MI clamps the level to
+     * the per-chip maximum, so what it took is not always what was asked
+     * for. The level is reported as itself. */
     g_vpe_para.level3DNR = 1;
     v8 = 0;
     CHECK(hal_isp_get_temper_strength(c, &v8) == RSS_OK, "get_temper succeeds");
-    CHECK(v8 == STAR_ISP_NEUTRAL, "level 1 must read back as neutral, got %u", v8);
+    CHECK(v8 == 1, "level 1 must read back as 1, got %d", v8);
 
     /* No IQ row is touched by any of it, which is the whole point of the
      * move: writing NR3D's manual block sets enOpType to manual and discards
@@ -766,17 +784,19 @@ static void test_temper_is_a_channel_level(void)
     vpe_para_set_ret = 0;
     st.vpe_chn_created = false;
     vpe_para_set_calls = 0;
-    CHECK(hal_isp_set_temper_strength(c, 255) == RSS_OK, "a set before the channel is held");
+    CHECK(hal_isp_set_temper_strength(c, STAR_VPE_NR3D_MAX) == RSS_OK,
+          "a set before the channel is held");
     CHECK(st.nr3d_level_req == 7, "the held level is recorded, got %d", st.nr3d_level_req);
     CHECK(vpe_para_set_calls == 0, "nothing may be written yet, got %u", vpe_para_set_calls);
 
     /* Out of range is rejected rather than clamped. */
-    CHECK(hal_isp_set_temper_strength(c, 256) == RSS_ERR_INVAL, "256 is rejected");
-    CHECK(hal_isp_set_temper_strength(NULL, 128) == RSS_ERR_INVAL, "NULL ctx rejected");
+    CHECK(hal_isp_set_temper_strength(c, STAR_VPE_NR3D_MAX + 1) == RSS_ERR_INVAL,
+          "a level above the channel's maximum is rejected");
+    CHECK(hal_isp_set_temper_strength(NULL, 1) == RSS_ERR_INVAL, "NULL ctx rejected");
 
     st.vpe_chn_created = true;
     st.vpe.fnSetChannelParam = NULL;
-    CHECK(hal_isp_set_temper_strength(c, 200) == RSS_ERR_NOTSUP, "a missing symbol is NOTSUP");
+    CHECK(hal_isp_set_temper_strength(c, 5) == RSS_ERR_NOTSUP, "a missing symbol is NOTSUP");
 }
 
 /*
@@ -891,14 +911,14 @@ static void test_recorded_values_survive_a_reload(void)
     for (i = 0; i < IQ_PARAM_COUNT; i++)
         g_iq[i].has_pending = false;
 
-    CHECK(hal_isp_set_saturation(c, 200) == RSS_OK, "saturation is recorded");
+    CHECK(hal_isp_set_saturation(c, 100) == RSS_OK, "saturation is recorded");
 
     /* No MI handle here, so the applies inside fail; what this test is
      * about is the state of the record afterwards. */
     star_isp_flush_pending(&st);
 
     CHECK(g_iq[IQ_SATURATION].has_pending, "the flush must not consume the record");
-    CHECK(g_iq[IQ_SATURATION].pending == 200, "nor alter it, got %d", g_iq[IQ_SATURATION].pending);
+    CHECK(g_iq[IQ_SATURATION].pending == 100, "nor alter it, got %d", g_iq[IQ_SATURATION].pending);
 
     /* A value set while the ISP *is* up must be recorded just the same, or
      * the reload after the next restart loses it. */
@@ -1634,12 +1654,11 @@ int main(void)
     test_table_bounds();
     test_table_matches_disassembly();
     test_field_access_is_surgical();
-    test_scale_neutral_is_unity();
-    test_scale_endpoints_and_monotonicity();
-    test_unscale_round_trip();
-    test_scale_degenerate_inputs();
+    test_a_written_value_reads_back_unchanged();
+    test_auto_is_out_of_band();
+    test_caps_describe_what_the_setter_accepts();
     test_evcomp_neutral_comes_from_the_tuning();
-    test_ae_comp_reaches_below_neutral();
+    test_ae_comp_is_signed_end_to_end();
     test_antiflicker_translates_the_mains_frequency();
     test_pending_queue();
     test_orientation_carries_both_axes();
