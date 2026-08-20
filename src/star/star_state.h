@@ -503,16 +503,6 @@ typedef struct {
      */
     unsigned int bin_max_sensor_gain;
 
-    /*
-     * The tuning's shutter ceiling, kept for the same reason and read at
-     * the same time. It is the upper bound star_isp_cap_exposure fits the
-     * frame period against: lowering the framerate widens the ceiling back
-     * toward this and no further, because a tuning that asks for less
-     * exposure than the frame period allows is stating a calibration, not
-     * leaving room.
-     */
-    unsigned int bin_max_shutter_us;
-
     /* How many times the tuning binary has been reloaded after finding the
      * ISP back on its defaults. Bounded: a reload that does not stick must
      * not become a loop. */
@@ -755,21 +745,12 @@ void star_isp_untune(star_state_t *st);
 void star_isp_teardown(star_state_t *st);
 
 /*
- * Fit the AE's maximum shutter to one frame period.
- *
- * Called from star_isp_bringup after the tuning binary is loaded, since
- * the binary carries its own AE limits and they are not required to
- * suit the framerate this pipeline asked for. An uncapped AE converges
- * on an exposure longer than the frame period in dim light, and the
- * sensor answers by dropping its own rate -- a 30 fps request silently
- * delivering 12 fps, with nothing in any log to say why.
- *
- * Called again whenever the framerate changes, which is why it fits
- * rather than only lowers: a drop to 15 fps has twice the frame period to
- * spend, and refusing to give it back would leave the picture darker than
- * the tuning intended for no reason the caller could see.
+ * There is no shutter ceiling on this backend. The AE keeps whatever its
+ * tuning binary calibrated, and a dim scene is allowed to run the sensor
+ * slower than the requested rate to buy the light. See the block comment
+ * where star_isp_cap_exposure used to be, in hal_isp.c, for the trade and
+ * for what to read before putting it back.
  */
-int star_isp_cap_exposure(star_state_t *st, unsigned int fps);
 
 /* ISP ops. Only those MI can honour are defined; see the OP COVERAGE
  * comment in hal_isp.c for what is deliberately absent and why. */

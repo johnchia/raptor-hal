@@ -981,8 +981,8 @@ static int star_isp_read_limits(star_state_t *st, i6_isp_exp *limit)
  * land on top of them.
  *
  * The ordering is the whole point and it is easy to get wrong:
- * star_isp_flush_pending runs before star_isp_cap_exposure, so by the time
- * anything else reads this struct a requested ceiling is already in it --
+ * star_isp_flush_pending runs before anything else touches these limits, so
+ * by the time another reader sees the struct a requested ceiling is in it --
  * and because every writer here is a read-modify-write, one bad ceiling
  * propagates into every later write. Snapshotting after the flush would
  * record the overwrite and call it calibration.
@@ -1002,7 +1002,6 @@ static void star_isp_snapshot_bin_limits(star_state_t *st)
     }
 
     st->bin_max_sensor_gain = limit.maxSensorGain;
-    st->bin_max_shutter_us = limit.maxShutterUs;
 
     /*
      * INFO because this is the line every night-mode threshold gets
@@ -1032,84 +1031,63 @@ static unsigned int star_snr_fps_arg(const star_state_t *st, unsigned int fps)
     return fps;
 }
 
-int star_isp_cap_exposure(star_state_t *st, unsigned int fps)
+/*
+ * THERE IS NO SHUTTER CEILING HERE ANY MORE
+ *
+ * This used to be star_isp_cap_exposure, which held the AE's maxShutterUs
+ * to one frame period and was rewritten after every tuning load and every
+ * rate change. It is gone, to match infinity6c: on these cameras the
+ * exposure is worth more than the frame rate, because the light it buys is
+ * what keeps the AE off the gain, and gain is where the noise comes from.
+ * There is nothing left to compensate with either -- sinter is withdrawn on
+ * this backend as broken, so denoise cannot be turned up to cover for a
+ * short exposure the way it might elsewhere.
+ *
+ * It was binding, not idle. gc4653.bin publishes a 50000 us ceiling and 25
+ * fps is a 40000 us frame, so the AE was being held 10 ms short of its own
+ * calibration on every dim frame, and then sent to a sensor whose gain
+ * ceiling is 128x to make the difference up.
+ *
+ * And it worked, which is the part worth stating plainly so nobody removes
+ * it a second time thinking it never did anything: driving ae_comp to 192
+ * makes the AE demand every photon it can, and it went shutter 9089 ->
+ * 30000 us, gain 1024 -> 1083, scene luma 42 -> 123 and stopped there --
+ * below the 33333 us frame period, rather than reaching for the 50000 the
+ * tuning binary asks for. The cap reached the algorithm. It is removed
+ * because it should not be there, not because it failed.
+ *
+ * What it costs: an AE that converges past the frame period makes the
+ * sensor stretch its frame length to fit, and the delivered rate falls
+ * below the requested one with nothing in any log to say why. Measured on
+ * this backend before the cap existed, a 30 fps request delivered 12. So a
+ * dark scene now runs slow and blurred instead of fast and noisy. That is
+ * the trade, chosen deliberately, and it is the thing to undo first if the
+ * frame rate turns out to matter more.
+ *
+ * Anyone restoring it should read the git history rather than start over.
+ * The cap had to derive its rate from st->fps and not from the rate the
+ * sensor reports, because MI_SNR_GetFps answers from the frame length
+ * currently programmed and the frame length is exactly what the AE
+ * stretches -- so a ceiling decided from a rate the AE had already
+ * depressed declines to cap and then latches.
+ */
+
+/*
+ * Re-issue the sensor's frame rate after a tuning load.
+ *
+ * This lived at the tail of the cap and has nothing to do with exposure,
+ * which makes it easy to delete along with it by mistake. It does not touch
+ * the AE: it makes the sensor driver recompute its timing, which is what
+ * recovers a sensor the tuning brought up slow. waybeam calls it the
+ * cold-boot fix (star6e_pipeline.c:2094) and it is measured working.
+ */
+static void star_isp_kick_sensor_rate(star_state_t *st, unsigned int fps)
 {
-    i6_isp_exp limit;
-    unsigned int frame_us, want;
-    int ret;
+    if (!st || !fps || !st->snr.fnSetFramerate)
+        return;
 
-    if (!st || !st->isp_loaded || !fps)
-        return RSS_ERR_INVAL;
-    if (!st->isp.fnGetExposureLimit || !st->isp.fnSetExposureLimit)
-        return RSS_ERR_NOTSUP;
-
-    /*
-     * Read before write, and the read is not optional: the
-     * read-modify-write below would otherwise hand the AE an uninitialised
-     * struct, writing stack contents into its limits. Nothing in the ARM
-     * -Werror build catches that, so the host suite covers it instead.
-     */
-    ret = star_isp_read_limits(st, &limit);
-    if (ret == RSS_ERR_IO)
-        return ret;
-    if (ret != RSS_OK || limit.maxShutterUs == 0) {
-        HAL_LOG_WARN("isp: AE published no exposure limits; shutter left uncapped");
-        return RSS_ERR_TIMEOUT;
-    }
-
-    frame_us = 1000000u / fps;
-
-    /*
-     * The frame period is the ceiling's upper bound, and the tuning's own
-     * ceiling is its target. Fitting to both means a rate change moves the
-     * ceiling either way: up to what the tuning asked for when the frame
-     * period allows it, down to the frame period when it does not. Neither
-     * direction ever exceeds the calibration.
-     */
-    want = st->bin_max_shutter_us ? st->bin_max_shutter_us : limit.maxShutterUs;
-    if (want > frame_us)
-        want = frame_us;
-
-    if (limit.maxShutterUs == want) {
-        HAL_LOG_DBG("isp: AE max shutter already %u us for the %u us frame period", want, frame_us);
-        return RSS_OK;
-    }
-
-    HAL_LOG_INFO("isp: AE max shutter %u -> %u us for %u fps", limit.maxShutterUs, want, fps);
-    limit.maxShutterUs = want;
-    if (limit.minShutterUs > want)
-        limit.minShutterUs = want;
-
-    ret = st->isp.fnSetExposureLimit(STAR_ISP_CHN, &limit);
-    if (ret) {
-        HAL_LOG_WARN("isp: MI_ISP_AE_SetExposureLimit failed: %d", ret);
-        return RSS_ERR_IO;
-    }
-
-    /*
-     * The cap above does reach the algorithm, which is worth stating because
-     * the evidence takes a detour. Driving ae_comp to 192 makes the AE
-     * demand every photon it can: shutter 9089 -> 30000 us, gain 1024 ->
-     * 1083, scene luma 42 -> 123, the picture on its way to blown out. And
-     * it stops there -- below this 33333, rather than reaching for the
-     * 50000 the tuning binary asks for.
-     *
-     * Which places the 20 fps that was once measured at a requested 30: the
-     * AE was running 50000 because the binary had been loaded too early and
-     * re-read from disk underneath us, taking this cap with it. Not the cap
-     * failing -- the cap being erased. See the comment above
-     * star_isp_reload_if_reset.
-     *
-     * The SetFps below is independent of all that, and it is measured
-     * working. It does not touch the AE: it makes the sensor driver
-     * recompute its timing, which is what recovers a sensor the tuning
-     * brought up slow. waybeam calls this the cold-boot fix
-     * (star6e_pipeline.c:2094).
-     */
-    if (st->snr.fnSetFramerate && st->snr.fnSetFramerate(STAR_SNR_INDEX, star_snr_fps_arg(st, fps)))
-        HAL_LOG_WARN("isp: MI_SNR_SetFps(%u) after the exposure fit failed", fps);
-
-    return RSS_OK;
+    if (st->snr.fnSetFramerate(STAR_SNR_INDEX, star_snr_fps_arg(st, fps)))
+        HAL_LOG_WARN("isp: MI_SNR_SetFps(%u) after the tuning load failed", fps);
 }
 
 /*
@@ -1224,11 +1202,10 @@ void star_isp_tune_when_ready(star_state_t *st, bool verbose)
      * Not before a frame has come out of the pipeline. CUS3A's AE init
      * reads its own iqfile from disk and takes the AE's limits from it, and
      * that init is deferred to CUS3A's frame thread -- so a load issued any
-     * earlier is read back over, taking the gain ceiling and the shutter
-     * cap with it. A delivered frame is strictly after the ISP frame
-     * interrupt that runs the init, which is what makes it the right
-     * witness where "the ISP is answering" and "the AE reports an exposure"
-     * are both too early.
+     * earlier is read back over, taking the gain ceiling with it. A
+     * delivered frame is strictly after the ISP frame interrupt that runs
+     * the init, which is what makes it the right witness where "the ISP is
+     * answering" and "the AE reports an exposure" are both too early.
      *
      * Callers on the bring-up path reach here before that and simply queue;
      * star_isp_note_frame issues the call that loads.
@@ -1291,10 +1268,9 @@ void star_isp_tune_when_ready(star_state_t *st, bool verbose)
     /* Config knobs go on after the tuning file, never before. */
     star_isp_flush_pending(st);
 
-    /* Worth doing whether or not a tuning file loaded: the limits come
-     * from whichever tuning is in effect, and neither is obliged to suit
-     * the framerate this pipeline asked for. */
-    star_isp_cap_exposure(st, st->fps);
+    /* Worth doing whether or not a tuning file loaded: either way the
+     * sensor may have been brought up slow and needs its timing recomputed. */
+    star_isp_kick_sensor_rate(st, st->fps);
 
     /*
      * Orientation needs no re-apply here. It lives in the VPE channel
@@ -2286,14 +2262,6 @@ int hal_isp_set_sensor_fps(void *ctx, uint32_t fps_num, uint32_t fps_den)
     st->fps_milli = milli;
     st->fps = (milli + 500) / 1000;
     HAL_LOG_INFO("isp: sensor fps %u.%03u", milli / 1000, milli % 1000);
-
-    /*
-     * The shutter ceiling is a function of the frame period, so it moves
-     * with the rate -- otherwise a drop to 15 fps would keep a 33 ms
-     * ceiling it no longer needs, and a rise to 30 would leave a 66 ms one
-     * the sensor cannot honour without slowing straight back down.
-     */
-    (void)star_isp_cap_exposure(st, st->fps);
 
     return RSS_OK;
 }

@@ -1383,28 +1383,47 @@ static void test_bin_limits_snapshot_records_the_tuning(void)
           st.bin_max_sensor_gain);
 }
 
-static void test_shutter_cap_holds_the_frame_period(void)
+/*
+ * The AE's shutter ceiling belongs to the tuning, not to this backend.
+ *
+ * A cap used to live here holding maxShutterUs to one frame period; the
+ * block comment where it was records why it went. What has to stay true is
+ * that nothing on the bring-up path writes the limits back, because the
+ * failure that would follow is invisible: no error anywhere, just a picture
+ * darker than the tuning intended at a frame rate nobody asked to keep.
+ */
+static void test_the_ae_shutter_ceiling_is_left_alone(void)
 {
     rss_hal_ctx_t ctx;
     star_state_t st;
 
     limit_setup(&ctx, &st);
+    st.snr.fnSetFramerate = fake_set_fps;
+    g_fps_set_ret = 0;
+    g_fps_programmed = 0;
 
-    /* 25 fps is a 40000 us period and the tuning already sits there. */
-    CHECK(star_isp_cap_exposure(&st, 25) == RSS_OK, "an in-range shutter must succeed");
-    CHECK(g_limit_set_calls == 0, "nothing to cap means no write, got %u", g_limit_set_calls);
+    star_isp_snapshot_bin_limits(&st);
+    star_isp_kick_sensor_rate(&st, 30);
 
-    /* At 30 fps the tuning's 40000 us overruns the 33333 us period. */
-    CHECK(star_isp_cap_exposure(&st, 30) == RSS_OK, "an overrunning shutter must be capped");
-    CHECK(g_limit.maxShutterUs == 33333, "shutter must cap to 33333, got %u",
+    CHECK(g_limit_set_calls == 0, "the exposure limits must not be written, got %u writes",
+          g_limit_set_calls);
+    CHECK(g_limit.maxShutterUs == 40000,
+          "the tuning's 40000 us ceiling must survive a 30 fps bring-up, got %u",
           g_limit.maxShutterUs);
-    CHECK(g_limit.maxSensorGain == 8192, "capping the shutter must leave the gains alone, got %u",
-          g_limit.maxSensorGain);
+    CHECK(g_limit.minShutterUs == 30, "the floor must survive it too, got %u",
+          g_limit.minShutterUs);
 
-    /* A failed read is an IO error, not a silently uncapped shutter. */
-    limit_setup(&ctx, &st);
-    g_limit_get_ret = -1;
-    CHECK(star_isp_cap_exposure(&st, 25) == RSS_ERR_IO, "a failed limit read must report io");
+    /* The sensor rate is still re-issued. That is the cold-boot fix, which
+     * shared a function with the cap rather than a purpose. */
+    CHECK(g_fps_programmed == 30, "the sensor rate must still be re-issued, got %u",
+          g_fps_programmed);
+
+    /* And a fractional rate still goes out in milli-frames rather than
+     * rounded, which is the one thing star_snr_fps_arg exists for. */
+    st.fps_milli = 12500;
+    star_isp_kick_sensor_rate(&st, 13);
+    CHECK(g_fps_programmed == 12500, "a fractional rate must go out as milli-frames, got %u",
+          g_fps_programmed);
 }
 
 /*
@@ -1605,7 +1624,7 @@ int main(void)
     test_exposure_luma_covers_only_the_live_grid();
     test_exposure_refuses_a_grid_that_disagrees();
     test_bin_limits_snapshot_records_the_tuning();
-    test_shutter_cap_holds_the_frame_period();
+    test_the_ae_shutter_ceiling_is_left_alone();
     test_the_tuning_is_reloaded_when_the_isp_resets();
     test_iq_file_search_order();
 
