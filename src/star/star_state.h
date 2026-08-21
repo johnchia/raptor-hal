@@ -615,10 +615,51 @@ typedef struct {
      */
     int nr3d_level_req;
 
+    /*
+     * What the channel param was last told, field by field.
+     *
+     * The param struct is rebuilt from these on every write rather than read
+     * back and edited -- see star_vpe_fill_param. They are also refreshed
+     * from the hardware whenever something does read it, so the redundant-
+     * write guard works off the best knowledge available rather than off a
+     * request that may have been clamped.
+     */
+    int vpe_mirror;
+    int vpe_flip;
+    int vpe_nr3d;
+
     bool vpe_chn_created;
     bool vpe_chn_started;
     bool vif_vpe_bound;
 } star_state_t;
+
+/*
+ * Build MI_VPE_ChannelPara_t from raptor's own record of it.
+ *
+ * Fresh every time, never read-modify-write. The struct's first member is
+ * MI_VPE_PqParam_t -- chroma and luma spatial/temporal NR strengths, six edge
+ * gains and a contrast value -- and MI_VPE_LdcParam_t follows it, 72 bytes.
+ * Neither is ours to carry: MI marks the first "only dvr use" and this
+ * pipeline is REALTIME, and no vendor reference ever round-trips this struct.
+ * Every one of them builds it from zero and fills the four fields it means,
+ * which is what this does.
+ *
+ * The round trip it replaces read the whole struct back and wrote it out
+ * again, so whatever MI_VPE_GetChannelParam had declined to populate went to
+ * the driver as the zeros the caller's memset left -- the same bytes, but
+ * arrived at by accident and only while Get kept quiet about those fields.
+ * Rebuilding says it deliberately, and drops a read from the write path.
+ */
+static inline void star_vpe_fill_param(const star_state_t *st, int mirror, int flip,
+                                       i6e_vpe_para *para)
+{
+    memset(para, 0, sizeof(*para));
+    para->hdr = I6_HDR_OFF;
+    para->level3DNR = st->nr3d_level_req;
+    para->mirror = mirror ? 1 : 0;
+    para->flip = flip ? 1 : 0;
+    para->lensAdjOn = 0;
+}
 
 static inline star_state_t *star_state(void *ctx)
 {

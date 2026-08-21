@@ -602,17 +602,20 @@ static void test_pending_queue(void)
  * vflip silently cancels an hflip that is already in effect. The whole path
  * is function pointers, so it tests without hardware.
  *
- * The mock answers a read with whatever the last write left, because the
- * op is a read-modify-write and the thing worth testing is that it does not
- * flatten the fields it is not there to change.
+ * The mock answers a read with whatever the last write left. The op is no
+ * longer a read-modify-write -- the param is rebuilt from st on every write --
+ * so what is worth testing is that rebuilding still carries the fields the
+ * call is not there to change, and that it does so without reading.
  */
 static unsigned int vpe_para_set_calls;
+static unsigned int vpe_para_get_calls;
 static i6e_vpe_para g_vpe_para;
 static int vpe_para_get_ret, vpe_para_set_ret;
 
 static int fake_get_chn_param(int chn, i6_vpe_para *param)
 {
     (void)chn;
+    vpe_para_get_calls++;
     if (vpe_para_get_ret)
         return vpe_para_get_ret;
     memcpy(param, &g_vpe_para, sizeof(g_vpe_para));
@@ -643,9 +646,13 @@ static void test_orientation_carries_both_axes(void)
     st.vpe.fnGetChannelParam = fake_get_chn_param;
     st.vpe.fnSetChannelParam = fake_set_chn_param;
     st.vpe_chn_created = true;
-    /* What star_vpe_bringup left behind, and what must still be there after. */
-    g_vpe_para.level3DNR = 1;
+    /* What star_vpe_bringup left behind, and what must still be there after.
+     * It is st that holds it now, not the channel: the write is built from
+     * raptor's record rather than read back off the hardware. */
+    st.nr3d_level_req = 1;
+    st.vpe_nr3d = 1;
     vpe_para_set_calls = 0;
+    vpe_para_get_calls = 0;
     vpe_para_get_ret = vpe_para_set_ret = 0;
 
     CHECK(hal_isp_set_hflip(c, 1) == RSS_OK, "set_hflip succeeds");
@@ -654,6 +661,8 @@ static void test_orientation_carries_both_axes(void)
           g_vpe_para.mirror, g_vpe_para.flip);
     CHECK(g_vpe_para.level3DNR == 1, "the rest of the param must survive the write, 3DNR got %d",
           g_vpe_para.level3DNR);
+    CHECK(vpe_para_get_calls == 0, "the write path must not read the channel, got %u",
+          vpe_para_get_calls);
 
     /* The one that would regress: vflip must not drop the live hflip. */
     CHECK(hal_isp_set_vflip(c, 1) == RSS_OK, "set_vflip succeeds");
@@ -698,11 +707,12 @@ static void test_orientation_carries_both_axes(void)
  * Temper is the VPE channel's 3DNR level, not an IQ module.
  *
  * The property worth pinning is what raptor's neutral means. It has to land
- * on the level star_vpe_bringup creates the channel with, because rvd applies
- * temper=128 on every start whether the config mentions the key or not -- a
- * midpoint unity would move every board from level 1 to level 4 on the first
- * boot after this changed. The rest is the get-then-set contract orientation
- * already has, on the same struct.
+ * on the level star_vpe_bringup creates the channel with -- a midpoint unity
+ * would move every board from level 1 to level 4 on the first boot after this
+ * changed. The rest is the build-it-fresh contract orientation already has, on
+ * the same struct: setting the level must carry the mirror and flip already in
+ * effect, and must do it from raptor's own record rather than by reading the
+ * channel back.
  */
 static void test_temper_is_a_channel_level(void)
 {
@@ -720,9 +730,13 @@ static void test_temper_is_a_channel_level(void)
     st.vpe.fnSetChannelParam = fake_set_chn_param;
     st.vpe_chn_created = true;
     st.nr3d_level_req = 1;
-    g_vpe_para.level3DNR = 1;
-    g_vpe_para.mirror = 1; /* orientation already in effect */
+    st.vpe_nr3d = 1;
+    /* Orientation already in effect. It is the caller's state that carries it
+     * into the write now, so that is where the test has to put it. */
+    ctx.hflip_state[0] = 1;
+    st.vpe_mirror = 1;
     vpe_para_set_calls = 0;
+    vpe_para_get_calls = 0;
     vpe_para_get_ret = vpe_para_set_ret = 0;
     for (i = 0; i < IQ_PARAM_COUNT; i++)
         g_iq[i].has_pending = false;
@@ -749,6 +763,8 @@ static void test_temper_is_a_channel_level(void)
     CHECK(g_vpe_para.level3DNR == 7, "the maximum is level 7, got %d", g_vpe_para.level3DNR);
     CHECK(g_vpe_para.mirror == 1, "the rest of the param must survive the write, mirror got %d",
           g_vpe_para.mirror);
+    CHECK(vpe_para_get_calls == 0, "the write path must not read the channel, got %u",
+          vpe_para_get_calls);
 
     CHECK(hal_isp_set_temper_strength(c, 0) == RSS_OK, "min temper succeeds");
     CHECK(g_vpe_para.level3DNR == 0, "0 must reach level 0, got %d", g_vpe_para.level3DNR);
@@ -797,6 +813,94 @@ static void test_temper_is_a_channel_level(void)
     st.vpe_chn_created = true;
     st.vpe.fnSetChannelParam = NULL;
     CHECK(hal_isp_set_temper_strength(c, 5) == RSS_ERR_NOTSUP, "a missing symbol is NOTSUP");
+}
+
+/*
+ * The channel param is built, not edited.
+ *
+ * MI_VPE_ChannelPara_t opens with MI_VPE_PqParam_t -- chroma and luma
+ * spatial/temporal NR strengths, six edge gains, a contrast value -- and
+ * carries MI_VPE_LdcParam_t after it. Neither belongs to this driver, and the
+ * old read-modify-write handed both back to MI having only ever zeroed them
+ * with the caller's memset. That worked while MI_VPE_GetChannelParam declined
+ * to fill them; it was not a decision.
+ *
+ * Two things are pinned here. The write path does not call Get at all, so a
+ * Get that fails, or one that starts returning those fields populated, cannot
+ * change what is written. And the bytes this driver does not own leave as
+ * zeros deliberately, which is what every vendor reference sends.
+ */
+static void test_channel_param_is_built_not_edited(void)
+{
+    rss_hal_ctx_t ctx;
+    star_state_t st;
+    void *c = &ctx;
+    size_t i;
+    int all_zero;
+
+    memset(&ctx, 0, sizeof(ctx));
+    memset(&st, 0, sizeof(st));
+    ctx.platform = &st;
+    st.vpe.fnGetChannelParam = fake_get_chn_param;
+    st.vpe.fnSetChannelParam = fake_set_chn_param;
+    st.vpe_chn_created = true;
+    st.nr3d_level_req = 3;
+    st.vpe_nr3d = 3;
+
+    /*
+     * The channel reports a param full of things the driver must not echo:
+     * a populated PqParam, an LDC config, LDC switched on. A read-modify-write
+     * would carry every one of them back into the next Set.
+     */
+    memset(&g_vpe_para, 0xA5, sizeof(g_vpe_para));
+    g_vpe_para.lensAdjOn = 1;
+    vpe_para_set_calls = 0;
+    vpe_para_get_calls = 0;
+    vpe_para_set_ret = 0;
+    /* And the read fails outright, which the old path treated as fatal. */
+    vpe_para_get_ret = -1;
+
+    CHECK(hal_isp_set_hflip(c, 1) == RSS_OK, "a write succeeds with the read failing");
+    CHECK(vpe_para_get_calls == 0, "the write path must not read at all, got %u",
+          vpe_para_get_calls);
+    CHECK(vpe_para_set_calls == 1, "exactly one write, got %u", vpe_para_set_calls);
+
+    CHECK(g_vpe_para.mirror == 1 && g_vpe_para.flip == 0,
+          "the asked-for orientation is written, "
+          "got (%d,%d)",
+          g_vpe_para.mirror, g_vpe_para.flip);
+    CHECK(g_vpe_para.level3DNR == 3, "the level comes from st, got %d", g_vpe_para.level3DNR);
+    CHECK(g_vpe_para.hdr == I6_HDR_OFF, "hdr is stated, got %d", (int)g_vpe_para.hdr);
+    CHECK(g_vpe_para.lensAdjOn == 0, "LDC must not be echoed back on, got %d",
+          g_vpe_para.lensAdjOn);
+
+    /* MI_VPE_PqParam_t: ours to zero, never to carry. */
+    all_zero = 1;
+    for (i = 0; i < sizeof(g_vpe_para.reserved); i++)
+        if (g_vpe_para.reserved[i])
+            all_zero = 0;
+    CHECK(all_zero, "PqParam must go out zeroed, not echoed");
+
+    /* MI_VPE_LdcParam_t, the 72 bytes after it. */
+    CHECK(g_vpe_para.lensAdj.bypassOn == 0 && g_vpe_para.lensAdj.configAddr == NULL &&
+              g_vpe_para.lensAdj.configSize == 0,
+          "LdcParam must go out zeroed, not echoed");
+
+    /* Same contract on the temper path, which shares the builder. */
+    memset(&g_vpe_para, 0xA5, sizeof(g_vpe_para));
+    vpe_para_get_calls = 0;
+    vpe_para_set_calls = 0;
+    CHECK(hal_isp_set_temper_strength(c, 5) == RSS_OK, "temper succeeds with the read failing");
+    CHECK(vpe_para_get_calls == 0, "temper must not read either, got %u", vpe_para_get_calls);
+    CHECK(g_vpe_para.level3DNR == 5, "the new level is written, got %d", g_vpe_para.level3DNR);
+    CHECK(g_vpe_para.mirror == 1, "and carries the live hflip, got %d", g_vpe_para.mirror);
+    all_zero = 1;
+    for (i = 0; i < sizeof(g_vpe_para.reserved); i++)
+        if (g_vpe_para.reserved[i])
+            all_zero = 0;
+    CHECK(all_zero, "PqParam must go out zeroed on the temper path too");
+
+    vpe_para_get_ret = 0;
 }
 
 /*
@@ -1663,6 +1767,7 @@ int main(void)
     test_pending_queue();
     test_orientation_carries_both_axes();
     test_temper_is_a_channel_level();
+    test_channel_param_is_built_not_edited();
     test_sensor_fps_clamps_to_the_mode();
     test_recorded_values_survive_a_reload();
     test_tuning_load_leaves_3a_alone();

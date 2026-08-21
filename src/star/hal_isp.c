@@ -1224,7 +1224,7 @@ void star_isp_bringup(star_state_t *st, const rss_sensor_config_t *cfg)
  */
 static void star_isp_flush_pending(star_state_t *st);
 static void star_isp_reload_if_reset(star_state_t *st, bool force);
-static int star_isp_apply_nr3d_level(star_state_t *st);
+static int star_isp_apply_nr3d_level(star_state_t *st, int mirror, int flip);
 
 static void star_isp_arm_tuning_reads(void)
 {
@@ -1479,6 +1479,7 @@ int hal_isp_set_sharpness(void *ctx, int val)
 
 int hal_isp_set_temper_strength(void *ctx, int val)
 {
+    rss_hal_ctx_t *c = (rss_hal_ctx_t *)ctx;
     star_state_t *st = star_state(ctx);
     int prev;
     int ret;
@@ -1498,7 +1499,7 @@ int hal_isp_set_temper_strength(void *ctx, int val)
     prev = st->nr3d_level_req;
     st->nr3d_level_req = val;
 
-    ret = star_isp_apply_nr3d_level(st);
+    ret = star_isp_apply_nr3d_level(st, c->hflip_state[0], c->vflip_state[0]);
     if (ret != RSS_OK) {
         st->nr3d_level_req = prev;
         return ret;
@@ -1564,8 +1565,10 @@ int hal_isp_get_temper_strength(void *ctx, int *val)
      */
     memset(&para, 0, sizeof(para));
     if (st->vpe_chn_created && st->vpe.fnGetChannelParam &&
-        !st->vpe.fnGetChannelParam(STAR_VPE_CHN, (i6_vpe_para *)&para) && para.level3DNR >= 0)
+        !st->vpe.fnGetChannelParam(STAR_VPE_CHN, (i6_vpe_para *)&para) && para.level3DNR >= 0) {
         st->nr3d_level_req = para.level3DNR;
+        st->vpe_nr3d = para.level3DNR;
+    }
 
     *val = st->nr3d_level_req;
     return RSS_OK;
@@ -2196,32 +2199,26 @@ int hal_isp_get_running_mode(void *ctx, rss_isp_mode_t *mode)
  * Not the per-port DMA mirror either. That one is applied after the OSD,
  * so it would flip the timestamp along with the picture.
  *
- * Get-then-set, as the vendor requires: the SDK mutates what it is given
- * (3DNR level is clamped to the per-chip maximum internally), so a blind
- * write would put whatever this file last guessed back over it.
+ * The param is built fresh rather than read back and edited -- see
+ * star_vpe_fill_param for why -- so the other fields it carries come from
+ * st's record of them, not from the channel. The redundant-write guard
+ * matters more than it looks: MI mutates a param it is handed, and on this
+ * SoC the write lands on a running channel.
  */
 static int star_isp_apply_orien(star_state_t *st, int mirror, int flip)
 {
     i6e_vpe_para para;
     int ret;
 
-    if (!st->vpe.fnGetChannelParam || !st->vpe.fnSetChannelParam)
+    if (!st->vpe.fnSetChannelParam)
         return RSS_ERR_NOTSUP;
     if (!st->vpe_chn_created)
         return RSS_ERR_NOENT;
 
-    memset(&para, 0, sizeof(para));
-    ret = st->vpe.fnGetChannelParam(STAR_VPE_CHN, (i6_vpe_para *)&para);
-    if (ret) {
-        HAL_LOG_WARN("isp: MI_VPE_GetChannelParam failed: %d", ret);
-        return RSS_ERR_IO;
-    }
-
-    if (para.mirror == (mirror ? 1 : 0) && para.flip == (flip ? 1 : 0))
+    if (st->vpe_mirror == (mirror ? 1 : 0) && st->vpe_flip == (flip ? 1 : 0))
         return RSS_OK;
 
-    para.mirror = mirror ? 1 : 0;
-    para.flip = flip ? 1 : 0;
+    star_vpe_fill_param(st, mirror, flip, &para);
 
     ret = st->vpe.fnSetChannelParam(STAR_VPE_CHN, (i6_vpe_para *)&para);
     if (ret) {
@@ -2229,6 +2226,10 @@ static int star_isp_apply_orien(star_state_t *st, int mirror, int flip)
                      para.flip, ret);
         return RSS_ERR_IO;
     }
+
+    st->vpe_mirror = para.mirror;
+    st->vpe_flip = para.flip;
+    st->vpe_nr3d = para.level3DNR;
 
     HAL_LOG_DBG("isp: orientation mirror=%d flip=%d", para.mirror, para.flip);
     return RSS_OK;
@@ -2252,15 +2253,17 @@ static int star_isp_apply_orien(star_state_t *st, int mirror, int flip)
  * which a running channel refuses, so the level is creation-time only.
  * MI_VPE_SetChannelParam takes it whenever, so here it is live.
  *
- * Get-then-set, for the reason star_isp_apply_orien gives: the SDK mutates
- * what it is handed, and this is the field it clamps.
+ * Built fresh, like orientation, so the mirror and flip already in effect
+ * have to be carried in by the caller -- they live in rss_hal_ctx_t, which
+ * this layer cannot reach. Reading them back off the channel instead is what
+ * star_vpe_fill_param exists to avoid.
  */
-static int star_isp_apply_nr3d_level(star_state_t *st)
+static int star_isp_apply_nr3d_level(star_state_t *st, int mirror, int flip)
 {
     i6e_vpe_para para;
     int ret;
 
-    if (!st->vpe.fnGetChannelParam || !st->vpe.fnSetChannelParam)
+    if (!st->vpe.fnSetChannelParam)
         return RSS_ERR_NOTSUP;
     /*
      * Held rather than refused: star_vpe_bringup reads nr3d_level_req when
@@ -2272,23 +2275,20 @@ static int star_isp_apply_nr3d_level(star_state_t *st)
     if (!st->vpe_chn_created)
         return RSS_OK;
 
-    memset(&para, 0, sizeof(para));
-    ret = st->vpe.fnGetChannelParam(STAR_VPE_CHN, (i6_vpe_para *)&para);
-    if (ret) {
-        HAL_LOG_WARN("isp: MI_VPE_GetChannelParam failed: %d", ret);
-        return RSS_ERR_IO;
-    }
-
-    if (para.level3DNR == st->nr3d_level_req)
+    if (st->vpe_nr3d == st->nr3d_level_req)
         return RSS_OK;
 
-    para.level3DNR = st->nr3d_level_req;
+    star_vpe_fill_param(st, mirror, flip, &para);
 
     ret = st->vpe.fnSetChannelParam(STAR_VPE_CHN, (i6_vpe_para *)&para);
     if (ret) {
         HAL_LOG_WARN("isp: MI_VPE_SetChannelParam(3dnr=%d) failed: %d", para.level3DNR, ret);
         return RSS_ERR_IO;
     }
+
+    st->vpe_nr3d = para.level3DNR;
+    st->vpe_mirror = para.mirror;
+    st->vpe_flip = para.flip;
 
     return RSS_OK;
 }
@@ -2348,6 +2348,8 @@ int hal_isp_get_hvflip(void *ctx, int *hflip, int *vflip)
         !st->vpe.fnGetChannelParam(STAR_VPE_CHN, (i6_vpe_para *)&para)) {
         c->hflip_state[0] = para.mirror ? 1 : 0;
         c->vflip_state[0] = para.flip ? 1 : 0;
+        st->vpe_mirror = c->hflip_state[0];
+        st->vpe_flip = c->vflip_state[0];
     }
 
     if (hflip)

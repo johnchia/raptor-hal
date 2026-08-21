@@ -559,33 +559,30 @@ static int star_vpe_bringup(star_state_t *st)
     }
     st->vpe_chn_created = true;
 
-    memset(&param, 0, sizeof(param));
-    param.hdr = I6_HDR_OFF;
-    /* 3DNR level, which is raptor's temper knob -- see
-     * hal_isp_set_temper_strength. Seeded to 1 in star_open, as both
-     * references default it, and carried here so a temper set before the
-     * channel existed still lands. The range is 0-7. */
-    param.level3DNR = st->nr3d_level_req;
     /*
-     * Orientation starts unrotated and arrives through isp_set_hflip /
-     * isp_set_vflip, which reach these same two fields (see
-     * star_isp_apply_orien). rvd applies them while building the pipeline,
-     * before any output port is enabled, so nothing is delivered the wrong
-     * way up -- and there is no config field here to keep in step with the
-     * ops.
+     * One builder for this struct, shared with the two setters that write it
+     * later -- star_isp_apply_orien and star_isp_apply_nr3d_level. It carries
+     * the 3DNR level from st->nr3d_level_req, seeded to 1 in star_open as both
+     * references default it, so a temper set that arrived before the channel
+     * existed still lands here.
      *
-     * reserved[16] is MI_VPE_PqParam_t, marked "only dvr use", so leaving
-     * it zero is what it is for.
+     * Orientation starts unrotated and arrives through isp_set_hflip /
+     * isp_set_vflip, which reach the same struct. rvd applies them while
+     * building the pipeline, before any output port is enabled, so nothing is
+     * delivered the wrong way up -- and there is no config field here to keep
+     * in step with the ops.
      */
-    param.mirror = 0;
-    param.flip = 0;
-    param.lensAdjOn = 0;
+    star_vpe_fill_param(st, 0, 0, &param);
 
     ret = st->vpe.fnSetChannelParam(STAR_VPE_CHN, (i6_vpe_para *)&param);
     if (ret) {
         HAL_LOG_ERR("MI_VPE_SetChannelParam(%d) failed: %d", STAR_VPE_CHN, ret);
         return RSS_ERR_IO;
     }
+
+    st->vpe_mirror = param.mirror;
+    st->vpe_flip = param.flip;
+    st->vpe_nr3d = param.level3DNR;
 
     ret = st->vpe.fnStartChannel(STAR_VPE_CHN);
     if (ret) {
