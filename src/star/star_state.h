@@ -616,17 +616,24 @@ typedef struct {
     int nr3d_level_req;
 
     /*
-     * What the channel param was last told, field by field.
+     * What the channel param was last told.
      *
-     * The param struct is rebuilt from these on every write rather than read
-     * back and edited -- see star_vpe_fill_param. They are also refreshed
-     * from the hardware whenever something does read it, so the redundant-
-     * write guard works off the best knowledge available rather than off a
-     * request that may have been clamped.
+     * The param struct is rebuilt from this on every write rather than read
+     * back and edited -- see star_vpe_fill_param. It is also refreshed from
+     * the hardware whenever something does read it, so the redundant-write
+     * guard works off the best knowledge available rather than off a request
+     * that may have been clamped.
      */
-    int vpe_mirror;
-    int vpe_flip;
     int vpe_nr3d;
+
+    /*
+     * What MI_SNR_SetOrien was told at bring-up, which is the only time it is
+     * told anything. MI_SNR_GetOrien cannot be used to check: the vendor
+     * driver answers it from its static default table rather than the live
+     * value, so it reports unmirrored however the image actually looks.
+     */
+    int snr_mirror;
+    int snr_flip;
 
     bool vpe_chn_created;
     bool vpe_chn_started;
@@ -650,14 +657,17 @@ typedef struct {
  * arrived at by accident and only while Get kept quiet about those fields.
  * Rebuilding says it deliberately, and drops a read from the write path.
  */
-static inline void star_vpe_fill_param(const star_state_t *st, int mirror, int flip,
-                                       i6e_vpe_para *para)
+static inline void star_vpe_fill_param(const star_state_t *st, i6e_vpe_para *para)
 {
     memset(para, 0, sizeof(*para));
     para->hdr = I6_HDR_OFF;
     para->level3DNR = st->nr3d_level_req;
-    para->mirror = mirror ? 1 : 0;
-    para->flip = flip ? 1 : 0;
+    /*
+     * mirror and flip stay zero here, and the sensor carries orientation
+     * instead -- star_sensor_bringup says why. They are left to the memset
+     * rather than assigned, so that a reader looking for where this backend
+     * sets them finds nothing, which is the point.
+     */
     para->lensAdjOn = 0;
 }
 

@@ -344,22 +344,44 @@ static int star_sensor_bringup(star_state_t *st, const rss_sensor_config_t *cfg)
     }
 
     /*
-     * Pin the sensor to unrotated before Enable, so that orientation is the
-     * VPE channel's business alone.
+     * Orientation, before Enable, because that is when the driver's init
+     * reads it. Both axes are written whatever the config asked for, so the
+     * call is also the normalisation it used to be on its own: a sensor
+     * driver's default orientation is whatever its own table says and need
+     * not be identity -- the GC4653 on this board comes up rotated 180
+     * degrees, measured by removing this call and watching the picture turn
+     * over -- so leaving the register alone means inheriting a per-sensor
+     * orientation nothing in the config can see or explain.
      *
-     * Not a no-op, and not skippable: a sensor driver's default orientation
-     * is whatever its own table says, and it need not be identity. The
-     * GC4653 on this board comes up rotated 180 degrees -- measured, by
-     * removing this call and watching the picture turn over -- so leaving
-     * the register alone means inheriting a per-sensor orientation that
-     * nothing in the config can see or explain. Before Enable, because that
-     * is when the driver's init reads it.
+     * The sensor, and not MI_VPE_ChannelPara_t's bMirror/bFlip, which is the
+     * same picture and a better runtime contract and was what this did for a
+     * fortnight. Those two fields also feed 3DNR's motion detection: with
+     * either set, the filter stops recognising a moving subject as moving and
+     * blends it into the background it crosses, so a person or a cyclist goes
+     * semi-transparent while the still parts of the scene stay clean. It is
+     * invisible in a static test frame, which is how it survived a bring-up
+     * that checked all four orientations against mirrored baselines. Proven
+     * against majestic on this board: same SoC, same sensor, same tuning
+     * binary, clean picture, and the one thing it does differently is leave
+     * the channel param at (0,0) and turn the sensor over instead.
+     *
+     * The cost is that orientation is now fixed at bring-up. MI_SNR_SetOrien
+     * on a live sensor only stores the value and sets a dirty flag, leaving
+     * pCus_AEStatusNotify(CUS_FRAME_ACTIVE) to write the register, so it
+     * lands on the next AE notification if 3A is running and sits pending if
+     * it is not -- which is why hal_isp_set_hflip refuses rather than
+     * pretending. Infinity6C reached the same place from the other direction:
+     * there the ISP channel param carries orientation and a running channel
+     * refuses the write outright.
      */
-    ret = st->snr.fnSetOrientation(STAR_SNR_INDEX, 0, 0);
+    st->snr_mirror = cfg->hflip ? 1 : 0;
+    st->snr_flip = cfg->vflip ? 1 : 0;
+
+    ret = st->snr.fnSetOrientation(STAR_SNR_INDEX, st->snr_mirror, st->snr_flip);
     if (ret)
-        HAL_LOG_WARN("MI_SNR_SetOrien(0,0) failed: %d -- the sensor keeps its driver's "
-                     "default orientation, which may not be unrotated",
-                     ret);
+        HAL_LOG_WARN("MI_SNR_SetOrien(%d,%d) failed: %d -- the sensor keeps its driver's "
+                     "default orientation, which may not be the one configured",
+                     st->snr_mirror, st->snr_flip, ret);
 
     /*
      * Read the driver module's name before Enable. It needs no MI call, and
@@ -553,12 +575,11 @@ static int star_vpe_bringup(star_state_t *st)
 
     ret = st->vpe.fnCreateChannel(STAR_VPE_CHN, (i6_vpe_chn *)&channel);
     if (ret) {
-        HAL_LOG_ERR("MI_VPE_CreateChannel(%d) failed: %d (%ux%u pixFmt %d)", STAR_VPE_CHN,
-                    ret, channel.capt.width, channel.capt.height, channel.pixFmt);
+        HAL_LOG_ERR("MI_VPE_CreateChannel(%d) failed: %d (%ux%u pixFmt %d)", STAR_VPE_CHN, ret,
+                    channel.capt.width, channel.capt.height, channel.pixFmt);
         return RSS_ERR_IO;
     }
     st->vpe_chn_created = true;
-
     /*
      * One builder for this struct, shared with the two setters that write it
      * later -- star_isp_apply_orien and star_isp_apply_nr3d_level. It carries
@@ -572,7 +593,7 @@ static int star_vpe_bringup(star_state_t *st)
      * delivered the wrong way up -- and there is no config field here to keep
      * in step with the ops.
      */
-    star_vpe_fill_param(st, 0, 0, &param);
+    star_vpe_fill_param(st, &param);
 
     ret = st->vpe.fnSetChannelParam(STAR_VPE_CHN, (i6_vpe_para *)&param);
     if (ret) {
@@ -580,9 +601,8 @@ static int star_vpe_bringup(star_state_t *st)
         return RSS_ERR_IO;
     }
 
-    st->vpe_mirror = param.mirror;
-    st->vpe_flip = param.flip;
     st->vpe_nr3d = param.level3DNR;
+
 
     ret = st->vpe.fnStartChannel(STAR_VPE_CHN);
     if (ret) {

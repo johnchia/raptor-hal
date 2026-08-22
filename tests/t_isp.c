@@ -597,15 +597,17 @@ static void test_pending_queue(void)
 }
 
 /*
- * Orientation. The VPE channel param carries both axes in one struct, so
- * setting one has to carry the other over -- get that wrong and enabling
- * vflip silently cancels an hflip that is already in effect. The whole path
- * is function pointers, so it tests without hardware.
+ * Orientation is a bring-up setting, applied to the sensor, and the VPE
+ * channel param must never carry it.
  *
- * The mock answers a read with whatever the last write left. The op is no
- * longer a read-modify-write -- the param is rebuilt from st on every write --
- * so what is worth testing is that rebuilding still carries the fields the
- * call is not there to change, and that it does so without reading.
+ * That last clause is the regression this file exists to prevent. bMirror and
+ * bFlip look like the obvious home for mirror and flip -- they are the right
+ * stage, they read back, and a runtime change lands there deterministically,
+ * which is why this backend used them for a fortnight. They also feed 3DNR's
+ * motion detection, and with either set the filter stops recognising a moving
+ * subject as moving and blends it into the background it crosses. No still
+ * frame shows it. So the test is on the param the level writes: whatever the
+ * sensor was told, those two fields go out zero.
  */
 static unsigned int vpe_para_set_calls;
 static unsigned int vpe_para_get_calls;
@@ -632,7 +634,7 @@ static int fake_set_chn_param(int chn, i6_vpe_para *param)
     return 0;
 }
 
-static void test_orientation_carries_both_axes(void)
+static void test_orientation_is_bringup_only(void)
 {
     rss_hal_ctx_t ctx;
     star_state_t st;
@@ -646,61 +648,59 @@ static void test_orientation_carries_both_axes(void)
     st.vpe.fnGetChannelParam = fake_get_chn_param;
     st.vpe.fnSetChannelParam = fake_set_chn_param;
     st.vpe_chn_created = true;
-    /* What star_vpe_bringup left behind, and what must still be there after.
-     * It is st that holds it now, not the channel: the write is built from
-     * raptor's record rather than read back off the hardware. */
     st.nr3d_level_req = 1;
     st.vpe_nr3d = 1;
+    /* What star_sensor_bringup told MI_SNR_SetOrien: a camera mounted upside
+     * down, which is the case that made this backend want a flip at all. */
+    st.snr_mirror = 1;
+    st.snr_flip = 1;
     vpe_para_set_calls = 0;
     vpe_para_get_calls = 0;
     vpe_para_get_ret = vpe_para_set_ret = 0;
 
-    CHECK(hal_isp_set_hflip(c, 1) == RSS_OK, "set_hflip succeeds");
-    CHECK(vpe_para_set_calls == 1, "set_hflip issues one write, got %u", vpe_para_set_calls);
-    CHECK(g_vpe_para.mirror == 1 && g_vpe_para.flip == 0, "hflip alone -> (1,0), got (%d,%d)",
-          g_vpe_para.mirror, g_vpe_para.flip);
-    CHECK(g_vpe_para.level3DNR == 1, "the rest of the param must survive the write, 3DNR got %d",
+    /* The reported orientation is what bring-up applied. MI_SNR_GetOrien
+     * answers from a static table rather than the live register, so this must
+     * come from raptor's record and not from the sensor. */
+    hf = vf = -1;
+    CHECK(hal_isp_get_hvflip(c, &hf, &vf) == RSS_OK, "get_hvflip succeeds");
+    CHECK(hf == 1 && vf == 1, "get_hvflip reports what bring-up applied, got (%d,%d)", hf, vf);
+
+    /* rvd drives the whole [image] block while building the pipeline, from the
+     * same keys the sensor config already carried, so the ordinary path asks
+     * for what is already true. That must succeed and must not write. */
+    CHECK(hal_isp_set_hflip(c, 1) == RSS_OK, "setting the value already applied succeeds");
+    CHECK(hal_isp_set_vflip(c, 1) == RSS_OK, "setting the value already applied succeeds");
+    CHECK(vpe_para_set_calls == 0, "agreeing with bring-up must not write, got %u",
+          vpe_para_set_calls);
+
+    /* An actual change cannot be honoured: on a live sensor MI_SNR_SetOrien
+     * only sets a dirty flag, and whether it lands depends on AE running.
+     * Refusing beats reporting success for a write that may never happen. */
+    CHECK(hal_isp_set_hflip(c, 0) == RSS_ERR_NOTSUP, "changing hflip at runtime is refused");
+    CHECK(hal_isp_set_vflip(c, 0) == RSS_ERR_NOTSUP, "changing vflip at runtime is refused");
+    CHECK(vpe_para_set_calls == 0, "a refused change must not write, got %u", vpe_para_set_calls);
+
+    /* A refusal must not be recorded, or a later read would report an
+     * orientation the sensor was never given. */
+    hf = vf = -1;
+    CHECK(hal_isp_get_hvflip(c, &hf, &vf) == RSS_OK, "get_hvflip still succeeds");
+    CHECK(hf == 1 && vf == 1, "a refused change must not be recorded, got (%d,%d)", hf, vf);
+
+    /*
+     * The regression guard. With the sensor mirrored and flipped, a write that
+     * exists for an unrelated field must still leave bMirror/bFlip zero --
+     * anything else re-creates the ghosting.
+     */
+    st.nr3d_level_req = 2;
+    CHECK(hal_isp_set_temper_strength(c, 2) == RSS_OK, "temper set succeeds");
+    CHECK(vpe_para_set_calls == 1, "temper issues one write, got %u", vpe_para_set_calls);
+    CHECK(g_vpe_para.mirror == 0 && g_vpe_para.flip == 0,
+          "the channel param must never carry orientation, got (%d,%d)", g_vpe_para.mirror,
+          g_vpe_para.flip);
+    CHECK(g_vpe_para.level3DNR == 2, "the level it was called for lands, got %d",
           g_vpe_para.level3DNR);
     CHECK(vpe_para_get_calls == 0, "the write path must not read the channel, got %u",
           vpe_para_get_calls);
-
-    /* The one that would regress: vflip must not drop the live hflip. */
-    CHECK(hal_isp_set_vflip(c, 1) == RSS_OK, "set_vflip succeeds");
-    CHECK(g_vpe_para.mirror == 1 && g_vpe_para.flip == 1, "vflip must keep hflip -> (1,1), "
-          "got (%d,%d)", g_vpe_para.mirror, g_vpe_para.flip);
-
-    hf = vf = -1;
-    CHECK(hal_isp_get_hvflip(c, &hf, &vf) == RSS_OK, "get_hvflip succeeds");
-    CHECK(hf == 1 && vf == 1, "get_hvflip reports both set, got (%d,%d)", hf, vf);
-
-    /* Clearing one leaves the other alone. */
-    CHECK(hal_isp_set_hflip(c, 0) == RSS_OK, "clearing hflip succeeds");
-    CHECK(g_vpe_para.mirror == 0 && g_vpe_para.flip == 1, "clearing hflip keeps vflip -> (0,1), "
-          "got (%d,%d)", g_vpe_para.mirror, g_vpe_para.flip);
-
-    /* Asking for what is already set costs no write. The SDK mutates a param
-     * it is handed, so a redundant one is not free. */
-    vpe_para_set_calls = 0;
-    CHECK(hal_isp_set_vflip(c, 1) == RSS_OK, "a redundant set succeeds");
-    CHECK(vpe_para_set_calls == 0, "a redundant set must not write, got %u", vpe_para_set_calls);
-
-    /* A failed write must not leave the cache claiming a change that never
-     * reached the hardware, or the next set would carry a lie. */
-    vpe_para_set_ret = -1;
-    CHECK(hal_isp_set_hflip(c, 1) != RSS_OK, "a failing write is reported");
-    hf = -1;
-    CHECK(hal_isp_get_hvflip(c, &hf, NULL) == RSS_OK, "get_hvflip still succeeds");
-    CHECK(hf == 0, "a failed set must not be recorded, got %d", hf);
-
-    /* Before the channel exists there is nothing to write to, and that is a
-     * different answer from a missing symbol. */
-    vpe_para_set_ret = 0;
-    st.vpe_chn_created = false;
-    CHECK(hal_isp_set_hflip(c, 1) == RSS_ERR_NOENT, "no channel yet is NOENT");
-
-    st.vpe_chn_created = true;
-    st.vpe.fnSetChannelParam = NULL;
-    CHECK(hal_isp_set_hflip(c, 1) == RSS_ERR_NOTSUP, "a missing symbol is NOTSUP");
 }
 
 /*
@@ -709,10 +709,10 @@ static void test_orientation_carries_both_axes(void)
  * The property worth pinning is what raptor's neutral means. It has to land
  * on the level star_vpe_bringup creates the channel with -- a midpoint unity
  * would move every board from level 1 to level 4 on the first boot after this
- * changed. The rest is the build-it-fresh contract orientation already has, on
- * the same struct: setting the level must carry the mirror and flip already in
- * effect, and must do it from raptor's own record rather than by reading the
- * channel back.
+ * changed. The rest is the build-it-fresh contract: the param is rebuilt from
+ * raptor's own record on every write rather than read back and edited, so a
+ * write must not read the channel, and the fields this backend does not use --
+ * bMirror and bFlip among them -- go out zero.
  */
 static void test_temper_is_a_channel_level(void)
 {
@@ -731,10 +731,8 @@ static void test_temper_is_a_channel_level(void)
     st.vpe_chn_created = true;
     st.nr3d_level_req = 1;
     st.vpe_nr3d = 1;
-    /* Orientation already in effect. It is the caller's state that carries it
-     * into the write now, so that is where the test has to put it. */
-    ctx.hflip_state[0] = 1;
-    st.vpe_mirror = 1;
+    /* The sensor is mirrored. Nothing about that may reach the channel param. */
+    st.snr_mirror = 1;
     vpe_para_set_calls = 0;
     vpe_para_get_calls = 0;
     vpe_para_get_ret = vpe_para_set_ret = 0;
@@ -761,8 +759,9 @@ static void test_temper_is_a_channel_level(void)
 
     CHECK(hal_isp_set_temper_strength(c, STAR_VPE_NR3D_MAX) == RSS_OK, "max temper succeeds");
     CHECK(g_vpe_para.level3DNR == 7, "the maximum is level 7, got %d", g_vpe_para.level3DNR);
-    CHECK(g_vpe_para.mirror == 1, "the rest of the param must survive the write, mirror got %d",
-          g_vpe_para.mirror);
+    CHECK(g_vpe_para.mirror == 0 && g_vpe_para.flip == 0,
+          "a mirrored sensor must not put orientation on the channel, got (%d,%d)",
+          g_vpe_para.mirror, g_vpe_para.flip);
     CHECK(vpe_para_get_calls == 0, "the write path must not read the channel, got %u",
           vpe_para_get_calls);
 
@@ -844,8 +843,11 @@ static void test_channel_param_is_built_not_edited(void)
     st.vpe.fnGetChannelParam = fake_get_chn_param;
     st.vpe.fnSetChannelParam = fake_set_chn_param;
     st.vpe_chn_created = true;
-    st.nr3d_level_req = 3;
-    st.vpe_nr3d = 3;
+    st.nr3d_level_req = 1;
+    st.vpe_nr3d = 1;
+    /* A mirrored sensor, so the builder has something it could wrongly echo. */
+    st.snr_mirror = 1;
+    st.snr_flip = 1;
 
     /*
      * The channel reports a param full of things the driver must not echo:
@@ -860,14 +862,13 @@ static void test_channel_param_is_built_not_edited(void)
     /* And the read fails outright, which the old path treated as fatal. */
     vpe_para_get_ret = -1;
 
-    CHECK(hal_isp_set_hflip(c, 1) == RSS_OK, "a write succeeds with the read failing");
+    CHECK(hal_isp_set_temper_strength(c, 3) == RSS_OK, "a write succeeds with the read failing");
     CHECK(vpe_para_get_calls == 0, "the write path must not read at all, got %u",
           vpe_para_get_calls);
     CHECK(vpe_para_set_calls == 1, "exactly one write, got %u", vpe_para_set_calls);
 
-    CHECK(g_vpe_para.mirror == 1 && g_vpe_para.flip == 0,
-          "the asked-for orientation is written, "
-          "got (%d,%d)",
+    CHECK(g_vpe_para.mirror == 0 && g_vpe_para.flip == 0,
+          "orientation must not reach the channel however the sensor is set, got (%d,%d)",
           g_vpe_para.mirror, g_vpe_para.flip);
     CHECK(g_vpe_para.level3DNR == 3, "the level comes from st, got %d", g_vpe_para.level3DNR);
     CHECK(g_vpe_para.hdr == I6_HDR_OFF, "hdr is stated, got %d", (int)g_vpe_para.hdr);
@@ -893,7 +894,8 @@ static void test_channel_param_is_built_not_edited(void)
     CHECK(hal_isp_set_temper_strength(c, 5) == RSS_OK, "temper succeeds with the read failing");
     CHECK(vpe_para_get_calls == 0, "temper must not read either, got %u", vpe_para_get_calls);
     CHECK(g_vpe_para.level3DNR == 5, "the new level is written, got %d", g_vpe_para.level3DNR);
-    CHECK(g_vpe_para.mirror == 1, "and carries the live hflip, got %d", g_vpe_para.mirror);
+    CHECK(g_vpe_para.mirror == 0 && g_vpe_para.flip == 0, "and still no orientation, got (%d,%d)",
+          g_vpe_para.mirror, g_vpe_para.flip);
     all_zero = 1;
     for (i = 0; i < sizeof(g_vpe_para.reserved); i++)
         if (g_vpe_para.reserved[i])
@@ -1765,7 +1767,7 @@ int main(void)
     test_ae_comp_is_signed_end_to_end();
     test_antiflicker_translates_the_mains_frequency();
     test_pending_queue();
-    test_orientation_carries_both_axes();
+    test_orientation_is_bringup_only();
     test_temper_is_a_channel_level();
     test_channel_param_is_built_not_edited();
     test_sensor_fps_clamps_to_the_mode();

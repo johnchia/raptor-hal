@@ -1224,7 +1224,7 @@ void star_isp_bringup(star_state_t *st, const rss_sensor_config_t *cfg)
  */
 static void star_isp_flush_pending(star_state_t *st);
 static void star_isp_reload_if_reset(star_state_t *st, bool force);
-static int star_isp_apply_nr3d_level(star_state_t *st, int mirror, int flip);
+static int star_isp_apply_nr3d_level(star_state_t *st);
 
 static void star_isp_arm_tuning_reads(void)
 {
@@ -1479,7 +1479,6 @@ int hal_isp_set_sharpness(void *ctx, int val)
 
 int hal_isp_set_temper_strength(void *ctx, int val)
 {
-    rss_hal_ctx_t *c = (rss_hal_ctx_t *)ctx;
     star_state_t *st = star_state(ctx);
     int prev;
     int ret;
@@ -1499,7 +1498,7 @@ int hal_isp_set_temper_strength(void *ctx, int val)
     prev = st->nr3d_level_req;
     st->nr3d_level_req = val;
 
-    ret = star_isp_apply_nr3d_level(st, c->hflip_state[0], c->vflip_state[0]);
+    ret = star_isp_apply_nr3d_level(st);
     if (ret != RSS_OK) {
         st->nr3d_level_req = prev;
         return ret;
@@ -2179,63 +2178,6 @@ int hal_isp_get_running_mode(void *ctx, rss_isp_mode_t *mode)
 }
 
 /*
- * Mirror and flip.
- *
- * The VPE channel's own mirror/flip, which is the same stage Ingenic's ISP
- * flip acts at: digital, downstream of the sensor, and settable whenever.
- * The vendor's stated reason for the fields existing is to cover sensors
- * that cannot flip themselves, so using them for every sensor costs
- * nothing and makes one path do the work.
- *
- * Not the sensor's MI_SNR_SetOrien, which was the earlier mechanism and is
- * best-effort by comparison: it only stores the value and sets a dirty
- * flag, leaving pCus_AEStatusNotify(CUS_FRAME_ACTIVE) to write the
- * register, so it lands on the next AE frame notification if 3A is running
- * and sits pending if it is not -- and MI_SNR_GetOrien cannot say which,
- * because the vendor driver answers it from its static default table
- * rather than the live value. A channel param has no pending state and
- * reads back what it is doing.
- *
- * Not the per-port DMA mirror either. That one is applied after the OSD,
- * so it would flip the timestamp along with the picture.
- *
- * The param is built fresh rather than read back and edited -- see
- * star_vpe_fill_param for why -- so the other fields it carries come from
- * st's record of them, not from the channel. The redundant-write guard
- * matters more than it looks: MI mutates a param it is handed, and on this
- * SoC the write lands on a running channel.
- */
-static int star_isp_apply_orien(star_state_t *st, int mirror, int flip)
-{
-    i6e_vpe_para para;
-    int ret;
-
-    if (!st->vpe.fnSetChannelParam)
-        return RSS_ERR_NOTSUP;
-    if (!st->vpe_chn_created)
-        return RSS_ERR_NOENT;
-
-    if (st->vpe_mirror == (mirror ? 1 : 0) && st->vpe_flip == (flip ? 1 : 0))
-        return RSS_OK;
-
-    star_vpe_fill_param(st, mirror, flip, &para);
-
-    ret = st->vpe.fnSetChannelParam(STAR_VPE_CHN, (i6_vpe_para *)&para);
-    if (ret) {
-        HAL_LOG_WARN("isp: MI_VPE_SetChannelParam(mirror=%d, flip=%d) failed: %d", para.mirror,
-                     para.flip, ret);
-        return RSS_ERR_IO;
-    }
-
-    st->vpe_mirror = para.mirror;
-    st->vpe_flip = para.flip;
-    st->vpe_nr3d = para.level3DNR;
-
-    HAL_LOG_DBG("isp: orientation mirror=%d flip=%d", para.mirror, para.flip);
-    return RSS_OK;
-}
-
-/*
  * Temporal denoise, as the VPE channel's own 3DNR level.
  *
  * Not MI_ISP_IQ_SetNR3D, which is what this was until the tuning work in
@@ -2253,12 +2195,11 @@ static int star_isp_apply_orien(star_state_t *st, int mirror, int flip)
  * which a running channel refuses, so the level is creation-time only.
  * MI_VPE_SetChannelParam takes it whenever, so here it is live.
  *
- * Built fresh, like orientation, so the mirror and flip already in effect
- * have to be carried in by the caller -- they live in rss_hal_ctx_t, which
- * this layer cannot reach. Reading them back off the channel instead is what
- * star_vpe_fill_param exists to avoid.
+ * Built fresh rather than read back and edited -- see star_vpe_fill_param.
+ * The struct's other live field, bMirror/bFlip, is written as zero because
+ * this backend puts orientation on the sensor; star_sensor_bringup says why.
  */
-static int star_isp_apply_nr3d_level(star_state_t *st, int mirror, int flip)
+static int star_isp_apply_nr3d_level(star_state_t *st)
 {
     i6e_vpe_para para;
     int ret;
@@ -2268,9 +2209,6 @@ static int star_isp_apply_nr3d_level(star_state_t *st, int mirror, int flip)
     /*
      * Held rather than refused: star_vpe_bringup reads nr3d_level_req when
      * it creates the channel, so a request that arrives first still lands.
-     * Orientation cannot do this -- its two fields are in rss_hal_ctx_t and
-     * the creation path writes them as zero -- which is why that one returns
-     * NOENT here and this one does not.
      */
     if (!st->vpe_chn_created)
         return RSS_OK;
@@ -2278,7 +2216,7 @@ static int star_isp_apply_nr3d_level(star_state_t *st, int mirror, int flip)
     if (st->vpe_nr3d == st->nr3d_level_req)
         return RSS_OK;
 
-    star_vpe_fill_param(st, mirror, flip, &para);
+    star_vpe_fill_param(st, &para);
 
     ret = st->vpe.fnSetChannelParam(STAR_VPE_CHN, (i6_vpe_para *)&para);
     if (ret) {
@@ -2287,75 +2225,87 @@ static int star_isp_apply_nr3d_level(star_state_t *st, int mirror, int flip)
     }
 
     st->vpe_nr3d = para.level3DNR;
-    st->vpe_mirror = para.mirror;
-    st->vpe_flip = para.flip;
 
     return RSS_OK;
 }
 
+/*
+ * Orientation is a bring-up setting on this backend, so these refuse.
+ *
+ * MI_SNR_SetOrien is where mirror and flip land -- star_sensor_bringup says
+ * why it is the sensor and not the VPE channel param -- and on a live sensor
+ * that call only stores the value and sets a dirty flag. The register is
+ * written by pCus_AEStatusNotify(CUS_FRAME_ACTIVE): once at the end of
+ * pCus_init, and thereafter on AE's frame notifications. So a runtime request
+ * lands on the next notification if 3A is running, sits pending if it is not,
+ * and MI_SNR_GetOrien cannot say which happened because the vendor driver
+ * answers it from a static table. Reporting success for that is worse than
+ * failing.
+ *
+ * The caller is told where the setting does work rather than handed a bare
+ * error, and the cached value is left alone, because a command that reports
+ * failure and then quietly takes effect on the next AE frame is the outcome
+ * worth avoiding. Infinity6C refuses these for the same reason from the other
+ * side -- there orientation rides MI_ISP_SetChnParam and a running channel
+ * rejects the write.
+ */
 int hal_isp_set_hflip(void *ctx, int enable)
 {
-    rss_hal_ctx_t *c = (rss_hal_ctx_t *)ctx;
     star_state_t *st = star_state(ctx);
-    int prev;
-    int ret;
 
     if (!st)
         return RSS_ERR_INVAL;
 
-    prev = c->hflip_state[0];
-    c->hflip_state[0] = enable ? 1 : 0;
-    ret = star_isp_apply_orien(st, c->hflip_state[0], c->vflip_state[0]);
-    if (ret != RSS_OK)
-        c->hflip_state[0] = prev;
+    /*
+     * Agreeing with what bring-up applied is not a change, so it succeeds
+     * quietly. rvd drives the whole [image] block while it builds the
+     * pipeline, from the same key this backend already read through
+     * rss_sensor_config_t, so the common path arrives here asking for what is
+     * already true and must not report a failure for it.
+     */
+    if ((enable ? 1 : 0) == st->snr_mirror)
+        return RSS_OK;
 
-    return ret;
+    HAL_LOG_WARN("isp: hflip is fixed at start-up on this SoC -- set [image] hflip = %d "
+                 "and restart rvd",
+                 enable ? 1 : 0);
+    return RSS_ERR_NOTSUP;
 }
 
 int hal_isp_set_vflip(void *ctx, int enable)
 {
-    rss_hal_ctx_t *c = (rss_hal_ctx_t *)ctx;
     star_state_t *st = star_state(ctx);
-    int prev;
-    int ret;
 
     if (!st)
         return RSS_ERR_INVAL;
 
-    prev = c->vflip_state[0];
-    c->vflip_state[0] = enable ? 1 : 0;
-    ret = star_isp_apply_orien(st, c->hflip_state[0], c->vflip_state[0]);
-    if (ret != RSS_OK)
-        c->vflip_state[0] = prev;
+    if ((enable ? 1 : 0) == st->snr_flip)
+        return RSS_OK;
 
-    return ret;
+    HAL_LOG_WARN("isp: vflip is fixed at start-up on this SoC -- set [image] vflip = %d "
+                 "and restart rvd",
+                 enable ? 1 : 0);
+    return RSS_ERR_NOTSUP;
 }
 
 int hal_isp_get_hvflip(void *ctx, int *hflip, int *vflip)
 {
-    rss_hal_ctx_t *c = (rss_hal_ctx_t *)ctx;
     star_state_t *st = star_state(ctx);
-    i6e_vpe_para para;
 
+    /*
+     * Answered from what bring-up wrote, not from the hardware. MI_SNR_GetOrien
+     * reads the driver's static default table rather than the live register, so
+     * it reports unmirrored however the image actually looks -- see
+     * star_state_t's snr_mirror. Nothing can change orientation after bring-up,
+     * so the record cannot drift from the sensor.
+     */
     if (!st)
         return RSS_ERR_INVAL;
 
-    /* Hardware first, cache only as the fallback: the point of moving off
-     * the sensor register is that this can now be asked rather than
-     * remembered. */
-    memset(&para, 0, sizeof(para));
-    if (st->vpe_chn_created && st->vpe.fnGetChannelParam &&
-        !st->vpe.fnGetChannelParam(STAR_VPE_CHN, (i6_vpe_para *)&para)) {
-        c->hflip_state[0] = para.mirror ? 1 : 0;
-        c->vflip_state[0] = para.flip ? 1 : 0;
-        st->vpe_mirror = c->hflip_state[0];
-        st->vpe_flip = c->vflip_state[0];
-    }
-
     if (hflip)
-        *hflip = c->hflip_state[0];
+        *hflip = st->snr_mirror;
     if (vflip)
-        *vflip = c->vflip_state[0];
+        *vflip = st->snr_flip;
 
     return RSS_OK;
 }

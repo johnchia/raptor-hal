@@ -476,6 +476,29 @@ typedef struct {
     int rst_gpio;
     int pwdn_gpio;
     int power_gpio;
+
+    /*
+     * Mirror and flip, as requested by the config.
+     *
+     * These are here, and not left to isp_set_hflip/isp_set_vflip, because on
+     * SigmaStar orientation belongs to the sensor and the driver latches it
+     * when MI_SNR_Enable runs the sensor's init routine. Enable happens inside
+     * hal_init, before any caller can reach an ISP op, so an op-only path
+     * cannot decide the orientation the pipeline starts with -- which is the
+     * case that matters, since a camera is mounted one way round and stays
+     * there.
+     *
+     * It was tried the other way. Orientation lived on the VPE channel param
+     * for a fortnight, where a runtime change did land deterministically, and
+     * the cost was not visible in any still frame: bMirror/bFlip also feed
+     * 3DNR's motion detection, and with them set a moving subject blends into
+     * the background it is crossing. See star_isp_apply_orien's absence.
+     *
+     * Ingenic backends ignore these and use the ops, where orientation is an
+     * ISP attribute settable at any time.
+     */
+    int hflip;
+    int vflip;
 } rss_sensor_config_t;
 
 /* Maximum number of sensors supported (IMPVI_MAIN, SEC, THR) */
