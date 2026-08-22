@@ -1572,6 +1572,29 @@ int hal_enc_get_avg_bitrate(void *ctx, int chn, uint32_t *bitrate)
     if (!bitrate)
         return RSS_ERR_INVAL;
 
+    /*
+     * A channel that is not receiving has no statistics, and asking anyway is
+     * not free. MI_VENC_Query reads the channel's ring pool, which
+     * MI_VENC_StartRecvPic creates and MI_VENC_DestroyChn frees, so between
+     * the two a created channel has none: the driver logs
+     * "pstChnRes->hRingPoolHandle == NULL" at kernel error level and returns
+     * 0xa0022010 without touching the caller's struct.
+     *
+     * That state is entirely normal here. rvd's JPEG channel is on-demand --
+     * rvd_frame_loop starts it when a consumer appears and stops it again
+     * when the last one leaves -- so it sits created-and-idle most of the
+     * time, and anything polling status walks every stream including that
+     * one. The result was two error lines per poll, in the kernel log and
+     * ours, for a channel doing exactly what it was asked to do.
+     *
+     * An idle channel's average bitrate is zero, which is both true and what
+     * every caller here already defaults to.
+     */
+    if (!enc->receiving) {
+        *bitrate = 0;
+        return RSS_OK;
+    }
+
     memset(&stat, 0, sizeof(stat));
     ret = st->venc.fnQuery(chn, &stat);
     if (ret) {
@@ -1599,6 +1622,14 @@ int hal_enc_query(void *ctx, int chn, bool *busy)
 
     if (!busy)
         return RSS_ERR_INVAL;
+
+    /* Same ring-pool precondition as hal_enc_get_avg_bitrate, and the same
+     * reason not to call: a channel that is not receiving is holding no work,
+     * which is the question this answers. */
+    if (!enc->receiving) {
+        *busy = false;
+        return RSS_OK;
+    }
 
     memset(&stat, 0, sizeof(stat));
     ret = st->venc.fnQuery(chn, &stat);

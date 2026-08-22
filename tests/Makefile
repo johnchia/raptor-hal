@@ -41,7 +41,7 @@ LDFLAGS = -fsanitize=$(SAN) -lpthread
 # rather than a star/ file. It is here because phase 6 (IR-cut day/night)
 # rests on it and its behaviour is which file gets written in what order,
 # which a host can check once the sysfs root is redirected.
-SUITES = osd isp audio gpio
+SUITES = osd isp audio gpio enc
 BINS = $(addprefix t_,$(SUITES)) t_isp_i6c t_enc_i6c t_isp_imp
 
 test: $(addprefix test-,$(SUITES)) test-isp_i6c test-enc_i6c test-isp_imp
