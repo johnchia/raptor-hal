@@ -311,13 +311,12 @@ static void test_caps_describe_what_the_setter_accepts(void)
     CHECK(hal_isp_set_drc_strength(c, caps.max + 1) == RSS_ERR_INVAL, "above the maximum refused");
     CHECK(hal_isp_set_drc_strength(c, RSS_ISP_AUTO) == RSS_OK, "auto accepted where caps allow it");
 
-    /* A knob with no auto mode says so, and refuses it. 3DNR is a channel
-     * level rather than an IQ module, so there is no curve to hand back. */
-    CHECK(hal_isp_get_knob_caps(c, "temper", &caps) == RSS_OK, "temper has caps");
-    CHECK(!caps.has_auto, "temper has no auto mode");
-    CHECK(caps.max == STAR_VPE_NR3D_MAX, "temper publishes the levels the channel has");
-    CHECK(hal_isp_set_temper_strength(c, caps.max + 1) == RSS_ERR_INVAL,
-          "a level the channel does not have is refused");
+    /* Temper is not published on this SoC at all. Neither route to temporal
+     * denoise is a strength raptor can offer: the VPE channel level picks a
+     * reference bit depth rather than an amount, and the tuning's NR3D module
+     * costs its own per-gain curve to write. So no caps, not invented ones. */
+    CHECK(hal_isp_get_knob_caps(c, "temper", &caps) == RSS_ERR_NOTSUP,
+          "temper is not published on this SoC");
 
     /* A knob this platform does not publish has no caps rather than
      * invented ones -- 6E withdrew these because every shipped tuning
@@ -638,6 +637,7 @@ static void test_orientation_is_bringup_only(void)
 {
     rss_hal_ctx_t ctx;
     star_state_t st;
+    i6e_vpe_para para;
     void *c = &ctx;
     int hf, vf;
 
@@ -648,8 +648,6 @@ static void test_orientation_is_bringup_only(void)
     st.vpe.fnGetChannelParam = fake_get_chn_param;
     st.vpe.fnSetChannelParam = fake_set_chn_param;
     st.vpe_chn_created = true;
-    st.nr3d_level_req = 1;
-    st.vpe_nr3d = 1;
     /* What star_sensor_bringup told MI_SNR_SetOrien: a camera mounted upside
      * down, which is the case that made this backend want a flip at all. */
     st.snr_mirror = 1;
@@ -687,131 +685,62 @@ static void test_orientation_is_bringup_only(void)
     CHECK(hf == 1 && vf == 1, "a refused change must not be recorded, got (%d,%d)", hf, vf);
 
     /*
-     * The regression guard. With the sensor mirrored and flipped, a write that
-     * exists for an unrelated field must still leave bMirror/bFlip zero --
-     * anything else re-creates the ghosting.
+     * The regression guard. With the sensor mirrored and flipped, the channel
+     * param the builder produces must still carry neither -- anything else
+     * re-creates the ghosting. Checked against the builder directly because
+     * there is no runtime writer of this struct left to go through.
      */
-    st.nr3d_level_req = 2;
-    CHECK(hal_isp_set_temper_strength(c, 2) == RSS_OK, "temper set succeeds");
-    CHECK(vpe_para_set_calls == 1, "temper issues one write, got %u", vpe_para_set_calls);
-    CHECK(g_vpe_para.mirror == 0 && g_vpe_para.flip == 0,
-          "the channel param must never carry orientation, got (%d,%d)", g_vpe_para.mirror,
-          g_vpe_para.flip);
-    CHECK(g_vpe_para.level3DNR == 2, "the level it was called for lands, got %d",
-          g_vpe_para.level3DNR);
-    CHECK(vpe_para_get_calls == 0, "the write path must not read the channel, got %u",
-          vpe_para_get_calls);
+    memset(&para, 0xA5, sizeof(para));
+    star_vpe_fill_param(&st, &para);
+    CHECK(para.mirror == 0 && para.flip == 0,
+          "the channel param must never carry orientation, got (%d,%d)", para.mirror, para.flip);
 }
 
 /*
- * Temper is the VPE channel's 3DNR level, not an IQ module.
+ * The VPE channel's 3DNR level is fixed, and temper is not a knob here.
  *
- * The property worth pinning is what raptor's neutral means. It has to land
- * on the level star_vpe_bringup creates the channel with -- a midpoint unity
- * would move every board from level 1 to level 4 on the first boot after this
- * changed. The rest is the build-it-fresh contract: the param is rebuilt from
- * raptor's own record on every write rather than read back and edited, so a
- * write must not read the channel, and the fields this backend does not use --
- * bMirror and bFlip among them -- go out zero.
+ * The level is not a strength: mhal maps level 1 to an 8-bit 3DNR reference
+ * frame and level 2 to a 12-bit one, and maps every other value -- 0 and 3..7
+ * alike -- to "engine disabled". Six of the eight positions mean off, so
+ * there is no scale to publish, and this backend fixes the level at 2 (what
+ * majestic and the SDK's own demos run) and offers no op to move it.
+ *
+ * Level 0 is the one that has to stay unreachable. The DNR engine it disables
+ * is also what carries mirror and flip on this SoC, so a channel holding a
+ * flip and asking for level 0 stalls the ISP outright -- reproduced on .229:
+ * 0.4 fps, "SclReal mode NO frame done", CMDQ WAIT_TRIG_TIMEOUT. Orientation
+ * lives on the sensor now and the level never moves, so neither half of that
+ * pair can occur; this pins both.
  */
-static void test_temper_is_a_channel_level(void)
+static void test_vpe_level_is_fixed_and_temper_is_unpublished(void)
 {
     rss_hal_ctx_t ctx;
     star_state_t st;
+    rss_isp_knob_t caps;
+    i6e_vpe_para para;
     void *c = &ctx;
-    int v8;
-    size_t i;
 
     memset(&ctx, 0, sizeof(ctx));
     memset(&st, 0, sizeof(st));
-    memset(&g_vpe_para, 0, sizeof(g_vpe_para));
     ctx.platform = &st;
-    st.vpe.fnGetChannelParam = fake_get_chn_param;
-    st.vpe.fnSetChannelParam = fake_set_chn_param;
-    st.vpe_chn_created = true;
-    st.nr3d_level_req = 1;
-    st.vpe_nr3d = 1;
-    /* The sensor is mirrored. Nothing about that may reach the channel param. */
+
+    /* A mirrored and flipped sensor -- the state that made level 0 fatal. */
     st.snr_mirror = 1;
-    vpe_para_set_calls = 0;
-    vpe_para_get_calls = 0;
-    vpe_para_get_ret = vpe_para_set_ret = 0;
-    for (i = 0; i < IQ_PARAM_COUNT; i++)
-        g_iq[i].has_pending = false;
+    st.snr_flip = 1;
 
-    /* Level 1 is the vendor default, and costs no write when already there. */
-    CHECK(hal_isp_set_temper_strength(c, STAR_VPE_NR3D_UNITY) == RSS_OK, "level 1 succeeds");
-    CHECK(st.nr3d_level_req == 1, "and is taken as level 1, got %d", st.nr3d_level_req);
-    CHECK(vpe_para_set_calls == 0, "a redundant level must not write, got %u", vpe_para_set_calls);
+    memset(&para, 0xA5, sizeof(para));
+    star_vpe_fill_param(&st, &para);
+    CHECK(para.level3DNR == STAR_VPE_NR3D_LEVEL, "the level is fixed at %d, got %d",
+          STAR_VPE_NR3D_LEVEL, para.level3DNR);
+    CHECK(para.level3DNR != 0, "level 0 disables the engine mirror and flip run on");
+    CHECK(para.mirror == 0 && para.flip == 0,
+          "orientation stays off the channel however the sensor is set, got (%d,%d)", para.mirror,
+          para.flip);
 
-    /*
-     * Every level the channel has is now reachable by name. Under the old
-     * abstract scale only two of the eight were, below neutral: the default
-     * is level 1, so raptor 1..127 all landed on level 0.
-     */
-    for (int lvl = 0; lvl <= STAR_VPE_NR3D_MAX; lvl++) {
-        CHECK(hal_isp_set_temper_strength(c, lvl) == RSS_OK, "level %d succeeds", lvl);
-        CHECK(g_vpe_para.level3DNR == lvl, "level %d must reach the channel, got %d", lvl,
-              g_vpe_para.level3DNR);
-    }
-    CHECK(hal_isp_set_temper_strength(c, STAR_VPE_NR3D_MAX + 1) == RSS_ERR_INVAL,
-          "a level the channel does not have is refused");
-
-    CHECK(hal_isp_set_temper_strength(c, STAR_VPE_NR3D_MAX) == RSS_OK, "max temper succeeds");
-    CHECK(g_vpe_para.level3DNR == 7, "the maximum is level 7, got %d", g_vpe_para.level3DNR);
-    CHECK(g_vpe_para.mirror == 0 && g_vpe_para.flip == 0,
-          "a mirrored sensor must not put orientation on the channel, got (%d,%d)",
-          g_vpe_para.mirror, g_vpe_para.flip);
-    CHECK(vpe_para_get_calls == 0, "the write path must not read the channel, got %u",
-          vpe_para_get_calls);
-
-    CHECK(hal_isp_set_temper_strength(c, 0) == RSS_OK, "min temper succeeds");
-    CHECK(g_vpe_para.level3DNR == 0, "0 must reach level 0, got %d", g_vpe_para.level3DNR);
-
-    /* Read from the channel rather than the request: MI clamps the level to
-     * the per-chip maximum, so what it took is not always what was asked
-     * for. The level is reported as itself. */
-    g_vpe_para.level3DNR = 1;
-    v8 = 0;
-    CHECK(hal_isp_get_temper_strength(c, &v8) == RSS_OK, "get_temper succeeds");
-    CHECK(v8 == 1, "level 1 must read back as 1, got %d", v8);
-
-    /* No IQ row is touched by any of it, which is the whole point of the
-     * move: writing NR3D's manual block sets enOpType to manual and discards
-     * the tuning's sixteen-entry gain curve. */
-    for (i = 0; i < IQ_PARAM_COUNT; i++)
-        CHECK(!g_iq[i].has_pending, "temper must not queue an IQ row (%s)", g_iq[i].name);
-
-    /* A failed write must not leave the request claiming a level the channel
-     * never took, or the next read would report a lie. */
-    g_vpe_para.level3DNR = 1;
-    st.nr3d_level_req = 1;
-    vpe_para_set_ret = -1;
-    CHECK(hal_isp_set_temper_strength(c, 255) != RSS_OK, "a failing write is reported");
-    CHECK(st.nr3d_level_req == 1, "a failed set must roll back, got %d", st.nr3d_level_req);
-
-    /*
-     * Before the channel exists the request is held rather than refused --
-     * star_vpe_bringup reads nr3d_level_req when it creates the channel. This
-     * is where temper and orientation differ: orientation answers NOENT,
-     * because the creation path writes its two fields as zero.
-     */
-    vpe_para_set_ret = 0;
-    st.vpe_chn_created = false;
-    vpe_para_set_calls = 0;
-    CHECK(hal_isp_set_temper_strength(c, STAR_VPE_NR3D_MAX) == RSS_OK,
-          "a set before the channel is held");
-    CHECK(st.nr3d_level_req == 7, "the held level is recorded, got %d", st.nr3d_level_req);
-    CHECK(vpe_para_set_calls == 0, "nothing may be written yet, got %u", vpe_para_set_calls);
-
-    /* Out of range is rejected rather than clamped. */
-    CHECK(hal_isp_set_temper_strength(c, STAR_VPE_NR3D_MAX + 1) == RSS_ERR_INVAL,
-          "a level above the channel's maximum is rejected");
-    CHECK(hal_isp_set_temper_strength(NULL, 1) == RSS_ERR_INVAL, "NULL ctx rejected");
-
-    st.vpe_chn_created = true;
-    st.vpe.fnSetChannelParam = NULL;
-    CHECK(hal_isp_set_temper_strength(c, 5) == RSS_ERR_NOTSUP, "a missing symbol is NOTSUP");
+    /* No op and no caps. rvd asks by name, so the name has to answer NOTSUP
+     * rather than a range nothing can honour. */
+    CHECK(hal_isp_get_knob_caps(c, "temper", &caps) == RSS_ERR_NOTSUP,
+          "temper publishes no caps on this SoC");
 }
 
 /*
@@ -831,78 +760,46 @@ static void test_temper_is_a_channel_level(void)
  */
 static void test_channel_param_is_built_not_edited(void)
 {
-    rss_hal_ctx_t ctx;
     star_state_t st;
-    void *c = &ctx;
+    i6e_vpe_para para;
     size_t i;
     int all_zero;
 
-    memset(&ctx, 0, sizeof(ctx));
     memset(&st, 0, sizeof(st));
-    ctx.platform = &st;
-    st.vpe.fnGetChannelParam = fake_get_chn_param;
-    st.vpe.fnSetChannelParam = fake_set_chn_param;
-    st.vpe_chn_created = true;
-    st.nr3d_level_req = 1;
-    st.vpe_nr3d = 1;
     /* A mirrored sensor, so the builder has something it could wrongly echo. */
     st.snr_mirror = 1;
     st.snr_flip = 1;
 
     /*
-     * The channel reports a param full of things the driver must not echo:
-     * a populated PqParam, an LDC config, LDC switched on. A read-modify-write
-     * would carry every one of them back into the next Set.
+     * The buffer arrives holding everything the builder must not preserve:
+     * a populated PqParam, an LDC config, LDC switched on. A builder that
+     * edited in place -- or a caller that read the channel back first --
+     * would carry every one of them into the next Set.
      */
-    memset(&g_vpe_para, 0xA5, sizeof(g_vpe_para));
-    g_vpe_para.lensAdjOn = 1;
-    vpe_para_set_calls = 0;
-    vpe_para_get_calls = 0;
-    vpe_para_set_ret = 0;
-    /* And the read fails outright, which the old path treated as fatal. */
-    vpe_para_get_ret = -1;
+    memset(&para, 0xA5, sizeof(para));
+    para.lensAdjOn = 1;
 
-    CHECK(hal_isp_set_temper_strength(c, 3) == RSS_OK, "a write succeeds with the read failing");
-    CHECK(vpe_para_get_calls == 0, "the write path must not read at all, got %u",
-          vpe_para_get_calls);
-    CHECK(vpe_para_set_calls == 1, "exactly one write, got %u", vpe_para_set_calls);
+    star_vpe_fill_param(&st, &para);
 
-    CHECK(g_vpe_para.mirror == 0 && g_vpe_para.flip == 0,
+    CHECK(para.mirror == 0 && para.flip == 0,
           "orientation must not reach the channel however the sensor is set, got (%d,%d)",
-          g_vpe_para.mirror, g_vpe_para.flip);
-    CHECK(g_vpe_para.level3DNR == 3, "the level comes from st, got %d", g_vpe_para.level3DNR);
-    CHECK(g_vpe_para.hdr == I6_HDR_OFF, "hdr is stated, got %d", (int)g_vpe_para.hdr);
-    CHECK(g_vpe_para.lensAdjOn == 0, "LDC must not be echoed back on, got %d",
-          g_vpe_para.lensAdjOn);
+          para.mirror, para.flip);
+    CHECK(para.level3DNR == STAR_VPE_NR3D_LEVEL, "the level is the fixed one, got %d",
+          para.level3DNR);
+    CHECK(para.hdr == I6_HDR_OFF, "hdr is stated, got %d", (int)para.hdr);
+    CHECK(para.lensAdjOn == 0, "LDC must not be echoed back on, got %d", para.lensAdjOn);
 
     /* MI_VPE_PqParam_t: ours to zero, never to carry. */
     all_zero = 1;
-    for (i = 0; i < sizeof(g_vpe_para.reserved); i++)
-        if (g_vpe_para.reserved[i])
+    for (i = 0; i < sizeof(para.reserved); i++)
+        if (para.reserved[i])
             all_zero = 0;
     CHECK(all_zero, "PqParam must go out zeroed, not echoed");
 
     /* MI_VPE_LdcParam_t, the 72 bytes after it. */
-    CHECK(g_vpe_para.lensAdj.bypassOn == 0 && g_vpe_para.lensAdj.configAddr == NULL &&
-              g_vpe_para.lensAdj.configSize == 0,
+    CHECK(para.lensAdj.bypassOn == 0 && para.lensAdj.configAddr == NULL &&
+              para.lensAdj.configSize == 0,
           "LdcParam must go out zeroed, not echoed");
-
-    /* Same contract on the temper path, which shares the builder. */
-    memset(&g_vpe_para, 0xA5, sizeof(g_vpe_para));
-    vpe_para_get_calls = 0;
-    vpe_para_set_calls = 0;
-    CHECK(hal_isp_set_temper_strength(c, 5) == RSS_OK, "temper succeeds with the read failing");
-    CHECK(vpe_para_get_calls == 0, "temper must not read either, got %u", vpe_para_get_calls);
-    CHECK(g_vpe_para.level3DNR == 5, "the new level is written, got %d", g_vpe_para.level3DNR);
-    CHECK(g_vpe_para.mirror == 0 && g_vpe_para.flip == 0, "and still no orientation, got (%d,%d)",
-          g_vpe_para.mirror, g_vpe_para.flip);
-    all_zero = 1;
-    for (i = 0; i < sizeof(g_vpe_para.reserved); i++)
-        if (g_vpe_para.reserved[i])
-            all_zero = 0;
-    CHECK(all_zero, "PqParam must go out zeroed on the temper path too");
-
-    vpe_para_get_ret = 0;
 }
 
 /*
@@ -1768,7 +1665,7 @@ int main(void)
     test_antiflicker_translates_the_mains_frequency();
     test_pending_queue();
     test_orientation_is_bringup_only();
-    test_temper_is_a_channel_level();
+    test_vpe_level_is_fixed_and_temper_is_unpublished();
     test_channel_param_is_built_not_edited();
     test_sensor_fps_clamps_to_the_mode();
     test_recorded_values_survive_a_reload();

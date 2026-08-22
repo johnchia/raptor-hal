@@ -111,12 +111,23 @@ const rss_hal_caps_t g_hal_caps = {
      * and raptor's keys carry Ingenic gain codes, which is not a unit
      * mismatch a HAL can convert away.
      *
-     * has_temper stays true and now means the VPE channel's 3DNR level, so
-     * it no longer costs the tuning's own NR3D curve to move it.
+     * has_temper is false for a reason particular to this SoC. MI offers two
+     * ways to reach temporal denoise and neither is a knob raptor can honestly
+     * publish. The VPE channel's e3DNRLevel is not a strength at all -- it
+     * picks the 3DNR reference frame's bit depth, and six of its eight values
+     * mean "engine off"; worse, that engine is what mirror and flip run on
+     * here, so its off position can stall the ISP outright. The tuning's NR3D
+     * module does have a strength, but reaching it means setting enOpType to
+     * manual and discarding the sixteen-entry gain-indexed curve the tuning
+     * spent its effort on -- the same trade that already keeps brightness,
+     * contrast, saturation and sharpness unpublished on this SoC.
+     *
+     * So temporal denoise belongs to the tuning binary here. The channel
+     * level is fixed at STAR_VPE_NR3D_LEVEL and nothing moves it at runtime.
      */
     .has_sinter = false,
     .has_drc = true,
-    .has_temper = true,
+    .has_temper = false,
     .has_ae_comp = true,
     .has_max_gain = false,
 #endif

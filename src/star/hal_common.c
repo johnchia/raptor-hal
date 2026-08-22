@@ -581,17 +581,12 @@ static int star_vpe_bringup(star_state_t *st)
     }
     st->vpe_chn_created = true;
     /*
-     * One builder for this struct, shared with the two setters that write it
-     * later -- star_isp_apply_orien and star_isp_apply_nr3d_level. It carries
-     * the 3DNR level from st->nr3d_level_req, seeded to 1 in star_open as both
-     * references default it, so a temper set that arrived before the channel
-     * existed still lands here.
-     *
-     * Orientation starts unrotated and arrives through isp_set_hflip /
-     * isp_set_vflip, which reach the same struct. rvd applies them while
-     * building the pipeline, before any output port is enabled, so nothing is
-     * delivered the wrong way up -- and there is no config field here to keep
-     * in step with the ops.
+     * The only place this struct is ever written. Both of its live fields are
+     * decided here and neither moves again: orientation is the sensor's job
+     * (star_sensor_bringup says why) so mirror and flip go out zero, and the
+     * 3DNR level is fixed at STAR_VPE_NR3D_LEVEL because none of its other
+     * values is a thing worth offering. There is no runtime setter left to
+     * share the builder with.
      */
     star_vpe_fill_param(st, &param);
 
@@ -600,9 +595,6 @@ static int star_vpe_bringup(star_state_t *st)
         HAL_LOG_ERR("MI_VPE_SetChannelParam(%d) failed: %d", STAR_VPE_CHN, ret);
         return RSS_ERR_IO;
     }
-
-    st->vpe_nr3d = param.level3DNR;
-
 
     ret = st->vpe.fnStartChannel(STAR_VPE_CHN);
     if (ret) {
@@ -694,11 +686,6 @@ static int hal_init(void *ctx, const rss_multi_sensor_config_t *cfg)
     if (!st)
         return RSS_ERR_NOMEM;
     c->platform = st;
-
-    /* The vendor default, and raptor's neutral temper. Seeded here rather
-     * than in star_isp_bringup because the VPE channel is created before
-     * that runs, and the creation is what reads it. */
-    st->nr3d_level_req = 1;
 
     /* -1, not the 0 calloc left behind: 0 is a legitimate file
      * descriptor, so "never opened" has to be distinguishable from
@@ -1218,7 +1205,6 @@ static const rss_hal_ops_t g_ops = {
      */
     .isp_get_sensor_attr = hal_isp_get_sensor_attr,
 
-    .isp_set_temper_strength = hal_isp_set_temper_strength,
     .isp_set_ae_comp = hal_isp_set_ae_comp,
     .isp_set_defog = hal_isp_set_defog,
     /*
@@ -1238,7 +1224,6 @@ static const rss_hal_ops_t g_ops = {
     .isp_set_vflip = hal_isp_set_vflip,
     .isp_set_sensor_fps = hal_isp_set_sensor_fps,
 
-    .isp_get_temper_strength = hal_isp_get_temper_strength,
     .isp_get_knob_caps = hal_isp_get_knob_caps,
     .isp_get_drc_strength = hal_isp_get_drc_strength,
     .isp_get_ae_comp = hal_isp_get_ae_comp,

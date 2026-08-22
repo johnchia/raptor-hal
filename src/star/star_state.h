@@ -606,27 +606,6 @@ typedef struct {
     bool vif_dev_enabled;
     bool vif_port_enabled;
     /*
-     * Temporal denoise, as a VPE channel level rather than an IQ module --
-     * see hal_isp_set_temper_strength. Held here because the channel is
-     * created before rvd applies its [image] block, so the creation in
-     * star_vpe_bringup reads it and a later set writes through to the live
-     * channel. 1 is the vendor default both references use, and raptor's
-     * neutral 128 maps onto it.
-     */
-    int nr3d_level_req;
-
-    /*
-     * What the channel param was last told.
-     *
-     * The param struct is rebuilt from this on every write rather than read
-     * back and edited -- see star_vpe_fill_param. It is also refreshed from
-     * the hardware whenever something does read it, so the redundant-write
-     * guard works off the best knowledge available rather than off a request
-     * that may have been clamped.
-     */
-    int vpe_nr3d;
-
-    /*
      * What MI_SNR_SetOrien was told at bring-up, which is the only time it is
      * told anything. MI_SNR_GetOrien cannot be used to check: the vendor
      * driver answers it from its static default table rather than the live
@@ -639,6 +618,38 @@ typedef struct {
     bool vpe_chn_started;
     bool vif_vpe_bound;
 } star_state_t;
+
+/*
+ * The 3DNR level the VPE channel is created with, and keeps.
+ *
+ * Not a strength knob and not raptor's temper -- despite the name, the level
+ * selects the *bit depth of the 3DNR reference frame*. mhal's
+ * Camera3DNR_GetConfigByLevel maps level 1 to Isp3DNRCompressLevel_2 (8-bit)
+ * and level 2 to Isp3DNRCompressLevel_0 (12-bit), and maps every other value,
+ * 0 and 3..7 alike, to "engine disabled". So of the eight the enum offers,
+ * six mean off and the remaining two differ only in precision. Measured on
+ * .229 at 2560x1440: level 1 allocates DNR_INFO0 at 0x384000 (2560 B/row),
+ * level 2 at 0x5a0000 (4096 B/row).
+ *
+ * 2 because that is what every clean reference on this silicon runs: majestic
+ * on this board and sensor, and the SDK's own cus3a and ldc demos. The extra
+ * ~2.1MB buys the temporal filter a finer history to difference against.
+ *
+ * Fixed rather than configurable because no other value is a sensible thing
+ * to offer: below it is off-by-another-name, and above it MI clamps to 3,
+ * which is also off. That is why this SoC publishes no temper op at all --
+ * temporal denoise strength lives in the tuning binary's NR3D block, and
+ * reaching it from here would cost the tuning's own per-gain curve. See the
+ * OP COVERAGE note in hal_isp.c.
+ *
+ * Level 0 is worth naming as the trap it is. It disables the DNR engine, and
+ * on this SoC that engine is what mirror and flip run on -- a channel
+ * carrying a flip and asking for level 0 stalls the ISP outright, with no
+ * frame-done and a CMDQ timeout. Orientation lives on the sensor now, so
+ * nothing here can reach that state, and this constant is the other half of
+ * why.
+ */
+#define STAR_VPE_NR3D_LEVEL 2
 
 /*
  * Build MI_VPE_ChannelPara_t from raptor's own record of it.
@@ -659,9 +670,10 @@ typedef struct {
  */
 static inline void star_vpe_fill_param(const star_state_t *st, i6e_vpe_para *para)
 {
+    (void)st;
     memset(para, 0, sizeof(*para));
     para->hdr = I6_HDR_OFF;
-    para->level3DNR = st->nr3d_level_req;
+    para->level3DNR = STAR_VPE_NR3D_LEVEL;
     /*
      * mirror and flip stay zero here, and the sensor carries orientation
      * instead -- star_sensor_bringup says why. They are left to the memset
@@ -809,7 +821,6 @@ int hal_isp_set_brightness(void *ctx, int val);
 int hal_isp_set_contrast(void *ctx, int val);
 int hal_isp_set_saturation(void *ctx, int val);
 int hal_isp_set_sharpness(void *ctx, int val);
-int hal_isp_set_temper_strength(void *ctx, int val);
 int hal_isp_set_ae_comp(void *ctx, int val);
 int hal_isp_set_drc_strength(void *ctx, int val);
 int hal_isp_get_drc_strength(void *ctx, int *val);
@@ -825,7 +836,6 @@ int hal_isp_get_brightness(void *ctx, int *val);
 int hal_isp_get_contrast(void *ctx, int *val);
 int hal_isp_get_saturation(void *ctx, int *val);
 int hal_isp_get_sharpness(void *ctx, int *val);
-int hal_isp_get_temper_strength(void *ctx, int *val);
 int hal_isp_get_knob_caps(void *ctx, const char *name, rss_isp_knob_t *caps);
 int hal_isp_get_ae_comp(void *ctx, int *val);
 int hal_isp_get_antiflicker(void *ctx, rss_antiflicker_t *mode);

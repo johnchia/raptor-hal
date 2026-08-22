@@ -145,13 +145,29 @@
  *                         contrast and six edge gains, but the vendor
  *                         marks it DVR-only and the channel is created in
  *                         REALTIME mode with bContrastEn and bEdgeEn
- *                         clear. temper is the counter-example and stays:
- *                         it is the VPE channel's own 3DNR level, one
- *                         value on the channel, and costs no curve.
- *                         Infinity6C keeps all four -- its sharpness op
- *                         scales a run of band gains and its brightness
+ *                         clear. Infinity6C keeps all four -- its sharpness
+ *                         op scales a run of band gains and its brightness
  *                         is flat in every shipped bin -- so this is a
  *                         6E/6B0 withdrawal, not a family-wide one.
+ *   isp_set_temper_strength / _get
+ *                         Temporal denoise, and withdrawn for both of the
+ *                         reasons above at once. MI's two routes to it are
+ *                         the VPE channel's e3DNRLevel and the tuning's
+ *                         NR3D module, and neither is a strength raptor can
+ *                         publish honestly. The channel level is not a
+ *                         strength at all -- it selects the 3DNR reference
+ *                         frame's bit depth, and six of its eight values
+ *                         mean "engine off" (see STAR_VPE_NR3D_LEVEL, which
+ *                         now fixes it at 2 and never moves it). Its off
+ *                         position is worse than useless here: mirror and
+ *                         flip are carried out by that same DNR hardware,
+ *                         so a flipped channel asking for level 0 stalls
+ *                         the ISP outright. NR3D does carry a real strength
+ *                         in TfStr, but writing it means going manual and
+ *                         discarding the sixteen-entry gain curve -- the
+ *                         same trade that withdrew the four above. So
+ *                         temporal denoise belongs to the tuning binary on
+ *                         this SoC, and has_temper is false.
  *   isp_set_sinter_strength / _get
  *                         Spatial luma denoise. NRLuma's manual block is
  *                         a blend weight and two filter selects, and the
@@ -1224,7 +1240,6 @@ void star_isp_bringup(star_state_t *st, const rss_sensor_config_t *cfg)
  */
 static void star_isp_flush_pending(star_state_t *st);
 static void star_isp_reload_if_reset(star_state_t *st, bool force);
-static int star_isp_apply_nr3d_level(star_state_t *st);
 
 static void star_isp_arm_tuning_reads(void)
 {
@@ -1460,55 +1475,6 @@ int hal_isp_set_sharpness(void *ctx, int val)
     return star_iq_set_scalar(ctx, IQ_SHARPNESS, val);
 }
 
-/*
- * MI bounds the level at 7 (i6_vpe.h), and 1 is what star_vpe_bringup
- * creates the channel with -- the value both references default it to.
- * That makes 1 the unity here rather than the midpoint, for the same reason
- * saturation's unity is 32 of 127: raptor's neutral has to mean "nobody
- * asked", and on this knob what nobody asking got is level 1. A midpoint
- * unity would move every default board from 1 to 4 on the first boot after
- * this change.
- *
- * The consequence, which the Infinity6C board test surfaced: a unity of 1 over
- * a floor of 0 leaves exactly one level below neutral, so every raptor value
- * under 128 asks for 3DNR off. There is no graded lower half to be had -- the
- * hardware has eight positions and the default is the second of them.
- */
-#define STAR_VPE_NR3D_MAX 7
-#define STAR_VPE_NR3D_UNITY 1
-
-int hal_isp_set_temper_strength(void *ctx, int val)
-{
-    star_state_t *st = star_state(ctx);
-    int prev;
-    int ret;
-
-    if (!st)
-        return RSS_ERR_INVAL;
-    /*
-     * The levels the VPE channel has, said as themselves. The old abstract
-     * 0..255 had to fit them around a neutral in the middle, and since the
-     * default is level 1 that left one level below neutral and mapped the
-     * whole of raptor 1..127 onto level 0 -- most of the lower half of the
-     * knob meaning "off".
-     */
-    if (val < 0 || val > STAR_VPE_NR3D_MAX)
-        return RSS_ERR_INVAL;
-
-    prev = st->nr3d_level_req;
-    st->nr3d_level_req = val;
-
-    ret = star_isp_apply_nr3d_level(st);
-    if (ret != RSS_OK) {
-        st->nr3d_level_req = prev;
-        return ret;
-    }
-
-    HAL_LOG_DBG("isp: temper = %d (3DNR level %d of %d)", val, st->nr3d_level_req,
-                STAR_VPE_NR3D_MAX);
-    return RSS_OK;
-}
-
 int hal_isp_set_ae_comp(void *ctx, int val)
 {
     return star_iq_set_scalar(ctx, IQ_EVCOMP, val);
@@ -1549,30 +1515,6 @@ int hal_isp_get_sharpness(void *ctx, int *val)
     return star_iq_get_scalar(ctx, IQ_SHARPNESS, val);
 }
 
-int hal_isp_get_temper_strength(void *ctx, int *val)
-{
-    star_state_t *st = star_state(ctx);
-    i6e_vpe_para para;
-
-    if (!st || !val)
-        return RSS_ERR_INVAL;
-
-    /*
-     * The channel outranks the request when there is one: MI clamps the
-     * level to the per-chip maximum, so what it took is not always what was
-     * asked for, and a reader wants the former.
-     */
-    memset(&para, 0, sizeof(para));
-    if (st->vpe_chn_created && st->vpe.fnGetChannelParam &&
-        !st->vpe.fnGetChannelParam(STAR_VPE_CHN, (i6_vpe_para *)&para) && para.level3DNR >= 0) {
-        st->nr3d_level_req = para.level3DNR;
-        st->vpe_nr3d = para.level3DNR;
-    }
-
-    *val = st->nr3d_level_req;
-    return RSS_OK;
-}
-
 /*
  * The daemon's key name for each row this platform publishes.
  *
@@ -1604,17 +1546,6 @@ int hal_isp_get_knob_caps(void *ctx, const char *name, rss_isp_knob_t *caps)
 
     if (!st || !name || !caps)
         return RSS_ERR_INVAL;
-
-    /* Not an IQ module: 3DNR is a VPE channel level, so there is no curve
-     * behind it and no auto to hand it back to. */
-    if (strcmp(name, "temper") == 0) {
-        caps->min = 0;
-        caps->max = STAR_VPE_NR3D_MAX;
-        caps->neutral = STAR_VPE_NR3D_UNITY;
-        caps->has_auto = false;
-        caps->enabled = true;
-        return RSS_OK;
-    }
 
     for (i = 0; i < sizeof(star_knob_keys) / sizeof(star_knob_keys[0]); i++)
         if (strcmp(star_knob_keys[i].key, name) == 0)
@@ -2175,58 +2106,6 @@ int hal_isp_get_running_mode(void *ctx, rss_isp_mode_t *mode)
         *mode = raw ? RSS_ISP_NIGHT : RSS_ISP_DAY;
 
     return ret;
-}
-
-/*
- * Temporal denoise, as the VPE channel's own 3DNR level.
- *
- * Not MI_ISP_IQ_SetNR3D, which is what this was until the tuning work in
- * FEASIBILITY-iq-temporal-nr-transplant.md. NR3D's manual block is
- * thresholds and per-band curves with no field that means "how much", so
- * the only scalar a row could reach was MdThd -- the motion threshold --
- * and writing it means setting enOpType to manual, which discards the
- * sixteen-entry gain-indexed curve the tuning binary spent its effort on.
- * Reading the shipped bins says how much that costs: imx335's NR3D varies
- * across gain in eight of its twelve fields. Eight coarse positions that
- * leave the tuning alone is the better trade.
- *
- * Infinity6C reaches temper the same way and for the same reason. The
- * difference is which call carries it: there it rides MI_ISP_SetChnParam,
- * which a running channel refuses, so the level is creation-time only.
- * MI_VPE_SetChannelParam takes it whenever, so here it is live.
- *
- * Built fresh rather than read back and edited -- see star_vpe_fill_param.
- * The struct's other live field, bMirror/bFlip, is written as zero because
- * this backend puts orientation on the sensor; star_sensor_bringup says why.
- */
-static int star_isp_apply_nr3d_level(star_state_t *st)
-{
-    i6e_vpe_para para;
-    int ret;
-
-    if (!st->vpe.fnSetChannelParam)
-        return RSS_ERR_NOTSUP;
-    /*
-     * Held rather than refused: star_vpe_bringup reads nr3d_level_req when
-     * it creates the channel, so a request that arrives first still lands.
-     */
-    if (!st->vpe_chn_created)
-        return RSS_OK;
-
-    if (st->vpe_nr3d == st->nr3d_level_req)
-        return RSS_OK;
-
-    star_vpe_fill_param(st, &para);
-
-    ret = st->vpe.fnSetChannelParam(STAR_VPE_CHN, (i6_vpe_para *)&para);
-    if (ret) {
-        HAL_LOG_WARN("isp: MI_VPE_SetChannelParam(3dnr=%d) failed: %d", para.level3DNR, ret);
-        return RSS_ERR_IO;
-    }
-
-    st->vpe_nr3d = para.level3DNR;
-
-    return RSS_OK;
 }
 
 /*
