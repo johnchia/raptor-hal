@@ -656,11 +656,16 @@ typedef struct {
  *
  * Fresh every time, never read-modify-write. The struct's first member is
  * MI_VPE_PqParam_t -- chroma and luma spatial/temporal NR strengths, six edge
- * gains and a contrast value -- and MI_VPE_LdcParam_t follows it, 72 bytes.
- * Neither is ours to carry: MI marks the first "only dvr use" and this
- * pipeline is REALTIME, and no vendor reference ever round-trips this struct.
- * Every one of them builds it from zero and fills the four fields it means,
- * which is what this does.
+ * gains and a contrast value -- and it is not ours to carry: MI marks it
+ * "only dvr use" and this pipeline is REALTIME. No vendor reference ever
+ * round-trips this struct; every one of them builds it from zero and fills
+ * the fields it means, which is what this does.
+ *
+ * i6_vpe_para, NOT i6e_vpe_para. The i6e_ form interposes a 72-byte LDC block
+ * that MI_VPE_ChannelPara_t does not have on any family, which put level3DNR
+ * 72 bytes past where the driver reads it -- so the 3DNR engine was handed a
+ * zero from the phantom block and never ran. i6_vpe.h has the evidence and
+ * asserts the offsets.
  *
  * The round trip it replaces read the whole struct back and wrote it out
  * again, so whatever MI_VPE_GetChannelParam had declined to populate went to
@@ -668,7 +673,7 @@ typedef struct {
  * arrived at by accident and only while Get kept quiet about those fields.
  * Rebuilding says it deliberately, and drops a read from the write path.
  */
-static inline void star_vpe_fill_param(const star_state_t *st, i6e_vpe_para *para)
+static inline void star_vpe_fill_param(const star_state_t *st, i6_vpe_para *para)
 {
     (void)st;
     memset(para, 0, sizeof(*para));

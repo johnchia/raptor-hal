@@ -550,7 +550,7 @@ static int star_vif_bringup(star_state_t *st)
 static int star_vpe_bringup(star_state_t *st)
 {
     i6e_vpe_chn channel;
-    i6e_vpe_para param;
+    i6_vpe_para param;
     i6_sys_bind source, dest;
     unsigned int fps;
     int ret;
@@ -590,7 +590,7 @@ static int star_vpe_bringup(star_state_t *st)
      */
     star_vpe_fill_param(st, &param);
 
-    ret = st->vpe.fnSetChannelParam(STAR_VPE_CHN, (i6_vpe_para *)&param);
+    ret = st->vpe.fnSetChannelParam(STAR_VPE_CHN, &param);
     if (ret) {
         HAL_LOG_ERR("MI_VPE_SetChannelParam(%d) failed: %d", STAR_VPE_CHN, ret);
         return RSS_ERR_IO;
