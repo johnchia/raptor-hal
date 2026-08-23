@@ -652,6 +652,18 @@ typedef struct {
 #define STAR_VPE_NR3D_LEVEL 2
 
 /*
+ * MI_VPE_SetChannelParam's argument, which is not the same struct on both
+ * families this backend serves -- see the ABI note in i6_vpe.h. Wrong choice
+ * is silent, so it is a typedef rather than a cast at the call site: the
+ * struct that is filled and the struct that is passed cannot drift apart.
+ */
+#if defined(PLATFORM_INFINITY6B0)
+typedef i6_vpe_para star_vpe_para;
+#else
+typedef i6e_vpe_para star_vpe_para;
+#endif
+
+/*
  * Build MI_VPE_ChannelPara_t from raptor's own record of it.
  *
  * Fresh every time, never read-modify-write. The struct's first member is
@@ -661,11 +673,12 @@ typedef struct {
  * round-trips this struct; every one of them builds it from zero and fills
  * the fields it means, which is what this does.
  *
- * i6_vpe_para, NOT i6e_vpe_para. The i6e_ form interposes a 72-byte LDC block
- * that MI_VPE_ChannelPara_t does not have on any family, which put level3DNR
- * 72 bytes past where the driver reads it -- so the 3DNR engine was handed a
- * zero from the phantom block and never ran. i6_vpe.h has the evidence and
- * asserts the offsets.
+ * star_vpe_para, because the two families disagree about this struct and a
+ * backend serving both cannot pick one. Infinity6E's libmi_vpe.so memcpys 100
+ * bytes out of it and finds level3DNR at +92; Infinity6B0's copies 28 and
+ * finds it at +20. Handing 6B0 the 6E form left the 3DNR engine reading a zero
+ * out of bytes that were never meant for it, so it never ran at all -- and
+ * silently, because the ioctl still succeeds. i6_vpe.h has the disassembly.
  *
  * The round trip it replaces read the whole struct back and wrote it out
  * again, so whatever MI_VPE_GetChannelParam had declined to populate went to
@@ -673,7 +686,7 @@ typedef struct {
  * arrived at by accident and only while Get kept quiet about those fields.
  * Rebuilding says it deliberately, and drops a read from the write path.
  */
-static inline void star_vpe_fill_param(const star_state_t *st, i6_vpe_para *para)
+static inline void star_vpe_fill_param(const star_state_t *st, star_vpe_para *para)
 {
     (void)st;
     memset(para, 0, sizeof(*para));
