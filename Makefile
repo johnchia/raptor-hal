@@ -80,6 +80,13 @@ CFLAGS  += -std=c11
 CFLAGS  += -ffunction-sections -fdata-sections -flto
 CFLAGS  += -fno-asynchronous-unwind-tables -fmerge-all-constants -fno-ident
 CFLAGS  += -DPLATFORM_$(PLATFORM)
+# The part within the family, where the caps tables need to tell two apart --
+# ssc333, ssc335 and ssc337 are one PLATFORM and three different encoder
+# ratings. Optional: no SOC_MODEL means no -DSOC_MODEL_*, and the per-part
+# caps fields stay 0, which reads as unmeasured. See src/caps_sigmastar.inc.
+ifneq ($(SOC_MODEL),)
+CFLAGS  += -DSOC_MODEL_$(shell echo $(SOC_MODEL) | tr '[:lower:]' '[:upper:]')
+endif
 CFLAGS  += -I$(SDK_INCLUDE)
 ifneq ($(VENDOR),sigmastar)   # IMP headers sit in an imp/ subdir; MI headers are flat
 CFLAGS  += -I$(SDK_INCLUDE)/imp

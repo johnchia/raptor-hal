@@ -10,6 +10,59 @@
  */
 
 /* ═══════════════════════════════════════════════════════════════════════
+ * ENCODE RATE BY PART
+ *
+ * The vendor rates each part's MAIN stream -- "3M@20", "5M@30" -- and leaves
+ * separate headroom for a substream that the figure does not describe. So
+ * this is a main-stream ceiling, and rvd compares main streams against it
+ * one at a time rather than summing the pipeline.
+ *
+ * Keyed by part and not by family, because the family does not determine it:
+ * ssc333, ssc335 and ssc337 are all INFINITY6B0 at 3M@20, 3M@30 and 5M@20.
+ * The suffixed variants (D/Q/DE/QE/G) differ in package and in how much DRAM
+ * they carry, never in the encoder, so they share their base part's rate.
+ *
+ * The part is not recoverable on the board -- the chip ID is family-wide,
+ * ipctool reports SSC33X for every 6B0, and /sys/devices/soc0/machine says
+ * only "INFINITY6B0 SSC009A-S01A QFN88" -- so SOC_MODEL arrives from the
+ * build. A build that names no part leaves this 0, which rvd reads as
+ * unmeasured and does not test against.
+ *
+ * DRAM is deliberately NOT recorded here even though it varies across these
+ * parts (64/128/256MB). It is readable at runtime from /proc/meminfo, and a
+ * fact that can be read must not be frozen into the binary.
+ * ═══════════════════════════════════════════════════════════════════════ */
+
+/* Infinity6B0 "Ispahan" (SSC33X) */
+#if defined(SOC_MODEL_SSC333) || defined(SOC_MODEL_SSC333DE)
+#define RSS_ENC_PIXEL_RATE 60000000u /* 3M @ 20fps */
+#elif defined(SOC_MODEL_SSC335) || defined(SOC_MODEL_SSC335DE)
+#define RSS_ENC_PIXEL_RATE 90000000u /* 3M @ 30fps */
+#elif defined(SOC_MODEL_SSC337) || defined(SOC_MODEL_SSC337DE)
+#define RSS_ENC_PIXEL_RATE 100000000u /* 5M @ 20fps */
+
+/* Infinity6E "Pudding" (SSC33X) */
+#elif defined(SOC_MODEL_SSC336D) || defined(SOC_MODEL_SSC336Q)
+#define RSS_ENC_PIXEL_RATE 90000000u /* 3M @ 30fps */
+#elif defined(SOC_MODEL_SSC30KD) || defined(SOC_MODEL_SSC30KQ)
+#define RSS_ENC_PIXEL_RATE 150000000u /* 5M @ 30fps */
+#elif defined(SOC_MODEL_SSC338D) || defined(SOC_MODEL_SSC338Q) || defined(SOC_MODEL_SSC338G)
+#define RSS_ENC_PIXEL_RATE 160000000u /* 8M @ 20fps */
+#elif defined(SOC_MODEL_SSC339G)
+#define RSS_ENC_PIXEL_RATE 240000000u /* 8M @ 30fps */
+
+/* Infinity6C "Maruko" (SSC37X) */
+#elif defined(SOC_MODEL_SSC377) || defined(SOC_MODEL_SSC377D) ||                                    \
+	defined(SOC_MODEL_SSC377DE) || defined(SOC_MODEL_SSC377QE)
+#define RSS_ENC_PIXEL_RATE 150000000u /* 5M @ 30fps */
+#elif defined(SOC_MODEL_SSC378DE) || defined(SOC_MODEL_SSC378QE)
+#define RSS_ENC_PIXEL_RATE 200000000u /* 8M @ 25fps */
+
+#else
+#define RSS_ENC_PIXEL_RATE 0u /* part not named at build time */
+#endif
+
+/* ═══════════════════════════════════════════════════════════════════════
  * INFINITY6E (SigmaStar SSC30KQ / SSC338Q)
  * INFINITY6B0 (SigmaStar SSC333 / SSC335 / SSC337)
  *
@@ -203,6 +256,43 @@ const rss_hal_caps_t g_hal_caps = {
      * rather than a per-family one, so INFINITY6B0 inherits it unmeasured. */
     .max_enc_channels = 8,
     .max_fs_channels = 4,
+    /*
+     * Rated main-stream ceiling for this part; see the table at the top of
+     * this file. rvd only warns against it, because the one part measured
+     * beats its own rating: an ssc333 at 2304x1296 H.264 30fps delivers 901
+     * frames in 30s -- 30.0fps, no drops -- which is 89.6M pixels/second
+     * against a rated 60M. The number earns its place by naming the envelope
+     * a misbehaving board has left, not by taking frame rate off one that
+     * works.
+     */
+    .max_enc_pixel_rate = RSS_ENC_PIXEL_RATE,
+#if defined(SOC_MODEL_SSC333)
+    /*
+     * The JPEG ceiling, unlike the rate, is a real failure: past it the
+     * channel is created, its ring is allocated, and it then never produces
+     * a frame. rvd logs "enc_poll failing (chn N, last=-110)" and /snap.jpg
+     * answers 503 after its timeout.
+     *
+     * It matches no documented limit. The i6b0 JPE HAL caps at 2688 wide and
+     * 2688*2688 pixels, and MI refuses a channel past max_width *
+     * max_height = 2688*1944 = 5225472; this starts failing below three
+     * quarters of that. Not memory either -- it persists with 9MB of the
+     * 32MB MMA heap free and a 9.79MB contiguous hole -- nor throughput
+     * (20fps fails exactly as 30fps does), nor width or height alone, since
+     * 2304x1080 and 1920x1296 both work at equal pixel counts.
+     *
+     * The likeliest reading is that a 3M part will not carry a 3M JPEG
+     * channel while the H.264 channel is also at 3M, which would make this
+     * ssc337's problem at 5M rather than at 3M. Untested, so ssc335 and
+     * ssc337 stay 0 rather than inherit a number measured elsewhere.
+     *
+     * Swept on an SSC333 with an SC3336: 2304x1248 (2875392) is the largest
+     * that works, 2304x1264 (2912256) and up do not. It is marginal rather
+     * than hard at the boundary -- one restart in six did produce a frame at
+     * 2304x1296 -- so this is the last size that worked every time.
+     */
+    .max_jpeg_pixels = 2875392u,
+#endif
     /* Keep in step with STAR_OSD_REGION_MAX in src/star/star_state.h.
      * Not referenced symbolically because this file is compiled for every
      * platform and must not pull in the MI headers. */
@@ -333,6 +423,12 @@ const rss_hal_caps_t g_hal_caps = {
     /* Limits — both counts are the scaler's four output ports. */
     .max_enc_channels = 4,
     .max_fs_channels = 4,
+    /*
+     * Rated main-stream ceiling for this part; see the table at the top of
+     * this file. Warn-only, and max_jpeg_pixels stays 0 because no 6C part
+     * has been swept for a JPEG ceiling.
+     */
+    .max_enc_pixel_rate = RSS_ENC_PIXEL_RATE,
 
     /*
      * OSD limits. A group here is a VENC channel that regions attach to, so

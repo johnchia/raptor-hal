@@ -686,6 +686,16 @@ typedef struct {
     const char *sdk_version;
     int max_fs_channels;
     int max_enc_channels;
+    /*
+     * Encode ceilings, in pixels and in pixels per second. Both are 0
+     * wherever a backend has not established them, and 0 means unknown
+     * rather than unlimited: rvd clamps nothing against a zero, because a
+     * default must not quietly shrink on a platform whose limits nobody
+     * has measured. These are properties of the silicon rather than of
+     * the board carrying it, so they belong here and not in a config file.
+     */
+    uint32_t max_enc_pixel_rate; /* video encode: width * height * fps */
+    uint32_t max_jpeg_pixels;    /* largest JPEG frame that encodes reliably */
     int max_osd_groups;
     int max_osd_regions;
 
