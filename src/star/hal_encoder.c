@@ -659,6 +659,13 @@ int hal_enc_register_channel(void *ctx, int grp, int chn)
         ret = star_fs_clone_port(st, src_port, port);
         if (ret == RSS_OK) {
             ret = star_enc_bind_port_rate(st, port, chn, snap_fps);
+            /*
+             * Only now. The port has to be bound before it is enabled -- see
+             * star_fs_clone_port for what an enable-then-bind produces, which
+             * is a port that reports success and never yields a frame.
+             */
+            if (ret == RSS_OK)
+                ret = star_fs_enable_port(st, port);
             if (ret == RSS_OK) {
                 enc->owns_port = true;
                 HAL_LOG_DBG("venc chn %d: snapshot channel attached on VPE port %d, "

@@ -542,18 +542,59 @@ int star_fs_clone_port(star_state_t *st, int src, int dst)
     d->user_depth = 0;
     d->queue_depth = STAR_VPE_SNAP_QUEUE_DEPTH;
 
-    ret = st->vpe.fnEnablePort(STAR_VPE_CHN, dst);
-    if (ret) {
-        HAL_LOG_ERR("MI_VPE_EnablePort(%d, %d) failed: %d", STAR_VPE_CHN, dst, ret);
-        d->configured = false;
-        return RSS_ERR_IO;
-    }
-    d->enabled = true;
-
-    HAL_LOG_DBG("vpe port %d: snapshot port cloned from port %d, %ux%u pixFmt %d, queue depth %u",
+    /*
+     * Configured, not enabled. The order a VPE output port needs is configure,
+     * bind, enable -- which is what rvd drives for the video ports
+     * (fs_create_channel, then the bind chain, then fs_enable_channel) and what
+     * the vendor's own ST_Vpe_StartPort does. A port enabled before anything is
+     * bound to it has nowhere to put a frame, and nothing reports an error: MI
+     * accepts the enable, accepts the later bind, and leaves the port sitting at
+     * PortCrop 0,0,0,0 with no geometry. On an SSC333 that showed as GetCnt 1
+     * against FailCnt 4509 and a /snap.jpg that returned one mangled frame and
+     * then "No snapshot available yet" for the rest of the boot.
+     *
+     * So enabling is the caller's, after its bind -- see
+     * hal_enc_register_channel and star_fs_enable_port.
+     */
+    HAL_LOG_DBG("vpe port %d: snapshot port cloned from port %d, %ux%u pixFmt %d, queue depth %u; "
+                "enable waits for the bind",
                 dst, src, d->width, d->height, d->pixFmt, d->queue_depth);
 
-    return star_fs_apply_depth(st, dst, d);
+    return RSS_OK;
+}
+
+/*
+ * star_fs_enable_port -- the second half of star_fs_clone_port, run once the
+ * caller has bound something to the port.
+ *
+ * Depth is applied after the enable rather than before it because
+ * star_fs_apply_depth declines to touch a port that is not up yet, which is the
+ * same order hal_fs_enable_channel uses for rvd's own ports.
+ */
+int star_fs_enable_port(star_state_t *st, int port)
+{
+    star_vpe_port_t *p;
+    int ret;
+
+    if (!st || port < 0 || port >= STAR_VPE_PORT_NUM)
+        return RSS_ERR_INVAL;
+
+    p = &st->port[port];
+    if (!p->configured) {
+        HAL_LOG_ERR("vpe port %d: enable before configure", port);
+        return RSS_ERR_INVAL;
+    }
+    if (p->enabled)
+        return RSS_OK;
+
+    ret = st->vpe.fnEnablePort(STAR_VPE_CHN, port);
+    if (ret) {
+        HAL_LOG_ERR("MI_VPE_EnablePort(%d, %d) failed: %d", STAR_VPE_CHN, port, ret);
+        return RSS_ERR_IO;
+    }
+    p->enabled = true;
+
+    return star_fs_apply_depth(st, port, p);
 }
 
 /*

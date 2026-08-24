@@ -901,6 +901,7 @@ void star_fs_release_all(star_state_t *st);
  * this backend knows these ports exist.
  */
 int star_fs_clone_port(star_state_t *st, int src, int dst);
+int star_fs_enable_port(star_state_t *st, int port);
 void star_fs_release_port(star_state_t *st, int port);
 
 /* Encoder ops -- src/star/hal_encoder.c */
