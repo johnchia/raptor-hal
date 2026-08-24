@@ -549,8 +549,6 @@ static int star_vif_bringup(star_state_t *st)
  */
 static int star_vpe_bringup(star_state_t *st)
 {
-    i6e_vpe_chn channel;
-    star_vpe_para param;
     i6_sys_bind source, dest;
     unsigned int fps;
     int ret;
@@ -564,19 +562,44 @@ static int star_vpe_bringup(star_state_t *st)
     for (i = 0; i < STAR_VPE_PORT_NUM; i++)
         st->port[i].fd = -1;
 
-    memset(&channel, 0, sizeof(channel));
-    channel.capt.width = st->plane.capt.width;
-    channel.capt.height = st->plane.capt.height;
-    channel.pixFmt = star_vif_pixfmt(&st->plane);
-    channel.hdr = I6_HDR_OFF;
-    /* i6_vpe_sens is 1-based: ID0 == 1. Both references pass index + 1. */
-    channel.sensor = (i6_vpe_sens)(STAR_SNR_INDEX + 1);
-    channel.mode = I6_VPE_MODE_REALTIME;
+    /*
+     * MI_VPE_ChannelAttr_t grew the same way MI_VPE_ChannelPara_t did: the
+     * libraries from 2022 copy 192 bytes out of it, the 2020 ones 108, and the
+     * two agree only up to tIspInitPara -- after which the long form carries an
+     * 84-byte MI_VPE_LdcInitPara_t where the short one goes straight to bEnLdc.
+     * Everything past the prefix is zero here, so the short-form driver reading
+     * the long form saw zeros where it wanted its last two fields and applied
+     * defaults, which is why this was survivable while nothing needed those
+     * fields set.
+     *
+     * i6_vpe_sens is 1-based: ID0 == 1. Both references pass index + 1.
+     */
+#define STAR_VPE_FILL_CHN(c)                                                                       \
+    do {                                                                                           \
+        memset(&(c), 0, sizeof(c));                                                                \
+        (c).capt.width = st->plane.capt.width;                                                     \
+        (c).capt.height = st->plane.capt.height;                                                   \
+        (c).pixFmt = star_vif_pixfmt(&st->plane);                                                  \
+        (c).hdr = I6_HDR_OFF;                                                                      \
+        (c).sensor = (i6_vpe_sens)(STAR_SNR_INDEX + 1);                                            \
+        (c).mode = I6_VPE_MODE_REALTIME;                                                           \
+    } while (0)
 
-    ret = st->vpe.fnCreateChannel(STAR_VPE_CHN, (i6_vpe_chn *)&channel);
+    if (star_vpe_modern(st)) {
+        i6e_vpe_chn chn_long;
+
+        STAR_VPE_FILL_CHN(chn_long);
+        ret = st->vpe.fnCreateChannel(STAR_VPE_CHN, (i6_vpe_chn *)&chn_long);
+    } else {
+        i6_vpe_chn chn_short;
+
+        STAR_VPE_FILL_CHN(chn_short);
+        ret = st->vpe.fnCreateChannel(STAR_VPE_CHN, &chn_short);
+    }
+#undef STAR_VPE_FILL_CHN
     if (ret) {
         HAL_LOG_ERR("MI_VPE_CreateChannel(%d) failed: %d (%ux%u pixFmt %d)", STAR_VPE_CHN, ret,
-                    channel.capt.width, channel.capt.height, channel.pixFmt);
+                    st->plane.capt.width, st->plane.capt.height, star_vif_pixfmt(&st->plane));
         return RSS_ERR_IO;
     }
     st->vpe_chn_created = true;
@@ -588,9 +611,17 @@ static int star_vpe_bringup(star_state_t *st)
      * values is a thing worth offering. There is no runtime setter left to
      * share the builder with.
      */
-    star_vpe_fill_param(st, &param);
+    if (star_vpe_modern(st)) {
+        i6e_vpe_para para_long;
 
-    ret = st->vpe.fnSetChannelParam(STAR_VPE_CHN, (i6_vpe_para *)&param);
+        star_vpe_fill_param_long(st, &para_long);
+        ret = st->vpe.fnSetChannelParam(STAR_VPE_CHN, (i6_vpe_para *)&para_long);
+    } else {
+        i6_vpe_para para_short;
+
+        star_vpe_fill_param_short(st, &para_short);
+        ret = st->vpe.fnSetChannelParam(STAR_VPE_CHN, &para_short);
+    }
     if (ret) {
         HAL_LOG_ERR("MI_VPE_SetChannelParam(%d) failed: %d", STAR_VPE_CHN, ret);
         return RSS_ERR_IO;
@@ -635,7 +666,7 @@ static int star_vpe_bringup(star_state_t *st)
     st->vif_vpe_bound = true;
 
     HAL_LOG_INFO("VPE up: chn %d, %ux%u in, realtime link from VIF at %u fps", STAR_VPE_CHN,
-                 channel.capt.width, channel.capt.height, fps);
+                 st->plane.capt.width, st->plane.capt.height, fps);
 
     return RSS_OK;
 }
@@ -653,6 +684,51 @@ static int star_teardown(star_state_t *st);
  * with VPE and VENC added by tasks 2c and 2d, which bind to the VIF port
  * this leaves enabled.
  */
+/*
+ * star_read_mi_build -- MI's build stamp as YYYYMMDDhhmmss, or 0.
+ *
+ * MI_SYS_GetVersion answers with a string of the shape
+ *
+ *   Sigmastar Module mi_sys version: project_commit.<h> sdk_commit.<h> build_time.20201022150013
+ *
+ * and the stamp is the only field in it that orders. The commit hashes do not,
+ * and the field list is not fixed -- Infinity6C's carries an mhal_commit the
+ * others lack -- so the parse looks for "build_time." and reads digits, rather
+ * than assuming a position. Every MI library on this bench from 2019 to 2024
+ * carries it; the ones that predate it return nothing and get 0, which
+ * star_vpe_modern reads as "fall back to the family".
+ *
+ * Note this reports the driver's build, not the library's: on a board the two
+ * differ by a few seconds. The driver is the half that defines the ioctl ABI,
+ * so it is the right half to ask.
+ */
+static unsigned long long star_read_mi_build(star_state_t *st)
+{
+    static const char key[] = "build_time.";
+    i6_sys_ver ver;
+    char buf[sizeof(ver.version) + 1];
+    unsigned long long stamp = 0;
+    const char *p;
+
+    if (!st->sys.fnGetVersion)
+        return 0;
+
+    memset(&ver, 0, sizeof(ver));
+    if (st->sys.fnGetVersion(&ver))
+        return 0;
+
+    snprintf(buf, sizeof(buf), "%.*s", (int)sizeof(ver.version), (char *)ver.version);
+    p = strstr(buf, key);
+    if (!p)
+        return 0;
+
+    for (p += sizeof(key) - 1; *p >= '0' && *p <= '9'; p++)
+        stamp = stamp * 10ull + (unsigned long long)(*p - '0');
+
+    /* YYYYMMDDhhmmss or nothing: a partial stamp is not worth guessing at. */
+    return stamp >= 19000000000000ull && stamp < 99999999999999ull ? stamp : 0;
+}
+
 static int hal_init(void *ctx, const rss_multi_sensor_config_t *cfg)
 {
     rss_hal_ctx_t *c = (rss_hal_ctx_t *)ctx;
@@ -708,6 +784,14 @@ static int hal_init(void *ctx, const rss_multi_sensor_config_t *cfg)
     ret = i6_sys_load(&st->sys);
     if (ret)
         goto err_free;
+
+    /*
+     * Before anything else asks MI for a struct: this is what decides which
+     * layout the VPE calls use. See star_vpe_modern.
+     */
+    st->mi_build = star_read_mi_build(st);
+    HAL_LOG_INFO("mi: build %llu, %s VPE struct layouts", st->mi_build,
+                 star_vpe_modern(st) ? "long" : "short");
     ret = i6_snr_load(&st->snr);
     if (ret)
         goto err_unload;

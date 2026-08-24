@@ -513,6 +513,13 @@ typedef struct {
      * can be re-issued exactly -- the AE fit re-programs the sensor, and
      * rounding there would move a 29.97 request to 30. */
     unsigned int fps;
+
+    /*
+     * MI's own build stamp as YYYYMMDDhhmmss, read once from
+     * MI_SYS_GetVersion, or 0 when it could not be read or parsed. This is what
+     * picks the VPE struct layouts -- see star_vpe_modern.
+     */
+    unsigned long long mi_build;
     unsigned int fps_milli;
 
     /*
@@ -742,10 +749,62 @@ typedef struct {
  * is silent, so it is a typedef rather than a cast at the call site: the
  * struct that is filled and the struct that is passed cannot drift apart.
  */
+/*
+ * Which MI_VPE_ChannelPara_t and MI_VPE_ChannelAttr_t this library wants.
+ *
+ * These two structs grew across MI releases, and the size tracks the *release*,
+ * not the chip. Measured from the memcpy length in each libmi_vpe.so:
+ *
+ *   build_time            MI_VPE_ChannelPara_t   MI_VPE_ChannelAttr_t
+ *   2019-10 .. 2021-09            28                52 -> 64 -> 108
+ *   2022-06 onward               100                     192
+ *
+ * The 2019 Infinity6E libraries take the same 28 and 52 that the early
+ * Infinity6B0 ones do, so "6E is long, 6B0 is short" was never a property of
+ * the silicon -- it is only true because OpenIPC happens to ship a 2022 drop
+ * for one and a 2020 drop for the other. Keying on the family gets the right
+ * answer today and the wrong one the moment either package is updated.
+ *
+ * MI_SYS_GetVersion reports the *driver's* build, not the library's -- the two
+ * differ by seconds on a board, which is how you can tell -- and the driver is
+ * what defines the ioctl ABI. So that is the key.
+ *
+ * Falling back to the family when the stamp cannot be read keeps today's
+ * behaviour on a library too old to carry one: the pre-2020 drops have no
+ * version string at all.
+ */
+#define STAR_MI_BUILD_LONG_PARA 20220101000000ull
+
+static inline bool star_vpe_modern(const star_state_t *st)
+{
+    if (st->mi_build)
+        return st->mi_build >= STAR_MI_BUILD_LONG_PARA;
 #if defined(PLATFORM_INFINITY6B0)
-typedef i6_vpe_para star_vpe_para;
+    return false;
 #else
-typedef i6e_vpe_para star_vpe_para;
+    return true;
+#endif
+}
+
+/*
+ * MI_VPE_ChannelAttr_t splits the same way and for the same reason, which is
+ * only visible once something past the common prefix is actually used. The two
+ * agree up to tIspInitPara; 6E then carries an 84-byte MI_VPE_LdcInitPara_t
+ * where 6B0 goes straight to bEnLdc and u32ChnPortMode. Infinity6B0's
+ * libmi_vpe.so memsets 112 and memcpys 108 out of MI_VPE_CreateChannel, which
+ * is sizeof(i6_vpe_chn) exactly; the 6E form is 192 and puts u32ChnPortMode at
+ * +188, eighty bytes past anything 6B0 reads.
+ *
+ * Handing 6B0 the 6E form was survivable only because every field past the
+ * prefix was zero, so the driver read zeros where it expected bEnLdc and
+ * u32ChnPortMode and applied its defaults. It became a bug the moment
+ * u32ChnPortMode needed a value: the write landed outside the struct the
+ * driver copies, and MI_VPE_CreateChannel succeeded regardless.
+ */
+#if defined(PLATFORM_INFINITY6B0)
+typedef i6_vpe_chn star_vpe_chn;
+#else
+typedef i6e_vpe_chn star_vpe_chn;
 #endif
 
 /*
@@ -758,12 +817,12 @@ typedef i6e_vpe_para star_vpe_para;
  * round-trips this struct; every one of them builds it from zero and fills
  * the fields it means, which is what this does.
  *
- * star_vpe_para, because the two families disagree about this struct and a
- * backend serving both cannot pick one. Infinity6E's libmi_vpe.so memcpys 100
- * bytes out of it and finds level3DNR at +92; Infinity6B0's copies 28 and
- * finds it at +20. Handing 6B0 the 6E form left the 3DNR engine reading a zero
- * out of bytes that were never meant for it, so it never ran at all -- and
- * silently, because the ioctl still succeeds. i6_vpe.h has the disassembly.
+ * Two layouts, because the struct grew between MI releases: the 2022 libraries
+ * memcpy 100 bytes out of it and find level3DNR at +92, the 2020 and earlier
+ * ones copy 28 and find it at +20. Handing a short-form library the long form
+ * left the 3DNR engine reading a zero out of bytes that were never meant for
+ * it, so it never ran at all -- and silently, because the ioctl still
+ * succeeds. star_vpe_modern picks; i6_vpe.h has the disassembly.
  *
  * The round trip it replaces read the whole struct back and wrote it out
  * again, so whatever MI_VPE_GetChannelParam had declined to populate went to
@@ -771,19 +830,34 @@ typedef i6e_vpe_para star_vpe_para;
  * arrived at by accident and only while Get kept quiet about those fields.
  * Rebuilding says it deliberately, and drops a read from the write path.
  */
-static inline void star_vpe_fill_param(const star_state_t *st, star_vpe_para *para)
+/*
+ * mirror and flip stay zero, and the sensor carries orientation instead --
+ * star_sensor_bringup says why. They are left to the memset rather than
+ * assigned, so that a reader looking for where this backend sets them finds
+ * nothing, which is the point.
+ *
+ * A macro rather than a function because the two layouts are different types
+ * with the same field names, and the alternative is writing these four lines
+ * twice and letting them drift.
+ */
+#define STAR_VPE_FILL_PARA(para)                                                                   \
+    do {                                                                                           \
+        memset((para), 0, sizeof(*(para)));                                                        \
+        (para)->hdr = I6_HDR_OFF;                                                                  \
+        (para)->level3DNR = STAR_VPE_NR3D_LEVEL;                                                   \
+        (para)->lensAdjOn = 0;                                                                     \
+    } while (0)
+
+static inline void star_vpe_fill_param_long(const star_state_t *st, i6e_vpe_para *para)
 {
     (void)st;
-    memset(para, 0, sizeof(*para));
-    para->hdr = I6_HDR_OFF;
-    para->level3DNR = STAR_VPE_NR3D_LEVEL;
-    /*
-     * mirror and flip stay zero here, and the sensor carries orientation
-     * instead -- star_sensor_bringup says why. They are left to the memset
-     * rather than assigned, so that a reader looking for where this backend
-     * sets them finds nothing, which is the point.
-     */
-    para->lensAdjOn = 0;
+    STAR_VPE_FILL_PARA(para);
+}
+
+static inline void star_vpe_fill_param_short(const star_state_t *st, i6_vpe_para *para)
+{
+    (void)st;
+    STAR_VPE_FILL_PARA(para);
 }
 
 static inline star_state_t *star_state(void *ctx)
