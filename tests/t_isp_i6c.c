@@ -1182,65 +1182,36 @@ static void test_the_awb_line_survives_ae_winning_the_race(void)
 }
 
 /*
- * Temper is the ISP channel's 3DNR level, and raptor's neutral has to land on
- * the level hal_init seeds the state with. rvd applies temper on every start
- * whether or not the config names the key, so a midpoint neutral would have a
- * default config quietly asking for level 4. Infinity6E's temper carries the
- * same unity for the same reason.
+ * Temper is gone from this backend, and this is what says so.
  *
- * pipeline_up stays false throughout: before there is a channel the level is
- * held rather than written, which is what lets the mapping be checked without
- * mocking MI at all.
+ * The ISP channel's e3DNRLevel is not a strength -- it selects the 3DNR
+ * reference frame's bit depth -- so publishing it as one described a control
+ * the hardware does not have. The ops are absent rather than stubbed, which
+ * means RSS_HAL_CALL answers RSS_ERR_NOTSUP and get-isp-caps stops listing the
+ * knob; the assertion here is on the caps side, since a removed op cannot be
+ * called to be tested.
+ *
+ * st->isp_nr3d_req is deliberately still live: the driver gates its flip and
+ * rotate predicates on 3DNR being on, so the seed has to reach the channel.
+ * That path is hal_framesource's, not a knob's.
  */
-static void test_temper_is_a_level_and_says_so(void)
+static void test_temper_is_not_published(void)
 {
     rss_hal_ctx_t ctx;
     infinity6c_state_t st;
     rss_isp_knob_t caps;
     void *c = &ctx;
-    int v = 0;
-    int lvl;
 
     reset(&st);
     memset(&ctx, 0, sizeof(ctx));
     ctx.platform = &st;
-    st.isp_nr3d_req = 1;
 
-    /*
-     * Every level the channel has, reachable and reported as itself. Under
-     * the abstract scale only two of the eight were reachable below neutral:
-     * the pipeline comes up on level 1, so a unity of 1 over a floor of 0 left
-     * exactly one level under neutral and raptor 1..127 all asked for level 0.
-     * Seven eighths of the bottom half of the knob meant "off", and a config
-     * that had round-tripped through get-isp carried 36 for what used to be
-     * the default -- which then meant off.
-     */
-    for (lvl = 0; lvl <= 7; lvl++) {
-        CHECK(hal_isp_set_temper_strength(c, lvl) == RSS_OK, "level %d succeeds", lvl);
-        CHECK(st.isp_nr3d_req == lvl, "level %d must be held as itself, got %d", lvl,
-              st.isp_nr3d_req);
-    }
+    CHECK(hal_isp_get_knob_caps(c, "temper", &caps) == RSS_ERR_NOTSUP,
+          "temper must not publish caps");
 
-    /* Round trip. With no channel to ask, the getter reports the request. */
-    st.isp_nr3d_req = 1;
-    CHECK(hal_isp_get_temper_strength(c, &v) == RSS_OK, "get succeeds");
-    CHECK(v == 1, "level 1 must read back as 1, got %d", v);
-
-    st.isp_nr3d_req = 7;
-    CHECK(hal_isp_get_temper_strength(c, &v) == RSS_OK, "get succeeds at the top");
-    CHECK(v == 7, "level 7 must read back as 7, got %d", v);
-
-    /* And the caps say all of that rather than leaving a client to guess a
-     * 0..255 slider over eight positions. */
-    CHECK(hal_isp_get_knob_caps(c, "temper", &caps) == RSS_OK, "temper publishes caps");
-    CHECK(caps.min == 0 && caps.max == 7, "the channel's levels, got %d..%d", caps.min, caps.max);
-    CHECK(caps.neutral == 1, "the level the pipeline comes up on, got %d", caps.neutral);
-    CHECK(!caps.has_auto, "a channel level has no tuning curve to hand back");
-
-    CHECK(hal_isp_set_temper_strength(c, 8) == RSS_ERR_INVAL, "out of range is refused");
-    CHECK(hal_isp_set_temper_strength(c, RSS_ISP_AUTO) == RSS_ERR_INVAL,
-          "and so is auto, which this knob does not have");
-    CHECK(hal_isp_set_temper_strength(NULL, 1) == RSS_ERR_INVAL, "NULL ctx is refused");
+    /* The knobs that remain still do, so the lookup itself is not just broken. */
+    CHECK(hal_isp_get_knob_caps(c, "defog_strength", &caps) == RSS_OK,
+          "defog_strength still publishes caps");
 }
 
 int main(void)
@@ -1273,7 +1244,7 @@ int main(void)
     test_defog_strength_leaves_defogs_own_switch_alone();
     test_a_drc_write_touches_only_the_level();
     test_the_awb_line_survives_ae_winning_the_race();
-    test_temper_is_a_level_and_says_so();
+    test_temper_is_not_published();
 
     if (failures) {
         printf("t_isp_i6c: %d failure(s)\n", failures);

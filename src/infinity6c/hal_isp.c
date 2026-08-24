@@ -1335,8 +1335,8 @@ int hal_isp_get_saturation(void *ctx, int *val)
  * sigmastar-headers with its assertions in tests/abi_iq_i6c.c, since what is
  * missing here is a useful range and not the knowledge of where the module is.
  *
- * Temporal denoise (temper, MI's 3DNR) is untouched by this: it is a channel
- * level with eight real positions, and it works.
+ * Temporal denoise is unpublished too, on its own grounds rather than these --
+ * see the comment above hal_isp_get_knob_caps.
  */
 int hal_isp_set_drc_strength(void *ctx, int val)
 {
@@ -1590,8 +1590,8 @@ static int i6c_isp_apply_chn_param(infinity6c_state_t *st)
         if (!explained) {
             explained = true;
             HAL_LOG_WARN("isp: this part takes orientation and 3DNR only while the ISP channel is "
-                         "being created -- set hflip, vflip and temper in the config and restart "
-                         "the stream. The SDK refuses a live change; it is not being dropped here");
+                         "being created -- set hflip and vflip in the config and restart the "
+                         "stream. The SDK refuses a live change; it is not being dropped here");
         }
         return RSS_ERR_IO;
     }
@@ -1674,97 +1674,28 @@ int hal_isp_get_hvflip(void *ctx, int *hflip, int *vflip)
 }
 
 /*
- * Temporal noise reduction, which MI calls 3DNR and raptor calls temper.
+ * Temporal noise reduction is not published here, for the reason Infinity6E
+ * already gives in src/caps_sigmastar.inc: the ISP channel's level is not a
+ * strength. e3DNRLevel picks the 3DNR reference frame's bit depth, so moving it
+ * does not trade noise against detail the way a temper knob promises -- most of
+ * its range just switches the engine off, and that engine is what mirror and
+ * flip run on.
  *
- * The ISP channel's level, not MI_ISP_IQ_SetNr3d: that module's manual block is
- * per-band arrays with no place for a single scalar, while this is one field the
- * driver itself bounds at 7 and clamps to the per-chip maximum. raptor's 0..255
- * maps onto 0..7, so the knob has eight distinct positions rather than 256 -- which
- * is what the hardware has.
+ * The tuning's own NR3D module does carry a strength, but reaching it means
+ * putting enOpType into manual and discarding the sixteen-entry gain-indexed
+ * curve the tuning spent its effort on. That is the trade that already keeps
+ * saturation unpublished on this SoC, and it buys less here than it costs.
  *
- * Neutral is level 1, not the midpoint. It has to be the level the pipeline comes
- * up on -- the one hal_init seeds -- because rvd applies temper on every start
- * whether or not the config names the key. Same unity as Infinity6E's, and the
- * same reasoning as saturation's 32-of-127: raptor's neutral means "nobody asked",
- * which can only be whatever the platform was already doing.
+ * So temporal denoise belongs to the tuning binary on this family too, and
+ * isp_{set,get}_temper_strength are absent rather than stubbed -- RSS_HAL_CALL
+ * answers RSS_ERR_NOTSUP and get-isp-caps stops listing the knob.
  *
- * The old map sent neutral to 4 and got away with it only by failing: rvd's
- * temper arrives after the channel is up, the running channel refuses the
- * write, and the setter rolls back to the seed. So a board measured at level 1
- * while reporting 36, and the mapping and the hardware now agree instead.
- *
- * Two consequences, both measured on an SSC377QE rather than reasoned about.
- * A unity of 1 over a floor of 0 leaves exactly one level below neutral, so
- * every raptor value under 128 asks for 3DNR off -- there is no graded lower
- * half to be had, because the hardware has eight positions and the default is
- * the second of them. And a config carrying a temper written by an older build
- * reads differently now: that build encoded level 1 as 36, so a stored 36 used
- * to mean the default and now means off. Configs that round-tripped through
- * get-isp are the ones to look at.
- *
- * Sinter is emphatically not this. Spatial luma denoise is its own module,
- * reached through the tuning API as a vector row, and aliasing the two would
- * have isp_set_sinter_strength quietly move temper -- which is the sort of
- * substitution that survives a bench check, because both do reduce noise.
+ * st->isp_nr3d_req stays regardless: hal_common seeds it at 1 and
+ * i6c_isp_apply_chn_param sends it, because the driver's flip and rotate
+ * predicates are gated on 3DNR being on (RotFlipRelyOn3Dnr) and a level of zero
+ * can refuse an orientation that would otherwise be accepted. It is a fixed
+ * level now rather than a knob's shadow.
  */
-#define I6C_ISP_NR3D_MAX 7
-#define I6C_ISP_NR3D_UNITY 1
-
-int hal_isp_set_temper_strength(void *ctx, int val)
-{
-    infinity6c_state_t *st = i6c_state(ctx);
-    int prev;
-    int ret;
-
-    if (!st)
-        return RSS_ERR_INVAL;
-    /*
-     * Eight positions, said as eight. The old abstract 0..255 had to squeeze
-     * them into a scale with a neutral in the middle, and since the default is
-     * level 1 -- the second of the eight -- that left exactly one level below
-     * neutral and put raptor 1..127 all on level 0. Seven-eighths of the lower
-     * half of the knob meant "off". Here the number is the level.
-     */
-    if (val < 0 || val > I6C_ISP_NR3D_MAX)
-        return RSS_ERR_INVAL;
-
-    prev = st->isp_nr3d_req;
-    st->isp_nr3d_req = val;
-
-    ret = i6c_isp_apply_chn_param(st);
-    if (ret != RSS_OK) {
-        st->isp_nr3d_req = prev;
-        return ret;
-    }
-
-    HAL_LOG_DBG("isp: temper = %d (3DNR level %d of %d)", val, st->isp_nr3d_req, I6C_ISP_NR3D_MAX);
-    return RSS_OK;
-}
-
-int hal_isp_get_temper_strength(void *ctx, int *val)
-{
-    infinity6c_state_t *st = i6c_state(ctx);
-    i6c_isp_para para;
-    int level;
-
-    if (!st || !val)
-        return RSS_ERR_INVAL;
-
-    /* The clamped level when the channel can be asked, the request otherwise: the
-     * SDK lowers a level the chip cannot do, so what was asked for is not always
-     * what is running. */
-    if (i6c_isp_chn_param(st, &para) == RSS_OK && para.level3DNR >= 0)
-        st->isp_nr3d_req = para.level3DNR;
-
-    level = st->isp_nr3d_req;
-    if (level < 0)
-        level = 0;
-    if (level > I6C_ISP_NR3D_MAX)
-        level = I6C_ISP_NR3D_MAX;
-
-    *val = level;
-    return RSS_OK;
-}
 
 /* ================================================================
  * KNOB CAPABILITIES
@@ -1798,19 +1729,6 @@ int hal_isp_get_knob_caps(void *ctx, const char *name, rss_isp_knob_t *caps)
 
     if (!st || !name || !caps)
         return RSS_ERR_INVAL;
-
-    /*
-     * Not an IQ module at all: 3DNR is a VPE channel parameter, so it has a
-     * level rather than a curve and there is no auto to hand it back to.
-     */
-    if (strcmp(name, "temper") == 0) {
-        caps->min = 0;
-        caps->max = I6C_ISP_NR3D_MAX;
-        caps->neutral = I6C_ISP_NR3D_UNITY;
-        caps->has_auto = false;
-        caps->enabled = true;
-        return RSS_OK;
-    }
 
     for (i = 0; i < sizeof(i6c_knob_keys) / sizeof(i6c_knob_keys[0]); i++)
         if (strcmp(i6c_knob_keys[i].key, name) == 0)

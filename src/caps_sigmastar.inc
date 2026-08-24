@@ -164,7 +164,7 @@ const rss_hal_caps_t g_hal_caps = {
      * and raptor's keys carry Ingenic gain codes, which is not a unit
      * mismatch a HAL can convert away.
      *
-     * has_temper is false for a reason particular to this SoC. MI offers two
+     * has_temper is false for a reason that holds across the family. MI offers two
      * ways to reach temporal denoise and neither is a knob raptor can honestly
      * publish. The VPE channel's e3DNRLevel is not a strength at all -- it
      * picks the 3DNR reference frame's bit depth, and six of its eight values
@@ -364,13 +364,9 @@ const rss_hal_caps_t g_hal_caps = {
  * both streams at once would be worse than an absent one.
  *
  * The ISP flags that are true are the ones whose ops hal_isp.c publishes:
- * defog, sinter, temper and ae_comp. sinter was false for as long as its
- * module had no single scalar to set -- it is a per-band table on maruko, as
- * sharpness is -- and is true now that a knob scales the whole run about the
- * tuning's own values rather than picking a band out of it. Nothing in raptor
- * reads these four today, so they are advertising rather than gating; they are
- * set because a wrong advertisement is what sent the last reader looking in the
- * wrong place.
+ * defog, drc and ae_comp. Nothing in raptor reads them today, so they are
+ * advertising rather than gating; they are set because a wrong advertisement is
+ * what sent the last reader looking in the wrong place.
  *
  * Sharpness has an op here too and no flag to go with it, because
  * rss_hal_caps_t has never carried one. rvd asks the vtable directly for that
@@ -416,7 +412,15 @@ const rss_hal_caps_t g_hal_caps = {
      */
     .has_sinter = false,
     .has_drc = true,
-    .has_temper = true,
+    /*
+     * has_temper is false for the reason Infinity6E's block above gives, which
+     * turns out to be a family property rather than one SoC's: the VPE channel's
+     * e3DNRLevel picks the 3DNR reference frame's bit depth rather than a
+     * strength, and the tuning's NR3D module has a strength only at the price of
+     * its gain-indexed curve. The channel level is fixed at the seed hal_common
+     * sets, which the flip predicates need to be non-zero.
+     */
+    .has_temper = false,
     .has_ae_comp = true,
     .max_sensors = 1,
 

@@ -145,8 +145,6 @@ int hal_isp_get_running_mode(void *ctx, rss_isp_mode_t *mode);
 int hal_isp_set_hflip(void *ctx, int enable);
 int hal_isp_set_vflip(void *ctx, int enable);
 int hal_isp_get_hvflip(void *ctx, int *hflip, int *vflip);
-int hal_isp_set_temper_strength(void *ctx, int val);
-int hal_isp_get_temper_strength(void *ctx, int *val);
 int hal_isp_get_knob_caps(void *ctx, const char *name, rss_isp_knob_t *caps);
 int hal_isp_set_sensor_fps(void *ctx, uint32_t fps_num, uint32_t fps_den);
 int hal_isp_get_sensor_fps(void *ctx, uint32_t *fps_num, uint32_t *fps_den);
@@ -779,8 +777,6 @@ static const rss_hal_ops_t g_ops = {
     .isp_set_hflip = hal_isp_set_hflip,
     .isp_set_vflip = hal_isp_set_vflip,
     .isp_get_hvflip = hal_isp_get_hvflip,
-    .isp_set_temper_strength = hal_isp_set_temper_strength,
-    .isp_get_temper_strength = hal_isp_get_temper_strength,
     .isp_set_sensor_fps = hal_isp_set_sensor_fps,
     .isp_get_sensor_fps = hal_isp_get_sensor_fps,
 
