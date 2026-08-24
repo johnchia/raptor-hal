@@ -210,12 +210,21 @@ static bool i6c_enc_fill_rate(i6c_venc_rate *rate, const rss_video_config_t *cfg
         rate->h264Vbr.fpsDen = fps_den;
         rate->h264Vbr.maxBitrate = cfg->max_bitrate ? cfg->max_bitrate : bitrate;
         /*
-         * MI's quality numbers run the same way as QP: smaller is better. So
-         * raptor's min_qp is the *best* quality bound and max_qp the worst, and
-         * swapping them here would invert the rate controller.
+         * These two are MaxQp and MinQp, whatever the header calls them --
+         * /proc/mi_modules/mi_venc/mi_venc0 prints them under exactly those
+         * headings, and the value written here is the value that appears.
+         *
+         * So they take raptor's bounds straight across. The earlier reading
+         * had it that "smaller is better" made min_qp the upper bound, which
+         * is true of quality and false of QP: it put 20 in MaxQp and 48 in
+         * MinQp, a range whose ceiling sits below its floor. The encoder does
+         * not refuse that -- it keeps producing frames at full rate, pinned to
+         * QP 20 because QP may never rise above it, which at 2560x1920 is far
+         * more than the bitrate cap allows and shows up as drops downstream
+         * rather than as an error here.
          */
-        rate->h264Vbr.maxQual = cfg->min_qp >= 0 ? (unsigned int)cfg->min_qp : 20;
-        rate->h264Vbr.minQual = cfg->max_qp >= 0 ? (unsigned int)cfg->max_qp : 48;
+        rate->h264Vbr.maxQual = cfg->max_qp >= 0 ? (unsigned int)cfg->max_qp : 48;
+        rate->h264Vbr.minQual = cfg->min_qp >= 0 ? (unsigned int)cfg->min_qp : 20;
         break;
 
     /*
@@ -232,8 +241,9 @@ static bool i6c_enc_fill_rate(i6c_venc_rate *rate, const rss_video_config_t *cfg
         rate->h264Avbr.fpsNum = fps_num;
         rate->h264Avbr.fpsDen = fps_den;
         rate->h264Avbr.maxBitrate = cfg->max_bitrate ? cfg->max_bitrate : bitrate;
-        rate->h264Avbr.maxQual = cfg->min_qp >= 0 ? (unsigned int)cfg->min_qp : 20;
-        rate->h264Avbr.minQual = cfg->max_qp >= 0 ? (unsigned int)cfg->max_qp : 48;
+        /* Same pair, same way round: AVBR shares the VBR struct. */
+        rate->h264Avbr.maxQual = cfg->max_qp >= 0 ? (unsigned int)cfg->max_qp : 48;
+        rate->h264Avbr.minQual = cfg->min_qp >= 0 ? (unsigned int)cfg->min_qp : 20;
         break;
 
     case RSS_RC_CBR:

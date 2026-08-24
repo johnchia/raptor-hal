@@ -674,6 +674,52 @@ static void test_rc_modes_use_the_drivers_numbering(void)
     }
 }
 
+/*
+ * MaxQp is the ceiling and MinQp the floor, and the ceiling is the larger
+ * number.
+ *
+ * The VBR struct's last two words are what /proc/mi_modules/mi_venc/mi_venc0
+ * prints as MaxQp and MinQp, whatever the header names them. Filling them from
+ * raptor's min_qp and max_qp respectively -- on the reasoning that smaller QP
+ * is better quality, so min_qp is the "best" bound -- produces a range whose
+ * ceiling sits under its floor.
+ *
+ * That does not fail anywhere it can be seen. The encoder keeps emitting at
+ * full frame rate, pinned to QP 20 because QP may never rise above it, which at
+ * 2560x1920 is several times the bitrate cap; the loss lands downstream as
+ * dropped frames and a stream a client cannot play. Measured on an SSC377QE:
+ * inverted gave +57 DropCnt in 8s and no decodable video over RTSP, correct
+ * gives 0 drops, 25 fps, and 3244 kbps against a 4000 kbps cap.
+ */
+static void test_qp_bounds_are_not_inverted(void)
+{
+    static const rss_rc_mode_t vbr_modes[] = {RSS_RC_VBR, RSS_RC_SMART, RSS_RC_CAPPED_VBR,
+                                              RSS_RC_CAPPED_QUALITY};
+    rss_video_config_t cfg;
+    i6c_venc_rate rate;
+    size_t i;
+
+    for (i = 0; i < sizeof(vbr_modes) / sizeof(vbr_modes[0]); i++) {
+        /* Unset bounds: the defaults have to be the right way round too. */
+        memset(&cfg, 0, sizeof(cfg));
+        cfg.rc_mode = vbr_modes[i];
+        cfg.bitrate = 4000000;
+        cfg.min_qp = -1;
+        cfg.max_qp = -1;
+        i6c_enc_fill_rate(&rate, &cfg, I6C_VENC_CODEC_H265);
+        CHECK(rate.h264Vbr.maxQual >= rate.h264Vbr.minQual,
+              "mode %d default MaxQp %u must not sit below MinQp %u", (int)vbr_modes[i],
+              rate.h264Vbr.maxQual, rate.h264Vbr.minQual);
+
+        /* And a configured pair reaches the fields it names. */
+        cfg.min_qp = 18;
+        cfg.max_qp = 44;
+        i6c_enc_fill_rate(&rate, &cfg, I6C_VENC_CODEC_H265);
+        CHECK(rate.h264Vbr.maxQual == 44, "max_qp 44 -> MaxQp, got %u", rate.h264Vbr.maxQual);
+        CHECK(rate.h264Vbr.minQual == 18, "min_qp 18 -> MinQp, got %u", rate.h264Vbr.minQual);
+    }
+}
+
 int main(void)
 {
     test_the_sub_cascades_off_the_main();
@@ -686,6 +732,7 @@ int main(void)
     test_a_jpeg_channel_is_not_a_sub();
     test_a_sub_larger_than_its_main_says_so();
     test_rc_modes_use_the_drivers_numbering();
+    test_qp_bounds_are_not_inverted();
 
     if (failures) {
         printf("t_enc_i6c: %d failure(s)\n", failures);
