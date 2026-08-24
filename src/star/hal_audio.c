@@ -29,18 +29,29 @@
  *
  * Implemented: audio_init, audio_deinit, audio_read_frame,
  * audio_release_frame, audio_set_volume, audio_get_volume,
- * audio_set_mute.
+ * audio_set_gain, audio_get_gain, audio_set_mute.
  *
  * Everything else is left NULL in the vtable, which RSS_HAL_CALL turns
  * into RSS_ERR_NOTSUP. Per op, why:
  *
- *   audio_set_gain / get_gain, audio_set_alc_gain / get_alc_gain
- *       MI has exactly one input-gain control and it is reached through
- *       MI_AI_SetVqeVolume, which audio_set_volume already owns. Wiring
- *       gain to the same register would mean whichever op rad called last
- *       silently overrode the other -- and rad calls set_volume then
- *       set_gain at startup, so the operator's volume would never take
- *       effect. One knob, one op.
+ *   audio_set_alc_gain / get_alc_gain
+ *       Automatic level control is an AGC feature, and AGC is one of the
+ *       absent VQE algorithms below.
+ *
+ *       (audio_set_gain / get_gain used to be listed here, on the grounds
+ *       that MI had exactly one input-gain control and audio_set_volume
+ *       already owned it. That was wrong. MI_AI_SetChnParam reaches a
+ *       second, independent stage -- see i6_aud_chn_para -- so the two ops
+ *       no longer fight over one register: gain drives the analog front end
+ *       through MI_AI_SetVqeVolume, volume drives the digital trim through
+ *       MI_AI_SetChnParam. rad calls both at startup, in that order, and
+ *       now both take effect.
+ *
+ *       Note which op got which stage: gain is the preamp and volume is the
+ *       level control, matching the Infinity6C backend. This file used to
+ *       have volume on the analog stage, because that was the only stage it
+ *       could reach; see star_state.h for why the swap costs a default
+ *       install nothing.)
  *
  *   audio_enable_ns / disable_ns, audio_enable_hpf / disable_hpf,
  *   audio_enable_agc / disable_agc, audio_set_agc_mode,
@@ -131,35 +142,74 @@ static const char *star_audio_err_name(int err)
 }
 
 /*
- * raptor volume (0..100) -> MI gain-table index.
+ * raptor gain (0..31) -> analog-gain table index.
  *
- * Linear across the device's whole table, so 0 is the quietest setting
- * the hardware offers and 100 the loudest. The ceilings are per input
- * type (see STAR_AUD_VOL_MAX_*), and the result is clamped: an index off
- * the end of the table earns MI_AI_ERR_ILLEGAL_PARAM, not a louder
- * signal.
+ * Linear across the device's whole table, so 0 is the quietest setting the
+ * hardware offers and 31 the loudest. The ceilings are per input type (see
+ * STAR_AUD_IF_GAIN_MAX_*), and the result is clamped: an index off the end
+ * of the table earns MI_AI_ERR_ILLEGAL_PARAM, not a louder signal.
  *
- * Worth knowing when reading the log: because the table spans about 60 dB
- * of analog gain, the mapping is steep. rad's default volume of 80 lands
- * high on purpose -- an electret mic needs the gain -- but if capture
- * clips, lowering `[audio] volume` is the fix rather than anything here.
+ * Same shape and same rounding as the Infinity6C backend's
+ * i6c_audio_gain_step, because it is the same quantity -- raptor's gain
+ * scale onto a 0..21 analog step -- and the two backends should not
+ * disagree about where a given number lands.
+ *
+ * Worth knowing when reading the log: the table spans about 60 dB, so the
+ * mapping is steep. rad's default of 25 lands on step 17, high on purpose
+ * because an electret mic needs the gain; if capture clips, lowering
+ * `[audio] gain` is the fix rather than anything here.
  */
-static int star_audio_volume_index(const star_state_t *st, int vol)
+static int star_audio_gain_index(const star_state_t *st, int gain)
 {
-    int max = st->aud_input == RSS_AUDIO_INPUT_DMIC ? STAR_AUD_VOL_MAX_DMIC
-                                                    : STAR_AUD_VOL_MAX_AMIC;
+    int max = st->aud_input == RSS_AUDIO_INPUT_DMIC ? STAR_AUD_IF_GAIN_MAX_DMIC
+                                                    : STAR_AUD_IF_GAIN_MAX_AMIC;
     int idx;
 
+    if (gain < 0)
+        gain = 0;
+    else if (gain > STAR_AUD_GAIN_MAX)
+        gain = STAR_AUD_GAIN_MAX;
+
+    idx = (gain * max + STAR_AUD_GAIN_MAX / 2) / STAR_AUD_GAIN_MAX;
+    if (idx > max)
+        idx = max;
+
+    return idx;
+}
+
+/*
+ * raptor volume (0..100) -> MI_AI_SetChnParam's s16RearGain, in whole dB.
+ *
+ * Piecewise around unity rather than linear across the range, and unity is
+ * rad's default of 80 on purpose: a camera whose config never mentions
+ * `[audio] volume` gets 0 dB here, which is what the digital stage was
+ * already doing when nothing wrote to it. Wiring this op to the digital
+ * stage therefore cannot change the level of a default install.
+ *
+ * Below unity attenuates toward STAR_AUD_DPGA_MIN_DB, above it boosts
+ * toward STAR_AUD_DPGA_MAX_DB. Both are the library's own bounds, so the
+ * whole output range is accepted; nothing here can produce the
+ * ILLEGAL_PARAM the analog path has to guard against.
+ *
+ * Note the asymmetry in resolution: 80 steps cover 60 dB of cut and 20
+ * cover 30 dB of boost. That falls out of putting unity at the default
+ * rather than at the midpoint, and it is the right way round -- boosting a
+ * digital signal amplifies the noise floor with it, so the coarser half is
+ * the one that hurts to use. Identical to i6c_audio_volume_db.
+ */
+static int star_audio_volume_db(int vol)
+{
     if (vol < 0)
         vol = 0;
     else if (vol > 100)
         vol = 100;
 
-    idx = (vol * max + 50) / 100;
-    if (idx > max)
-        idx = max;
+    if (vol < STAR_AUD_VOL_UNITY)
+        return STAR_AUD_DPGA_MIN_DB +
+               (vol * -STAR_AUD_DPGA_MIN_DB + STAR_AUD_VOL_UNITY / 2) / STAR_AUD_VOL_UNITY;
 
-    return idx;
+    return ((vol - STAR_AUD_VOL_UNITY) * STAR_AUD_DPGA_MAX_DB + (100 - STAR_AUD_VOL_UNITY) / 2) /
+           (100 - STAR_AUD_VOL_UNITY);
 }
 
 /*
@@ -319,10 +369,14 @@ int hal_audio_init(void *ctx, const rss_audio_config_t *cfg)
         return RSS_ERR_INVAL;
     }
 
+    /* PCM channels in a captured frame, not MI channels -- see the
+     * dev_cfg.chnNum assignment below for why those are not the same
+     * number. rss_audio_config_t documents this field as 1=mono, 2=stereo,
+     * so two is the ceiling rather than STAR_AUD_CHN_MAX. */
     chn_count = cfg->chn_count > 0 ? (unsigned int)cfg->chn_count : 1;
-    if (chn_count > STAR_AUD_CHN_MAX) {
-        HAL_LOG_WARN("audio: %u channels requested, capping at %d", chn_count, STAR_AUD_CHN_MAX);
-        chn_count = STAR_AUD_CHN_MAX;
+    if (chn_count > 2) {
+        HAL_LOG_WARN("audio: %u PCM channels requested, capping at 2 (stereo)", chn_count);
+        chn_count = 2;
     }
 
     /*
@@ -368,7 +422,14 @@ int hal_audio_init(void *ctx, const rss_audio_config_t *cfg)
     }
 
     st->aud_dev = STAR_AUD_DEV;
-    st->aud_chn_count = chn_count;
+    /*
+     * One MI channel, always. MI puts a stereo pair inside a single
+     * channel's frame -- interleaved in addr[0], with length covering both
+     * -- so the PCM width is carried by the sound mode, not by the channel
+     * count. See dev_cfg.chnNum below.
+     */
+    st->aud_chn_count = 1;
+    st->aud_pcm_chn = chn_count;
     st->aud_rate = (int)cfg->sample_rate;
     st->aud_input = cfg->input_type;
 
@@ -380,38 +441,89 @@ int hal_audio_init(void *ctx, const rss_audio_config_t *cfg)
     samples = cfg->samples_per_frame > 0 ? (unsigned int)cfg->samples_per_frame
                                          : (unsigned int)cfg->sample_rate / 50;
 
+    /*
+     * MI's own bound on this field, which it enforces rather than clamps:
+     * libmi_ai.so refuses packNumPerFrm of 0 or greater than the sample
+     * rate with ILLEGAL_PARAM, i.e. a config typo would cost all audio
+     * instead of one odd period length. The rate above is screened this
+     * carefully already; this is the same courtesy for the field beside it.
+     */
+    if (samples == 0 || samples > (unsigned int)cfg->sample_rate) {
+        unsigned int fallback = (unsigned int)cfg->sample_rate / 50;
+
+        HAL_LOG_WARN("audio: %u samples/frame is outside MI's range (1..%d); using %u",
+                     samples, (int)cfg->sample_rate, fallback);
+        samples = fallback;
+    }
+
     memset(&dev_cfg, 0, sizeof(dev_cfg));
     dev_cfg.rate = (int)cfg->sample_rate;
     dev_cfg.bit24On = 0;
     /*
-     * I2S_SLAVE. The references disagree here -- divinus uses slave,
-     * waybeam master -- and every example in the vendor MI_AI reference
-     * uses E_MI_AUDIO_MODE_I2S_SLAVE, as does the divinus build this
-     * board is known to run. The docs also warn that "whether the master
-     * mode and the slave mode is supported depends on the chip", so this
-     * is the value with both the documentation and this hardware behind
-     * it. If capture ever comes back silent with the device happily
-     * enabled, waybeam's I6_AUD_INTF_I2S_MASTER is the one-line thing to
-     * try.
+     * I2S_SLAVE, and this is a hardware finding rather than a documented
+     * one. The sources genuinely disagree: divinus uses slave, waybeam
+     * master, and the SSC30KQ SDK's own audio sample uses
+     * E_MI_AUDIO_MODE_I2S_MASTER. libmi_ai.so accepts either -- it range
+     * checks this field at [0,3] and nothing more -- so neither is refused
+     * and a wrong choice shows up as silence, not as an error.
+     *
+     * Slave stays because it is what this board is known to capture with,
+     * which outranks a sample written for a demo carrier. (An earlier
+     * version of this comment claimed the vendor documentation backed
+     * slave; that referred to the SSD20X reference, and the SDK for this
+     * SoC does not agree. The value is unchanged, the justification is.)
+     * If capture ever comes back silent with the device happily enabled,
+     * I6_AUD_INTF_I2S_MASTER is the one-line thing to try.
      */
     dev_cfg.intf = I6_AUD_INTF_I2S_SLAVE;
     dev_cfg.sound = chn_count >= 2 ? I6_AUD_SND_STEREO : I6_AUD_SND_MONO;
-    /* DMA ring depth. waybeam's 20 (~400 ms at 20 ms periods) with its
-     * reasoning: the capture thread competes with ISP and AE work, and a
-     * shallow ring turns a scheduling delay into lost audio. frame_depth
-     * is raptor's name for the same quantity. */
+    /*
+     * Not a ring depth, whatever the name suggests. The vendor's own sample
+     * marks u32FrmNum "useless", and libmi_ai.so bears that out: it is the
+     * one attribute field the library never reads, validates or acts on --
+     * it is copied to the driver and nothing more. What actually decides
+     * how much slack a slow reader gets is the MI_SYS output port queue set
+     * below, so `[audio] frame_depth` is not the knob for that and the
+     * bring-up log deliberately no longer advertises it as one.
+     *
+     * Still forwarded rather than dropped: it costs nothing, and if a
+     * future firmware starts honouring it, waybeam's 20 (~400 ms at 20 ms
+     * periods) is the value with reasoning behind it.
+     */
     dev_cfg.frmNum = cfg->frame_depth > 0 ? (unsigned int)cfg->frame_depth : 20;
     dev_cfg.packNumPerFrm = samples;
     dev_cfg.codecChnNum = 0;
-    dev_cfg.chnNum = chn_count;
+    /*
+     * One MI channel carrying chn_count PCM channels -- NOT chn_count MI
+     * channels. u32ChnCnt is how many independent capture channels the
+     * device offers (the library uses it to bound the valid channel index),
+     * while eSoundmode above is the frame format of each. Setting both from
+     * the same number asked for two channels of stereo, i.e. four PCM
+     * channels, when the caller meant one stereo stream.
+     */
+    dev_cfg.chnNum = st->aud_chn_count;
     /* MCLK off: the vendor's own audio sample leaves it disabled and lets
      * the interface derive its clock from the rate. */
     dev_cfg.i2s.clock = I6_AUD_CLK_OFF;
+    /*
+     * syncRxClkOn stays zero, and that is a decision rather than an
+     * oversight -- the vendor sample sets bSyncClock = TRUE, so this is a
+     * deliberate divergence from the one configuration it exercises.
+     *
+     * "I2s Tx BCLK, Rx BCLK use the same clock source" only means something
+     * when there is a Tx side, and the sample is full duplex: it brings up
+     * MI_AO alongside MI_AI. Nothing in this process opens MI_AO at all, so
+     * pointing the receive clock at a transmit clock that was never started
+     * has no upside here and one plausible downside -- silence from a
+     * device that still reports itself enabled, which is among the harder
+     * faults to read. Left alone until there is a board to try it on.
+     */
 
     ret = st->aud.fnSetDeviceConfig(st->aud_dev, &dev_cfg);
     if (ret) {
-        HAL_LOG_ERR("MI_AI_SetPubAttr(%d) failed: %d (%d Hz, %u ch, %u samples/frame)",
-                    st->aud_dev, ret, dev_cfg.rate, chn_count, samples);
+        HAL_LOG_ERR("MI_AI_SetPubAttr(%d) failed: %d (%d Hz, %u PCM ch in %u MI ch, "
+                    "%u samples/frame)",
+                    st->aud_dev, ret, dev_cfg.rate, st->aud_pcm_chn, dev_cfg.chnNum, samples);
         return RSS_ERR_IO;
     }
 
@@ -422,7 +534,7 @@ int hal_audio_init(void *ctx, const rss_audio_config_t *cfg)
     }
     st->aud_dev_enabled = true;
 
-    for (i = 0; i < chn_count; i++) {
+    for (i = 0; i < st->aud_chn_count; i++) {
         ret = st->aud.fnEnableChannel(st->aud_dev, (int)i);
         if (ret) {
             HAL_LOG_ERR("MI_AI_EnableChn(%d, %u) failed: %d", st->aud_dev, i, ret);
@@ -441,12 +553,34 @@ int hal_audio_init(void *ctx, const rss_audio_config_t *cfg)
         }
     }
 
-    HAL_LOG_INFO("audio: AI device %d up, %d Hz %s, %u samples/frame, ring %u", st->aud_dev,
-                 dev_cfg.rate, chn_count >= 2 ? "stereo" : "mono", samples, dev_cfg.frmNum);
+    HAL_LOG_INFO("audio: AI device %d up, %d Hz %s, %u samples/frame", st->aud_dev, dev_cfg.rate,
+                 st->aud_pcm_chn >= 2 ? "stereo" : "mono", samples);
 
-    /* Volume is not set here: rad sets it right after init, and picking a
-     * default would mean overriding whatever the codec came up with for
-     * no reason. */
+    /*
+     * Seed the remembered analog step from whatever the driver came up with,
+     * so the first hal_audio_set_volume has a real front gain to preserve
+     * rather than a guess. rad sets the volume before the gain, so without
+     * this that first call is the one with nothing to go on.
+     */
+    st->aud_front_idx = -1;
+    if (st->aud.fnGetChannelParam) {
+        i6_aud_chn_para para;
+
+        memset(&para, 0, sizeof(para));
+        if (!st->aud.fnGetChannelParam(st->aud_dev, 0, &para))
+            st->aud_front_idx = para.gain.front;
+    }
+
+    /* Said once, at INFO, because it changes which ops work rather than
+     * being a fault: a library without this keeps capturing at full quality
+     * and only loses the digital trim. */
+    if (!st->aud.fnSetChannelParam)
+        HAL_LOG_INFO("audio: libmi_ai.so has no MI_AI_SetChnParam; volume will report "
+                     "unsupported and gain is the only level control");
+
+    /* Volume and gain are not set here: rad sets both right after init, and
+     * picking a default would mean overriding whatever the codec came up
+     * with for no reason. */
     return RSS_OK;
 }
 
@@ -652,33 +786,65 @@ int hal_audio_release_frame(void *ctx, int dev, int chn, rss_audio_frame_t *fram
     return RSS_OK;
 }
 
+/*
+ * hal_audio_set_volume -- the digital trim, i.e. the stage after the ADC.
+ *
+ * The counterpart to audio_set_gain rather than a duplicate of it: gain
+ * moves the analog front end, this moves s16RearGain, and i6_aud_chn_para
+ * has the evidence that they are separate stages.
+ *
+ * The awkward part is that MI_AI_ChnParam_t carries BOTH gains and applies
+ * both whenever gainOn is set, so this op has to supply a front gain even
+ * though it does not mean to change one. Writing a zero there would drive
+ * the analog stage to its minimum and silently undo audio_set_gain. The
+ * value therefore comes from what this backend last wrote (aud_front_idx),
+ * seeded at init from what the driver was already using.
+ */
 int hal_audio_set_volume(void *ctx, int dev, int chn, int vol)
 {
     star_state_t *st = star_state(ctx);
-    int idx;
+    i6_aud_chn_para para;
+    int front;
+    int db;
     int ret;
 
     if (!st)
         return RSS_ERR_INVAL;
     if (!st->aud_loaded)
         return RSS_ERR_NOTSUP;
+    if (!st->aud.fnSetChannelParam)
+        return RSS_ERR_NOTSUP;
 
     dev = star_audio_dev(st, dev);
     if (!star_audio_chn_ok(st, chn))
         return RSS_ERR_INVAL;
 
-    idx = star_audio_volume_index(st, vol);
+    db = star_audio_volume_db(vol);
 
-    ret = st->aud.fnSetVolume(dev, chn, idx);
+    front = st->aud_front_idx;
+    if (front < 0) {
+        /* Neither init nor set_gain has established one. Derive it from the
+         * gain this backend holds rather than writing a zero; rad sets the
+         * gain immediately after the volume, so this is corrected within
+         * milliseconds of being wrong. */
+        front = star_audio_gain_index(st, st->aud_gain);
+    }
+
+    memset(&para, 0, sizeof(para));
+    para.gain.gainOn = 1;
+    para.gain.front = (short)front;
+    para.gain.rear = (short)db;
+
+    ret = st->aud.fnSetChannelParam(dev, chn, &para);
     if (ret) {
-        HAL_LOG_WARN("MI_AI_SetVqeVolume(%d, %d, %d) failed: %#x", dev, chn, idx,
-                     (unsigned int)ret);
+        HAL_LOG_WARN("MI_AI_SetChnParam(%d, %d, front %d, rear %d dB) failed: %#x (%s)", dev, chn,
+                     front, db, (unsigned int)ret, star_audio_err_name(ret));
         return RSS_ERR_IO;
     }
 
     st->aud_volume = vol < 0 ? 0 : (vol > 100 ? 100 : vol);
-    HAL_LOG_DBG("audio: volume %d -> gain index %d (%s)", st->aud_volume, idx,
-                st->aud_input == RSS_AUDIO_INPUT_DMIC ? "dmic" : "amic");
+    HAL_LOG_DBG("audio: volume %d -> digital %d dB (analog front end left at %d)", st->aud_volume,
+                db, front);
 
     return RSS_OK;
 }
@@ -697,6 +863,74 @@ int hal_audio_get_volume(void *ctx, int dev, int chn, int *vol)
      * the VQE algorithms are absent here, so what it answers is not what
      * SetVqeVolume wrote. */
     *vol = st->aud_volume;
+
+    return RSS_OK;
+}
+
+/*
+ * hal_audio_set_gain -- the analog front end, i.e. the preamp.
+ *
+ * Through MI_AI_SetVqeVolume, which despite its name indexes the per-device
+ * analog-gain table rather than taking decibels. This is the call the
+ * backend has always used for level; only the op it hangs off has changed,
+ * so the proven path stays proven.
+ *
+ * Left on MI_AI_SetVqeVolume rather than moved to MI_AI_SetChnParam's front
+ * field on purpose, even though the two reach the same stage and using one
+ * call for both gains would be tidier. If SetChnParam's front path turned
+ * out not to work, the failure would be no analog gain control at all,
+ * which is far worse than the failure mode of the split -- and this call is
+ * known good on both boards in the fleet.
+ */
+int hal_audio_set_gain(void *ctx, int dev, int chn, int gain)
+{
+    star_state_t *st = star_state(ctx);
+    int idx;
+    int ret;
+
+    if (!st)
+        return RSS_ERR_INVAL;
+    if (!st->aud_loaded)
+        return RSS_ERR_NOTSUP;
+
+    dev = star_audio_dev(st, dev);
+    if (!star_audio_chn_ok(st, chn))
+        return RSS_ERR_INVAL;
+
+    idx = star_audio_gain_index(st, gain);
+
+    ret = st->aud.fnSetVolume(dev, chn, idx);
+    if (ret) {
+        HAL_LOG_WARN("MI_AI_SetVqeVolume(%d, %d, %d) failed: %#x (%s)", dev, chn, idx,
+                     (unsigned int)ret, star_audio_err_name(ret));
+        return RSS_ERR_IO;
+    }
+
+    st->aud_gain = gain < 0 ? 0 : (gain > STAR_AUD_GAIN_MAX ? STAR_AUD_GAIN_MAX : gain);
+    /* Remembered so hal_audio_set_volume can preserve it -- MI_AI_ChnParam_t
+     * carries both stages and would otherwise zero this one. */
+    st->aud_front_idx = idx;
+    HAL_LOG_DBG("audio: gain %d -> analog step %d (%s)", st->aud_gain, idx,
+                st->aud_input == RSS_AUDIO_INPUT_DMIC ? "dmic" : "amic");
+
+    return RSS_OK;
+}
+
+int hal_audio_get_gain(void *ctx, int dev, int chn, int *gain)
+{
+    star_state_t *st = star_state(ctx);
+
+    if (!st || !gain)
+        return RSS_ERR_INVAL;
+
+    (void)star_audio_dev(st, dev);
+    (void)chn;
+
+    /* Tracked rather than read back, for the same reason the Infinity6C
+     * backend tracks its own: MI answers in dB, and converting that to
+     * raptor's 0..31 would round through a lossy map, so a caller reading
+     * back what it just wrote would not always see it. */
+    *gain = st->aud_gain;
 
     return RSS_OK;
 }

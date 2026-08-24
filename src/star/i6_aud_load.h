@@ -38,10 +38,25 @@ typedef struct {
     int (*fnEnableChannel)(int device, int channel);
 
     int (*fnSetMute)(int device, int channel, char active);
-    /* Despite the name this takes an *index* into a per-device gain
-     * table, not a decibel value -- see star_audio_volume_index in
-     * hal_audio.c. Both references pass dB-shaped numbers here. */
+    /* Despite the name this takes an *index* into a per-device analog gain
+     * table, not a decibel value -- see star_audio_gain_index in
+     * hal_audio.c. Both references pass dB-shaped numbers here, which is
+     * why the constants are named for the stage and not for the call.
+     *
+     * It backs audio_set_GAIN, not audio_set_volume: this is the preamp,
+     * and the digital trim volume drives lives in fnSetChannelParam. */
     int (*fnSetVolume)(int device, int channel, int level);
+
+    /*
+     * The other gain stage -- see i6_aud_chn_para. OPTIONAL, and the only
+     * pair here that is: everything above is what capture needs, so a
+     * library missing any of it is a library this backend cannot use, while
+     * a library missing these two just has no digital trim. Both are NULL
+     * then, and hal_audio_set_gain answers RSS_ERR_NOTSUP exactly as it did
+     * before the pair was bound at all.
+     */
+    int (*fnSetChannelParam)(int device, int channel, i6_aud_chn_para *param);
+    int (*fnGetChannelParam)(int device, int channel, i6_aud_chn_para *param);
 
     int (*fnGetFrame)(int device, int channel, i6_aud_frm *frame, i6_aud_efrm *encFrame,
                       int millis);
@@ -96,6 +111,17 @@ static inline int i6_aud_load(i6_aud_impl *aud_lib)
     if (!(aud_lib->fnSetVolume = (int (*)(int, int, int))hal_symbol_load(
               "i6_aud", aud_lib->handle, "MI_AI_SetVqeVolume")))
         return RSS_ERR_NOTSUP;
+
+    /*
+     * Optional, so plain dlsym rather than hal_symbol_load: the helper logs
+     * an error on a miss, and a miss here is not one -- the backend loses
+     * the digital trim and keeps capturing. Absence is reported once, by
+     * hal_audio_init, as information rather than as a fault.
+     */
+    aud_lib->fnSetChannelParam = (int (*)(int, int, i6_aud_chn_para *))dlsym(
+        aud_lib->handle, "MI_AI_SetChnParam");
+    aud_lib->fnGetChannelParam = (int (*)(int, int, i6_aud_chn_para *))dlsym(
+        aud_lib->handle, "MI_AI_GetChnParam");
 
     if (!(aud_lib->fnGetFrame = (int (*)(int, int, i6_aud_frm *, i6_aud_efrm *, int))
               hal_symbol_load("i6_aud", aud_lib->handle, "MI_AI_GetFrame")))

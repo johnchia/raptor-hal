@@ -180,21 +180,82 @@ typedef struct {
 #define STAR_AUD_GET_TIMEOUT_MS 128
 
 /*
- * MI_AI_SetVqeVolume's argument is an index into a per-device analog-gain
- * table, not a decibel value -- the MI_AI reference spells the table out
- * ("the corresponding gain (DB) of s32volumedb under each device"). The
- * columns are arithmetically self-consistent, which is what makes them
- * safe to quote: Amic runs 0..21 for -6..+57 dB in 3 dB steps, Line in
- * 0..7 for -6..+15 dB, Dmic 0..4 for 0..+24 dB in 6 dB steps.
+ * WHICH RAPTOR OP DRIVES WHICH STAGE
  *
- * Both references pass dB-shaped numbers straight through -- divinus
- * validates its `[audio] gain` to [-60,30] and waybeam maps 0..100 onto
- * -60..+30 -- so on this API most of their range is out of table. Their
- * *defaults* happen to be valid indices, which is presumably why it never
- * surfaced.
+ * There are two, and they are reached by two different MI calls:
+ *
+ *   gain    the analog front end, through MI_AI_SetVqeVolume. Despite the
+ *           name that call takes an *index* into a per-device analog-gain
+ *           table, not decibels.
+ *   volume  the digital trim, through MI_AI_SetChnParam's s16RearGain.
+ *
+ * That pairing is the way round the Infinity6C backend has it -- gain is
+ * the preamp, volume is the level control -- and matching it is the point.
+ * This backend had them the other way for a long time, because
+ * MI_AI_SetVqeVolume was the only level control it knew about and `volume`
+ * was the natural op to hang it on. Once MI_AI_SetChnParam turned out to
+ * reach a second, genuinely independent stage, keeping the old pairing
+ * would have meant the same two config keys meaning opposite things on two
+ * SigmaStar backends in the same tree.
+ *
+ * The swap is free at rad's defaults, which is what makes it safe to make:
+ * gain 25 lands on analog step 17, exactly where volume 80 used to put it,
+ * and volume 80 is this map's unity, i.e. 0 dB of digital -- which is what
+ * the digital stage was doing when nothing wrote to it. A default install
+ * captures at an identical level before and after. Only a hand-tuned
+ * `[audio] volume` moves.
  */
-#define STAR_AUD_VOL_MAX_AMIC 21
-#define STAR_AUD_VOL_MAX_DMIC 4
+
+/*
+ * The analog table, indexed by `gain`.
+ *
+ * The MI_AI reference spells it out ("the corresponding gain (DB) of
+ * s32volumedb under each device") and the columns are arithmetically
+ * self-consistent, which is what makes them safe to quote: Amic runs 0..21
+ * for -6..+57 dB in 3 dB steps, Line in 0..7 for -6..+15 dB, Dmic 0..4 for
+ * 0..+24 dB in 6 dB steps.
+ *
+ * No longer only a quotation, either. MI_AI_SetChnParam validates this same
+ * stage in userspace, per device, and the board's libmi_ai.so bounds it at
+ * exactly [0,21] for device 0, [0,7] for device 3 and refuses device 2 --
+ * the Amic and Line in columns above, confirmed against the code that
+ * enforces them. Only the Dmic 0..4 column remains doc-only, because this
+ * backend always configures device 0.
+ *
+ * Named for the stage rather than for the op, as the Infinity6C backend
+ * names its I6C_AUD_IF_GAIN_MAX_*: both references pass dB-shaped numbers
+ * to MI_AI_SetVqeVolume -- divinus validates its `[audio] gain` to [-60,30]
+ * and waybeam maps 0..100 onto -60..+30 -- so most of their range is off
+ * the end of the table, and only their defaults happen to be valid indices.
+ * That is the mistake the name is there to stop.
+ */
+#define STAR_AUD_IF_GAIN_MAX_AMIC 21
+#define STAR_AUD_IF_GAIN_MAX_DMIC 4
+
+/* raptor's gain scale, matching the Infinity6C backend and rad's default
+ * of 25. Mapped linearly onto the analog table above. */
+#define STAR_AUD_GAIN_MAX 31
+
+/*
+ * The digital stage: MI_AI_SetChnParam's s16RearGain, a trim in whole dB
+ * that nothing else on this API can reach. See i6_aud_chn_para for why
+ * front and rear are not interchangeable.
+ *
+ * The dB bounds are the library's own range check, not a quotation, and
+ * they are the same span the Infinity6C backend documents for its DPGA
+ * (I6C_AUD_DPGA_MIN_DB / _MAX_DB) -- two independent SoC generations
+ * agreeing on the digital stage's range.
+ *
+ * UNITY is rad's default volume, so a default install applies exactly 0 dB
+ * here; below it attenuates toward -60, above it boosts toward +30. Same
+ * value and same reasoning as I6C_AUD_VOL_UNITY: mapping volume linearly
+ * across the full range would put the shipped default at about +12 dB of
+ * digital gain on top of the analog stage, i.e. clipping out of the box for
+ * a number nobody chose.
+ */
+#define STAR_AUD_VOL_UNITY 80
+#define STAR_AUD_DPGA_MIN_DB (-60)
+#define STAR_AUD_DPGA_MAX_DB 30
 
 /*
  * MI_AI_ERR_BUF_EMPTY -- "audio input buffer is empty", from the MI_AI
@@ -569,7 +630,31 @@ typedef struct {
     unsigned int aud_chn_count;
     int aud_rate;
     int aud_volume;
+    int aud_gain;
+
+    /*
+     * The analog step last written through MI_AI_SetVqeVolume, or -1 before
+     * anything has set the gain.
+     *
+     * Tracked because MI_AI_SetChnParam carries BOTH stages in one struct
+     * and applies both: hal_audio_set_volume has to supply a front gain
+     * even though it only means to change the rear one, and supplying a
+     * remembered value beats reading one back on every call. The -1 case is
+     * the startup ordering -- rad sets volume before gain, so the first
+     * set_volume runs before there is anything to remember, and asks the
+     * driver once rather than writing a zero over whatever it is using.
+     */
+    int aud_front_idx;
     rss_audio_input_t aud_input;
+
+    /*
+     * PCM channels per captured frame -- 1 for mono, 2 for interleaved
+     * stereo. Distinct from aud_chn_count, which counts MI *channels* and
+     * is 1 either way: MI carries a stereo pair inside one channel's frame
+     * rather than across two channels. Kept only so the bring-up log can
+     * say what was configured.
+     */
+    unsigned int aud_pcm_chn;
 
     /* One outstanding frame per channel. MI hands out a descriptor that
      * must come back to MI_AI_ReleaseFrame unchanged, and
@@ -874,6 +959,8 @@ int hal_audio_read_frame(void *ctx, int dev, int chn, rss_audio_frame_t *frame, 
 int hal_audio_release_frame(void *ctx, int dev, int chn, rss_audio_frame_t *frame);
 int hal_audio_set_volume(void *ctx, int dev, int chn, int vol);
 int hal_audio_get_volume(void *ctx, int dev, int chn, int *vol);
+int hal_audio_set_gain(void *ctx, int dev, int chn, int gain);
+int hal_audio_get_gain(void *ctx, int dev, int chn, int *gain);
 int hal_audio_set_mute(void *ctx, int dev, int chn, int mute);
 
 /*

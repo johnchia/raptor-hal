@@ -1308,6 +1308,10 @@ static const rss_hal_ops_t g_ops = {
      * MI's noise reduction, AGC, HPF and echo cancellation are all VQE
      * features whose algorithm packs are weak-undefined NULL on this
      * platform, and there is no audio output in scope at all.
+     *
+     * Volume and gain are both here because they are genuinely two stages
+     * -- analog front end and digital trim -- reached through two different
+     * MI calls, which is the same split the Infinity6C backend has.
      */
     .audio_init = hal_audio_init,
     .audio_deinit = hal_audio_deinit,
@@ -1315,6 +1319,8 @@ static const rss_hal_ops_t g_ops = {
     .audio_release_frame = hal_audio_release_frame,
     .audio_set_volume = hal_audio_set_volume,
     .audio_get_volume = hal_audio_get_volume,
+    .audio_set_gain = hal_audio_set_gain,
+    .audio_get_gain = hal_audio_get_gain,
     .audio_set_mute = hal_audio_set_mute,
 #endif
 
