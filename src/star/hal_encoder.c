@@ -555,15 +555,35 @@ static unsigned int star_enc_port_max_width(int port)
  * The lowest unconfigured port whose scaler can carry `width`, or -1. A caller
  * that gets -1 shares its video stream's port instead, which is a real fallback
  * on this family -- MI 2.x accepts a second bind on an already-bound source.
+ *
+ * `widest` reports why there was no answer, because the two reasons want
+ * different things done about them and read identically from the outside. It
+ * comes back as the largest ceiling among the ports still free, counting only
+ * ports that could host a snapshot at all -- so 0 means every usable port is
+ * already taken, and any other value means one was free and too narrow.
+ *
+ * Ports that star_enc_port_max_width excludes outright, port 3 above, are not
+ * "too narrow for this stream"; they are not candidates. Reporting them as a
+ * width failure is how a full port table came to be logged as a 640-pixel
+ * snapshot finding no port wide enough for it, on an SSC30KQ whose every port
+ * scales to 3840.
  */
-static int star_enc_spare_port(const star_state_t *st, unsigned int width)
+static int star_enc_spare_port(const star_state_t *st, unsigned int width, unsigned int *widest)
 {
+    unsigned int max;
     int i;
+
+    *widest = 0;
 
     for (i = 0; i < STAR_VPE_PORT_NUM; i++) {
         if (st->port[i].configured)
             continue;
-        if (width > star_enc_port_max_width(i))
+        max = star_enc_port_max_width(i);
+        if (!max)
+            continue;
+        if (max > *widest)
+            *widest = max;
+        if (width > max)
             continue;
         return i;
     }
@@ -623,6 +643,7 @@ int hal_enc_register_channel(void *ctx, int grp, int chn)
     star_state_t *st = star_state(ctx);
     star_venc_chn_t *enc = star_enc_chn(ctx, chn);
     unsigned int snap_fps;
+    unsigned int widest;
     int src_port;
     int port;
     int ret;
@@ -654,7 +675,7 @@ int hal_enc_register_channel(void *ctx, int grp, int chn)
 
     snap_fps = enc->fps_num / (enc->fps_den ? enc->fps_den : 1);
 
-    port = star_enc_spare_port(st, (unsigned int)enc->width);
+    port = star_enc_spare_port(st, (unsigned int)enc->width, &widest);
     if (port >= 0) {
         ret = star_fs_clone_port(st, src_port, port);
         if (ret == RSS_OK) {
@@ -680,10 +701,14 @@ int hal_enc_register_channel(void *ctx, int grp, int chn)
             HAL_LOG_WARN("venc chn %d: could not bring up VPE port %d from port %d: %d", chn, port,
                          src_port, ret);
         }
+    } else if (widest) {
+        HAL_LOG_WARN("venc chn %d: the widest spare VPE output port scales to %u, short of this "
+                     "stream's %d -- sharing the video stream's port instead",
+                     chn, widest, enc->width);
     } else {
-        HAL_LOG_WARN("venc chn %d: no spare VPE output port wide enough for %d (of %d) -- "
-                     "sharing the video stream's port instead",
-                     chn, enc->width, STAR_VPE_PORT_NUM);
+        HAL_LOG_WARN("venc chn %d: every VPE output port that can host a snapshot is already in "
+                     "use (%d ports) -- sharing the video stream's port instead",
+                     chn, STAR_VPE_PORT_NUM);
     }
 
     /*
