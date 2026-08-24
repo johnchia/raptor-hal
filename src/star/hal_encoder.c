@@ -209,10 +209,8 @@ static int star_enc_fill_rate(i6_venc_rate *rate, rss_codec_t codec,
      * Avbr and Qp), so they are the same bytes of the same union, and
      * `mode` is what tells the encoder which codec it is configuring.
      *
-     * AVBR shares the VBR arm for the same reason: MI_VENC_AttrH264Avbr_t,
-     * Ubr_t and Vbr_t are all seven u32s in the same order. The UBR modes
-     * are declared but unreachable -- star_enc_ratemode maps nothing to
-     * them, since no rss_rc_mode_t asks for an unconstrained bitrate.
+     * AVBR shares the VBR arm for the same reason: MI_VENC_AttrH264Avbr_t
+     * and Vbr_t are both seven u32s in the same order.
      */
     switch (mode) {
     case I6_VENC_RATEMODE_MJPGCBR:

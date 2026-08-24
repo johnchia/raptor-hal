@@ -225,6 +225,63 @@ static void test_a_real_failure_still_reports(void)
     CHECK(g_query_calls == 2, "both did call, got %u", g_query_calls);
 }
 
+/*
+ * The rate-mode numbers that go on the wire.
+ *
+ * Read from the driver, not from upstream: _MI_VENC_IMPL_CheckRcMode, inlined
+ * into MI_VENC_IMPL_CreateChn, range-checks per codec, and the shipped
+ * infinity6e and infinity6b0 mi_venc.ko agree exactly --
+ *
+ *     eType 2 (H.264)   mode-1 <= 4   ->  1..5
+ *     eType 3 (H.265)   mode-8 <= 3   ->  8..11
+ *
+ * Five H.264 slots, MJPEG's two, then four H.265. The version this pins
+ * replaces had the H.264 block as CBR/VBR/FIXQP/AVBR/UBR, one slot short,
+ * which put FIXQP and AVBR one low. Measured on an SSC333 before the fix:
+ * asking for smart gave a channel the driver reported as FixQP, and asking for
+ * fixqp landed on slot 3 -- ABR, which this part does not implement, so the
+ * channel never came up and the kernel logged an error. H.265 was unaffected
+ * either way because its block starts at a fixed 8 and holds four modes.
+ */
+static void test_rc_modes_use_the_drivers_numbering(void)
+{
+	static const struct {
+		rss_rc_mode_t ask;
+		i6_venc_ratemode h264;
+		i6_venc_ratemode h265;
+		const char *proc_name;
+	} expect[] = {
+		{RSS_RC_CBR, 1, 8, "CBR"},
+		{RSS_RC_VBR, 2, 9, "VBR"},
+		{RSS_RC_FIXQP, 4, 10, "FixQP"},
+		{RSS_RC_SMART, 5, 11, "AVBR"},
+		{RSS_RC_CAPPED_VBR, 5, 11, "AVBR"},
+		{RSS_RC_CAPPED_QUALITY, 5, 11, "AVBR"},
+	};
+	size_t i;
+
+	for (i = 0; i < sizeof(expect) / sizeof(expect[0]); i++) {
+		CHECK(star_enc_ratemode(RSS_CODEC_H264, expect[i].ask) == expect[i].h264,
+		      "H.264 %s -> %d, got %d", expect[i].proc_name, (int)expect[i].h264,
+		      (int)star_enc_ratemode(RSS_CODEC_H264, expect[i].ask));
+		CHECK(star_enc_ratemode(RSS_CODEC_H265, expect[i].ask) == expect[i].h265,
+		      "H.265 %s -> %d, got %d", expect[i].proc_name, (int)expect[i].h265,
+		      (int)star_enc_ratemode(RSS_CODEC_H265, expect[i].ask));
+	}
+
+	/* MJPEG sits between the two blocks and takes only these two. */
+	CHECK(star_enc_ratemode(RSS_CODEC_MJPEG, RSS_RC_CBR) == 6, "MJPEG CBR is 6");
+	CHECK(star_enc_ratemode(RSS_CODEC_MJPEG, RSS_RC_FIXQP) == 7, "MJPEG FixQP is 7");
+	CHECK(star_enc_ratemode(RSS_CODEC_MJPEG, RSS_RC_VBR) == I6_VENC_RATEMODE_END,
+	      "and refuses the rest rather than substituting");
+
+	/* Every value lands inside the range CheckRcMode enforces. */
+	for (i = 0; i < sizeof(expect) / sizeof(expect[0]); i++) {
+		CHECK(expect[i].h264 >= 1 && expect[i].h264 <= 5, "H.264 modes are 1..5");
+		CHECK(expect[i].h265 >= 8 && expect[i].h265 <= 11, "H.265 modes are 8..11");
+	}
+}
+
 int main(void)
 {
     test_a_receiving_channel_is_queried();
