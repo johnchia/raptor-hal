@@ -65,6 +65,13 @@ void star_fs_release_port(star_state_t *st, int port)
     (void)port;
 }
 
+int star_fs_enable_port(star_state_t *st, int port)
+{
+    (void)st;
+    (void)port;
+    return RSS_OK;
+}
+
 void star_isp_tune_when_ready(star_state_t *st, bool verbose)
 {
     (void)st;
@@ -245,41 +252,41 @@ static void test_a_real_failure_still_reports(void)
  */
 static void test_rc_modes_use_the_drivers_numbering(void)
 {
-	static const struct {
-		rss_rc_mode_t ask;
-		i6_venc_ratemode h264;
-		i6_venc_ratemode h265;
-		const char *proc_name;
-	} expect[] = {
-		{RSS_RC_CBR, 1, 8, "CBR"},
-		{RSS_RC_VBR, 2, 9, "VBR"},
-		{RSS_RC_FIXQP, 4, 10, "FixQP"},
-		{RSS_RC_SMART, 5, 11, "AVBR"},
-		{RSS_RC_CAPPED_VBR, 5, 11, "AVBR"},
-		{RSS_RC_CAPPED_QUALITY, 5, 11, "AVBR"},
-	};
-	size_t i;
+    static const struct {
+        rss_rc_mode_t ask;
+        i6_venc_ratemode h264;
+        i6_venc_ratemode h265;
+        const char *proc_name;
+    } expect[] = {
+        {RSS_RC_CBR, 1, 8, "CBR"},
+        {RSS_RC_VBR, 2, 9, "VBR"},
+        {RSS_RC_FIXQP, 4, 10, "FixQP"},
+        {RSS_RC_SMART, 5, 11, "AVBR"},
+        {RSS_RC_CAPPED_VBR, 5, 11, "AVBR"},
+        {RSS_RC_CAPPED_QUALITY, 5, 11, "AVBR"},
+    };
+    size_t i;
 
-	for (i = 0; i < sizeof(expect) / sizeof(expect[0]); i++) {
-		CHECK(star_enc_ratemode(RSS_CODEC_H264, expect[i].ask) == expect[i].h264,
-		      "H.264 %s -> %d, got %d", expect[i].proc_name, (int)expect[i].h264,
-		      (int)star_enc_ratemode(RSS_CODEC_H264, expect[i].ask));
-		CHECK(star_enc_ratemode(RSS_CODEC_H265, expect[i].ask) == expect[i].h265,
-		      "H.265 %s -> %d, got %d", expect[i].proc_name, (int)expect[i].h265,
-		      (int)star_enc_ratemode(RSS_CODEC_H265, expect[i].ask));
-	}
+    for (i = 0; i < sizeof(expect) / sizeof(expect[0]); i++) {
+        CHECK(star_enc_ratemode(RSS_CODEC_H264, expect[i].ask) == expect[i].h264,
+              "H.264 %s -> %d, got %d", expect[i].proc_name, (int)expect[i].h264,
+              (int)star_enc_ratemode(RSS_CODEC_H264, expect[i].ask));
+        CHECK(star_enc_ratemode(RSS_CODEC_H265, expect[i].ask) == expect[i].h265,
+              "H.265 %s -> %d, got %d", expect[i].proc_name, (int)expect[i].h265,
+              (int)star_enc_ratemode(RSS_CODEC_H265, expect[i].ask));
+    }
 
-	/* MJPEG sits between the two blocks and takes only these two. */
-	CHECK(star_enc_ratemode(RSS_CODEC_MJPEG, RSS_RC_CBR) == 6, "MJPEG CBR is 6");
-	CHECK(star_enc_ratemode(RSS_CODEC_MJPEG, RSS_RC_FIXQP) == 7, "MJPEG FixQP is 7");
-	CHECK(star_enc_ratemode(RSS_CODEC_MJPEG, RSS_RC_VBR) == I6_VENC_RATEMODE_END,
-	      "and refuses the rest rather than substituting");
+    /* MJPEG sits between the two blocks and takes only these two. */
+    CHECK(star_enc_ratemode(RSS_CODEC_MJPEG, RSS_RC_CBR) == 6, "MJPEG CBR is 6");
+    CHECK(star_enc_ratemode(RSS_CODEC_MJPEG, RSS_RC_FIXQP) == 7, "MJPEG FixQP is 7");
+    CHECK(star_enc_ratemode(RSS_CODEC_MJPEG, RSS_RC_VBR) == I6_VENC_RATEMODE_END,
+          "and refuses the rest rather than substituting");
 
-	/* Every value lands inside the range CheckRcMode enforces. */
-	for (i = 0; i < sizeof(expect) / sizeof(expect[0]); i++) {
-		CHECK(expect[i].h264 >= 1 && expect[i].h264 <= 5, "H.264 modes are 1..5");
-		CHECK(expect[i].h265 >= 8 && expect[i].h265 <= 11, "H.265 modes are 8..11");
-	}
+    /* Every value lands inside the range CheckRcMode enforces. */
+    for (i = 0; i < sizeof(expect) / sizeof(expect[0]); i++) {
+        CHECK(expect[i].h264 >= 1 && expect[i].h264 <= 5, "H.264 modes are 1..5");
+        CHECK(expect[i].h265 >= 8 && expect[i].h265 <= 11, "H.265 modes are 8..11");
+    }
 }
 
 int main(void)
@@ -289,6 +296,7 @@ int main(void)
     test_the_guard_follows_the_flag();
     test_an_uncreated_channel_still_says_noent();
     test_a_real_failure_still_reports();
+    test_rc_modes_use_the_drivers_numbering();
 
     if (failures) {
         printf("t_enc: %d failure(s)\n", failures);

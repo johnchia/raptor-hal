@@ -638,6 +638,7 @@ static void test_orientation_is_bringup_only(void)
     rss_hal_ctx_t ctx;
     star_state_t st;
     i6e_vpe_para para;
+    i6_vpe_para short_para;
     void *c = &ctx;
     int hf, vf;
 
@@ -689,11 +690,22 @@ static void test_orientation_is_bringup_only(void)
      * param the builder produces must still carry neither -- anything else
      * re-creates the ghosting. Checked against the builder directly because
      * there is no runtime writer of this struct left to go through.
+     *
+     * Both builders, because both reach a live board: the layout is chosen at
+     * runtime from MI's build stamp, so a guard on one of them leaves the
+     * other free to drift.
      */
     memset(&para, 0xA5, sizeof(para));
-    star_vpe_fill_param(&st, &para);
+    star_vpe_fill_param_long(&st, &para);
     CHECK(para.mirror == 0 && para.flip == 0,
-          "the channel param must never carry orientation, got (%d,%d)", para.mirror, para.flip);
+          "the long channel param must never carry orientation, got (%d,%d)", para.mirror,
+          para.flip);
+
+    memset(&short_para, 0xA5, sizeof(short_para));
+    star_vpe_fill_param_short(&st, &short_para);
+    CHECK(short_para.mirror == 0 && short_para.flip == 0,
+          "the short channel param must never carry orientation, got (%d,%d)", short_para.mirror,
+          short_para.flip);
 }
 
 /*
@@ -729,7 +741,7 @@ static void test_vpe_level_is_fixed_and_temper_is_unpublished(void)
     st.snr_flip = 1;
 
     memset(&para, 0xA5, sizeof(para));
-    star_vpe_fill_param(&st, &para);
+    star_vpe_fill_param_long(&st, &para);
     CHECK(para.level3DNR == STAR_VPE_NR3D_LEVEL, "the level is fixed at %d, got %d",
           STAR_VPE_NR3D_LEVEL, para.level3DNR);
     CHECK(para.level3DNR != 0, "level 0 disables the engine mirror and flip run on");
@@ -779,7 +791,7 @@ static void test_channel_param_is_built_not_edited(void)
     memset(&para, 0xA5, sizeof(para));
     para.lensAdjOn = 1;
 
-    star_vpe_fill_param(&st, &para);
+    star_vpe_fill_param_long(&st, &para);
 
     CHECK(para.mirror == 0 && para.flip == 0,
           "orientation must not reach the channel however the sensor is set, got (%d,%d)",
