@@ -539,16 +539,50 @@ int hal_enc_destroy_group(void *ctx, int grp)
  * where a 2304-wide snapshot on port 2 (ceiling 1920) sat at PortCrop 0,0,0,0
  * with GetCnt 1 against FailCnt 4509, and /snap.jpg served one mangled frame
  * and then "No snapshot available yet" for the rest of the boot.
+ *
+ * Port 2 has a second ceiling, and it is the one that actually bites: its
+ * scaler is not fed from the VPE input at all. The same document's port-crop
+ * note draws Scaler0 and Scaler1 off the input and Scaler2 off *Port1*, and
+ * states the rule for both chip rows --
+ *
+ *     由于 port2 的 Source 是 port1 的 output:
+ *     1. port1 enable, port2 的 crop win < port1 size;
+ *     2. port1 disable, port2 的 crop win < Vpe input.
+ *
+ * -- so port 2 can carry no more than whatever port 1 is currently emitting.
+ * rvd's port 1 is the substream, 640 wide by default, which makes port 2
+ * useless for a full-size snapshot in the ordinary two-stream pipeline and
+ * catastrophic if used anyway: the picture is port 1's, upscaled to the
+ * geometry that was asked for.
+ *
+ * Measured on an SSC30KQ at 2560x1440, against an H.265 frame off the same
+ * channel (gradient energy 1090, HF-90 cutoff 0.269). A snapshot on port 2
+ * with the substream up came back at 688 and 0.182 -- soft, not broken, which
+ * is why this hid for so long. The same snapshot on a cloned port 1, and again
+ * on the shared port 0, came back at 1065-1090 and 0.307-0.324. The chip
+ * ceilings above are identical in all three cases; the source is not.
  */
-static unsigned int star_enc_port_max_width(int port)
+static unsigned int star_enc_port_max_width(const star_state_t *st, int port)
 {
+    unsigned int max;
+
     if (port < 0 || port > 2)
         return 0;
 #if defined(PLATFORM_INFINITY6B0)
-    return port <= 1 ? 2688u : 1920u;
+    max = port <= 1 ? 2688u : 1920u;
 #else
-    return 3840u;
+    max = 3840u;
 #endif
+
+    if (port == 2) {
+        unsigned int src =
+            st->port[1].configured ? st->port[1].width : st->plane.capt.width;
+
+        if (src < max)
+            max = src;
+    }
+
+    return max;
 }
 
 /*
@@ -578,7 +612,7 @@ static int star_enc_spare_port(const star_state_t *st, unsigned int width, unsig
     for (i = 0; i < STAR_VPE_PORT_NUM; i++) {
         if (st->port[i].configured)
             continue;
-        max = star_enc_port_max_width(i);
+        max = star_enc_port_max_width(st, i);
         if (!max)
             continue;
         if (max > *widest)
