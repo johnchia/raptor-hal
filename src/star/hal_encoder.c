@@ -521,13 +521,52 @@ int hal_enc_destroy_group(void *ctx, int grp)
  * stream), so by the time this is asked the only unconfigured ports are
  * genuinely spare.
  */
-static int star_enc_spare_port(const star_state_t *st)
+/*
+ * The scaler behind each VPE output port has its own width ceiling, and they
+ * differ per port and per chip. From MI VPE API v2.12, "Max width/height":
+ *
+ *   chip              Port0  Port1  Port2  Port3
+ *   336D/336Q/339G     3840   3840   3840  no scaling
+ *   335/337DE          2688   2688   1920  1920
+ *
+ * Port 3 is excluded outright rather than given a number: the same document's
+ * bind-type table has it as "Realtime bind / DIVP" on 335/337DE and unscaled
+ * passthrough on the other row, neither of which is a snapshot port.
+ *
+ * Asking a port for more than it can scale does not fail. MI_VPE_SetPortMode
+ * returns success and the port simply keeps its default state -- no geometry,
+ * no crop rectangle, and a frame count that never moves. Measured on an SSC333,
+ * where a 2304-wide snapshot on port 2 (ceiling 1920) sat at PortCrop 0,0,0,0
+ * with GetCnt 1 against FailCnt 4509, and /snap.jpg served one mangled frame
+ * and then "No snapshot available yet" for the rest of the boot.
+ */
+static unsigned int star_enc_port_max_width(int port)
+{
+    if (port < 0 || port > 2)
+        return 0;
+#if defined(PLATFORM_INFINITY6B0)
+    return port <= 1 ? 2688u : 1920u;
+#else
+    return 3840u;
+#endif
+}
+
+/*
+ * The lowest unconfigured port whose scaler can carry `width`, or -1. A caller
+ * that gets -1 shares its video stream's port instead, which is a real fallback
+ * on this family -- MI 2.x accepts a second bind on an already-bound source.
+ */
+static int star_enc_spare_port(const star_state_t *st, unsigned int width)
 {
     int i;
 
-    for (i = 0; i < STAR_VPE_PORT_NUM; i++)
-        if (!st->port[i].configured)
-            return i;
+    for (i = 0; i < STAR_VPE_PORT_NUM; i++) {
+        if (st->port[i].configured)
+            continue;
+        if (width > star_enc_port_max_width(i))
+            continue;
+        return i;
+    }
 
     return -1;
 }
@@ -615,7 +654,7 @@ int hal_enc_register_channel(void *ctx, int grp, int chn)
 
     snap_fps = enc->fps_num / (enc->fps_den ? enc->fps_den : 1);
 
-    port = star_enc_spare_port(st);
+    port = star_enc_spare_port(st, (unsigned int)enc->width);
     if (port >= 0) {
         ret = star_fs_clone_port(st, src_port, port);
         if (ret == RSS_OK) {
@@ -635,7 +674,9 @@ int hal_enc_register_channel(void *ctx, int grp, int chn)
                          src_port, ret);
         }
     } else {
-        HAL_LOG_WARN("venc chn %d: no spare VPE output port (of %d)", chn, STAR_VPE_PORT_NUM);
+        HAL_LOG_WARN("venc chn %d: no spare VPE output port wide enough for %d (of %d) -- "
+                     "sharing the video stream's port instead",
+                     chn, enc->width, STAR_VPE_PORT_NUM);
     }
 
     /*
