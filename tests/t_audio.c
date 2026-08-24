@@ -53,6 +53,11 @@ static struct {
     int disable_chn_calls, disable_dev_calls;
     int last_dev, last_chn, last_vol, last_mute;
     int get_ret, free_ret, vol_ret;
+
+    /* MI_AI_SetChnParam -- the digital trim, which is where volume goes now
+     * that gain owns the analog table. */
+    int chn_calls, chn_ret;
+    int last_gain_on, last_front, last_rear;
     unsigned char buf[64];
     unsigned int length;
     int timeout_ms;
@@ -144,6 +149,20 @@ static int fake_vol(int dev, int chn, int level)
     return mi.vol_ret;
 }
 
+static int fake_set_chn_para(int dev, int chn, i6_aud_chn_para *para)
+{
+    mi.chn_calls++;
+    mi.last_dev = dev;
+    mi.last_chn = chn;
+    CHECK(para != NULL, "SetChnParam must be handed a block");
+    if (para) {
+        mi.last_gain_on = para->gain.gainOn;
+        mi.last_front = para->gain.front;
+        mi.last_rear = para->gain.rear;
+    }
+    return mi.chn_ret;
+}
+
 static int fake_mute(int dev, int chn, char active)
 {
     mi.mute_calls++;
@@ -184,6 +203,10 @@ static void setup(rss_hal_ctx_t *ctx, star_state_t *st, int chn_count)
     st->aud.fnGetFrame = fake_get;
     st->aud.fnFreeFrame = fake_free;
     st->aud.fnSetVolume = fake_vol;
+    st->aud.fnSetChannelParam = fake_set_chn_para;
+    /* What hal_audio_init leaves when the library has no MI_AI_GetChnParam:
+     * "no front-end index established yet", which is not the same as zero. */
+    st->aud_front_idx = -1;
     st->aud.fnSetMute = fake_mute;
     st->aud.fnDisableChannel = fake_disable_chn;
     st->aud.fnDisableDevice = fake_disable_dev;
@@ -211,50 +234,104 @@ static void test_rate_gate(void)
     CHECK(!star_audio_rate_ok(-16000), "negative refused");
 }
 
-static void test_volume_maps_to_table_index(void)
+/*
+ * The analog front end is gain's, not volume's.
+ *
+ * Both references drive MI_AI_SetVqeVolume with a dB-shaped number, but the
+ * argument is an *index* into a per-device table -- 0..21 on amic, 0..4 on
+ * dmic. raptor's gain is 0..31, so this is the map between them, and it is
+ * what Infinity6C already does: gain analog, volume digital.
+ */
+static void test_gain_maps_to_table_index(void)
 {
     rss_hal_ctx_t ctx;
     star_state_t st;
 
     setup(&ctx, &st, 1);
 
-    /* Amic table is 0..21. Endpoints must land exactly on the ends -- a
-     * volume of 100 that produced 22 would earn ILLEGAL_PARAM, and a 0
-     * that produced 1 would mean the quietest setting was unreachable. */
-    CHECK(star_audio_volume_index(&st, 0) == 0, "volume 0 -> index 0, got %d",
-          star_audio_volume_index(&st, 0));
-    CHECK(star_audio_volume_index(&st, 100) == STAR_AUD_VOL_MAX_AMIC,
-          "volume 100 -> index %d, got %d", STAR_AUD_VOL_MAX_AMIC,
-          star_audio_volume_index(&st, 100));
+    /* Endpoints land exactly on the ends. A gain of 31 that produced 22 would
+     * earn ILLEGAL_PARAM, and a 0 that produced 1 would put the quietest
+     * setting out of reach. */
+    CHECK(star_audio_gain_index(&st, 0) == 0, "gain 0 -> index 0, got %d",
+          star_audio_gain_index(&st, 0));
+    CHECK(star_audio_gain_index(&st, STAR_AUD_GAIN_MAX) == STAR_AUD_IF_GAIN_MAX_AMIC,
+          "gain %d -> index %d, got %d", STAR_AUD_GAIN_MAX, STAR_AUD_IF_GAIN_MAX_AMIC,
+          star_audio_gain_index(&st, STAR_AUD_GAIN_MAX));
 
-    /* Out-of-range input is clamped, never passed through: MI rejects an
-     * index off the end of the table. */
-    CHECK(star_audio_volume_index(&st, -50) == 0, "negative volume clamps to 0");
-    CHECK(star_audio_volume_index(&st, 1000) == STAR_AUD_VOL_MAX_AMIC,
-          "huge volume clamps to the table end");
+    /* The interior points are the ones swept on an SSC333 and read back out of
+     * /proc/mi_modules/mi_ai/mi_ai0, so these are measurements rather than
+     * restatements of the arithmetic. */
+    CHECK(star_audio_gain_index(&st, 8) == 5, "gain 8 -> 5, got %d", star_audio_gain_index(&st, 8));
+    CHECK(star_audio_gain_index(&st, 16) == 11, "gain 16 -> 11, got %d",
+          star_audio_gain_index(&st, 16));
+    CHECK(star_audio_gain_index(&st, 25) == 17, "gain 25 -> 17, got %d",
+          star_audio_gain_index(&st, 25));
+
+    /* Out-of-range input is clamped, never passed through. */
+    CHECK(star_audio_gain_index(&st, -50) == 0, "negative gain clamps to 0");
+    CHECK(star_audio_gain_index(&st, 1000) == STAR_AUD_IF_GAIN_MAX_AMIC,
+          "huge gain clamps to the table end");
 
     /* Monotonic, and never off the end anywhere in between. */
-    for (int v = 0; v <= 100; v++) {
-        int idx = star_audio_volume_index(&st, v);
-        int prev = star_audio_volume_index(&st, v ? v - 1 : 0);
+    for (int g = 0; g <= STAR_AUD_GAIN_MAX; g++) {
+        int idx = star_audio_gain_index(&st, g);
+        int prev = star_audio_gain_index(&st, g ? g - 1 : 0);
 
-        CHECK(idx >= 0 && idx <= STAR_AUD_VOL_MAX_AMIC, "volume %d -> index %d out of table", v,
+        CHECK(idx >= 0 && idx <= STAR_AUD_IF_GAIN_MAX_AMIC, "gain %d -> index %d out of table", g,
               idx);
-        CHECK(idx >= prev, "volume %d gave a lower index than %d", v, v - 1);
+        CHECK(idx >= prev, "gain %d gave a lower index than %d", g, g - 1);
     }
 
-    /* Dmic's table is much shorter, and picking the wrong ceiling would
-     * push a mid-range volume off the end of it. */
+    /* Dmic's table is much shorter, and picking the wrong ceiling would push a
+     * mid-range gain off the end of it. */
     st.aud_input = RSS_AUDIO_INPUT_DMIC;
-    CHECK(star_audio_volume_index(&st, 100) == STAR_AUD_VOL_MAX_DMIC,
-          "dmic volume 100 -> index %d, got %d", STAR_AUD_VOL_MAX_DMIC,
-          star_audio_volume_index(&st, 100));
-    for (int v = 0; v <= 100; v++)
-        CHECK(star_audio_volume_index(&st, v) <= STAR_AUD_VOL_MAX_DMIC,
-              "dmic volume %d ran off its table", v);
+    CHECK(star_audio_gain_index(&st, STAR_AUD_GAIN_MAX) == STAR_AUD_IF_GAIN_MAX_DMIC,
+          "dmic gain %d -> index %d, got %d", STAR_AUD_GAIN_MAX, STAR_AUD_IF_GAIN_MAX_DMIC,
+          star_audio_gain_index(&st, STAR_AUD_GAIN_MAX));
+    for (int g = 0; g <= STAR_AUD_GAIN_MAX; g++)
+        CHECK(star_audio_gain_index(&st, g) <= STAR_AUD_IF_GAIN_MAX_DMIC,
+              "dmic gain %d ran off its table", g);
 }
 
-static void test_set_volume_passes_index_not_percent(void)
+static void test_set_gain_passes_index_not_percent(void)
+{
+    rss_hal_ctx_t ctx;
+    star_state_t st;
+    int gain = -1;
+
+    setup(&ctx, &st, 1);
+
+    /* The regression this guards: passing 25 straight to MI. 25 is not a valid
+     * index in any of the tables. */
+    CHECK(hal_audio_set_gain(&ctx, STAR_AUD_DEV, 0, 25) == RSS_OK, "set_gain succeeds");
+    CHECK(mi.vol_calls == 1, "one SetVqeVolume call, got %d", mi.vol_calls);
+    CHECK(mi.last_vol == 17, "gain 25 should reach MI as index 17, got %d", mi.last_vol);
+    CHECK(mi.last_vol <= STAR_AUD_IF_GAIN_MAX_AMIC, "index must be inside the table");
+
+    /* And it is remembered, so a later volume write does not have to guess a
+     * front-end index. */
+    CHECK(st.aud_front_idx == 17, "the index is held for set_volume, got %d", st.aud_front_idx);
+
+    CHECK(hal_audio_get_gain(&ctx, STAR_AUD_DEV, 0, &gain) == RSS_OK, "get_gain succeeds");
+    CHECK(gain == 25, "get_gain returns the requested value, got %d", gain);
+
+    /* A failing MI call must not be recorded as the live gain. */
+    mi.vol_ret = -1;
+    CHECK(hal_audio_set_gain(&ctx, STAR_AUD_DEV, 0, 10) != RSS_OK, "a failing set is reported");
+    CHECK(hal_audio_get_gain(&ctx, STAR_AUD_DEV, 0, &gain) == RSS_OK, "get_gain still works");
+    CHECK(gain == 25, "failed set must not update tracked gain, got %d", gain);
+}
+
+/*
+ * Volume is the digital DPGA trim, in dB, through MI_AI_SetChnParam -- the
+ * stage nothing could reach before it was bound. Unity is 80, so a default
+ * install writes 0 dB and the picture is unchanged from when volume drove the
+ * analog table.
+ *
+ * The four points below were read back off an SSC333's own
+ * /proc/mi_modules/mi_ai/mi_ai0 rather than derived from the helper.
+ */
+static void test_set_volume_is_the_digital_trim(void)
 {
     rss_hal_ctx_t ctx;
     star_state_t st;
@@ -262,22 +339,60 @@ static void test_set_volume_passes_index_not_percent(void)
 
     setup(&ctx, &st, 1);
 
-    /* The regression this guards: passing 80 straight to MI. 80 is not a
-     * valid index in any of the tables. */
+    CHECK(star_audio_volume_db(0) == STAR_AUD_DPGA_MIN_DB, "volume 0 -> %d dB, got %d",
+          STAR_AUD_DPGA_MIN_DB, star_audio_volume_db(0));
+    CHECK(star_audio_volume_db(40) == -30, "volume 40 -> -30 dB, got %d", star_audio_volume_db(40));
+    CHECK(star_audio_volume_db(STAR_AUD_VOL_UNITY) == 0, "unity -> 0 dB, got %d",
+          star_audio_volume_db(STAR_AUD_VOL_UNITY));
+    CHECK(star_audio_volume_db(100) == STAR_AUD_DPGA_MAX_DB, "volume 100 -> %d dB, got %d",
+          STAR_AUD_DPGA_MAX_DB, star_audio_volume_db(100));
+
     CHECK(hal_audio_set_volume(&ctx, STAR_AUD_DEV, 0, 80) == RSS_OK, "set_volume succeeds");
-    CHECK(mi.vol_calls == 1, "one SetVqeVolume call, got %d", mi.vol_calls);
-    CHECK(mi.last_vol == 17, "volume 80 should reach MI as index 17, got %d", mi.last_vol);
-    CHECK(mi.last_vol <= STAR_AUD_VOL_MAX_AMIC, "index must be inside the table");
+    CHECK(mi.chn_calls == 1, "one SetChnParam call, got %d", mi.chn_calls);
+    CHECK(mi.last_rear == 0, "volume 80 is 0 dB of trim, got %d", mi.last_rear);
+    CHECK(mi.last_gain_on == 1, "the gain block has to be switched on to be read");
+    CHECK(mi.vol_calls == 0, "volume must not touch the analog table");
+
+    /* With no gain set and no index established, the front end is derived from
+     * the gain this backend holds rather than written as a zero -- which would
+     * silently mute the preamp on the way past. */
+    CHECK(mi.last_front == star_audio_gain_index(&st, st.aud_gain),
+          "front comes from the held gain, got %d", mi.last_front);
+
+    /* An index established by set_gain is the one volume carries through. */
+    CHECK(hal_audio_set_gain(&ctx, STAR_AUD_DEV, 0, 25) == RSS_OK, "set_gain succeeds");
+    CHECK(hal_audio_set_volume(&ctx, STAR_AUD_DEV, 0, 100) == RSS_OK, "set_volume succeeds");
+    CHECK(mi.last_front == 17, "volume preserves the analog index, got %d", mi.last_front);
+    CHECK(mi.last_rear == STAR_AUD_DPGA_MAX_DB, "volume 100 is +%d dB, got %d",
+          STAR_AUD_DPGA_MAX_DB, mi.last_rear);
 
     /* get_volume answers in raptor's units, not MI's. */
     CHECK(hal_audio_get_volume(&ctx, STAR_AUD_DEV, 0, &vol) == RSS_OK, "get_volume succeeds");
-    CHECK(vol == 80, "get_volume returns the requested percent, got %d", vol);
+    CHECK(vol == 100, "get_volume returns the requested percent, got %d", vol);
 
     /* A failing MI call must not be recorded as the live volume. */
-    mi.vol_ret = -1;
+    mi.chn_ret = -1;
     CHECK(hal_audio_set_volume(&ctx, STAR_AUD_DEV, 0, 10) != RSS_OK, "a failing set is reported");
     CHECK(hal_audio_get_volume(&ctx, STAR_AUD_DEV, 0, &vol) == RSS_OK, "get_volume still works");
-    CHECK(vol == 80, "failed set must not update tracked volume, got %d", vol);
+    CHECK(vol == 100, "failed set must not update tracked volume, got %d", vol);
+}
+
+/*
+ * A library too old to carry MI_AI_SetChnParam loses the digital trim and keeps
+ * capturing: the pair is bound with plain dlsym and left NULL on a miss, and
+ * this is the answer that reaches rad.
+ */
+static void test_volume_without_the_digital_stage(void)
+{
+    rss_hal_ctx_t ctx;
+    star_state_t st;
+
+    setup(&ctx, &st, 1);
+    st.aud.fnSetChannelParam = NULL;
+
+    CHECK(hal_audio_set_volume(&ctx, STAR_AUD_DEV, 0, 80) == RSS_ERR_NOTSUP,
+          "no SetChnParam means no volume control");
+    CHECK(mi.vol_calls == 0, "and it must not fall back onto the analog table");
 }
 
 static void test_frame_lifecycle(void)
@@ -476,10 +591,13 @@ static void test_init_sets_the_output_port_queue(void)
 
         CHECK(hal_audio_init(&ctx, &cfg) == RSS_OK, "init succeeds for %u channel(s)", i);
 
-        /* One queue per enabled channel: a stereo setup that only sets
-         * channel 0 would capture left and starve right. */
-        CHECK(mi.depth_calls == (int)i, "%u channel(s) -> %d SetChnOutputPortDepth call(s)", i,
-              mi.depth_calls);
+        /* One queue, always, because there is one MI channel however many PCM
+         * channels it carries: eSoundmode says stereo and the interleaved pair
+         * arrives in apVirAddr[0] with the full length. An earlier build read
+         * u32ChnCnt as the PCM count and enabled two, which the driver reports
+         * as EnChnNum and the board showed as 1. */
+        CHECK(mi.depth_calls == 1, "%u PCM channel(s) -> %d SetChnOutputPortDepth call(s), want 1",
+              i, mi.depth_calls);
         CHECK(mi.depth_usr == STAR_AUD_PORT_USR_DEPTH && mi.depth_buf == STAR_AUD_PORT_BUF_DEPTH,
               "depths passed through as (%d, %d), got (%u, %u)", STAR_AUD_PORT_USR_DEPTH,
               STAR_AUD_PORT_BUF_DEPTH, mi.depth_usr, mi.depth_buf);
@@ -490,7 +608,7 @@ static void test_init_sets_the_output_port_queue(void)
          * board. */
         CHECK(mi.depth_port.module == I6_SYS_MOD_AI, "port names the AI module");
         CHECK(mi.depth_port.device == (unsigned int)STAR_AUD_DEV, "port names the AI device");
-        CHECK(mi.depth_port.channel == i - 1, "last port is channel %u, got %u", i - 1,
+        CHECK(mi.depth_port.channel == 0, "the one AI channel is 0, got %u",
               mi.depth_port.channel);
         CHECK(mi.depth_port.port == 0, "AI has a single output port, 0");
 
@@ -667,8 +785,10 @@ static void test_buf_empty_does_not_touch_the_port(void)
 int main(void)
 {
     test_rate_gate();
-    test_volume_maps_to_table_index();
-    test_set_volume_passes_index_not_percent();
+    test_gain_maps_to_table_index();
+    test_set_gain_passes_index_not_percent();
+    test_set_volume_is_the_digital_trim();
+    test_volume_without_the_digital_stage();
     test_frame_lifecycle();
     test_empty_buffer_is_a_timeout_not_an_error();
     test_device_and_channel_bounds();
