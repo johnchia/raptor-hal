@@ -148,13 +148,38 @@ ALL_OBJS := src/hal_common_video.o src/hal_common_audio.o \
             $(CORE_OBJS) $(VIDEO_OBJS) $(AUDIO_OBJS)
 DEPS := $(ALL_OBJS:.o=.d)
 
+
 # Output — two archives, one per module set
 LIB_VIDEO := libraptor_hal_video.a
 LIB_AUDIO := libraptor_hal_audio.a
 
-.PHONY: all clean info
+.PHONY: all clean info FORCE
 
 all: $(LIB_VIDEO) $(LIB_AUDIO)
+
+# Which platform an object was built for is invisible to Make. PLATFORM and
+# SOC_MODEL reach the compiler only as -D flags, so switching platform in a
+# tree that has already been built leaves every .o looking as up to date as it
+# is wrong, and the archive keeps the previous chip's port ceilings and the
+# previous part's encoder ratings. Nothing fails; the daemon that links it just
+# runs a board as if it were another one, and says so nowhere.
+#
+# So record the settings that select code, make every object depend on that
+# record, and rewrite it only when it actually differs -- a same-platform
+# rebuild stays incremental, a switch rebuilds everything.
+BUILD_CONFIG := PLATFORM=$(PLATFORM) SOC_MODEL=$(SOC_MODEL) VENDOR=$(VENDOR) \
+                DEBUG=$(DEBUG) PERSONDET=$(PERSONDET) CC=$(CC)
+CONFIG_STAMP := .build-config
+
+$(ALL_OBJS): $(CONFIG_STAMP)
+
+$(CONFIG_STAMP): FORCE
+	$(Q)if [ ! -f $@ ] || [ "`cat $@`" != "$(BUILD_CONFIG)" ]; then \
+		echo "  CONFIG  $(BUILD_CONFIG)"; \
+		printf '%s' "$(BUILD_CONFIG)" > $@; \
+	fi
+
+FORCE:
 
 # Compile hal_common.c twice with different module defines
 src/hal_common_video.o: $(HAL_COMMON_SRC)
@@ -186,7 +211,7 @@ $(LIB_AUDIO): src/hal_common_audio.o $(CORE_OBJS) $(AUDIO_OBJS)
 clean:
 	@echo "  CLEAN"
 	$(Q)rm -f $(ALL_OBJS) $(DEPS) src/hal_v4l2.o src/hal_v4l2.d \
-		$(LIB_VIDEO) $(LIB_AUDIO)
+		$(LIB_VIDEO) $(LIB_AUDIO) $(CONFIG_STAMP)
 	# `make clean` runs without PLATFORM, so VENDOR defaults to ingenic and
 	# $(ALL_OBJS) names only that backend's objects. Sweep the other
 	# vendors' subdirs explicitly so a clean is vendor-independent.
