@@ -615,6 +615,65 @@ static void test_a_sub_larger_than_its_main_says_so(void)
     CHECK(!st.enc[1].cascade_pending, "and is not left waiting");
 }
 
+/*
+ * The rate-mode numbers that go on the wire.
+ *
+ * This SoC's driver speaks the UBR enum -- H.264 1..6, MJPEG 7..9, H.265 10..14
+ * -- and not the numbering the SDK document prints, which stops at 12. The two
+ * agree on CBR and VBR for H.264 and disagree on everything else, so a revert to
+ * the published enum would keep the default path working and quietly change
+ * what every other mode means. That is what this pins.
+ *
+ * The values were confirmed against an SSC377QE: each one was set with
+ * `raptorctl rvd set-rc-mode` and read back out of
+ * /proc/mi_modules/mi_venc/mi_venc0, which names the mode the driver is
+ * actually in.
+ */
+static void test_rc_modes_use_the_drivers_numbering(void)
+{
+    static const struct {
+        rss_rc_mode_t ask;
+        unsigned int h264;
+        unsigned int h265;
+        const char *proc_name;
+    } expect[] = {
+        {RSS_RC_CBR, 1, 10, "CBR"},
+        {RSS_RC_VBR, 2, 11, "VBR"},
+        {RSS_RC_FIXQP, 5, 13, "FixQP"},
+        {RSS_RC_SMART, 6, 14, "AVBR"},
+        {RSS_RC_CAPPED_VBR, 6, 14, "AVBR"},
+        {RSS_RC_CAPPED_QUALITY, 6, 14, "AVBR"},
+    };
+    rss_video_config_t cfg;
+    i6c_venc_rate rate;
+    size_t i;
+
+    for (i = 0; i < sizeof(expect) / sizeof(expect[0]); i++) {
+        memset(&cfg, 0, sizeof(cfg));
+        cfg.rc_mode = expect[i].ask;
+        cfg.bitrate = 5000000;
+
+        CHECK(!i6c_enc_fill_rate(&rate, &cfg, I6C_VENC_CODEC_H264),
+              "H.264 %s needs no substitution", expect[i].proc_name);
+        CHECK(rate.mode == expect[i].h264, "H.264 %s -> %u, got %u", expect[i].proc_name,
+              expect[i].h264, rate.mode);
+
+        /* The half that used to be unreachable: H.265 CBR was refused outright
+         * and H.265 AVBR oopsed the kernel, both because the number was one
+         * low. Neither is substituted any more. */
+        CHECK(!i6c_enc_fill_rate(&rate, &cfg, I6C_VENC_CODEC_H265),
+              "H.265 %s needs no substitution", expect[i].proc_name);
+        CHECK(rate.mode == expect[i].h265, "H.265 %s -> %u, got %u", expect[i].proc_name,
+              expect[i].h265, rate.mode);
+    }
+
+    /* Every value lands inside the range the driver's CheckRcMode enforces. */
+    for (i = 0; i < sizeof(expect) / sizeof(expect[0]); i++) {
+        CHECK(expect[i].h264 >= 1 && expect[i].h264 <= 6, "H.264 modes are 1..6");
+        CHECK(expect[i].h265 >= 10 && expect[i].h265 <= 14, "H.265 modes are 10..14");
+    }
+}
+
 int main(void)
 {
     test_the_sub_cascades_off_the_main();
@@ -626,6 +685,7 @@ int main(void)
     test_the_full_teardown_still_unhooks_first();
     test_a_jpeg_channel_is_not_a_sub();
     test_a_sub_larger_than_its_main_says_so();
+    test_rc_modes_use_the_drivers_numbering();
 
     if (failures) {
         printf("t_enc_i6c: %d failure(s)\n", failures);

@@ -145,12 +145,12 @@ static bool i6c_enc_fill_rate(i6c_venc_rate *rate, const rss_video_config_t *cfg
          * anything here: a bitrate target or a fixed quality.
          */
         if (cfg->rc_mode == RSS_RC_FIXQP) {
-            rate->mode = I6C_VENC_RATEMODE_MJPGQP;
+            rate->mode = I6C_VENC_RATEMODE_UBR_MJPGQP;
             rate->mjpgQp.fpsNum = fps_num;
             rate->mjpgQp.fpsDen = fps_den;
             rate->mjpgQp.quality = cfg->init_qp > 0 ? (unsigned int)cfg->init_qp : 8;
         } else {
-            rate->mode = I6C_VENC_RATEMODE_MJPGCBR;
+            rate->mode = I6C_VENC_RATEMODE_UBR_MJPGCBR;
             rate->mjpgCbr.bitrate = bitrate;
             rate->mjpgCbr.fpsNum = fps_num;
             rate->mjpgCbr.fpsDen = fps_den;
@@ -159,41 +159,41 @@ static bool i6c_enc_fill_rate(i6c_venc_rate *rate, const rss_video_config_t *cfg
     }
 
     /*
-     * H.265 has two working rate controls on this part, VBR and fixed QP, and
-     * everything else is remapped onto VBR rather than passed through. Both of
-     * the modes that go through here fail, and they fail differently:
+     * The rate-mode enum this SoC's driver speaks is the UBR one, not the one
+     * the SDK document prints, and that is why every mode here is spelled
+     * I6C_VENC_RATEMODE_UBR_*.
      *
-     *   CBR (mode 9)  the driver refuses at create -- "eType:3 unsupport rc
-     *                 mode:9" from CheckRcMode, MI_VENC_CreateChn returns
-     *                 ILLEGAL_PARAM, and the stream never comes up.
-     *   AVBR (mode 12) worse, and it does not stop at this process. The channel
-     *                 is created, and then MI_VENC_StartRecvPic calls through a
-     *                 NULL pointer inside the driver and oopses the kernel (PC
-     *                 0x0, from MI_VENC_IMPL_StartRecvPicEx). MI_DEVICE_Ioctl
-     *                 releases the VENC device's rwsem only after the handler
-     *                 returns, and this handler never does, so the lock is held
-     *                 for the rest of the boot: the next MI_DEVICE_Open on that
-     *                 device sleeps in down_write and cannot be killed. That is
-     *                 a reboot, and the same config comes back up and does it
-     *                 again.
+     * MI ships two numberings. The published enum runs H.264 1..5, MJPEG 6..8,
+     * H.265 9..12. The UBR enum inserts a UBR mode into each codec's block, so
+     * it runs H.264 1..6, MJPEG 7..9, H.265 10..14. Nothing in the header says
+     * which a given chip wants; the driver does. _MI_VENC_IMPL_CheckRcMode,
+     * inlined into MI_VENC_IMPL_CreateChn at 0xde984 of the mi.ko this image
+     * ships, bounds eType 2 at mode-1 <= 5, eType 4 at mode-7 <= 2 and eType 3
+     * at mode-10 <= 4. Six, three and five: the UBR shape exactly.
      *
-     * Board-measured, 3/3 each, both by asking outright and via this remap. So
-     * refusing is not the honest alternative it would normally be: CBR is
-     * raptor's default rate control and AVBR is what "smart" means, so a plain
-     * `codec = h265` or one dropdown in Home Assistant is a camera off air or a
-     * kernel oops loop. VBR is what works, and it is also what Majestic sends
-     * for a CBR request on this SoC -- silently, which is why this cost a
-     * driver-level trace to find. Hence the return value: say so out loud.
+     * Sending the published numbering into that driver is an off-by-one that
+     * changes meaning rather than failing cleanly. It is what produced both of
+     * the symptoms this file used to remap around -- H.265 CBR (9) fell below
+     * eType 3's floor and MI_VENC_CreateChn returned ILLEGAL_PARAM with
+     * "eType:3 unsupport rc mode:9", while H.265 AVBR (12) was read as
+     * H265UBR, whose union is not the one filled in here, and
+     * MI_VENC_StartRecvPic dereferenced NULL inside the driver and took the
+     * VENC device's rwsem down with it.
+     *
+     * Confirmed on an SSC377QE before the change: with [stream0] codec h265 and
+     * rc_mode cbr, the old remap sent H265VBR (10) and
+     * /proc/mi_modules/mi_venc/mi_venc0 reported RateCtl CBR. The driver was
+     * reading one lower than raptor was writing, on a mode raptor believed it
+     * had substituted.
+     *
+     * So the remap is gone: all six of raptor's modes reach this part, on both
+     * codecs, at their right numbers. CBR and VBR keep the values 1 and 2 in
+     * both numberings, which is why the default path never showed this.
      */
-    if (codec == I6C_VENC_CODEC_H265 && mode != RSS_RC_VBR && mode != RSS_RC_FIXQP) {
-        mode = RSS_RC_VBR;
-        substituted = true;
-    }
-
     switch (mode) {
     case RSS_RC_FIXQP:
-        rate->mode =
-            codec == I6C_VENC_CODEC_H265 ? I6C_VENC_RATEMODE_H265QP : I6C_VENC_RATEMODE_H264QP;
+        rate->mode = codec == I6C_VENC_CODEC_H265 ? I6C_VENC_RATEMODE_UBR_H265QP
+                                                  : I6C_VENC_RATEMODE_UBR_H264QP;
         rate->h264Qp.gop = gop;
         rate->h264Qp.fpsNum = fps_num;
         rate->h264Qp.fpsDen = fps_den;
@@ -202,8 +202,8 @@ static bool i6c_enc_fill_rate(i6c_venc_rate *rate, const rss_video_config_t *cfg
         break;
 
     case RSS_RC_VBR:
-        rate->mode =
-            codec == I6C_VENC_CODEC_H265 ? I6C_VENC_RATEMODE_H265VBR : I6C_VENC_RATEMODE_H264VBR;
+        rate->mode = codec == I6C_VENC_CODEC_H265 ? I6C_VENC_RATEMODE_UBR_H265VBR
+                                                  : I6C_VENC_RATEMODE_UBR_H264VBR;
         rate->h264Vbr.gop = gop;
         rate->h264Vbr.statTime = 1;
         rate->h264Vbr.fpsNum = fps_num;
@@ -221,13 +221,12 @@ static bool i6c_enc_fill_rate(i6c_venc_rate *rate, const rss_video_config_t *cfg
     /*
      * The capped and smart modes map onto AVBR, which is what MI offers that is
      * bounded above but free to spend less. Nothing here distinguishes them.
-     * H.264 only -- H.265 never arrives here, see the remap above.
      */
     case RSS_RC_SMART:
     case RSS_RC_CAPPED_VBR:
     case RSS_RC_CAPPED_QUALITY:
-        rate->mode =
-            codec == I6C_VENC_CODEC_H265 ? I6C_VENC_RATEMODE_H265AVBR : I6C_VENC_RATEMODE_H264AVBR;
+        rate->mode = codec == I6C_VENC_CODEC_H265 ? I6C_VENC_RATEMODE_UBR_H265AVBR
+                                                  : I6C_VENC_RATEMODE_UBR_H264AVBR;
         rate->h264Avbr.gop = gop;
         rate->h264Avbr.statTime = 1;
         rate->h264Avbr.fpsNum = fps_num;
@@ -237,10 +236,10 @@ static bool i6c_enc_fill_rate(i6c_venc_rate *rate, const rss_video_config_t *cfg
         rate->h264Avbr.minQual = cfg->max_qp >= 0 ? (unsigned int)cfg->max_qp : 48;
         break;
 
-    /* H.264 only for the same reason: an H.265 CBR request left as VBR above. */
     case RSS_RC_CBR:
     default:
-        rate->mode = I6C_VENC_RATEMODE_H264CBR;
+        rate->mode = codec == I6C_VENC_CODEC_H265 ? I6C_VENC_RATEMODE_UBR_H265CBR
+                                                  : I6C_VENC_RATEMODE_UBR_H264CBR;
         rate->h264Cbr.gop = gop;
         rate->h264Cbr.statTime = 1;
         rate->h264Cbr.fpsNum = fps_num;
