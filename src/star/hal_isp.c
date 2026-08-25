@@ -289,7 +289,7 @@ typedef struct {
     uint8_t width;       /* 1, 2 or 4 bytes */
     uint8_t shape;       /* star_iq_shape_t */
     int32_t mi_max;   /* MI's maximum for the field */
-    int32_t mi_unity; /* MI value that means the same as raptor's 128 */
+    int32_t mi_unity; /* the field's neutral: the value that leaves the picture alone */
     /*
      * MI's *minimum*, which is 0 for every module whose field is unsigned
      * and negative for the one that is not. It is what lets raptor's
@@ -368,9 +368,10 @@ enum {
 /*
  * Payload sizes and manual-block offsets live in i6_isp.h, where the
  * vendor ABI belongs and where tests/abi_iq.c asserts every one of them
- * against the vendor headers. mi_unity is the MI value corresponding to
- * raptor's neutral 128, which is what keeps a default config from
- * shifting the image:
+ * against the vendor headers. mi_unity is the field's neutral -- the value
+ * that leaves the picture as the tuner left it -- and it is what
+ * hal_isp_get_knob_caps publishes as caps->neutral, which is where a
+ * client centres a control:
  *
  *   brightness/contrast  0..100, midpoint 50
  *   saturation           0..127 where 32 is unity gain (1X), *not* the
@@ -378,8 +379,14 @@ enum {
  *                        a linear 0..255 -> 0..127 map would silently
  *                        double saturation at raptor's neutral
  *   sharpness, NR        0..255, midpoint 128
+ *   drc                  0..255, neutral 0 -- a one-sided effect strength,
+ *                        where the midpoint means half on rather than off
  *   EV compensation      signed, +/-STAR_AE_EV_SPAN about the tuning's own
  *                        value -- see unity_from_tuning and mi_floor
+ *
+ * The midpoint is only a neutral for a knob with two sides to be between;
+ * for a strength whose floor is "off" it is nothing of the sort. Defog is
+ * a bare enable on this family, so its neutral is already 0 by shape.
  */
 
 /*
@@ -430,6 +437,11 @@ static star_iq_param_t g_iq[IQ_PARAM_COUNT] = {
      * Every one of them is now reachable: auto is asked for by name rather
      * than by spending the value 128 on it.
      *
+     * Neutral is 0 for the same reason it is on Infinity6C: WDR strength is
+     * one-sided, so 0 is the value that leaves the picture alone and 128 is
+     * half on. The 128 that used to sit here was the centre of the abstract
+     * scale ec571b7 retired, not a property of the field.
+     *
      * The layout is this family's own -- a 52-byte entry with the level at
      * +43, against Infinity6C's 112 and +34 -- and even the symbol differs in
      * case: MI_ISP_IQ_GetWDR here, MI_ISP_IQ_GetWdr there.
@@ -442,7 +454,7 @@ static star_iq_param_t g_iq[IQ_PARAM_COUNT] = {
      */
     [IQ_DRC] = { "drc", "MI_ISP_IQ_GetWDR", "MI_ISP_IQ_SetWDR",
                  I6_ISP_IQ_WDR_PAYLOAD, I6_ISP_IQ_WDR_MANUAL + I6_ISP_IQ_WDR_STRENGTH,
-                 1, IQ_AUTOMAN, 255, 128, 0, false, NULL, NULL },
+                 1, IQ_AUTOMAN, 255, 0, 0, false, NULL, NULL },
     [IQ_GRAY] = { "gray", "MI_ISP_IQ_GetColorToGray", "MI_ISP_IQ_SetColorToGray",
                   I6_ISP_IQ_GRAY_PAYLOAD, 0, 4, IQ_BOOL, 1, 0, 0, false, NULL, NULL },
     /*

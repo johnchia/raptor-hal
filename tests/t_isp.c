@@ -154,9 +154,12 @@ static void test_table_matches_disassembly(void)
      * write into a neighbouring field that no picture would obviously show.
      */
     CHECK(g_iq[IQ_DRC].payload == 892 && g_iq[IQ_DRC].manual_off == 883, "drc");
-    CHECK(g_iq[IQ_DRC].mi_unity == 128 && g_iq[IQ_DRC].mi_max == 255 && g_iq[IQ_DRC].mi_floor == 0,
-          "drc must map 1:1, which is what makes a majestic overrideWdr value mean the same "
-          "thing here");
+    CHECK(g_iq[IQ_DRC].mi_max == 255 && g_iq[IQ_DRC].mi_floor == 0,
+          "drc must span the field 1:1, which is what makes a majestic overrideWdr value mean "
+          "the same thing here");
+    CHECK(g_iq[IQ_DRC].mi_unity == 0,
+          "drc's neutral is off, not the midpoint -- WDR strength is one-sided, so a client "
+          "centring its control on the neutral would otherwise open at half strength");
     CHECK(g_iq[IQ_DEFOG].payload == 28, "defog");
     CHECK(g_iq[IQ_GRAY].payload == 4, "gray");
     CHECK(g_iq[IQ_EVCOMP].payload == 8, "evcomp");
@@ -304,6 +307,14 @@ static void test_caps_describe_what_the_setter_accepts(void)
     CHECK(hal_isp_get_knob_caps(c, "drc_strength", &caps) == RSS_OK, "drc_strength has caps");
     CHECK(caps.min == p->mi_floor && caps.max == p->mi_max, "caps carry the field's own range");
     CHECK(caps.has_auto, "drc is an auto/manual module");
+
+    /*
+     * The neutral a client centres on. For a one-sided strength that is the
+     * floor: 0 is no WDR contribution, and there is nothing below it for a
+     * midpoint to sit between. 128 was the centre of the abstract 0..255 scale
+     * raptor used to publish, and it outlived the scale by one commit.
+     */
+    CHECK(caps.neutral == caps.min, "drc's neutral is off, not the midpoint");
 
     CHECK(hal_isp_set_drc_strength(c, caps.min) == RSS_OK, "the published minimum is accepted");
     CHECK(hal_isp_set_drc_strength(c, caps.max) == RSS_OK, "the published maximum is accepted");

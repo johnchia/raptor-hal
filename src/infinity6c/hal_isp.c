@@ -283,7 +283,7 @@ typedef struct {
     uint8_t count;       /* fields in the run: 1 for everything but IQ_VECTOR */
     uint8_t shape;       /* i6c_iq_shape_t */
     int32_t mi_max;      /* MI's maximum for the field */
-    int32_t mi_unity;    /* the MI value that means the same as raptor's 128 */
+    int32_t mi_unity;    /* the field's neutral: the value that leaves the picture alone */
     int32_t mi_floor;    /* MI's minimum: 0 unless the field is signed */
     /*
      * Set for a module whose neutral is not a constant this port can know: the
@@ -352,16 +352,29 @@ enum {
 /*
  * Payload sizes and manual offsets come from sigmastar-headers, where the vendor
  * ABI belongs and where tests/abi_iq_i6c.c asserts every one against the vendor
- * headers. mi_unity is the MI value raptor's neutral 128 maps to, which is what
- * keeps a default config from shifting the image:
+ * headers. mi_unity is the field's neutral -- the value that leaves the picture
+ * as the tuner left it -- and it is what hal_isp_get_knob_caps publishes as
+ * caps->neutral, which is where a client centres a control:
  *
  *   brightness/contrast  u32Lev 0..100, midpoint 50
  *   saturation           u8SatAllStr 0..127 where 32 is unity gain (1X), *not*
  *                        the midpoint -- a linear 0..255 -> 0..127 map would
  *                        silently double saturation at raptor's neutral
- *   defog                u8Strength 0..255, and the module's own bEnable is what
- *                        isp_set_defog switches
+ *   defog/drc            one-sided effect strengths: 0 is no contribution, so
+ *                        0 is the neutral and the midpoint means half on
  *   EV compensation      signed, +/-I6C_AE_EV_SPAN about the tuning's own value
+ *
+ * The midpoint is only a neutral for a knob with two sides to be between. For a
+ * strength whose floor is "off" it is nothing of the sort, and the distinction
+ * is the same one imp_knob_caps in src/hal_isp.c draws for highlight_depress
+ * and backlight_comp.
+ *
+ * defog's range is the one number here the vendor does not state:
+ * MI_ISP_IQ_DefogParam_t carries a bare MI_U8 u8Strength with no bound comment,
+ * where its neighbours in that header are annotated (0 ~ 127, 0 ~ 64, 0 ~ 31).
+ * 255 is the type's width, and every value across it round-trips through
+ * MI_ISP_IQ_{Set,Get}Defog on an SSC377QE, so nothing narrower is enforced --
+ * but it is inference, not documentation.
  *
  * The two vector rows have no constant to put here at all, which is why both
  * learn their neutral from the tuning; see i6c_iq_apply_vector. What is in
@@ -410,9 +423,13 @@ static i6c_iq_param_t g_iq[IQ_PARAM_COUNT] = {
      * and isp_set_defog_strength overwriting each other's request while both are
      * still queued -- which is exactly what rvd does, since its [image] block sets
      * both before the first frame.
+     *
+     * Neutral is 0: defogging off is what leaves the picture alone, and there is
+     * no second side for a midpoint to sit between. See the table header for the
+     * 255, which is inferred from the field width rather than stated.
      */
     [IQ_DEFOG] = {"defog", "MI_ISP_IQ_GetDefog", "MI_ISP_IQ_SetDefog", I6C_ISP_IQ_DEFOG_PAYLOAD,
-                  I6C_ISP_IQ_DEFOG_MANUAL, 1, 1, IQ_AUTOMAN, 255, 128, 0, false, NULL, NULL, 0,
+                  I6C_ISP_IQ_DEFOG_MANUAL, 1, 1, IQ_AUTOMAN, 255, 0, 0, false, NULL, NULL, 0,
                   false, false, false},
     [IQ_DEFOG_EN] = {"defog enable", "MI_ISP_IQ_GetDefog", "MI_ISP_IQ_SetDefog",
                      I6C_ISP_IQ_DEFOG_PAYLOAD, I6C_ISP_ENABLE_OFF, 4, 1, IQ_BOOL, 1, 0, 0, false,
@@ -420,13 +437,17 @@ static i6c_iq_param_t g_iq[IQ_PARAM_COUNT] = {
     /*
      * DRC -- MI's WDR module, and the level is one byte of it.
      *
-     * Neutral is 128 and means auto, as everywhere else here. Above and below
-     * it the map is the identity: unity 128 against a 0..255 field makes
-     * i6c_iq_scale return its own argument, so drc=100 writes Strength 100 and
-     * drc=200 writes 200. That is deliberate rather than convenient -- it is
-     * the same scale majestic's overrideWdr has used on this SoC for years, so
-     * a number carried over from a majestic config means the same picture.
-     * The one value it cannot express is 128 itself, which is spent on auto.
+     * The field is u8Strength, documented 0 ~ 255 in the maruko header, so what
+     * is written here is what MI stores: drc=100 writes Strength 100 and
+     * drc=200 writes 200. That is the same scale majestic's overrideWdr has
+     * used on this SoC for years, so a number carried over from a majestic
+     * config means the same picture.
+     *
+     * Neutral is 0, not the midpoint. WDR strength is one-sided -- 0 is no
+     * contribution, and there is nothing below it to be between -- so 128 is
+     * half on, not "leave it alone". It was 128 because raptor once published
+     * every knob on an abstract 0..255 and spent the centre of it on auto;
+     * ec571b7 retired both, and this row kept the number anyway.
      *
      * The enable bit is NOT forced. majestic sets it on every write; this does
      * not, because a tuner that shipped WDR disabled was saying this sensor
@@ -435,7 +456,7 @@ static i6c_iq_param_t g_iq[IQ_PARAM_COUNT] = {
      * says so rather than leaving it a mystery.
      */
     [IQ_DRC] = {"drc", "MI_ISP_IQ_GetWdr", "MI_ISP_IQ_SetWdr", I6C_ISP_IQ_WDR_PAYLOAD,
-                I6C_ISP_IQ_WDR_MANUAL + I6C_ISP_IQ_WDR_STRENGTH, 1, 1, IQ_AUTOMAN, 255, 128, 0,
+                I6C_ISP_IQ_WDR_MANUAL + I6C_ISP_IQ_WDR_STRENGTH, 1, 1, IQ_AUTOMAN, 255, 0, 0,
                 false, NULL, NULL, 0, false, false, false},
     [IQ_GRAY] = {"gray", "MI_ISP_IQ_GetColorToGray", "MI_ISP_IQ_SetColorToGray",
                  I6C_ISP_IQ_GRAY_PAYLOAD, 0, 4, 1, IQ_BOOL, 1, 0, 0, false, NULL, NULL, 0, false,

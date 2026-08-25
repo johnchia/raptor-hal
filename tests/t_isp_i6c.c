@@ -1214,6 +1214,52 @@ static void test_temper_is_not_published(void)
           "defog_strength still publishes caps");
 }
 
+/*
+ * The neutral a client centres its control on, which is not the same question
+ * as the range.
+ *
+ * Two shapes of knob live in this table. Brightness and contrast are two-sided
+ * -- MI's u32Lev runs 0..100 and 50 really is the value that changes nothing --
+ * so their neutral is the midpoint. DRC and defog are one-sided effect
+ * strengths: 0 is no contribution and there is nothing beneath it, so the
+ * midpoint is half on rather than off.
+ *
+ * Both carried 128 until this test existed, which was the centre of the
+ * abstract 0..255 scale every knob was published on before ec571b7. The scale
+ * went; the number stayed. A console centring a slider on the published neutral
+ * therefore opened DRC at half strength, and reported a defog module the tuning
+ * had switched off as sitting at 128 -- see rvd_ctrl.c, which substitutes the
+ * neutral as the reported value for any knob in auto.
+ */
+static void test_a_one_sided_strength_is_neutral_at_its_floor(void)
+{
+    rss_hal_ctx_t ctx;
+    infinity6c_state_t st;
+    rss_isp_knob_t caps;
+    void *c = &ctx;
+
+    reset(&st);
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.platform = &st;
+
+    CHECK(hal_isp_get_knob_caps(c, "drc_strength", &caps) == RSS_OK, "drc_strength has caps");
+    CHECK(caps.min == 0 && caps.max == 255, "drc spans WDR's own u8Strength, got %d..%d",
+          caps.min, caps.max);
+    CHECK(caps.neutral == 0, "drc's neutral is off, not the midpoint, got %d", caps.neutral);
+
+    CHECK(hal_isp_get_knob_caps(c, "defog_strength", &caps) == RSS_OK, "defog_strength has caps");
+    CHECK(caps.neutral == 0, "defog's neutral is off, not the midpoint, got %d", caps.neutral);
+
+    /* And the two-sided knobs keep theirs, so this is a distinction rather
+     * than a rule that every neutral is the floor. */
+    CHECK(hal_isp_get_knob_caps(c, "brightness", &caps) == RSS_OK, "brightness has caps");
+    CHECK(caps.neutral == 50 && caps.min == 0 && caps.max == 100,
+          "brightness stays 0..100 neutral 50, got %d..%d neutral %d", caps.min, caps.max,
+          caps.neutral);
+    CHECK(hal_isp_get_knob_caps(c, "contrast", &caps) == RSS_OK, "contrast has caps");
+    CHECK(caps.neutral == 50, "contrast stays neutral 50, got %d", caps.neutral);
+}
+
 int main(void)
 {
     test_reporting_does_not_cache_the_sensors_answer();
@@ -1245,6 +1291,7 @@ int main(void)
     test_a_drc_write_touches_only_the_level();
     test_the_awb_line_survives_ae_winning_the_race();
     test_temper_is_not_published();
+    test_a_one_sided_strength_is_neutral_at_its_floor();
 
     if (failures) {
         printf("t_isp_i6c: %d failure(s)\n", failures);
