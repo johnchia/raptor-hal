@@ -130,6 +130,8 @@ int hal_isp_set_saturation(void *ctx, int val);
 int hal_isp_get_saturation(void *ctx, int *val);
 int hal_isp_set_drc_strength(void *ctx, int val);
 int hal_isp_get_drc_strength(void *ctx, int *val);
+int hal_isp_set_temper_strength(void *ctx, int val);
+int hal_isp_get_temper_strength(void *ctx, int *val);
 int hal_isp_set_sharpness(void *ctx, int val);
 int hal_isp_get_sharpness(void *ctx, int *val);
 int hal_isp_set_defog(void *ctx, int enable);
@@ -749,10 +751,19 @@ static const rss_hal_ops_t g_ops = {
      * varies across gain in every bin -- which is the same cost saturation was
      * withdrawn for, taken deliberately this time because there is no other way
      * to offer the control at all and majestic has offered it this way for
-     * years. Neutral 128 hands the curve back.
+     * years. Asking for auto by name hands the curve back.
      */
     .isp_set_drc_strength = hal_isp_set_drc_strength,
     .isp_get_drc_strength = hal_isp_get_drc_strength,
+    /*
+     * Temper is NR3D's u8TfStrY, and it pays none of DRC's cost: the value goes
+     * into all sixteen gain entries rather than into stManual, so the module
+     * never leaves auto and the rest of its curve -- MdGain, MdThd and the two
+     * by-luma tables, which is where this tuning's work actually is -- stays in
+     * use. See the IQ_GAINRUN row in hal_isp.c.
+     */
+    .isp_set_temper_strength = hal_isp_set_temper_strength,
+    .isp_get_temper_strength = hal_isp_get_temper_strength,
     /*
      * No isp_{set,get}_sinter_strength: NrLumaAdv's blend weight is already at
      * the tuning's maximum on every sensor here, so the knob had no range to

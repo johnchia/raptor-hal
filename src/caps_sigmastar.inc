@@ -164,19 +164,24 @@ const rss_hal_caps_t g_hal_caps = {
      * and raptor's keys carry Ingenic gain codes, which is not a unit
      * mismatch a HAL can convert away.
      *
-     * has_temper is false for a reason that holds across the family. MI offers two
-     * ways to reach temporal denoise and neither is a knob raptor can honestly
-     * publish. The VPE channel's e3DNRLevel is not a strength at all -- it
-     * picks the 3DNR reference frame's bit depth, and six of its eight values
-     * mean "engine off"; worse, that engine is what mirror and flip run on
-     * here, so its off position can stall the ISP outright. The tuning's NR3D
-     * module does have a strength, but reaching it means setting enOpType to
-     * manual and discarding the sixteen-entry gain-indexed curve the tuning
-     * spent its effort on -- the same trade that already keeps brightness,
-     * contrast, saturation and sharpness unpublished on this SoC.
+     * has_temper is false here, and no longer for a reason that holds across the
+     * family -- Infinity6C publishes it, see that block below.
      *
-     * So temporal denoise belongs to the tuning binary here. The channel
-     * level is fixed at STAR_VPE_NR3D_LEVEL and nothing moves it at runtime.
+     * The VPE channel's e3DNRLevel is not a strength at all and never will be:
+     * it picks the 3DNR reference frame's bit depth, six of its eight values
+     * mean "engine off", and that engine is what mirror and flip run on here, so
+     * its off position can stall the ISP outright. The level is fixed at
+     * STAR_VPE_NR3D_LEVEL and nothing moves it at runtime.
+     *
+     * The tuning's NR3D module does have a strength, u8TfStrY, and the objection
+     * to it was that reaching it meant setting enOpType to manual and discarding
+     * the sixteen-entry gain curve. That objection is answered on 6C by writing
+     * the field into the sixteen entries instead, which leaves the module in
+     * auto -- and the same thing should work here. It has not been done: this
+     * family's NR3D is a different layout (1776 bytes against 1912, a 104-byte
+     * parameter block against 112) and none of it has been verified against a 6E
+     * tuning yet. So this stays false until it is measured, not because it
+     * cannot be done.
      */
     .has_sinter = false,
     .has_drc = true,
@@ -413,14 +418,17 @@ const rss_hal_caps_t g_hal_caps = {
     .has_sinter = false,
     .has_drc = true,
     /*
-     * has_temper is false for the reason Infinity6E's block above gives, which
-     * turns out to be a family property rather than one SoC's: the VPE channel's
-     * e3DNRLevel picks the 3DNR reference frame's bit depth rather than a
-     * strength, and the tuning's NR3D module has a strength only at the price of
-     * its gain-indexed curve. The channel level is fixed at the seed hal_common
-     * sets, which the flip predicates need to be non-zero.
+     * has_temper is true here and false on Infinity6E, and the difference is the
+     * shape rather than the silicon. Both families' channel-level route is still
+     * useless -- e3DNRLevel picks the 3DNR reference frame's bit depth, not a
+     * strength, and the level stays fixed at the seed hal_common sets because
+     * the flip predicates need it non-zero. What this SoC's backend gained is a
+     * way to reach the tuning's own NR3D strength, u8TfStrY, without paying for
+     * it: IQ_GAINRUN writes the field into all sixteen gain entries and leaves
+     * enOpType in auto, so the module's curve is still the one MI interpolates.
+     * The same thing is possible on 6E and has not been done there yet.
      */
-    .has_temper = false,
+    .has_temper = true,
     .has_ae_comp = true,
     .max_sensors = 1,
 

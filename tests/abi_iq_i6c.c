@@ -72,9 +72,40 @@
                        sizeof(param),                                                              \
                    #row ": the strength run reaches past the end of " #param);
 
+/*
+ * A gain row: the value is one field written into every stAuto entry, so the
+ * three numbers that have to hold are where the entry array starts, how long an
+ * entry is, and where the field sits inside one.
+ *
+ * The stride is the one worth spelling out, because getting it wrong fails in a
+ * way no picture makes obvious. A vector row that miscounts writes into a
+ * neighbouring field of the same block; a gain row that miscounts writes into a
+ * different field of a *different gain's* entry, so the module misbehaves at one
+ * exposure and is correct at the next. AUTO_NUM is asserted against the vendor's
+ * own MI_ISP_AUTO_NUM rather than against 16, so a header drop that changed the
+ * number of entries is a build failure and not a partly-written run.
+ */
+#define IQ_GAINRUN_AT(row, type, param, field, elem, fieldoff)                                     \
+    IQ_FITS(row, type)                                                                             \
+    _Static_assert(I6C_ISP_##row##_AUTO == offsetof(type, stAuto),                                 \
+                   #row ": the entry array does not start at offsetof(" #type ", stAuto)");        \
+    _Static_assert(I6C_ISP_##row##_ENTRY == sizeof(param),                                         \
+                   #row ": the stride is not sizeof(" #param ") -- a write lands in another "      \
+                        "gain's entry");                                                           \
+    _Static_assert((fieldoff) == offsetof(param, field),                                           \
+                   #row ": the field is not at offsetof(" #param ", " #field ")");                 \
+    _Static_assert(sizeof(elem) == sizeof(((param *)0)->field),                                    \
+                   #row ": the table's field width is not " #field "'s");                          \
+    _Static_assert(I6C_ISP_##row##_AUTO_NUM == MI_ISP_AUTO_NUM,                                    \
+                   #row ": the run is not one element per auto entry");                            \
+    _Static_assert(I6C_ISP_##row##_AUTO + MI_ISP_AUTO_NUM * sizeof(param) ==                       \
+                       offsetof(type, stManual),                                                   \
+                   #row ": the entry array does not end where stManual begins");
+
 I6C_ISP_IQ_AUTOMAN_ROWS(IQ_MANUAL_AT)
 I6C_ISP_IQ_FLAT_ROWS(IQ_FITS)
 I6C_ISP_IQ_VECTOR_ROWS(IQ_VECTOR_AT)
+I6C_ISP_IQ_GAINRUN_ROWS(IQ_GAINRUN_AT)
 
 /*
  * Sharpness's run is six fields where the vendor declares two arrays of three,
@@ -111,17 +142,15 @@ _Static_assert(sizeof(MI_ISP_IQ_SaturationParam_t) == 24,
                "SAT_LUT_X_NUM 5 and SAT_LUT_Y_NUM 6, plus the strength and coring bytes");
 
 /*
- * The one module the table still omits. If a future header drop shrinks it to
- * Infinity6E's size, that is a fact worth learning from a build failure rather
- * than from a picture: it would mean the families had converged and a level
- * could be driven the same way on both.
+ * NR3D was the one module the table omitted, and is now a gain row above. The
+ * assertion that used to stand here said only that its layout was not
+ * Infinity6E's 1776 bytes; IQ_GAINRUN_AT says considerably more than that, so
+ * the weaker check is gone rather than kept alongside.
  *
- * Sharpness was the other one and no longer is -- it is a vector row above. It
- * is still not Infinity6E's 1268-byte layout and the check that says so is now
- * IQ_FITS's, against 6264.
+ * The two families have still not converged: 1912 here against 1776 there, from
+ * a 112-byte parameter block against a 104-byte one. That is why has_temper is
+ * true on this SoC and false on 6E -- see src/caps_sigmastar.inc.
  */
-_Static_assert(sizeof(MI_ISP_IQ_Nr3dType_t) != 1776,
-               "3DNR matches Infinity6E's layout -- it may now belong in the table");
 
 /*
  * The ISP channel parameters, which are where Infinity6C's flip, rotation and

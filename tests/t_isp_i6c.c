@@ -185,6 +185,36 @@ static int fake_set_defog(unsigned int device, unsigned int channel, void *paylo
     return 0;
 }
 
+/*
+ * NR3D, the one module raptor writes into stAuto rather than stManual. Its
+ * payload is the biggest of the three at 1912 bytes, sixteen 112-byte entries
+ * behind the two-word header.
+ */
+static uint8_t g_nr3d[I6C_ISP_IQ_NR3D_PAYLOAD];
+static int g_nr3d_sets;
+
+static int fake_get_nr3d(unsigned int device, unsigned int channel, void *payload)
+{
+    (void)device;
+    (void)channel;
+    memcpy(payload, g_nr3d, sizeof(g_nr3d));
+    return 0;
+}
+
+static int fake_set_nr3d(unsigned int device, unsigned int channel, void *payload)
+{
+    (void)device;
+    (void)channel;
+    g_nr3d_sets++;
+    memcpy(g_nr3d, payload, sizeof(g_nr3d));
+    return 0;
+}
+
+/* u16MdGain, the field four bytes into a parameter block. Stands in here for
+ * everything the knob must not touch: it is the one that actually ramps with
+ * gain in a shipped tuning. */
+#define NR3D_MDGAIN 4
+
 /* g_iq is file-static and outlives a test, so each one puts its rows back. */
 static void reset_row(int idx, i6c_isp_cmd_fn get, i6c_isp_cmd_fn set)
 {
@@ -202,6 +232,7 @@ static void reset_row(int idx, i6c_isp_cmd_fn get, i6c_isp_cmd_fn set)
     p->tuning_stale = true;
     p->tuned_on = false;
     p->tuned_on_valid = false;
+    p->overridden = false;
     memset(p->base, 0, sizeof(p->base));
 }
 
@@ -223,6 +254,38 @@ static uint32_t run_at(const uint8_t *store, unsigned int off, uint8_t width, un
     return i6c_iq_read(store, off + i * width, width);
 }
 
+/*
+ * The same for a gain run, where the stride is the parameter block rather than
+ * the field width. The neighbour argument seeds one field of every entry with a
+ * value that varies by entry, which is what a real curve looks like and what
+ * makes a stray write visible.
+ */
+static void seed_gain_run(uint8_t *store, unsigned int off, unsigned int stride, uint8_t width,
+                          const uint16_t *vals, unsigned int count, unsigned int neighbour_off,
+                          uint32_t optype)
+{
+    unsigned int i;
+
+    memset(store, 0, I6C_ISP_IQ_NR3D_PAYLOAD);
+    i6c_iq_write(store, I6C_ISP_ENABLE_OFF, 4, 1);
+    i6c_iq_write(store, I6C_ISP_OPTYPE_OFF, 4, optype);
+    for (i = 0; i < count; i++) {
+        i6c_iq_write(store, off + i * stride, width, vals[i]);
+        i6c_iq_write(store, I6C_ISP_IQ_NR3D_AUTO + i * stride + neighbour_off, 2,
+                     (uint32_t)(100 + i * 50));
+    }
+}
+
+static uint32_t gain_at(const uint8_t *store, unsigned int off, uint8_t width, unsigned int i)
+{
+    return i6c_iq_read(store, off + i * I6C_ISP_IQ_NR3D_ENTRY, width);
+}
+
+static uint32_t neighbour_at(const uint8_t *store, unsigned int i)
+{
+    return i6c_iq_read(store, I6C_ISP_IQ_NR3D_AUTO + i * I6C_ISP_IQ_NR3D_ENTRY + NR3D_MDGAIN, 2);
+}
+
 static void reset(infinity6c_state_t *st)
 {
     memset(st, 0, sizeof(*st));
@@ -237,6 +300,10 @@ static void reset(infinity6c_state_t *st)
     memset(g_wdr, 0, sizeof(g_wdr));
     g_wdr_sets = 0;
     g_wdr_get_ret = g_wdr_set_ret = 0;
+
+    reset_row(IQ_NR3D, fake_get_nr3d, fake_set_nr3d);
+    memset(g_nr3d, 0, sizeof(g_nr3d));
+    g_nr3d_sets = 0;
 
     reset_row(IQ_DEFOG, fake_get_defog, fake_set_defog);
     reset_row(IQ_DEFOG_EN, fake_get_defog, fake_set_defog);
@@ -1195,7 +1262,7 @@ static void test_the_awb_line_survives_ae_winning_the_race(void)
  * rotate predicates on 3DNR being on, so the seed has to reach the channel.
  * That path is hal_framesource's, not a knob's.
  */
-static void test_temper_is_not_published(void)
+static void test_sinter_is_not_published(void)
 {
     rss_hal_ctx_t ctx;
     infinity6c_state_t st;
@@ -1206,12 +1273,164 @@ static void test_temper_is_not_published(void)
     memset(&ctx, 0, sizeof(ctx));
     ctx.platform = &st;
 
-    CHECK(hal_isp_get_knob_caps(c, "temper", &caps) == RSS_ERR_NOTSUP,
-          "temper must not publish caps");
+    /*
+     * Spatial luma denoise stays unpublished: NrLumaAdv's only field is a blend
+     * weight the shipped tunings already run at maximum, so the knob's whole
+     * usable range would be its own default. Temper used to be here for a
+     * different reason and no longer is -- see below.
+     */
+    CHECK(hal_isp_get_knob_caps(c, "sinter", &caps) == RSS_ERR_NOTSUP,
+          "sinter must not publish caps");
 
     /* The knobs that remain still do, so the lookup itself is not just broken. */
     CHECK(hal_isp_get_knob_caps(c, "defog_strength", &caps) == RSS_OK,
           "defog_strength still publishes caps");
+}
+
+/* imx335's own TfStrY, flat across the ladder, as every 6C tuning ships it. */
+static const uint16_t g_tuned_tf[16] = {63, 63, 63, 63, 63, 63, 63, 63,
+                                        63, 63, 63, 63, 63, 63, 63, 63};
+
+static void arm_nr3d(rss_hal_ctx_t *ctx, infinity6c_state_t *st, uint32_t optype)
+{
+    arm(ctx, st);
+    seed_gain_run(g_nr3d, I6C_ISP_IQ_NR3D_AUTO + I6C_ISP_IQ_NR3D_TFSTRY, I6C_ISP_IQ_NR3D_ENTRY, 1,
+                  g_tuned_tf, I6C_ISP_IQ_NR3D_AUTO_NUM, NR3D_MDGAIN, optype);
+}
+
+/*
+ * The property the whole shape exists for.
+ *
+ * MI interpolates stAuto by gain, so a knob that wrote one entry would be a knob
+ * that worked at one exposure. All sixteen carry the value, and enOpType is
+ * still auto afterwards -- which is what keeps MI interpolating at all.
+ */
+static void test_temper_writes_every_gain_entry_and_stays_in_auto(void)
+{
+    unsigned int off = I6C_ISP_IQ_NR3D_AUTO + I6C_ISP_IQ_NR3D_TFSTRY;
+    rss_hal_ctx_t ctx;
+    infinity6c_state_t st;
+    unsigned int i;
+
+    arm_nr3d(&ctx, &st, I6C_ISP_OP_AUTO);
+
+    CHECK(hal_isp_set_temper_strength(&ctx, 90) == RSS_OK, "temper 90 must take");
+    for (i = 0; i < I6C_ISP_IQ_NR3D_AUTO_NUM; i++)
+        CHECK(gain_at(g_nr3d, off, 1, i) == 90, "entry %u must carry 90, got %u", i,
+              gain_at(g_nr3d, off, 1, i));
+
+    CHECK(i6c_iq_read(g_nr3d, I6C_ISP_OPTYPE_OFF, 4) == I6C_ISP_OP_AUTO,
+          "the module must still be in auto -- going manual is what this shape avoids");
+
+    /* Both ends of the published range, since the vendor's advice stops at 64
+     * and raptor deliberately publishes past it. */
+    CHECK(hal_isp_set_temper_strength(&ctx, 0) == RSS_OK, "temper 0 must take");
+    CHECK(gain_at(g_nr3d, off, 1, 7) == 0, "temper 0 is TfStrY 0");
+    CHECK(hal_isp_set_temper_strength(&ctx, 127) == RSS_OK, "temper 127 must take");
+    CHECK(gain_at(g_nr3d, off, 1, 7) == 127, "temper 127 is TfStrY 127");
+    CHECK(hal_isp_set_temper_strength(&ctx, 128) == RSS_ERR_INVAL, "past the field is refused");
+    CHECK(hal_isp_set_temper_strength(&ctx, -1) == RSS_ERR_INVAL, "below the field is refused");
+}
+
+/*
+ * And the thing it is worth paying sixteen writes for: everything else in the
+ * entry is the tuner's, and stays the tuner's.
+ *
+ * MdGain stands in for the rest here because it is the field that actually
+ * ramps -- 125 to 900 across the ladder on the shipped imx335 bin. A stride
+ * error would land the strength inside one of these instead, and this is what
+ * catches it: the failure is not a wrong TfStrY but an intact one next to a
+ * corrupted curve.
+ */
+static void test_temper_leaves_the_rest_of_the_gain_curve_alone(void)
+{
+    rss_hal_ctx_t ctx;
+    infinity6c_state_t st;
+    unsigned int i;
+
+    arm_nr3d(&ctx, &st, I6C_ISP_OP_AUTO);
+
+    CHECK(hal_isp_set_temper_strength(&ctx, 20) == RSS_OK, "temper 20 must take");
+    for (i = 0; i < I6C_ISP_IQ_NR3D_AUTO_NUM; i++)
+        CHECK(neighbour_at(g_nr3d, i) == 100 + i * 50,
+              "entry %u's curve must be untouched: want %u, got %u", i, 100 + i * 50,
+              neighbour_at(g_nr3d, i));
+}
+
+/*
+ * Auto is a restore here, not a mode change, and that is the one way this shape
+ * is harder than the others. Every other row hands a module back by setting
+ * enOpType and leaving stManual stale; this one has overwritten the only copy of
+ * the tuning's numbers, so auto has to put them back from the baseline.
+ */
+static void test_temper_auto_puts_the_tunings_entries_back(void)
+{
+    unsigned int off = I6C_ISP_IQ_NR3D_AUTO + I6C_ISP_IQ_NR3D_TFSTRY;
+    rss_hal_ctx_t ctx;
+    infinity6c_state_t st;
+    unsigned int i;
+    int val;
+
+    arm_nr3d(&ctx, &st, I6C_ISP_OP_AUTO);
+
+    CHECK(hal_isp_set_temper_strength(&ctx, 110) == RSS_OK, "temper 110 must take");
+    CHECK(hal_isp_get_temper_strength(&ctx, &val) == RSS_OK && val == 110,
+          "a written knob reads back its value, got %d", val);
+
+    CHECK(hal_isp_set_temper_strength(&ctx, RSS_ISP_AUTO) == RSS_OK, "auto must take");
+    for (i = 0; i < I6C_ISP_IQ_NR3D_AUTO_NUM; i++)
+        CHECK(gain_at(g_nr3d, off, 1, i) == g_tuned_tf[i],
+              "entry %u must be back to the tuning's %u, got %u", i, g_tuned_tf[i],
+              gain_at(g_nr3d, off, 1, i));
+
+    /*
+     * And it reads as auto afterwards. enOpType cannot answer that for this
+     * shape -- it never left auto -- so the row's own flag is what does, and a
+     * caller must not be able to tell the difference.
+     */
+    CHECK(hal_isp_get_temper_strength(&ctx, &val) == RSS_OK && val == RSS_ISP_AUTO,
+          "a restored knob reads back as auto, got %d", val);
+}
+
+/*
+ * The neutral is the tuning's, because no constant is right for every sensor.
+ * 64 is the vendor's 1x and is only the fallback for a board with no tuning
+ * file at all.
+ */
+static void test_temper_caps_come_from_the_tuning(void)
+{
+    rss_hal_ctx_t ctx;
+    infinity6c_state_t st;
+    rss_isp_knob_t caps;
+    void *c = &ctx;
+
+    arm_nr3d(&ctx, &st, I6C_ISP_OP_AUTO);
+
+    CHECK(hal_isp_get_knob_caps(c, "temper", &caps) == RSS_OK, "temper publishes caps now");
+    CHECK(caps.min == 0 && caps.max == 127, "the full field, got %d..%d", caps.min, caps.max);
+    CHECK(caps.neutral == 63, "the neutral is this tuning's own TfStrY, got %d", caps.neutral);
+    CHECK(caps.has_auto, "auto is askable -- it restores the tuning's entries");
+    CHECK(caps.enabled, "the seeded module is enabled");
+}
+
+/*
+ * A tuning that ships NR3D in manual is reading stManual, so the entries this
+ * writes are not the ones in use. Said rather than corrected: forcing auto would
+ * overrule a tuning decision on the strength of a knob nobody has to set.
+ */
+static void test_temper_says_so_when_the_tuning_is_in_manual(void)
+{
+    rss_hal_ctx_t ctx;
+    infinity6c_state_t st;
+
+    arm_nr3d(&ctx, &st, I6C_ISP_OP_MANUAL);
+    g_log_len = 0;
+    g_log[0] = 0;
+
+    CHECK(hal_isp_set_temper_strength(&ctx, 70) == RSS_OK, "the write still goes in");
+    CHECK(strstr(g_log, "in manual") != NULL, "it must say the entries are not the ones in use");
+    CHECK(i6c_iq_read(g_nr3d, I6C_ISP_OPTYPE_OFF, 4) == I6C_ISP_OP_MANUAL,
+          "and must not have moved the module to auto behind the tuner");
 }
 
 /*
@@ -1290,7 +1509,12 @@ int main(void)
     test_defog_strength_leaves_defogs_own_switch_alone();
     test_a_drc_write_touches_only_the_level();
     test_the_awb_line_survives_ae_winning_the_race();
-    test_temper_is_not_published();
+    test_sinter_is_not_published();
+    test_temper_writes_every_gain_entry_and_stays_in_auto();
+    test_temper_leaves_the_rest_of_the_gain_curve_alone();
+    test_temper_auto_puts_the_tunings_entries_back();
+    test_temper_caps_come_from_the_tuning();
+    test_temper_says_so_when_the_tuning_is_in_manual();
     test_a_one_sided_strength_is_neutral_at_its_floor();
 
     if (failures) {

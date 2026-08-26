@@ -73,6 +73,12 @@
  * tuning is a handful of gains, not the module.
  */
 #define I6C_IQ_VECTOR_MAX 6
+/*
+ * A gain run is one field across MI's sixteen auto entries, so it is longer than
+ * any vector run and base[] has to hold whichever is bigger.
+ */
+#define I6C_IQ_GAINRUN_MAX 16
+#define I6C_IQ_RUN_MAX     I6C_IQ_GAINRUN_MAX
 
 /*
  * MI's flicker enum, which is not raptor's. MI orders 60Hz before 50Hz and
@@ -266,12 +272,17 @@ typedef enum {
     IQ_FLAT,    /* the value is the whole payload, at offset 0 */
     IQ_BOOL,    /* bEnable at offset 0 is itself the value */
     IQ_AUTOMAN, /* bEnable, enOpType, stAuto[16], stManual at manual_off */
-    IQ_VECTOR   /* as IQ_AUTOMAN, but the value is a run of `count` fields */
+    IQ_VECTOR,  /* as IQ_AUTOMAN, but the value is a run of `count` fields */
+    IQ_GAINRUN  /* the run is one field across stAuto[16]; enOpType stays auto */
 } i6c_iq_shape_t;
 
-/* The two shapes that carry enOpType, so that neutral can hand the module back
- * to the tuning rather than pinning it to the tuning's own numbers. */
-#define I6C_IQ_HAS_AUTO(p) ((p)->shape == IQ_AUTOMAN || (p)->shape == IQ_VECTOR)
+/* The three shapes that carry enOpType, so that neutral can hand the module back
+ * to the tuning rather than pinning it to the tuning's own numbers. IQ_GAINRUN
+ * is in the list for the switch and the caps, not for the getter: it never
+ * leaves auto, so enOpType cannot be what tells a caller it is in auto. See
+ * i6c_iq_get_scalar. */
+#define I6C_IQ_HAS_AUTO(p)                                                                         \
+    ((p)->shape == IQ_AUTOMAN || (p)->shape == IQ_VECTOR || (p)->shape == IQ_GAINRUN)
 
 typedef struct {
     const char *name; /* for diagnostics only */
@@ -280,7 +291,14 @@ typedef struct {
     uint16_t payload;    /* the wrapper's own declared payload length */
     uint16_t manual_off; /* where the value lives (0 for FLAT and BOOL) */
     uint8_t width;       /* 1, 2 or 4 bytes */
-    uint8_t count;       /* fields in the run: 1 for everything but IQ_VECTOR */
+    uint8_t count;       /* elements in the run: 1 for a single-field row */
+    /*
+     * Bytes between elements of the run. Equal to width where the run is
+     * adjacent fields, which is every vector row; for a gain run it is the
+     * parameter block, because successive elements are the same field in
+     * successive stAuto entries.
+     */
+    uint16_t stride;
     uint8_t shape;       /* i6c_iq_shape_t */
     int32_t mi_max;      /* MI's maximum for the field */
     int32_t mi_unity;    /* the field's neutral: the value that leaves the picture alone */
@@ -326,13 +344,24 @@ typedef struct {
      * once, with no way back short of a tuning reload.
      */
     bool base_valid;
-    uint16_t base[I6C_IQ_VECTOR_MAX];
+    uint16_t base[I6C_IQ_RUN_MAX];
 
     /*
      * Which field of the run the getter reports from; chosen with the baseline
      * rather than fixed at 0. See i6c_iq_pick_report_field.
      */
     uint8_t report;
+
+    /*
+     * IQ_GAINRUN only: whether raptor has written over the tuning's entries.
+     *
+     * Every other shape answers "am I in auto?" by reading enOpType. A gain run
+     * never touches it -- staying in auto is the whole point -- so the flag is
+     * the only thing that can tell a value of raptor's from the tuning's own.
+     * Cleared by a tuning load along with tuning_stale, because the load puts
+     * the tuner's numbers back underneath us.
+     */
+    bool overridden;
 } i6c_iq_param_t;
 
 enum {
@@ -344,6 +373,7 @@ enum {
     IQ_DEFOG_EN,
     IQ_DRC,
     IQ_GRAY,
+    IQ_NR3D,
     AE_EVCOMP,
     AE_FLICKER,
     IQ_PARAM_COUNT
@@ -387,13 +417,13 @@ enum {
  */
 static i6c_iq_param_t g_iq[IQ_PARAM_COUNT] = {
     [IQ_BRIGHTNESS] = {"brightness", "MI_ISP_IQ_GetBrightness", "MI_ISP_IQ_SetBrightness",
-                       I6C_ISP_IQ_BRIGHTNESS_PAYLOAD, I6C_ISP_IQ_BRIGHTNESS_MANUAL, 4, 1,
+                       I6C_ISP_IQ_BRIGHTNESS_PAYLOAD, I6C_ISP_IQ_BRIGHTNESS_MANUAL, 4, 1, 4,
                        IQ_AUTOMAN, 100, 50, 0, false, NULL, NULL, 0, false, false, false},
     [IQ_CONTRAST] = {"contrast", "MI_ISP_IQ_GetContrast", "MI_ISP_IQ_SetContrast",
-                     I6C_ISP_IQ_CONTRAST_PAYLOAD, I6C_ISP_IQ_CONTRAST_MANUAL, 4, 1, IQ_AUTOMAN, 100,
-                     50, 0, false, NULL, NULL, 0, false, false, false},
+                     I6C_ISP_IQ_CONTRAST_PAYLOAD, I6C_ISP_IQ_CONTRAST_MANUAL, 4, 1, 4,
+                     IQ_AUTOMAN, 100, 50, 0, false, NULL, NULL, 0, false, false, false},
     [IQ_SATURATION] = {"saturation", "MI_ISP_IQ_GetSaturation", "MI_ISP_IQ_SetSaturation",
-                       I6C_ISP_IQ_SATURATION_PAYLOAD, I6C_ISP_IQ_SATURATION_MANUAL, 1, 1,
+                       I6C_ISP_IQ_SATURATION_PAYLOAD, I6C_ISP_IQ_SATURATION_MANUAL, 1, 1, 1,
                        IQ_AUTOMAN, 127, 32, 0, false, NULL, NULL, 0, false, false, false},
     /*
      * Sharpness, and the reason this file grew a vector shape.
@@ -410,7 +440,7 @@ static i6c_iq_param_t g_iq[IQ_PARAM_COUNT] = {
     [IQ_SHARPNESS] = {"sharpness", "MI_ISP_IQ_GetSharpness", "MI_ISP_IQ_SetSharpness",
                       I6C_ISP_IQ_SHARPNESS_PAYLOAD,
                       I6C_ISP_IQ_SHARPNESS_MANUAL + I6C_ISP_IQ_SHARPNESS_STRENGTH, 1,
-                      I6C_ISP_IQ_SHARPNESS_STRENGTH_NUM, IQ_VECTOR,
+                      I6C_ISP_IQ_SHARPNESS_STRENGTH_NUM, 1, IQ_VECTOR,
                       I6C_ISP_IQ_SHARPNESS_STRENGTH_MAX, 63, 0, true, NULL, NULL, 0, false, false,
                       false},
     /*
@@ -429,11 +459,11 @@ static i6c_iq_param_t g_iq[IQ_PARAM_COUNT] = {
      * 255, which is inferred from the field width rather than stated.
      */
     [IQ_DEFOG] = {"defog", "MI_ISP_IQ_GetDefog", "MI_ISP_IQ_SetDefog", I6C_ISP_IQ_DEFOG_PAYLOAD,
-                  I6C_ISP_IQ_DEFOG_MANUAL, 1, 1, IQ_AUTOMAN, 255, 0, 0, false, NULL, NULL, 0,
+                  I6C_ISP_IQ_DEFOG_MANUAL, 1, 1, 1, IQ_AUTOMAN, 255, 0, 0, false, NULL, NULL, 0,
                   false, false, false},
     [IQ_DEFOG_EN] = {"defog enable", "MI_ISP_IQ_GetDefog", "MI_ISP_IQ_SetDefog",
-                     I6C_ISP_IQ_DEFOG_PAYLOAD, I6C_ISP_ENABLE_OFF, 4, 1, IQ_BOOL, 1, 0, 0, false,
-                     NULL, NULL, 0, false, false, false},
+                     I6C_ISP_IQ_DEFOG_PAYLOAD, I6C_ISP_ENABLE_OFF, 4, 1, 4, IQ_BOOL, 1, 0, 0,
+                     false, NULL, NULL, 0, false, false, false},
     /*
      * DRC -- MI's WDR module, and the level is one byte of it.
      *
@@ -456,11 +486,49 @@ static i6c_iq_param_t g_iq[IQ_PARAM_COUNT] = {
      * says so rather than leaving it a mystery.
      */
     [IQ_DRC] = {"drc", "MI_ISP_IQ_GetWdr", "MI_ISP_IQ_SetWdr", I6C_ISP_IQ_WDR_PAYLOAD,
-                I6C_ISP_IQ_WDR_MANUAL + I6C_ISP_IQ_WDR_STRENGTH, 1, 1, IQ_AUTOMAN, 255, 0, 0,
+                I6C_ISP_IQ_WDR_MANUAL + I6C_ISP_IQ_WDR_STRENGTH, 1, 1, 1, IQ_AUTOMAN, 255, 0, 0,
                 false, NULL, NULL, 0, false, false, false},
     [IQ_GRAY] = {"gray", "MI_ISP_IQ_GetColorToGray", "MI_ISP_IQ_SetColorToGray",
-                 I6C_ISP_IQ_GRAY_PAYLOAD, 0, 4, 1, IQ_BOOL, 1, 0, 0, false, NULL, NULL, 0, false,
-                 false, false},
+                 I6C_ISP_IQ_GRAY_PAYLOAD, 0, 4, 1, 4, IQ_BOOL, 1, 0, 0, false, NULL, NULL, 0,
+                 false, false, false},
+    /*
+     * NR3D -- raptor's temper knob, and the only row that writes into stAuto.
+     *
+     * u8TfStrY is the temporal denoise strength for luma, and it is the field
+     * that means what temper means. SigmaStar's own tuning SOP: 值域 0 ~ 127，
+     * 值越大 denoise 强度越强, with a warning that above 64 moving objects
+     * smear. isp_api.xml annotates it "64 is x1 gain", so it is a multiplier on
+     * the temporal filter with unity in the middle of the usable half.
+     *
+     * MdGain is the field that ramps with gain and it is *not* this knob. The
+     * SOP calls it a motion scale -- 值越大 motion information 越小，NR3D 越强
+     * -- so it changes how much of the frame the filter is applied to, not how
+     * hard it filters. Both move noise; only one of them is a strength.
+     *
+     * Published on the full 0..127 even though the vendor advises against the
+     * upper half, because the caps say what the field takes and the operator is
+     * entitled to the trade. Whether raptor should also warn past 64 is a
+     * separate question from what the range is.
+     *
+     * IQ_GAINRUN, so the value goes into all sixteen stAuto entries and
+     * enOpType is never touched. Writing stManual would have been one field
+     * instead of sixteen and would have cost the module's whole gain curve: 672
+     * of NR3D's 1488 values vary by gain on the shipped imx335 tuning, and its
+     * manual entry is unpopulated -- MdGain 0, MdThd 9, the by-Y curves
+     * flattened to 64, and a TfLut whose last element is 139 where the SOP says
+     * it must be 0 or moving objects ghost.
+     *
+     * unity_from_tuning, because the neutral is whatever the binary left in the
+     * field rather than a constant this port can know. Every 6C tuning to hand
+     * ships 63 -- just under the documented 1x -- flat across all sixteen
+     * entries, which is what makes one scalar able to stand for the run. The 64
+     * here is the fallback for a board with no tuning file, and it is the
+     * vendor's 1x rather than a midpoint.
+     */
+    [IQ_NR3D] = {"temper", "MI_ISP_IQ_GetNr3d", "MI_ISP_IQ_SetNr3d", I6C_ISP_IQ_NR3D_PAYLOAD,
+                 I6C_ISP_IQ_NR3D_AUTO + I6C_ISP_IQ_NR3D_TFSTRY, 1, I6C_ISP_IQ_NR3D_AUTO_NUM,
+                 I6C_ISP_IQ_NR3D_ENTRY, IQ_GAINRUN, 127, 64, 0, true, NULL, NULL, 0, false, false,
+                 false},
     /*
      * The only row whose neutral has to be learned and the only one whose MI
      * field is signed. It is IQ_FLAT, so there is no auto mode to hand it back
@@ -468,11 +536,11 @@ static i6c_iq_param_t g_iq[IQ_PARAM_COUNT] = {
      * shifts every default image.
      */
     [AE_EVCOMP] = {"ae_comp", "MI_ISP_AE_GetEvComp", "MI_ISP_AE_SetEvComp",
-                   I6C_ISP_AE_EVCOMP_PAYLOAD, 0, 4, 1, IQ_FLAT, I6C_AE_EV_SPAN, 0, -I6C_AE_EV_SPAN,
-                   true, NULL, NULL, 0, false, false, false},
+                   I6C_ISP_AE_EVCOMP_PAYLOAD, 0, 4, 1, 4, IQ_FLAT, I6C_AE_EV_SPAN, 0,
+                   -I6C_AE_EV_SPAN, true, NULL, NULL, 0, false, false, false},
     [AE_FLICKER] = {"antiflicker", "MI_ISP_AE_GetFlicker", "MI_ISP_AE_SetFlicker",
-                    I6C_ISP_AE_FLICKER_PAYLOAD, 0, 4, 1, IQ_FLAT, 3, 0, 0, false, NULL, NULL, 0,
-                    false, false, false},
+                    I6C_ISP_AE_FLICKER_PAYLOAD, 0, 4, 1, 4, IQ_FLAT, 3, 0, 0, false, NULL, NULL,
+                    0, false, false, false},
 };
 
 /* memcpy rather than a cast: the payload is a byte buffer and these offsets
@@ -567,10 +635,10 @@ static int i6c_iq_resolve(infinity6c_state_t *st, i6c_iq_param_t *p)
      * library copy from past the staging buffer on the way out. Checked here
      * rather than asserted, because the test build defines _Static_assert away.
      */
-    if (p->count > I6C_IQ_VECTOR_MAX ||
-        (uint32_t)p->manual_off + (uint32_t)p->count * p->width > p->payload) {
-        HAL_LOG_ERR("isp: %s run of %u x %u at %u does not fit its %u-byte payload", p->name,
-                    p->count, p->width, p->manual_off, p->payload);
+    if (p->count > (p->shape == IQ_GAINRUN ? I6C_IQ_GAINRUN_MAX : I6C_IQ_VECTOR_MAX) ||
+        (uint32_t)p->manual_off + (uint32_t)(p->count - 1) * p->stride + p->width > p->payload) {
+        HAL_LOG_ERR("isp: %s run of %u x %u every %u bytes at %u does not fit its %u-byte payload",
+                    p->name, p->count, p->width, p->stride, p->manual_off, p->payload);
         return RSS_ERR_INVAL;
     }
 
@@ -670,9 +738,9 @@ static void i6c_iq_learn_from_tuning(i6c_iq_param_t *p, const uint8_t *buf)
      * everything above it scales up from nothing -- which is the correct
      * reading of a knob whose baseline is zero, not a failure to find one.
      */
-    if (p->shape == IQ_VECTOR) {
+    if (p->shape == IQ_VECTOR || p->shape == IQ_GAINRUN) {
         for (i = 0; i < p->count; i++) {
-            base = (int32_t)i6c_iq_read(buf, p->manual_off + i * p->width, p->width);
+            base = (int32_t)i6c_iq_read(buf, p->manual_off + i * p->stride, p->width);
             if (base > p->mi_max || base < p->mi_floor) {
                 HAL_LOG_WARN("isp: %s field %u reads MI %d, outside its %d..%d range -- not "
                              "adopting the tuning's run as the neutral, keeping %d throughout",
@@ -687,6 +755,13 @@ static void i6c_iq_learn_from_tuning(i6c_iq_param_t *p, const uint8_t *buf)
 
         p->base_valid = true;
         p->tuning_stale = false;
+        /*
+         * A load has put the tuner's own entries back underneath us, so a gain
+         * run is no longer carrying a value of raptor's. Cleared here rather
+         * than at the load, because this is the point at which the new baseline
+         * is the thing that was read.
+         */
+        p->overridden = false;
         i6c_iq_pick_report_field(p);
         HAL_LOG_INFO("isp: %s baseline from the tuning is MI %u..%u over %u fields in %d..%d, "
                      "reporting from field %u (MI %u)",
@@ -725,7 +800,7 @@ static void i6c_iq_learn_from_tuning(i6c_iq_param_t *p, const uint8_t *buf)
  */
 static int32_t i6c_iq_baseline(const i6c_iq_param_t *p, unsigned int i)
 {
-    if (p->shape != IQ_VECTOR || !p->base_valid)
+    if ((p->shape != IQ_VECTOR && p->shape != IQ_GAINRUN) || !p->base_valid)
         return p->mi_unity;
 
     return p->base[i];
@@ -977,7 +1052,7 @@ static int i6c_iq_apply_vector(infinity6c_state_t *st, int idx, int val)
     for (i = 0; i < p->count; i++) {
         int32_t mi_val = i6c_iq_reband(val, pivot, i6c_iq_baseline(p, i), p->mi_floor, p->mi_max);
 
-        i6c_iq_write(buf, p->manual_off + i * p->width, p->width, (uint32_t)mi_val);
+        i6c_iq_write(buf, p->manual_off + i * p->stride, p->width, (uint32_t)mi_val);
     }
 
     ret = i6c_iq_store(st, idx, buf);
@@ -987,6 +1062,92 @@ static int i6c_iq_apply_vector(infinity6c_state_t *st, int idx, int val)
             i6c_iq_reband(val, pivot, i6c_iq_baseline(p, 0), p->mi_floor, p->mi_max),
             i6c_iq_reband(val, pivot, i6c_iq_baseline(p, p->count - 1), p->mi_floor, p->mi_max),
             p->mi_floor, p->mi_max);
+
+    return ret;
+}
+
+/*
+ * Apply a knob whose run is one field across MI's sixteen gain entries.
+ *
+ * The difference from every other shape here is what it does not do: enOpType
+ * is never written, so the module stays in auto and MI goes on interpolating
+ * stAuto by gain. What changes is the value it interpolates *between* -- all
+ * sixteen entries get the same number, so the answer is that number at every
+ * gain, while every other field in the module keeps the curve the tuner gave it.
+ *
+ * That is the whole reason the shape exists. NR3D's manual entry would have been
+ * one write instead of sixteen, and it would have cost the module: 672 of its
+ * 1488 values vary by gain on the shipped imx335 tuning, and the manual entry
+ * they would have been replaced by is a block the tuner never filled in.
+ *
+ * All sixteen or none. A write that missed an entry would leave one gain step
+ * running the tuner's value and the rest running raptor's, which reads as a knob
+ * that stops working at one exposure and is the least debuggable failure this
+ * could have.
+ */
+static int i6c_iq_apply_gainrun(infinity6c_state_t *st, int idx, int val)
+{
+    i6c_iq_param_t *p = &g_iq[idx];
+    uint8_t buf[I6C_IQ_PAYLOAD_MAX];
+    unsigned int i;
+    int ret;
+
+    /* Which is also what learns the baseline, on the first fetch after a load. */
+    ret = i6c_iq_fetch(st, idx, buf);
+    if (ret != RSS_OK)
+        return ret;
+
+    /*
+     * Auto is a restore rather than a mode change, because the module was never
+     * taken out of auto: the tuning's own sixteen values go back into the
+     * entries this knob overwrote. Every other shape can hand a module back by
+     * setting enOpType and leaving the manual field stale, and this one cannot
+     * -- there is nowhere else the tuning's numbers still are.
+     *
+     * So without a baseline there is nothing to put back, and saying so beats
+     * writing a guess over the entries. A tuning reload is the way out, and it
+     * is also what re-arms the baseline.
+     */
+    if (val == RSS_ISP_AUTO) {
+        if (!p->base_valid) {
+            HAL_LOG_WARN("isp: %s has no baseline read from the tuning, so there is nothing to "
+                         "restore -- reload the tuning file to put its own entries back",
+                         p->name);
+            return RSS_ERR_NOTSUP;
+        }
+        for (i = 0; i < p->count; i++)
+            i6c_iq_write(buf, p->manual_off + i * p->stride, p->width, p->base[i]);
+        i6c_iq_restore_switch(p, buf);
+        ret = i6c_iq_store(st, idx, buf);
+        if (ret == RSS_OK) {
+            p->overridden = false;
+            HAL_LOG_DBG("isp: %s left to the tuning file (auto), %u entries restored", p->name,
+                        p->count);
+        }
+        return ret;
+    }
+
+    /*
+     * A tuning that ships the module in manual is reading stManual, so these
+     * entries are not the ones in use and the knob would write and do nothing.
+     * Said rather than corrected: forcing auto here would overrule a tuning
+     * decision on the strength of a knob nobody has to set.
+     */
+    if (i6c_iq_read(buf, I6C_ISP_OPTYPE_OFF, 4) != I6C_ISP_OP_AUTO)
+        HAL_LOG_WARN("isp: %s -- this sensor's tuning has the module in manual, so the per-gain "
+                     "entries this writes are not the ones the ISP is reading",
+                     p->name);
+
+    for (i = 0; i < p->count; i++)
+        i6c_iq_write(buf, p->manual_off + i * p->stride, p->width, (uint32_t)val);
+    i6c_iq_switch_on(p, buf);
+
+    ret = i6c_iq_store(st, idx, buf);
+    if (ret == RSS_OK) {
+        p->overridden = true;
+        HAL_LOG_DBG("isp: %s = %d across %u gain entries (in %d..%d)", p->name, val, p->count,
+                    p->mi_floor, p->mi_max);
+    }
 
     return ret;
 }
@@ -1024,6 +1185,8 @@ static int i6c_iq_apply(infinity6c_state_t *st, int idx, int val, bool raw)
         return i6c_iq_apply_raw(st, idx, (uint32_t)val);
     if (g_iq[idx].shape == IQ_VECTOR)
         return i6c_iq_apply_vector(st, idx, val);
+    if (g_iq[idx].shape == IQ_GAINRUN)
+        return i6c_iq_apply_gainrun(st, idx, val);
 
     return i6c_iq_apply_scalar(st, idx, val);
 }
@@ -1118,7 +1281,18 @@ static int i6c_iq_get_scalar(void *ctx, int idx, int *val)
      * use. This used to answer with the neutral 128, which was the same claim
      * made in a way the caller could not distinguish from a real setting.
      */
-    if (I6C_IQ_HAS_AUTO(p) && i6c_iq_read(buf, I6C_ISP_OPTYPE_OFF, 4) == I6C_ISP_OP_AUTO) {
+    if (I6C_IQ_HAS_AUTO(p) && p->shape != IQ_GAINRUN &&
+        i6c_iq_read(buf, I6C_ISP_OPTYPE_OFF, 4) == I6C_ISP_OP_AUTO) {
+        *val = RSS_ISP_AUTO;
+        return RSS_OK;
+    }
+
+    /*
+     * A gain run is always in auto -- that is the point of the shape -- so
+     * enOpType cannot answer this. What distinguishes the two cases is whether
+     * raptor has written over the tuning's entries, which only the row knows.
+     */
+    if (p->shape == IQ_GAINRUN && !p->overridden) {
         *val = RSS_ISP_AUTO;
         return RSS_OK;
     }
@@ -1133,7 +1307,7 @@ static int i6c_iq_get_scalar(void *ctx, int idx, int *val)
      * field's own scale, so this is the same number the setter was given. The
      * sign extension is for ae_comp, the one row whose MI field is signed.
      */
-    *val = i6c_iq_sign_extend(i6c_iq_read(buf, p->manual_off + p->report * p->width, p->width),
+    *val = i6c_iq_sign_extend(i6c_iq_read(buf, p->manual_off + p->report * p->stride, p->width),
                               p->width, p->mi_floor < 0);
     return RSS_OK;
 }
@@ -1257,6 +1431,7 @@ void i6c_isp_forget_knobs(void)
         g_iq[i].fn_get = NULL;
         g_iq[i].fn_set = NULL;
         g_iq[i].tuning_stale = false;
+        g_iq[i].overridden = false;
     }
 }
 
@@ -1367,6 +1542,16 @@ int hal_isp_set_drc_strength(void *ctx, int val)
 int hal_isp_get_drc_strength(void *ctx, int *val)
 {
     return i6c_iq_get_scalar(ctx, IQ_DRC, val);
+}
+
+int hal_isp_set_temper_strength(void *ctx, int val)
+{
+    return i6c_iq_set_scalar(ctx, IQ_NR3D, val);
+}
+
+int hal_isp_get_temper_strength(void *ctx, int *val)
+{
+    return i6c_iq_get_scalar(ctx, IQ_NR3D, val);
 }
 
 int hal_isp_set_sharpness(void *ctx, int val)
@@ -1695,27 +1880,29 @@ int hal_isp_get_hvflip(void *ctx, int *hflip, int *vflip)
 }
 
 /*
- * Temporal noise reduction is not published here, for the reason Infinity6E
- * already gives in src/caps_sigmastar.inc: the ISP channel's level is not a
- * strength. e3DNRLevel picks the 3DNR reference frame's bit depth, so moving it
- * does not trade noise against detail the way a temper knob promises -- most of
- * its range just switches the engine off, and that engine is what mirror and
- * flip run on.
+ * Temporal noise reduction, which is published here now and was not before.
  *
- * The tuning's own NR3D module does carry a strength, but reaching it means
- * putting enOpType into manual and discarding the sixteen-entry gain-indexed
- * curve the tuning spent its effort on. That is the trade that already keeps
- * saturation unpublished on this SoC, and it buys less here than it costs.
+ * What has not changed is the ISP channel's e3DNRLevel: it picks the 3DNR
+ * reference frame's bit depth rather than a strength, most of its range just
+ * switches the engine off, and that engine is what mirror and flip run on. It is
+ * still not a knob. st->isp_nr3d_req stays a fixed seed from hal_common for
+ * exactly that reason -- the driver's flip and rotate predicates are gated on
+ * 3DNR being on (RotFlipRelyOn3Dnr), and a level of zero can refuse an
+ * orientation that would otherwise be accepted.
  *
- * So temporal denoise belongs to the tuning binary on this family too, and
- * isp_{set,get}_temper_strength are absent rather than stubbed -- RSS_HAL_CALL
- * answers RSS_ERR_NOTSUP and get-isp-caps stops listing the knob.
+ * What changed is the tuning's NR3D module. The objection to it was that
+ * reaching its strength meant going manual and discarding the sixteen-entry
+ * gain curve -- true of stManual, and not true of the entries themselves.
+ * IQ_GAINRUN writes u8TfStrY into all sixteen and leaves enOpType alone, so the
+ * curve is still what MI interpolates and only the one field raptor names is
+ * different from what the tuner wrote.
  *
- * st->isp_nr3d_req stays regardless: hal_common seeds it at 1 and
- * i6c_isp_apply_chn_param sends it, because the driver's flip and rotate
- * predicates are gated on 3DNR being on (RotFlipRelyOn3Dnr) and a level of zero
- * can refuse an orientation that would otherwise be accepted. It is a fixed
- * level now rather than a knob's shadow.
+ * u8TfStrY is the right field for the knob, and this took a wrong turn first.
+ * MdGain is what ramps with gain and it is what earlier noise work reached for,
+ * but the vendor's tuning SOP calls it a motion scale -- 值越大 motion
+ * information 越小，NR3D 越强 -- so it decides how much of the frame is filtered.
+ * TfStrY is the strength itself: 值越大 denoise 强度越强, with 64 documented as
+ * 1x gain in isp_api.xml. See the row in the table for the rest.
  */
 
 /* ================================================================
@@ -1739,6 +1926,7 @@ static const struct {
 } i6c_knob_keys[] = {
     {"brightness", IQ_BRIGHTNESS}, {"contrast", IQ_CONTRAST}, {"sharpness", IQ_SHARPNESS},
     {"defog_strength", IQ_DEFOG},  {"drc_strength", IQ_DRC},  {"ae_comp", AE_EVCOMP},
+    {"temper", IQ_NR3D},
 };
 
 int hal_isp_get_knob_caps(void *ctx, const char *name, rss_isp_knob_t *caps)
