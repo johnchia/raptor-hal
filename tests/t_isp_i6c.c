@@ -1282,6 +1282,16 @@ static void test_sinter_is_not_published(void)
     CHECK(hal_isp_get_knob_caps(c, "sinter", &caps) == RSS_ERR_NOTSUP,
           "sinter must not publish caps");
 
+    /*
+     * Sharpness joined it. The row still works and the tests below still drive
+     * it directly, but the knob is withdrawn: leaving auto costs a manual block
+     * whose EdgeGain is 8 against the curve's 40, and no value of the six the
+     * run reaches makes that back. Measured 4790 grad in auto against 1794 at
+     * sharpness 127 on an SSC377QE.
+     */
+    CHECK(hal_isp_get_knob_caps(c, "sharpness", &caps) == RSS_ERR_NOTSUP,
+          "sharpness must not publish caps");
+
     /* The knobs that remain still do, so the lookup itself is not just broken. */
     CHECK(hal_isp_get_knob_caps(c, "defog_strength", &caps) == RSS_OK,
           "defog_strength still publishes caps");

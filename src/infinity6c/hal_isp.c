@@ -436,6 +436,12 @@ static i6c_iq_param_t g_iq[IQ_PARAM_COUNT] = {
      * sharpness" that does not throw the tuning away.
      *
      * 63 is the no-tuning fallback and is a midpoint, not a measurement.
+     *
+     * The row is kept and the op is not published -- hal_common.c leaves both
+     * pointers NULL. Scaling the run turned out not to be enough, because
+     * reaching it costs enOpType and the manual block that swaps in is a much
+     * weaker sharpener in fields this run does not reach. Measured numbers and
+     * the shape that would fix it are above hal_isp_set_sharpness.
      */
     [IQ_SHARPNESS] = {"sharpness", "MI_ISP_IQ_GetSharpness", "MI_ISP_IQ_SetSharpness",
                       I6C_ISP_IQ_SHARPNESS_PAYLOAD,
@@ -1554,6 +1560,42 @@ int hal_isp_get_temper_strength(void *ctx, int *val)
     return i6c_iq_get_scalar(ctx, IQ_NR3D, val);
 }
 
+/*
+ * Sharpness is implemented and not published: hal_common.c leaves the ops NULL,
+ * so rvd answers RSS_ERR_NOTSUP and the knob is absent from get-isp-caps. The
+ * code stays because the row and its ABI are correct -- what is wrong is the
+ * trade, and that is a property of the module rather than of this file.
+ *
+ * The six band gains this writes are real and reaching them costs enOpType, as
+ * it does for every auto/manual module here. What makes sharpness different
+ * from DRC, where the same trade was taken deliberately, is what else is inside
+ * the block that swaps in. On the IMX335 tuning this board ships, stManual
+ * differs from the interpolated auto curve in 24 of its 39 fields, and the ones
+ * that matter are all weaker:
+ *
+ *   EdgeGain        40                     ->  8
+ *   UDWeiByState    180 180 128 128        ->  32 32 128 128
+ *   DWeiByState     256 256 128 128        ->  32 32 128 128
+ *
+ * None of those is inside the run, so the knob pins the pre-gains wherever it
+ * is asked and the gate behind them stays shut. Measured on an SSC377QE, mean
+ * gradient energy over five frames of a 1280x960 crop, run-to-run spread 1-2%:
+ *
+ *   auto  4790      sharpness 0  1224      sharpness 40  1610      sharpness 127  1794
+ *
+ * Every point of the published range is about a third of what the tuning was
+ * already doing, and the maximum is softer than not touching it. A knob whose
+ * best setting is worse than its absence is not a knob. The 6C gc4653 bin is
+ * the same shape -- 28 of 39 fields differ, EdgeGain 180 -> 128 -- so this is
+ * the module, not one tuner.
+ *
+ * There is a version of this that would work, and it is the shape IQ_NR3D uses:
+ * write the six gains into the sixteen stAuto entries and never leave auto, so
+ * EdgeGain and the rest keep the tuner's values. It is a real extension rather
+ * than a reuse -- six fields across sixteen entries is 96 values against
+ * IQ_GAINRUN's 16, and the reband pivot becomes per-gain-step -- and it has not
+ * been done. Sharpness is a tuning-file adjustment on this SoC until it is.
+ */
 int hal_isp_set_sharpness(void *ctx, int val)
 {
     return i6c_iq_set_scalar(ctx, IQ_SHARPNESS, val);
@@ -1924,7 +1966,7 @@ static const struct {
     const char *key;
     int idx;
 } i6c_knob_keys[] = {
-    {"brightness", IQ_BRIGHTNESS}, {"contrast", IQ_CONTRAST}, {"sharpness", IQ_SHARPNESS},
+    {"brightness", IQ_BRIGHTNESS}, {"contrast", IQ_CONTRAST},
     {"defog_strength", IQ_DEFOG},  {"drc_strength", IQ_DRC},  {"ae_comp", AE_EVCOMP},
     {"temper", IQ_NR3D},
 };

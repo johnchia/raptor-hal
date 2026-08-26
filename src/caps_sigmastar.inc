@@ -373,9 +373,9 @@ const rss_hal_caps_t g_hal_caps = {
  * advertising rather than gating; they are set because a wrong advertisement is
  * what sent the last reader looking in the wrong place.
  *
- * Sharpness has an op here too and no flag to go with it, because
- * rss_hal_caps_t has never carried one. rvd asks the vtable directly for that
- * knob, so the absence costs nothing.
+ * Sharpness has neither, and the missing flag is not why. rss_hal_caps_t has
+ * never carried one -- rvd asks the vtable directly for that knob -- and the op
+ * itself is NULL here now; see the note above hal_isp_set_sharpness.
  *
  * The permanent falses are the same three as above and for the same
  * reason -- xburst2, the IMP SDK generation and the IMPVI calling

@@ -724,9 +724,10 @@ static const rss_hal_ops_t g_ops = {
      * the counterpart costs too much. Every shipped tuning here varies it
      * across gain, and enOpType has no state between auto and manual, so the
      * knob could only trade that curve for a constant. See the note above
-     * hal_isp_set_saturation. Brightness, contrast, sharpness and defog stay --
-     * their curves are either flat in every bin or preserved by the vector
-     * write -- so this is one row, not the family-wide withdrawal 6E took.
+     * hal_isp_set_saturation. Brightness, contrast and defog stay -- their
+     * curves are flat in every bin -- so this is still a row at a time rather
+     * than the family-wide withdrawal 6E took. Sharpness has since joined it,
+     * for a different reason; see below.
      */
     .isp_set_brightness = hal_isp_set_brightness,
     .isp_get_brightness = hal_isp_get_brightness,
@@ -734,14 +735,13 @@ static const rss_hal_ops_t g_ops = {
     .isp_set_contrast = hal_isp_set_contrast,
     .isp_get_contrast = hal_isp_get_contrast,
     /*
-     * Sharpness and spatial denoise are per-band tables on this generation
-     * rather than levels, so one knob scales the whole run about the tuning's
-     * own values -- see i6c_iq_apply_vector. They were NULL until that existed,
-     * on the grounds that moving one band and calling it sharpness is worse
-     * than not having the op.
+     * Sharpness is absent, and unlike saturation it is not the per-gain curve
+     * that costs too much -- it is the rest of the module. Measured on an
+     * SSC377QE + IMX335: gradient energy 4790 with the knob left alone, 1224 at
+     * sharpness 0, 1794 at sharpness 127. Every point of the published range is
+     * a third of what the tuning was already doing, and the maximum is softer
+     * than not touching it. See the note above hal_isp_set_sharpness.
      */
-    .isp_set_sharpness = hal_isp_set_sharpness,
-    .isp_get_sharpness = hal_isp_get_sharpness,
     /*
      * DRC is MI's WDR module. It is published where saturation is not, and the
      * difference is which way the trade falls: WDR's level is one byte the knob
