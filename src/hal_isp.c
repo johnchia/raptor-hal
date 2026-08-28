@@ -682,6 +682,15 @@ int hal_isp_set_drc_strength(void *ctx, int val)
  * Only on T20, T23, T30, T31 (absent on T21).
  * Signature: SetAeComp(int comp)
  * T32/T40/T41 do not have this function.
+ *
+ * Clamped like every other tuning byte, and for the same reason: the range
+ * this layer publishes in imp_knob_caps has to be the range it enforces, or
+ * a client that drew its control from that answer still gets a bare -1 back
+ * from the SDK. It matters more here than elsewhere because rcd's key table
+ * is one table for every platform and says -255..255, signed for SigmaStar --
+ * so a config written for one part reaches this one out of range as a matter
+ * of course, and the nearest in-range value is a better answer than a refusal
+ * the caller cannot act on.
  * ================================================================ */
 
 int hal_isp_set_ae_comp(void *ctx, int val)
@@ -690,7 +699,7 @@ int hal_isp_set_ae_comp(void *ctx, int val)
     HAL_ISP_REFUSE_AUTO(val);
 
 #if defined(PLATFORM_T20) || defined(PLATFORM_T23) || defined(PLATFORM_T30) || defined(PLATFORM_T31)
-    return IMP_ISP_Tuning_SetAeComp(val);
+    return IMP_ISP_Tuning_SetAeComp(hal_clamp_u8(val));
 #else
     (void)val;
     return RSS_ERR_NOTSUP;
@@ -904,9 +913,15 @@ int hal_isp_get_hue(void *ctx, int *val)
  *    raptor's schema has always said 0..10, so it stays the published answer
  *    rather than being widened by accident on the way through here.
  *
- * ae_comp is absent: IMP_ISP_Tuning_SetAeComp takes a bare int with no
- * documented bound, and inventing one here would be a guess wearing the
- * clothes of a capability.
+ * ae_comp is the one row the vendor does not document: SetAeComp takes a bare
+ * int. It is here anyway because the part answers the question directly --
+ * every value in 0..255 is accepted and everything either side is refused --
+ * so this is a reading, not a guess. Leaving it out was worse than a missing
+ * capability: a knob with no row is the one knob a client draws from its own
+ * fallback, which for rcd means the schema's -255..255 (signed for SigmaStar,
+ * which states compensation in EV steps around zero) and an auto button that
+ * every other row's has_auto false would have vetoed. The absent answer was
+ * louder than a wrong one.
  */
 static const struct {
     const char *key;
@@ -919,6 +934,7 @@ static const struct {
     {"hue", 0, 255, 128},
     {"sinter", 0, 255, 128},
     {"temper", 0, 255, 128},
+    {"ae_comp", 0, 255, 128},
     {"dpc_strength", 0, 255, 128},
     {"drc_strength", 0, 255, 128},
     {"defog_strength", 0, 255, 128},
@@ -3581,12 +3597,12 @@ int hal_isp_set_ae_comp_n(void *ctx, int sensor_idx, int val)
     HAL_ISP_REFUSE_AUTO(val);
     /* AeComp only on T20/T23/T30/T31; not on T32/T40/T41 */
 #if defined(HAL_T23_MULTICAM)
-    return IMP_ISP_MultiCamera_Tuning_SetAeComp((IMPVI_NUM)sensor_idx, val);
+    return IMP_ISP_MultiCamera_Tuning_SetAeComp((IMPVI_NUM)sensor_idx, hal_clamp_u8(val));
 #elif defined(PLATFORM_T20) || defined(PLATFORM_T23) || defined(PLATFORM_T30) ||                   \
     defined(PLATFORM_T31)
     if (sensor_idx != 0)
         return RSS_ERR_NOTSUP;
-    return IMP_ISP_Tuning_SetAeComp(val);
+    return IMP_ISP_Tuning_SetAeComp(hal_clamp_u8(val));
 #else
     (void)sensor_idx;
     (void)val;

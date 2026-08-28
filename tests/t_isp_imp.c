@@ -71,6 +71,22 @@ int IMP_ISP_Tuning_SetBrightness(unsigned char bright)
     return 0;
 }
 
+/*
+ * The second recording fake, and for the same reason as the first: ae_comp now
+ * clamps, and a clamp can only be shown by the value that arrives. Its own
+ * prototype rather than brightness's -- SetAeComp takes a bare int, which is
+ * exactly what made the unclamped version able to hand the SDK a negative.
+ */
+static int g_ae_comp_calls;
+static int g_ae_comp_last;
+
+int IMP_ISP_Tuning_SetAeComp(int comp)
+{
+    g_ae_comp_calls++;
+    g_ae_comp_last = comp;
+    return 0;
+}
+
 static int failures;
 
 #define CHECK(cond, fmt, ...)                                                                      \
@@ -120,17 +136,32 @@ static void test_every_knob_refuses_auto(void)
 }
 
 /*
- * ae_comp is the one that could not be caught by a clamp even in principle: it
- * takes a bare int and handed it straight to the SDK, so the sentinel arrived
- * as INT_MIN rather than as 0. Worth its own test because the fix for the
- * others -- refuse before clamping -- reads like it is about the clamp, and a
- * later simplification that folded the guard into hal_clamp_u8 would silently
- * drop this one.
+ * ae_comp refuses the sentinel before it clamps, and the order is the whole
+ * point: fold the guard into hal_clamp_u8 and INT_MIN becomes an ordinary 0 --
+ * maximum negative bias, silently, on a knob whose caller asked for auto.
+ *
+ * That it clamps at all is the second claim. SetAeComp takes a bare int and
+ * the part accepts 0..255, so the range this backend publishes has to be the
+ * range it enforces; rcd's key table is one table for every platform and says
+ * -255..255, so out-of-range values arrive here as a matter of course rather
+ * than as a caller's mistake.
  */
-static void test_ae_comp_refuses_auto_though_it_never_clamps(void)
+static void test_ae_comp_refuses_auto_then_clamps(void)
 {
+    g_ae_comp_calls = 0;
+
     CHECK(hal_isp_set_ae_comp(NULL, RSS_ISP_AUTO) == RSS_ERR_INVAL,
-          "the unclamped knob must refuse the sentinel too");
+          "the sentinel is refused, not clamped to the floor");
+    CHECK(g_ae_comp_calls == 0, "and never reaches the SDK, %d calls", g_ae_comp_calls);
+
+    CHECK(hal_isp_set_ae_comp(NULL, 128) == 0, "the neutral is legal");
+    CHECK(g_ae_comp_last == 128, "and arrives unchanged, got %d", g_ae_comp_last);
+
+    CHECK(hal_isp_set_ae_comp(NULL, -10) == 0, "a SigmaStar-shaped negative is accepted");
+    CHECK(g_ae_comp_last == 0, "clamped to the floor, got %d", g_ae_comp_last);
+
+    CHECK(hal_isp_set_ae_comp(NULL, 1000) == 0, "and so is an overflow");
+    CHECK(g_ae_comp_last == 255, "clamped to the ceiling, got %d", g_ae_comp_last);
 }
 
 /*
@@ -180,18 +211,11 @@ static void test_a_legal_value_still_reaches_the_sdk(void)
  */
 static void test_caps_never_claim_an_auto_this_family_does_not_have(void)
 {
-    static const char *const knobs[] = {"brightness",
-                                        "contrast",
-                                        "saturation",
-                                        "sharpness",
-                                        "hue",
-                                        "sinter",
-                                        "temper",
-                                        "dpc_strength",
-                                        "drc_strength",
-                                        "defog_strength",
-                                        "highlight_depress",
-                                        "backlight_comp"};
+    static const char *const knobs[] = {
+        "brightness",    "contrast",     "saturation",     "sharpness",
+        "hue",           "sinter",       "temper",         "ae_comp",
+        "dpc_strength",  "drc_strength", "defog_strength", "highlight_depress",
+        "backlight_comp"};
     size_t i;
 
     for (i = 0; i < sizeof(knobs) / sizeof(knobs[0]); i++) {
@@ -207,21 +231,40 @@ static void test_caps_never_claim_an_auto_this_family_does_not_have(void)
 
 /*
  * A knob the platform does not describe answers NOTSUP rather than inventing a
- * range. ae_comp is the live example and the reason the distinction matters:
- * IMP_ISP_Tuning_SetAeComp takes a bare int with no documented bound, so the
- * table deliberately has no row for it, and a client is told "no better
- * information" rather than handed a guess.
+ * range -- "no better information" is a usable answer and a guess is not.
+ *
+ * ae_comp used to be the live example here and is now the counter-example: a
+ * missing row is not free. It is the one thing a client falls back from, and
+ * rcd's fallback is a schema range that spans two platforms plus an auto
+ * button that every other row's has_auto false would have vetoed. Leaving the
+ * row out was louder than getting it wrong, so it is measured and published --
+ * see test_ae_comp_is_the_byte_the_part_accepts.
  */
 static void test_an_undescribed_knob_says_so(void)
 {
     rss_isp_knob_t caps;
 
-    CHECK(hal_isp_get_knob_caps(NULL, "ae_comp", &caps) == RSS_ERR_NOTSUP,
-          "ae_comp has no documented range on this family and must not claim one");
     CHECK(hal_isp_get_knob_caps(NULL, "no_such_knob", &caps) == RSS_ERR_NOTSUP,
           "an unknown name is NOTSUP");
     CHECK(hal_isp_get_knob_caps(NULL, NULL, &caps) == RSS_ERR_INVAL, "NULL name is refused");
     CHECK(hal_isp_get_knob_caps(NULL, "brightness", NULL) == RSS_ERR_INVAL, "NULL caps is refused");
+}
+
+/*
+ * The measured row, asserted by value. Bisected on a T31/gc2053 against
+ * IMP_ISP_Tuning_SetAeComp: 0 and 255 accepted, -1 and 256 refused with -1,
+ * and the part boots at 128. The neutral matters as much as the bounds --
+ * without a row at all, a console draws the slider at min rather than where
+ * the hardware is sitting.
+ */
+static void test_ae_comp_is_the_byte_the_part_accepts(void)
+{
+    rss_isp_knob_t caps;
+
+    CHECK(hal_isp_get_knob_caps(NULL, "ae_comp", &caps) == RSS_OK, "ae_comp has caps");
+    CHECK(caps.min == 0 && caps.max == 255, "measured 0..255, got %d..%d", caps.min, caps.max);
+    CHECK(caps.neutral == 128, "the part boots at 128, got %d", caps.neutral);
+    CHECK(!caps.has_auto, "nothing on this family has an auto mode to hand back to");
 }
 
 /*
@@ -244,11 +287,12 @@ static void test_the_strengths_whose_neutral_is_off(void)
 int main(void)
 {
     test_every_knob_refuses_auto();
-    test_ae_comp_refuses_auto_though_it_never_clamps();
+    test_ae_comp_refuses_auto_then_clamps();
     test_only_the_sentinel_is_refused();
     test_a_legal_value_still_reaches_the_sdk();
     test_caps_never_claim_an_auto_this_family_does_not_have();
     test_an_undescribed_knob_says_so();
+    test_ae_comp_is_the_byte_the_part_accepts();
     test_the_strengths_whose_neutral_is_off();
 
     if (failures) {
