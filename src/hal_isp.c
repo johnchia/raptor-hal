@@ -50,6 +50,71 @@ extern const rss_hal_caps_t g_hal_caps;
             return RSS_ERR_INVAL;                                                                  \
     } while (0)
 
+/*
+ * Which knobs this process has given a value to.
+ *
+ * IMP's tuning getters answer for the value libimp is holding, not for the
+ * value the ISP is applying, and the two come apart the moment rvd restarts:
+ * the hardware goes on using what it was last told and the getter reports the
+ * tuning's own figure again. Measured on a T31 -- brightness set to 200, rvd
+ * restarted, getter says 0, and the picture is still the 200 one, luma 239.4
+ * against 239.5 for an explicit 200 and 118.2 for 128. Not all knobs do it,
+ * and which ones is not a distinction this file can safely encode: hue, DPC
+ * and defog kept their reading across the same restart and the other nine did
+ * not.
+ *
+ * So the readback is only meaningful for a value this process wrote, and a
+ * bit per knob is not a heuristic for that -- it is exactly that. The flag and
+ * libimp's cache are created and lost together, so the flag says precisely
+ * when the cache can be believed.
+ *
+ * It answers the question a caller is really asking, too. "What is this knob
+ * set to" has no answer for a knob raptor has never set: the tuning owns it,
+ * and the tuning's value is not something IMP will hand back. Declining is
+ * both the honest reply and the only available one -- there is no second API
+ * to read what is applied, so a wrong number is the alternative, not a better
+ * one.
+ */
+typedef enum {
+    IMP_KNOB_BRIGHTNESS,
+    IMP_KNOB_CONTRAST,
+    IMP_KNOB_SATURATION,
+    IMP_KNOB_SHARPNESS,
+    IMP_KNOB_HUE,
+    IMP_KNOB_AE_COMP,
+    IMP_KNOB_DPC,
+    IMP_KNOB_DRC,
+    IMP_KNOB_DEFOG,
+    IMP_KNOB_HIGHLIGHT,
+    IMP_KNOB_BACKLIGHT,
+    IMP_KNOB_COUNT
+} imp_knob_t;
+
+static unsigned int g_imp_knob_written;
+
+/* Records the write and passes the result through, so a setter states the one
+ * fact its getter depends on without repeating the test. Only a call the SDK
+ * accepted counts: a refused write left the knob where it was. */
+static int imp_knob_wrote(imp_knob_t k, int ret)
+{
+    if (ret == 0)
+        g_imp_knob_written |= 1u << (unsigned int)k;
+    return ret;
+}
+
+static bool imp_knob_readable(imp_knob_t k)
+{
+    return (g_imp_knob_written >> (unsigned int)k) & 1u;
+}
+
+/* Expands to a return, hence the shouting name -- as with HAL_ISP_REFUSE_AUTO
+ * above, which it sits beside in every getter that has one. */
+#define HAL_ISP_NEED_WRITTEN(k)                                                                    \
+    do {                                                                                           \
+        if (!imp_knob_readable(k))                                                                 \
+            return RSS_ERR_NOENT;                                                                  \
+    } while (0)
+
 /* ================================================================
  * BASIC IMAGE CONTROLS: brightness, contrast, saturation, sharpness
  *
@@ -63,9 +128,9 @@ int hal_isp_set_brightness(void *ctx, int val)
     HAL_ISP_REFUSE_AUTO(val);
     uint8_t v = hal_clamp_u8(val);
 #if defined(HAL_ISP_PTR_ARGS)
-    return IMP_ISP_Tuning_SetBrightness(IMPVI_MAIN, &v);
+    return imp_knob_wrote(IMP_KNOB_BRIGHTNESS, IMP_ISP_Tuning_SetBrightness(IMPVI_MAIN, &v));
 #else
-    return IMP_ISP_Tuning_SetBrightness(v);
+    return imp_knob_wrote(IMP_KNOB_BRIGHTNESS, IMP_ISP_Tuning_SetBrightness(v));
 #endif
 }
 
@@ -75,9 +140,9 @@ int hal_isp_set_contrast(void *ctx, int val)
     HAL_ISP_REFUSE_AUTO(val);
     uint8_t v = hal_clamp_u8(val);
 #if defined(HAL_ISP_PTR_ARGS)
-    return IMP_ISP_Tuning_SetContrast(IMPVI_MAIN, &v);
+    return imp_knob_wrote(IMP_KNOB_CONTRAST, IMP_ISP_Tuning_SetContrast(IMPVI_MAIN, &v));
 #else
-    return IMP_ISP_Tuning_SetContrast(v);
+    return imp_knob_wrote(IMP_KNOB_CONTRAST, IMP_ISP_Tuning_SetContrast(v));
 #endif
 }
 
@@ -87,9 +152,9 @@ int hal_isp_set_saturation(void *ctx, int val)
     HAL_ISP_REFUSE_AUTO(val);
     uint8_t v = hal_clamp_u8(val);
 #if defined(HAL_ISP_PTR_ARGS)
-    return IMP_ISP_Tuning_SetSaturation(IMPVI_MAIN, &v);
+    return imp_knob_wrote(IMP_KNOB_SATURATION, IMP_ISP_Tuning_SetSaturation(IMPVI_MAIN, &v));
 #else
-    return IMP_ISP_Tuning_SetSaturation(v);
+    return imp_knob_wrote(IMP_KNOB_SATURATION, IMP_ISP_Tuning_SetSaturation(v));
 #endif
 }
 
@@ -99,9 +164,9 @@ int hal_isp_set_sharpness(void *ctx, int val)
     HAL_ISP_REFUSE_AUTO(val);
     uint8_t v = hal_clamp_u8(val);
 #if defined(HAL_ISP_PTR_ARGS)
-    return IMP_ISP_Tuning_SetSharpness(IMPVI_MAIN, &v);
+    return imp_knob_wrote(IMP_KNOB_SHARPNESS, IMP_ISP_Tuning_SetSharpness(IMPVI_MAIN, &v));
 #else
-    return IMP_ISP_Tuning_SetSharpness(v);
+    return imp_knob_wrote(IMP_KNOB_SHARPNESS, IMP_ISP_Tuning_SetSharpness(v));
 #endif
 }
 
@@ -119,10 +184,10 @@ int hal_isp_set_hue(void *ctx, int val)
     uint8_t v = hal_clamp_u8(val);
 #if defined(HAL_ISP_PTR_ARGS)
     /* Gen3: T32/T40/T41 */
-    return IMP_ISP_Tuning_SetBcshHue(IMPVI_MAIN, &v);
+    return imp_knob_wrote(IMP_KNOB_HUE, IMP_ISP_Tuning_SetBcshHue(IMPVI_MAIN, &v));
 #elif defined(PLATFORM_T23) || defined(PLATFORM_T31)
     /* Gen2: scalar */
-    return IMP_ISP_Tuning_SetBcshHue(v);
+    return imp_knob_wrote(IMP_KNOB_HUE, IMP_ISP_Tuning_SetBcshHue(v));
 #else
     /* T20/T21/T30: not supported */
     (void)v;
@@ -645,7 +710,7 @@ int hal_isp_set_dpc_strength(void *ctx, int val)
         return RSS_ERR_NOTSUP;
 
 #if defined(PLATFORM_T23) || defined(PLATFORM_T31)
-    return IMP_ISP_Tuning_SetDPC_Strength((unsigned int)v);
+    return imp_knob_wrote(IMP_KNOB_DPC, IMP_ISP_Tuning_SetDPC_Strength((unsigned int)v));
 #else
     (void)v;
     return RSS_ERR_NOTSUP;
@@ -669,7 +734,7 @@ int hal_isp_set_drc_strength(void *ctx, int val)
         return RSS_ERR_NOTSUP;
 
 #if defined(PLATFORM_T21) || defined(PLATFORM_T23) || defined(PLATFORM_T31)
-    return IMP_ISP_Tuning_SetDRC_Strength((unsigned int)v);
+    return imp_knob_wrote(IMP_KNOB_DRC, IMP_ISP_Tuning_SetDRC_Strength((unsigned int)v));
 #else
     (void)v;
     return RSS_ERR_NOTSUP;
@@ -699,7 +764,7 @@ int hal_isp_set_ae_comp(void *ctx, int val)
     HAL_ISP_REFUSE_AUTO(val);
 
 #if defined(PLATFORM_T20) || defined(PLATFORM_T23) || defined(PLATFORM_T30) || defined(PLATFORM_T31)
-    return IMP_ISP_Tuning_SetAeComp(hal_clamp_u8(val));
+    return imp_knob_wrote(IMP_KNOB_AE_COMP, IMP_ISP_Tuning_SetAeComp(hal_clamp_u8(val)));
 #else
     (void)val;
     return RSS_ERR_NOTSUP;
@@ -766,7 +831,7 @@ int hal_isp_set_highlight_depress(void *ctx, int val)
 
 #if defined(PLATFORM_T20) || defined(PLATFORM_T21) || defined(PLATFORM_T23) ||                     \
     defined(PLATFORM_T30) || defined(PLATFORM_T31)
-    return IMP_ISP_Tuning_SetHiLightDepress((uint32_t)v);
+    return imp_knob_wrote(IMP_KNOB_HIGHLIGHT, IMP_ISP_Tuning_SetHiLightDepress((uint32_t)v));
 #else
     (void)v;
     return RSS_ERR_NOTSUP;
@@ -788,6 +853,7 @@ int hal_isp_get_brightness(void *ctx, int *val)
     (void)ctx;
     if (!val)
         return RSS_ERR_INVAL;
+    HAL_ISP_NEED_WRITTEN(IMP_KNOB_BRIGHTNESS);
     /* IMP reports these as one byte; the HAL publishes an int so that a
      * knob with a signed or wider native range can use the same shape. */
     unsigned char v;
@@ -807,6 +873,7 @@ int hal_isp_get_contrast(void *ctx, int *val)
     (void)ctx;
     if (!val)
         return RSS_ERR_INVAL;
+    HAL_ISP_NEED_WRITTEN(IMP_KNOB_CONTRAST);
     /* IMP reports these as one byte; the HAL publishes an int so that a
      * knob with a signed or wider native range can use the same shape. */
     unsigned char v;
@@ -826,6 +893,7 @@ int hal_isp_get_saturation(void *ctx, int *val)
     (void)ctx;
     if (!val)
         return RSS_ERR_INVAL;
+    HAL_ISP_NEED_WRITTEN(IMP_KNOB_SATURATION);
     /* IMP reports these as one byte; the HAL publishes an int so that a
      * knob with a signed or wider native range can use the same shape. */
     unsigned char v;
@@ -845,6 +913,7 @@ int hal_isp_get_sharpness(void *ctx, int *val)
     (void)ctx;
     if (!val)
         return RSS_ERR_INVAL;
+    HAL_ISP_NEED_WRITTEN(IMP_KNOB_SHARPNESS);
     /* IMP reports these as one byte; the HAL publishes an int so that a
      * knob with a signed or wider native range can use the same shape. */
     unsigned char v;
@@ -870,6 +939,7 @@ int hal_isp_get_hue(void *ctx, int *val)
     (void)ctx;
     if (!val)
         return RSS_ERR_INVAL;
+    HAL_ISP_NEED_WRITTEN(IMP_KNOB_HUE);
 #if defined(HAL_ISP_PTR_ARGS) || defined(PLATFORM_T23) || defined(PLATFORM_T31)
     /* IMP reports this as one byte; the HAL publishes an int so that a knob
      * with a signed or wider native range can use the same shape. */
@@ -1250,6 +1320,7 @@ int hal_isp_get_ae_comp(void *ctx, int *val)
     (void)ctx;
     if (!val)
         return RSS_ERR_INVAL;
+    HAL_ISP_NEED_WRITTEN(IMP_KNOB_AE_COMP);
 
 #if defined(PLATFORM_T20) || defined(PLATFORM_T23) || defined(PLATFORM_T30) || defined(PLATFORM_T31)
     return IMP_ISP_Tuning_GetAeComp(val);
@@ -1351,6 +1422,7 @@ int hal_isp_get_defog_strength(void *ctx, int *val)
     (void)ctx;
     if (!val)
         return RSS_ERR_INVAL;
+    HAL_ISP_NEED_WRITTEN(IMP_KNOB_DEFOG);
 
     if (!g_hal_caps.has_defog)
         return RSS_ERR_NOTSUP;
@@ -1379,7 +1451,7 @@ int hal_isp_set_defog_strength(void *ctx, int val)
         return RSS_ERR_NOTSUP;
 
 #if defined(PLATFORM_T23) || defined(PLATFORM_T31)
-    return IMP_ISP_Tuning_SetDefog_Strength(&v);
+    return imp_knob_wrote(IMP_KNOB_DEFOG, IMP_ISP_Tuning_SetDefog_Strength(&v));
 #else
     (void)v;
     return RSS_ERR_NOTSUP;
@@ -1391,6 +1463,7 @@ int hal_isp_get_dpc_strength(void *ctx, int *val)
     (void)ctx;
     if (!val)
         return RSS_ERR_INVAL;
+    HAL_ISP_NEED_WRITTEN(IMP_KNOB_DPC);
 
 #if defined(PLATFORM_T23) || defined(PLATFORM_T31)
     unsigned int ratio;
@@ -1410,6 +1483,7 @@ int hal_isp_get_drc_strength(void *ctx, int *val)
     (void)ctx;
     if (!val)
         return RSS_ERR_INVAL;
+    HAL_ISP_NEED_WRITTEN(IMP_KNOB_DRC);
 
 #if defined(PLATFORM_T21) || defined(PLATFORM_T23) || defined(PLATFORM_T31)
     unsigned int ratio;
@@ -1436,6 +1510,7 @@ int hal_isp_get_highlight_depress(void *ctx, int *val)
     (void)ctx;
     if (!val)
         return RSS_ERR_INVAL;
+    HAL_ISP_NEED_WRITTEN(IMP_KNOB_HIGHLIGHT);
 
 #if defined(PLATFORM_T21) || defined(PLATFORM_T23) || defined(PLATFORM_T31)
     uint32_t strength;
@@ -1462,6 +1537,7 @@ int hal_isp_get_backlight_comp(void *ctx, int *val)
     (void)ctx;
     if (!val)
         return RSS_ERR_INVAL;
+    HAL_ISP_NEED_WRITTEN(IMP_KNOB_BACKLIGHT);
 
 #if defined(PLATFORM_T31)
     uint32_t strength;
@@ -2803,7 +2879,7 @@ int hal_isp_set_backlight_comp(void *ctx, int strength)
     uint32_t s = hal_clamp_u32(strength);
 
 #if defined(PLATFORM_T23) || defined(PLATFORM_T31)
-    return IMP_ISP_Tuning_SetBacklightComp(s);
+    return imp_knob_wrote(IMP_KNOB_BACKLIGHT, IMP_ISP_Tuning_SetBacklightComp(s));
 #else
     (void)s;
     return RSS_ERR_NOTSUP;
@@ -3313,13 +3389,15 @@ int hal_isp_set_brightness_n(void *ctx, int sensor_idx, int val)
     HAL_ISP_REFUSE_AUTO(val);
     uint8_t v = hal_clamp_u8(val);
 #if defined(HAL_ISP_PTR_ARGS)
-    return IMP_ISP_Tuning_SetBrightness((IMPVI_NUM)sensor_idx, &v);
+    return imp_knob_wrote(IMP_KNOB_BRIGHTNESS,
+                          IMP_ISP_Tuning_SetBrightness((IMPVI_NUM)sensor_idx, &v));
 #elif defined(HAL_T23_MULTICAM)
-    return IMP_ISP_MultiCamera_Tuning_SetBrightness((IMPVI_NUM)sensor_idx, v);
+    return imp_knob_wrote(IMP_KNOB_BRIGHTNESS,
+                          IMP_ISP_MultiCamera_Tuning_SetBrightness((IMPVI_NUM)sensor_idx, v));
 #else
     if (sensor_idx != 0)
         return RSS_ERR_NOTSUP;
-    return IMP_ISP_Tuning_SetBrightness(v);
+    return imp_knob_wrote(IMP_KNOB_BRIGHTNESS, IMP_ISP_Tuning_SetBrightness(v));
 #endif
 }
 
@@ -3329,13 +3407,14 @@ int hal_isp_set_contrast_n(void *ctx, int sensor_idx, int val)
     HAL_ISP_REFUSE_AUTO(val);
     uint8_t v = hal_clamp_u8(val);
 #if defined(HAL_ISP_PTR_ARGS)
-    return IMP_ISP_Tuning_SetContrast((IMPVI_NUM)sensor_idx, &v);
+    return imp_knob_wrote(IMP_KNOB_CONTRAST, IMP_ISP_Tuning_SetContrast((IMPVI_NUM)sensor_idx, &v));
 #elif defined(HAL_T23_MULTICAM)
-    return IMP_ISP_MultiCamera_Tuning_SetContrast((IMPVI_NUM)sensor_idx, v);
+    return imp_knob_wrote(IMP_KNOB_CONTRAST,
+                          IMP_ISP_MultiCamera_Tuning_SetContrast((IMPVI_NUM)sensor_idx, v));
 #else
     if (sensor_idx != 0)
         return RSS_ERR_NOTSUP;
-    return IMP_ISP_Tuning_SetContrast(v);
+    return imp_knob_wrote(IMP_KNOB_CONTRAST, IMP_ISP_Tuning_SetContrast(v));
 #endif
 }
 
@@ -3345,13 +3424,15 @@ int hal_isp_set_saturation_n(void *ctx, int sensor_idx, int val)
     HAL_ISP_REFUSE_AUTO(val);
     uint8_t v = hal_clamp_u8(val);
 #if defined(HAL_ISP_PTR_ARGS)
-    return IMP_ISP_Tuning_SetSaturation((IMPVI_NUM)sensor_idx, &v);
+    return imp_knob_wrote(IMP_KNOB_SATURATION,
+                          IMP_ISP_Tuning_SetSaturation((IMPVI_NUM)sensor_idx, &v));
 #elif defined(HAL_T23_MULTICAM)
-    return IMP_ISP_MultiCamera_Tuning_SetSaturation((IMPVI_NUM)sensor_idx, v);
+    return imp_knob_wrote(IMP_KNOB_SATURATION,
+                          IMP_ISP_MultiCamera_Tuning_SetSaturation((IMPVI_NUM)sensor_idx, v));
 #else
     if (sensor_idx != 0)
         return RSS_ERR_NOTSUP;
-    return IMP_ISP_Tuning_SetSaturation(v);
+    return imp_knob_wrote(IMP_KNOB_SATURATION, IMP_ISP_Tuning_SetSaturation(v));
 #endif
 }
 
@@ -3361,13 +3442,15 @@ int hal_isp_set_sharpness_n(void *ctx, int sensor_idx, int val)
     HAL_ISP_REFUSE_AUTO(val);
     uint8_t v = hal_clamp_u8(val);
 #if defined(HAL_ISP_PTR_ARGS)
-    return IMP_ISP_Tuning_SetSharpness((IMPVI_NUM)sensor_idx, &v);
+    return imp_knob_wrote(IMP_KNOB_SHARPNESS,
+                          IMP_ISP_Tuning_SetSharpness((IMPVI_NUM)sensor_idx, &v));
 #elif defined(HAL_T23_MULTICAM)
-    return IMP_ISP_MultiCamera_Tuning_SetSharpness((IMPVI_NUM)sensor_idx, v);
+    return imp_knob_wrote(IMP_KNOB_SHARPNESS,
+                          IMP_ISP_MultiCamera_Tuning_SetSharpness((IMPVI_NUM)sensor_idx, v));
 #else
     if (sensor_idx != 0)
         return RSS_ERR_NOTSUP;
-    return IMP_ISP_Tuning_SetSharpness(v);
+    return imp_knob_wrote(IMP_KNOB_SHARPNESS, IMP_ISP_Tuning_SetSharpness(v));
 #endif
 }
 
@@ -3377,13 +3460,14 @@ int hal_isp_set_hue_n(void *ctx, int sensor_idx, int val)
     HAL_ISP_REFUSE_AUTO(val);
     uint8_t v = hal_clamp_u8(val);
 #if defined(HAL_ISP_PTR_ARGS)
-    return IMP_ISP_Tuning_SetBcshHue((IMPVI_NUM)sensor_idx, &v);
+    return imp_knob_wrote(IMP_KNOB_HUE, IMP_ISP_Tuning_SetBcshHue((IMPVI_NUM)sensor_idx, &v));
 #elif defined(HAL_T23_MULTICAM)
-    return IMP_ISP_MultiCamera_Tuning_SetBcshHue((IMPVI_NUM)sensor_idx, v);
+    return imp_knob_wrote(IMP_KNOB_HUE,
+                          IMP_ISP_MultiCamera_Tuning_SetBcshHue((IMPVI_NUM)sensor_idx, v));
 #elif defined(PLATFORM_T23) || defined(PLATFORM_T31)
     if (sensor_idx != 0)
         return RSS_ERR_NOTSUP;
-    return IMP_ISP_Tuning_SetBcshHue(v);
+    return imp_knob_wrote(IMP_KNOB_HUE, IMP_ISP_Tuning_SetBcshHue(v));
 #else
     (void)sensor_idx;
     (void)v;
@@ -3597,12 +3681,13 @@ int hal_isp_set_ae_comp_n(void *ctx, int sensor_idx, int val)
     HAL_ISP_REFUSE_AUTO(val);
     /* AeComp only on T20/T23/T30/T31; not on T32/T40/T41 */
 #if defined(HAL_T23_MULTICAM)
-    return IMP_ISP_MultiCamera_Tuning_SetAeComp((IMPVI_NUM)sensor_idx, hal_clamp_u8(val));
+    return imp_knob_wrote(IMP_KNOB_AE_COMP, IMP_ISP_MultiCamera_Tuning_SetAeComp(
+                                                (IMPVI_NUM)sensor_idx, hal_clamp_u8(val)));
 #elif defined(PLATFORM_T20) || defined(PLATFORM_T23) || defined(PLATFORM_T30) ||                   \
     defined(PLATFORM_T31)
     if (sensor_idx != 0)
         return RSS_ERR_NOTSUP;
-    return IMP_ISP_Tuning_SetAeComp(hal_clamp_u8(val));
+    return imp_knob_wrote(IMP_KNOB_AE_COMP, IMP_ISP_Tuning_SetAeComp(hal_clamp_u8(val)));
 #else
     (void)sensor_idx;
     (void)val;

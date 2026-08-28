@@ -80,6 +80,20 @@ int IMP_ISP_Tuning_SetBrightness(unsigned char bright)
 static int g_ae_comp_calls;
 static int g_ae_comp_last;
 
+/*
+ * The readback, faked to answer whatever the last write set. The point of the
+ * suite's legs on it is not the number -- it is whether the call arrives at
+ * all, which the guard decides before this is reached.
+ */
+static int g_bright_gets;
+
+int IMP_ISP_Tuning_GetBrightness(unsigned char *bright)
+{
+    g_bright_gets++;
+    *bright = g_bright_last;
+    return 0;
+}
+
 int IMP_ISP_Tuning_SetAeComp(int comp)
 {
     g_ae_comp_calls++;
@@ -284,8 +298,45 @@ static void test_the_strengths_whose_neutral_is_off(void)
     CHECK(caps.max == 10, "backlight_comp is the vendor's 0..10, got 0..%d", caps.max);
 }
 
+/*
+ * A knob nobody has written this run has no readback, and the getter says so
+ * rather than passing off what IMP hands back.
+ *
+ * IMP's readback is a cache with the process's lifetime, and the ISP's is the
+ * hardware's: restart rvd and the getter reports the tuning's figure again
+ * while the sensor goes on using the last value written. Measured on a T31 --
+ * brightness set to 200, rvd restarted, getter says 0, picture still at 200
+ * (luma 239.4, against 239.5 for an explicit 200 and 118.2 for 128). So the
+ * only readings worth reporting are this process's own.
+ *
+ * First in main() on purpose: the flag is set by the first successful write,
+ * and every other leg here makes one.
+ */
+static void test_a_getter_has_nothing_to_say_before_the_first_write(void)
+{
+    int v = 4242;
+
+    g_bright_gets = 0;
+    CHECK(hal_isp_get_brightness(NULL, &v) == RSS_ERR_NOENT,
+          "an unwritten knob has no reading to give");
+    CHECK(g_bright_gets == 0, "and the SDK is not asked for one, %d calls", g_bright_gets);
+    CHECK(v == 4242, "the caller's variable is left alone, got %d", v);
+
+    /* A refused write is not a write: the sentinel never reached the SDK, so
+     * it cannot have made the readback meaningful. */
+    CHECK(hal_isp_set_brightness(NULL, RSS_ISP_AUTO) == RSS_ERR_INVAL, "auto is refused");
+    CHECK(hal_isp_get_brightness(NULL, &v) == RSS_ERR_NOENT,
+          "and leaves the knob as unreadable as it was");
+
+    CHECK(hal_isp_set_brightness(NULL, 96) == 0, "a real write is accepted");
+    CHECK(hal_isp_get_brightness(NULL, &v) == 0, "and the reading is answerable now");
+    CHECK(v == 96, "carrying what was written, got %d", v);
+    CHECK(g_bright_gets == 1, "reaching the SDK exactly once, %d calls", g_bright_gets);
+}
+
 int main(void)
 {
+    test_a_getter_has_nothing_to_say_before_the_first_write();
     test_every_knob_refuses_auto();
     test_ae_comp_refuses_auto_then_clamps();
     test_only_the_sentinel_is_refused();
