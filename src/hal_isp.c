@@ -109,6 +109,19 @@ static bool imp_knob_readable(imp_knob_t k)
 
 /* Expands to a return, hence the shouting name -- as with HAL_ISP_REFUSE_AUTO
  * above, which it sits beside in every getter that has one. */
+/*
+ * Brightness is the one knob here whose scale does not start where its type
+ * does. IMP runs it dark-to-light over 1..255 and 0 sits off the end of that,
+ * coming back as a blown white frame -- 254.8 mean luma, against 0.2 at 1 --
+ * so it is not a position anyone can have meant. Contrast, saturation,
+ * sharpness and AE compensation are all continuous across 0, so this is a
+ * floor under one knob and not a rule about the range.
+ */
+static uint8_t hal_clamp_brightness(int val)
+{
+    return val < 1 ? 1 : hal_clamp_u8(val);
+}
+
 #define HAL_ISP_NEED_WRITTEN(k)                                                                    \
     do {                                                                                           \
         if (!imp_knob_readable(k))                                                                 \
@@ -126,7 +139,7 @@ int hal_isp_set_brightness(void *ctx, int val)
 {
     (void)ctx;
     HAL_ISP_REFUSE_AUTO(val);
-    uint8_t v = hal_clamp_u8(val);
+    uint8_t v = hal_clamp_brightness(val);
 #if defined(HAL_ISP_PTR_ARGS)
     return imp_knob_wrote(IMP_KNOB_BRIGHTNESS, IMP_ISP_Tuning_SetBrightness(IMPVI_MAIN, &v));
 #else
@@ -997,7 +1010,7 @@ static const struct {
     const char *key;
     int min, max, neutral;
 } imp_knob_caps[] = {
-    {"brightness", 0, 255, 128},
+    {"brightness", 1, 255, 128},
     {"contrast", 0, 255, 128},
     {"saturation", 0, 255, 128},
     {"sharpness", 0, 255, 128},
@@ -3387,7 +3400,7 @@ int hal_isp_set_brightness_n(void *ctx, int sensor_idx, int val)
 {
     (void)ctx;
     HAL_ISP_REFUSE_AUTO(val);
-    uint8_t v = hal_clamp_u8(val);
+    uint8_t v = hal_clamp_brightness(val);
 #if defined(HAL_ISP_PTR_ARGS)
     return imp_knob_wrote(IMP_KNOB_BRIGHTNESS,
                           IMP_ISP_Tuning_SetBrightness((IMPVI_NUM)sensor_idx, &v));

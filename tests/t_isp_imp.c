@@ -191,7 +191,7 @@ static void test_only_the_sentinel_is_refused(void)
     CHECK(hal_isp_set_brightness(NULL, RSS_ISP_AUTO + 1) != RSS_ERR_INVAL,
           "INT_MIN + 1 is not the sentinel and must not be refused as one");
     CHECK(g_bright_calls == 1, "and must still reach the SDK, %d calls", g_bright_calls);
-    CHECK(g_bright_last == 0, "clamped to the floor, got %u", g_bright_last);
+    CHECK(g_bright_last == 1, "clamped to the floor, got %u", g_bright_last);
 }
 
 /*
@@ -208,11 +208,39 @@ static void test_a_legal_value_still_reaches_the_sdk(void)
     CHECK(g_bright_calls == 1, "exactly one vendor call, got %d", g_bright_calls);
     CHECK(g_bright_last == 140, "carrying the value unchanged, got %u", g_bright_last);
 
-    CHECK(hal_isp_set_brightness(NULL, 0) == 0, "the floor is legal");
-    CHECK(g_bright_last == 0, "and arrives as 0, got %u", g_bright_last);
+    CHECK(hal_isp_set_brightness(NULL, 1) == 0, "the floor is legal");
+    CHECK(g_bright_last == 1, "and arrives as 1, got %u", g_bright_last);
 
     CHECK(hal_isp_set_brightness(NULL, 255) == 0, "the ceiling is legal");
     CHECK(g_bright_last == 255, "and arrives as 255, got %u", g_bright_last);
+}
+
+/*
+ * Brightness stops at 1, and the published range says so.
+ *
+ * Measured on a T31/gc2053 by mean frame luma: 1 gives 0.24, 64 gives 18.87,
+ * 128 gives 117.88, 255 gives 250.70 -- and 0 gives 254.81, off the top of a
+ * scale it should sit under. So 0 is not a dim picture but a blown one, and
+ * the caller that reaches it is a slider parked at its own minimum.
+ *
+ * The two halves are asserted together because either alone is the bug: a
+ * floor the caps do not publish still draws a control that can reach 0, and a
+ * published floor the setter does not enforce still lets the CLI through.
+ */
+static void test_brightness_has_no_zero(void)
+{
+    rss_isp_knob_t caps;
+
+    CHECK(hal_isp_get_knob_caps(NULL, "brightness", &caps) == RSS_OK, "brightness has caps");
+    CHECK(caps.min == 1, "the published floor is 1, got %d", caps.min);
+
+    g_bright_calls = 0;
+    CHECK(hal_isp_set_brightness(NULL, 0) == 0, "0 is absorbed rather than refused");
+    CHECK(g_bright_calls == 1, "and still reaches the SDK, %d calls", g_bright_calls);
+    CHECK(g_bright_last == 1, "as the floor, got %u", g_bright_last);
+
+    CHECK(hal_isp_set_brightness_n(NULL, 0, 0) == 0, "the per-sensor setter too");
+    CHECK(g_bright_last == 1, "as the floor, got %u", g_bright_last);
 }
 
 /*
@@ -341,6 +369,7 @@ int main(void)
     test_ae_comp_refuses_auto_then_clamps();
     test_only_the_sentinel_is_refused();
     test_a_legal_value_still_reaches_the_sdk();
+    test_brightness_has_no_zero();
     test_caps_never_claim_an_auto_this_family_does_not_have();
     test_an_undescribed_knob_says_so();
     test_ae_comp_is_the_byte_the_part_accepts();
