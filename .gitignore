@@ -11,4 +11,5 @@ tests/t_enc
 tests/t_isp_i6c
 tests/t_enc_i6c
 tests/t_isp_imp
+tests/t_enc_imp
 .build-config

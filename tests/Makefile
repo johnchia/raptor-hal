@@ -42,9 +42,9 @@ LDFLAGS = -fsanitize=$(SAN) -lpthread
 # rests on it and its behaviour is which file gets written in what order,
 # which a host can check once the sysfs root is redirected.
 SUITES = osd isp audio gpio enc
-BINS = $(addprefix t_,$(SUITES)) t_isp_i6c t_enc_i6c t_isp_imp
+BINS = $(addprefix t_,$(SUITES)) t_isp_i6c t_enc_i6c t_isp_imp t_enc_imp
 
-test: $(addprefix test-,$(SUITES)) test-isp_i6c test-enc_i6c test-isp_imp
+test: $(addprefix test-,$(SUITES)) test-isp_i6c test-enc_i6c test-isp_imp test-enc_imp
 
 $(addprefix test-,$(SUITES)): test-%: t_%
 	@./$<
@@ -115,6 +115,16 @@ t_isp_imp: t_isp_imp.c imp_stubs.c $(IMP_DEPS)
 
 test-isp_imp: t_isp_imp
 	@if [ -x ./t_isp_imp ]; then ./t_isp_imp; fi
+
+t_enc_imp: t_enc_imp.c imp_enc_stubs.c $(IMP_DEPS)
+	@if [ -d "$(IMP_HEADERS)" ]; then \
+		$(CC) $(IMP_CFLAGS) -o $@ t_enc_imp.c imp_enc_stubs.c $(LDFLAGS); \
+	else \
+		echo "t_enc_imp: skipped, no $(IMP_HEADERS)"; \
+	fi
+
+test-enc_imp: t_enc_imp
+	@if [ -x ./t_enc_imp ]; then ./t_enc_imp; fi
 
 # ABI conformance against SigmaStar's own headers. Opt-in: the vendor
 # headers are not redistributable and are not in the repo, so this is

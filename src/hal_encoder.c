@@ -1078,6 +1078,25 @@ int hal_enc_request_idr(void *ctx, int chn)
  *
  * All platforms: IMP_Encoder_SetChnAttrRcMode(chn, &rcMode)
  * Takes effect at next IDR frame.
+ *
+ * IMPEncoderAttrRcMode is a tag plus a union, and the arms do not line up:
+ * CBR carries no uMaxBitRate, so every field after the target bitrate sits one
+ * uint32_t earlier than VBR's. Reading the channel's current attributes and
+ * then writing them back through the target mode's arm therefore hands the
+ * encoder one field's bytes under another field's name -- an I/P delta of -1
+ * arriving as a QP bound, which the SDK is right to refuse. The arm is built
+ * from nothing here for that reason, and nothing is carried across a mode
+ * change: a value that exists in both arms means the same thing only by
+ * coincidence, and one that exists in neither is not preserved by copying it.
+ *
+ * The QP bounds the caller configured live in rvd's stream config, not in the
+ * SDK, and reach the encoder through set-qp-bounds and through the next
+ * channel creation. What this sets are the same defaults creation uses when
+ * the config names none.
+ *
+ * A refusal is not always a no-op: the T31 driver logs Codec_Encode_SetRcParam
+ * and can leave the channel unable to produce a frame, which is why getting
+ * the struct right matters more than reporting the error well.
  */
 int hal_enc_set_rc_mode(void *ctx, int chn, rss_rc_mode_t mode, uint32_t bitrate)
 {
@@ -1088,131 +1107,146 @@ int hal_enc_set_rc_mode(void *ctx, int chn, rss_rc_mode_t mode, uint32_t bitrate
     if (bitrate_kbps == 0)
         bitrate_kbps = 2000; /* fallback */
 
-    /* Read current RC attrs to preserve QP bounds, deltas, step sizes.
-     * Only change the mode and bitrate fields. */
     IMPEncoderAttrRcMode rcAttr;
-    int ret = IMP_Encoder_GetChnAttrRcMode(chn, &rcAttr);
-    if (ret != 0) {
-        HAL_LOG_ERR("GetChnAttrRcMode(%d) failed: %d", chn, ret);
-        return ret;
-    }
-    rcAttr.rcMode = vendor_mode;
+    int ret;
+
+    memset(&rcAttr, 0, sizeof(rcAttr));
 
 #if defined(HAL_NEW_SDK) && !defined(HAL_HYBRID_SDK)
-    /* New SDK (T31/T40/T41): patch bitrate in the target mode struct */
+    /*
+     * New SDK (T31/T40/T41): let the vendor initialise the arm. Channel
+     * creation builds its attributes with SetDefaultParam, and the fields it
+     * fills are not all ones this header gives a meaning to -- so seeding from
+     * it is the only way to be sure the arm is whole, rather than whole as far
+     * as we can see. The geometry it wants is the channel's own, read back
+     * from the encoder.
+     */
+    {
+        IMPEncoderCHNAttr cur, fresh;
+        int init_qp = (vendor_mode == IMP_ENC_RC_MODE_FIXQP) ? 35 : -1;
+        uint32_t br = (vendor_mode == IMP_ENC_RC_MODE_FIXQP) ? 0 : bitrate_kbps;
+        int max_scene;
+
+        memset(&cur, 0, sizeof(cur));
+        ret = IMP_Encoder_GetChnAttr(chn, &cur);
+        if (ret != 0) {
+            HAL_LOG_ERR("GetChnAttr(%d) failed: %d", chn, ret);
+            return ret;
+        }
+        max_scene = (cur.gopAttr.uMaxSameSenceCnt > 0) ? (int)cur.gopAttr.uMaxSameSenceCnt : 2;
+
+        memset(&fresh, 0, sizeof(fresh));
+        ret = IMP_Encoder_SetDefaultParam(
+            &fresh, cur.encAttr.eProfile, vendor_mode, cur.encAttr.uWidth, cur.encAttr.uHeight,
+            cur.rcAttr.outFrmRate.frmRateNum, cur.rcAttr.outFrmRate.frmRateDen,
+            cur.gopAttr.uGopLength, max_scene, init_qp, br);
+        if (ret != 0) {
+            HAL_LOG_ERR("SetDefaultParam(chn %d, mode=%d) failed: %d", chn, (int)vendor_mode, ret);
+            return ret;
+        }
+        rcAttr = fresh.rcAttr.attrRcMode;
+    }
+
+    /* The same overrides creation applies: the SDK's own defaults (MinQP 15,
+     * MaxQP 48) are worse than these. Unconditional -- the arm was just
+     * initialised, so there is no caller value here to preserve. */
+    rcAttr.rcMode = vendor_mode;
     switch (vendor_mode) {
     case IMP_ENC_RC_MODE_FIXQP:
-        if (rcAttr.attrFixQp.iInitialQP < 1)
-            rcAttr.attrFixQp.iInitialQP = 35;
+        rcAttr.attrFixQp.iInitialQP = 35;
         break;
     case IMP_ENC_RC_MODE_CBR:
         rcAttr.attrCbr.uTargetBitRate = bitrate_kbps;
         rcAttr.attrCbr.uMaxPictureSize = bitrate_kbps;
-        if (rcAttr.attrCbr.iMaxQP == 0)
-            rcAttr.attrCbr.iMaxQP = 51;
-        if (rcAttr.attrCbr.iMinQP == 0)
-            rcAttr.attrCbr.iMinQP = 34;
+        rcAttr.attrCbr.iMinQP = 34;
+        rcAttr.attrCbr.iMaxQP = 51;
         break;
     case IMP_ENC_RC_MODE_VBR:
         rcAttr.attrVbr.uTargetBitRate = bitrate_kbps;
         rcAttr.attrVbr.uMaxBitRate = bitrate_kbps * 4 / 3;
         rcAttr.attrVbr.uMaxPictureSize = bitrate_kbps;
-        if (rcAttr.attrVbr.iMaxQP == 0)
-            rcAttr.attrVbr.iMaxQP = 45;
-        if (rcAttr.attrVbr.iMinQP == 0)
-            rcAttr.attrVbr.iMinQP = 20;
+        rcAttr.attrVbr.iMinQP = 20;
+        rcAttr.attrVbr.iMaxQP = 45;
         break;
     case IMP_ENC_RC_MODE_CAPPED_VBR:
         rcAttr.attrCappedVbr.uTargetBitRate = bitrate_kbps;
         rcAttr.attrCappedVbr.uMaxBitRate = bitrate_kbps * 4 / 3;
         rcAttr.attrCappedVbr.uMaxPictureSize = bitrate_kbps;
-        if (rcAttr.attrCappedVbr.iMaxQP == 0)
-            rcAttr.attrCappedVbr.iMaxQP = 45;
-        if (rcAttr.attrCappedVbr.iMinQP == 0)
-            rcAttr.attrCappedVbr.iMinQP = 20;
+        rcAttr.attrCappedVbr.iMinQP = 20;
+        rcAttr.attrCappedVbr.iMaxQP = 45;
         break;
     case IMP_ENC_RC_MODE_CAPPED_QUALITY:
         rcAttr.attrCappedQuality.uTargetBitRate = bitrate_kbps;
         rcAttr.attrCappedQuality.uMaxBitRate = bitrate_kbps * 4 / 3;
         rcAttr.attrCappedQuality.uMaxPictureSize = bitrate_kbps;
-        if (rcAttr.attrCappedQuality.iMaxQP == 0)
-            rcAttr.attrCappedQuality.iMaxQP = 45;
-        if (rcAttr.attrCappedQuality.iMinQP == 0)
-            rcAttr.attrCappedQuality.iMinQP = 20;
+        rcAttr.attrCappedQuality.iMinQP = 20;
+        rcAttr.attrCappedQuality.iMaxQP = 45;
         break;
     default:
         break;
     }
 #elif defined(HAL_HYBRID_SDK)
-    /* T32 hybrid: H264-prefixed structs but different member names */
+    /* T32 hybrid: H264-prefixed structs but different member names. No
+     * SetDefaultParam seeding -- its signature takes a buffer size this
+     * function does not have, and creation fills these arms field by field
+     * anyway, which is what is repeated here. */
+    rcAttr.rcMode = vendor_mode;
     switch (vendor_mode) {
     case ENC_RC_MODE_FIXQP:
-        if (rcAttr.attrH264FixQp.IQp == 0)
-            rcAttr.attrH264FixQp.IQp = 35;
+        rcAttr.attrH264FixQp.IQp = 35;
         break;
     case ENC_RC_MODE_CBR:
         rcAttr.attrH264Cbr.outBitRate = bitrate_kbps;
-        if (rcAttr.attrH264Cbr.maxQp == 0)
-            rcAttr.attrH264Cbr.maxQp = 45;
-        if (rcAttr.attrH264Cbr.minQp == 0)
-            rcAttr.attrH264Cbr.minQp = 15;
+        rcAttr.attrH264Cbr.minQp = 15;
+        rcAttr.attrH264Cbr.maxQp = 45;
         break;
     case ENC_RC_MODE_VBR:
         rcAttr.attrH264Vbr.maxBitRate = bitrate_kbps;
-        if (rcAttr.attrH264Vbr.maxQp == 0)
-            rcAttr.attrH264Vbr.maxQp = 45;
-        if (rcAttr.attrH264Vbr.minQp == 0)
-            rcAttr.attrH264Vbr.minQp = 15;
+        rcAttr.attrH264Vbr.minQp = 15;
+        rcAttr.attrH264Vbr.maxQp = 45;
         break;
     case ENC_RC_MODE_SMART:
         rcAttr.attrH264Smart.maxBitRate = bitrate_kbps;
-        if (rcAttr.attrH264Smart.maxQp == 0)
-            rcAttr.attrH264Smart.maxQp = 45;
-        if (rcAttr.attrH264Smart.minQp == 0)
-            rcAttr.attrH264Smart.minQp = 15;
+        rcAttr.attrH264Smart.minQp = 15;
+        rcAttr.attrH264Smart.maxQp = 45;
         break;
     default:
         break;
     }
 #else
-    /* Old SDK (T10/T20/T21/T23/T30): H264-prefixed structs with QP step fields */
+    /* Old SDK (T10/T20/T21/T23/T30): H264-prefixed structs with QP step
+     * fields. Same shape as hal_enc_create_channel_old builds. */
+    rcAttr.rcMode = vendor_mode;
     switch (vendor_mode) {
     case ENC_RC_MODE_FIXQP:
-        if (rcAttr.attrH264FixQp.qp == 0)
-            rcAttr.attrH264FixQp.qp = 35;
+        rcAttr.attrH264FixQp.qp = 35;
         break;
     case ENC_RC_MODE_CBR:
         rcAttr.attrH264Cbr.outBitRate = bitrate_kbps;
-        if (rcAttr.attrH264Cbr.maxQp == 0)
-            rcAttr.attrH264Cbr.maxQp = 45;
-        if (rcAttr.attrH264Cbr.minQp == 0)
-            rcAttr.attrH264Cbr.minQp = 15;
-        if (rcAttr.attrH264Cbr.frmQPStep == 0)
-            rcAttr.attrH264Cbr.frmQPStep = 3;
-        if (rcAttr.attrH264Cbr.gopQPStep == 0)
-            rcAttr.attrH264Cbr.gopQPStep = 15;
+        rcAttr.attrH264Cbr.minQp = 15;
+        rcAttr.attrH264Cbr.maxQp = 45;
+        rcAttr.attrH264Cbr.frmQPStep = 3;
+        rcAttr.attrH264Cbr.gopQPStep = 15;
         break;
     case ENC_RC_MODE_VBR:
         rcAttr.attrH264Vbr.maxBitRate = bitrate_kbps;
-        if (rcAttr.attrH264Vbr.maxQp == 0)
-            rcAttr.attrH264Vbr.maxQp = 45;
-        if (rcAttr.attrH264Vbr.minQp == 0)
-            rcAttr.attrH264Vbr.minQp = 15;
-        if (rcAttr.attrH264Vbr.frmQPStep == 0)
-            rcAttr.attrH264Vbr.frmQPStep = 3;
-        if (rcAttr.attrH264Vbr.gopQPStep == 0)
-            rcAttr.attrH264Vbr.gopQPStep = 15;
+        rcAttr.attrH264Vbr.minQp = 15;
+        rcAttr.attrH264Vbr.maxQp = 45;
+        rcAttr.attrH264Vbr.staticTime = 1;
+        rcAttr.attrH264Vbr.changePos = 80;
+        rcAttr.attrH264Vbr.qualityLvl = 2;
+        rcAttr.attrH264Vbr.frmQPStep = 3;
+        rcAttr.attrH264Vbr.gopQPStep = 15;
         break;
     case ENC_RC_MODE_SMART:
         rcAttr.attrH264Smart.maxBitRate = bitrate_kbps;
-        if (rcAttr.attrH264Smart.maxQp == 0)
-            rcAttr.attrH264Smart.maxQp = 45;
-        if (rcAttr.attrH264Smart.minQp == 0)
-            rcAttr.attrH264Smart.minQp = 15;
-        if (rcAttr.attrH264Smart.frmQPStep == 0)
-            rcAttr.attrH264Smart.frmQPStep = 3;
-        if (rcAttr.attrH264Smart.gopQPStep == 0)
-            rcAttr.attrH264Smart.gopQPStep = 15;
+        rcAttr.attrH264Smart.minQp = 15;
+        rcAttr.attrH264Smart.maxQp = 45;
+        rcAttr.attrH264Smart.staticTime = 1;
+        rcAttr.attrH264Smart.changePos = 80;
+        rcAttr.attrH264Smart.qualityLvl = 2;
+        rcAttr.attrH264Smart.frmQPStep = 3;
+        rcAttr.attrH264Smart.gopQPStep = 15;
         break;
     default:
         break;
