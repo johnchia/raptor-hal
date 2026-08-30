@@ -177,13 +177,18 @@ int hal_isp_get_exposure(void *ctx, rss_exposure_t *exposure)
     }
 
     exposure->exposure_time = ae.shutterUs;
+    exposure->valid_mask |= RSS_EXPOSURE_VALID_TIME;
     /*
      * Combined analogue and ISP gain, kept in the same 1024-per-unit the parts
      * come in: the product carries the unit twice, so one factor is divided back
      * out.
      */
     exposure->total_gain = (uint32_t)(((uint64_t)ae.sensorGain * ae.ispGain) >> 10);
+    exposure->valid_mask |= RSS_EXPOSURE_VALID_TOTAL_GAIN;
+    /* preAvgY comes out of the same status read, so it is as valid as the
+     * gain is -- including when the frame really is black. */
     exposure->ae_luma = ae.preAvgY;
+    exposure->valid_mask |= RSS_EXPOSURE_VALID_AE_LUMA;
 
     have_awb =
         st->isp.awb_status && st->isp.awb_status(I6C_DEV_ID(I6C_ISP_DEV), I6C_ISP_CHN, &awb) == 0;
@@ -191,6 +196,8 @@ int hal_isp_get_exposure(void *ctx, rss_exposure_t *exposure)
         exposure->wb_rgain = (uint16_t)awb.rGain;
         exposure->wb_ggain = (uint16_t)awb.gGain;
         exposure->wb_bgain = (uint16_t)awb.bGain;
+        exposure->valid_mask |= RSS_EXPOSURE_VALID_WB_RGAIN | RSS_EXPOSURE_VALID_WB_GGAIN |
+                                RSS_EXPOSURE_VALID_WB_BGAIN;
     }
 
     if (!ae_logged) {

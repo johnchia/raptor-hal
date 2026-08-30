@@ -1453,6 +1453,25 @@ rss_hal_ctx_t *rss_hal_create(void)
 }
 
 /*
+ * rss_hal_create_backend -- pick a pipeline backend by name.
+ *
+ * This build carries one, and it is the vendor's: MI is how a SigmaStar Infinity6E
+ * part talks to its ISP and encoder at all. "imp" is the name the config's default
+ * carries on every platform, so it means "the built-in one" here rather
+ * than Ingenic's library. Any other name -- v4l2, composed on the Ingenic
+ * side out of parts that have no counterpart here -- gets NULL, because a
+ * caller that asked for a different pipeline is better told it is missing
+ * than handed this one under its name.
+ */
+rss_hal_ctx_t *rss_hal_create_backend(const char *backend)
+{
+    if (backend && strcmp(backend, "imp") != 0)
+        return NULL;
+
+    return rss_hal_create();
+}
+
+/*
  * rss_hal_destroy -- free a HAL context and internal resources.
  *
  * Does NOT call deinit() -- the caller must do that first.

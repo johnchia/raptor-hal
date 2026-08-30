@@ -2062,7 +2062,7 @@ static uint32_t star_ae_total_gain(const i6_isp_ae_status *ae)
  * disagrees with itself is a reason to report no luma rather than a
  * plausible-looking number that will move the IR-cut filter.
  */
-static uint32_t star_ae_luma(star_state_t *st, const i6_isp_ae_status *ae)
+static uint32_t star_ae_luma(star_state_t *st, const i6_isp_ae_status *ae, bool *ok)
 {
     static bool layout_logged;
     static bool layout_warned;
@@ -2074,6 +2074,8 @@ static uint32_t star_ae_luma(star_state_t *st, const i6_isp_ae_status *ae)
     uint64_t sum[I6_ISP_AE_CELL_SZ] = {0};
     uint32_t luma;
     int ret;
+
+    *ok = false;
 
     if (!st->isp.fnGetAeHwAvgStats)
         return 0;
@@ -2143,6 +2145,7 @@ static uint32_t star_ae_luma(star_state_t *st, const i6_isp_ae_status *ae)
     }
 
     free(stats);
+    *ok = true;
     return luma;
 }
 
@@ -2172,11 +2175,17 @@ static uint32_t star_ae_luma(star_state_t *st, const i6_isp_ae_status *ae)
  * near-black frame reads it while the AE converges. A value above 255 is
  * not the mean night_luma is calibrated against, whatever else it may be,
  * so it is refused rather than passed on rescaled by a guess.
+ *
+ * *ok separates a luma of zero that was measured -- a black frame is a
+ * legitimate reading -- from one that stands in for no reading at all,
+ * which is what the caller reports in valid_mask.
  */
-static uint32_t star_ae_scene_luma(star_state_t *st, const i6_isp_ae_status *ae)
+static uint32_t star_ae_scene_luma(star_state_t *st, const i6_isp_ae_status *ae, bool *ok)
 {
-    if (ae->preAvgY > 0 && ae->preAvgY <= 255)
+    if (ae->preAvgY > 0 && ae->preAvgY <= 255) {
+        *ok = true;
         return ae->preAvgY;
+    }
 
     if (ae->preAvgY > 255) {
         static bool warned;
@@ -2189,7 +2198,7 @@ static uint32_t star_ae_scene_luma(star_state_t *st, const i6_isp_ae_status *ae)
         }
     }
 
-    return star_ae_luma(st, ae);
+    return star_ae_luma(st, ae, ok);
 }
 
 #define STAR_LIMIT_REASSERT_S 2
@@ -2329,6 +2338,7 @@ int hal_isp_get_exposure(void *ctx, rss_exposure_t *exposure)
 {
     star_state_t *st = star_state(ctx);
     i6_isp_ae_status ae;
+    bool luma_ok = false;
     int ret;
 
     if (!st || !st->isp_loaded)
@@ -2363,8 +2373,12 @@ int hal_isp_get_exposure(void *ctx, rss_exposure_t *exposure)
     }
 
     exposure->exposure_time = ae.shutterUs;
+    exposure->valid_mask |= RSS_EXPOSURE_VALID_TIME;
     exposure->total_gain = star_ae_total_gain(&ae);
-    exposure->ae_luma = star_ae_scene_luma(st, &ae);
+    exposure->valid_mask |= RSS_EXPOSURE_VALID_TOTAL_GAIN;
+    exposure->ae_luma = star_ae_scene_luma(st, &ae, &luma_ok);
+    if (luma_ok)
+        exposure->valid_mask |= RSS_EXPOSURE_VALID_AE_LUMA;
 
     star_isp_reload_if_reset(st, false);
 

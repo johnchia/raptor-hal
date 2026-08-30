@@ -12,6 +12,7 @@
 #include <linux/videodev2.h>
 #include <limits.h>
 #include <poll.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -22,9 +23,10 @@
 
 #include "hal_internal.h"
 
-/* One buffer may be owned by AVPU while the ISP fills the other.  A third
- * full-resolution NV12 allocation adds 5.5 MiB of contiguous pressure on T41
- * without increasing this single-in-flight encoder's throughput. */
+/* Prefer two buffers so the ISP can fill one while AVPU owns the other.  The
+ * adapter itself keeps only one frame in flight, however, so drivers with a
+ * smaller contiguous pool can safely grant one buffer without changing the
+ * capture/encode ownership contract. */
 #define RSS_V4L2_BUFFER_COUNT 2U
 #define OPENIMP_AVC_PIXFMT_NV12 10U
 
@@ -33,7 +35,7 @@
  * header is not available here without introducing a package dependency
  * cycle. These declarations are copied verbatim from:
  *
- *   opensensor/openimp@7c6ca718170a01a86c6222a3af21b662efa6bbd9
+ *   opensensor/openimp@e236efffed2b2399e9d04dc159ece14a345b6e69
  *   include/openimp/openimp_avc.h
  *
  * That commit is the bridge ABI contract. Update this block and the pinned
@@ -90,6 +92,10 @@ extern int OpenIMP_AVC_Dequeue(OpenIMPAVCEncoder *encoder, OpenIMPAVCPacket *pac
 extern int OpenIMP_AVC_Release(OpenIMPAVCEncoder *encoder, OpenIMPAVCPacket *packet)
     __attribute__((weak));
 extern int OpenIMP_AVC_RequestIDR(OpenIMPAVCEncoder *encoder) __attribute__((weak));
+extern int OpenIMP_AVC_SetBitrate(OpenIMPAVCEncoder *encoder, uint32_t bitrate)
+    __attribute__((weak));
+extern int OpenIMP_AVC_SetGopLength(OpenIMPAVCEncoder *encoder, uint32_t gop_length)
+    __attribute__((weak));
 extern int OpenIMP_AVC_ImportDMABuf(int dma_buf_fd, uint32_t size, uint32_t *physical_address)
     __attribute__((weak));
 
@@ -118,6 +124,14 @@ struct rss_v4l2_h264 {
     int source_requeue_pending;
     int packet_valid;
     int warned_key_mismatch;
+    atomic_uint pending_idr;
+    atomic_uint pending_bitrate;
+    atomic_uint target_bitrate;
+    atomic_uint pending_gop;
+    atomic_uint target_gop;
+    atomic_uint average_bitrate;
+    uint64_t bitrate_window_start;
+    uint64_t bitrate_window_bits;
 };
 
 static uint64_t monotonic_ms(void)
@@ -163,6 +177,75 @@ static int openimp_symbols_available(void)
 {
     return OpenIMP_AVC_Create && OpenIMP_AVC_Destroy && OpenIMP_AVC_Submit && OpenIMP_AVC_Dequeue &&
            OpenIMP_AVC_Release && OpenIMP_AVC_RequestIDR && OpenIMP_AVC_ImportDMABuf;
+}
+
+static int apply_pending_bitrate(rss_v4l2_h264_t *backend)
+{
+    unsigned int bitrate = atomic_exchange(&backend->pending_bitrate, 0);
+
+    if (!bitrate)
+        return 0;
+    if (!OpenIMP_AVC_SetBitrate)
+        return -ENOTSUP;
+    if (OpenIMP_AVC_SetBitrate(backend->encoder, bitrate) != 0) {
+        unsigned int empty = 0;
+
+        atomic_compare_exchange_strong(&backend->pending_bitrate, &empty, bitrate);
+        return -EIO;
+    }
+    return 0;
+}
+
+static int apply_pending_idr(rss_v4l2_h264_t *backend)
+{
+    unsigned int pending = atomic_exchange(&backend->pending_idr, 0);
+
+    if (!pending)
+        return 0;
+    if (OpenIMP_AVC_RequestIDR(backend->encoder) != 0) {
+        atomic_store(&backend->pending_idr, 1);
+        return -EIO;
+    }
+    return 0;
+}
+
+static int apply_pending_gop(rss_v4l2_h264_t *backend)
+{
+    unsigned int gop = atomic_exchange(&backend->pending_gop, 0);
+
+    if (!gop)
+        return 0;
+    if (!OpenIMP_AVC_SetGopLength)
+        return -ENOTSUP;
+    if (OpenIMP_AVC_SetGopLength(backend->encoder, gop) != 0) {
+        unsigned int empty = 0;
+
+        atomic_compare_exchange_strong(&backend->pending_gop, &empty, gop);
+        return -EIO;
+    }
+    return 0;
+}
+
+static void update_average_bitrate(rss_v4l2_h264_t *backend)
+{
+    uint64_t timestamp = backend->packet.timestamp;
+    uint64_t elapsed;
+    uint64_t bitrate;
+
+    if (!backend->bitrate_window_start || timestamp <= backend->bitrate_window_start) {
+        backend->bitrate_window_start = timestamp;
+        backend->bitrate_window_bits = 0;
+        return;
+    }
+    backend->bitrate_window_bits += (uint64_t)backend->packet.length * 8U;
+    elapsed = timestamp - backend->bitrate_window_start;
+    if (elapsed < 1000000U)
+        return;
+    bitrate = backend->bitrate_window_bits * 1000000U / elapsed;
+    atomic_store(&backend->average_bitrate,
+                 bitrate > UINT32_MAX ? UINT32_MAX : (unsigned int)bitrate);
+    backend->bitrate_window_start = timestamp;
+    backend->bitrate_window_bits = 0;
 }
 
 static int queue_buffer(rss_v4l2_h264_t *backend, uint32_t index)
@@ -268,9 +351,11 @@ int rss_v4l2_h264_create(rss_v4l2_h264_t **backend_out, const char *video_device
                          const rss_video_config_t *config)
 {
     rss_v4l2_h264_t *backend;
-    struct v4l2_requestbuffers request;
-    struct v4l2_format format;
+    struct v4l2_requestbuffers request = {0};
+    struct v4l2_format format = {0};
     uint32_t index;
+    uint32_t failed_index = UINT32_MAX;
+    const char *stage = "validate";
     int ret = -EINVAL;
 
     if (!backend_out || !config || config->codec != RSS_CODEC_H264 || !config->width ||
@@ -285,9 +370,16 @@ int rss_v4l2_h264_create(rss_v4l2_h264_t **backend_out, const char *video_device
         return -ENOMEM;
     backend->video_fd = -1;
     backend->type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    atomic_init(&backend->pending_idr, 0);
+    atomic_init(&backend->pending_bitrate, 0);
+    atomic_init(&backend->target_bitrate, config->bitrate);
+    atomic_init(&backend->pending_gop, 0);
+    atomic_init(&backend->target_gop, config->gop_length);
+    atomic_init(&backend->average_bitrate, 0);
     for (index = 0; index < RSS_V4L2_BUFFER_COUNT; ++index)
         backend->buffers[index].dma_fd = -1;
 
+    stage = "open";
     backend->video_fd =
         open(video_device ? video_device : "/dev/video0", O_RDWR | O_NONBLOCK | O_CLOEXEC);
     if (backend->video_fd < 0) {
@@ -299,7 +391,11 @@ int rss_v4l2_h264_create(rss_v4l2_h264_t **backend_out, const char *video_device
     format.fmt.pix.width = config->width;
     format.fmt.pix.height = config->height;
     format.fmt.pix.pixelformat = V4L2_PIX_FMT_NV12;
-    format.fmt.pix.field = V4L2_FIELD_NONE;
+    /* Legacy Ingenic queues normalize FIELD_ANY to their native marker even
+     * though the delivered NV12 is progressive.  Newer adapters accept ANY
+     * too, making it the portable negotiation value. */
+    format.fmt.pix.field = V4L2_FIELD_ANY;
+    stage = "s_fmt";
     ret = v4l2_ioctl(backend->video_fd, VIDIOC_S_FMT, &format);
     if (ret)
         goto fail;
@@ -316,23 +412,45 @@ int rss_v4l2_h264_create(rss_v4l2_h264_t **backend_out, const char *video_device
     request.count = RSS_V4L2_BUFFER_COUNT;
     request.type = backend->type;
     request.memory = V4L2_MEMORY_MMAP;
+    stage = "reqbufs";
     ret = v4l2_ioctl(backend->video_fd, VIDIOC_REQBUFS, &request);
+    if (ret == -ENOMEM && request.count > 0U) {
+        /* Legacy vb2 allocators may report the successfully allocated prefix
+         * with -ENOMEM.  Release that partial queue before requesting the one
+         * buffer this synchronous bridge can operate with. */
+        memset(&request, 0, sizeof(request));
+        request.type = backend->type;
+        request.memory = V4L2_MEMORY_MMAP;
+        stage = "reqbufs_release_partial";
+        ret = v4l2_ioctl(backend->video_fd, VIDIOC_REQBUFS, &request);
+        if (ret)
+            goto fail;
+        request.count = 1U;
+        stage = "reqbufs_single";
+        ret = v4l2_ioctl(backend->video_fd, VIDIOC_REQBUFS, &request);
+    }
     if (ret)
         goto fail;
-    if (request.count < RSS_V4L2_BUFFER_COUNT) {
+    if (!request.count) {
         ret = -ENOMEM;
         goto fail;
     }
-    backend->buffer_count = RSS_V4L2_BUFFER_COUNT;
+    if (request.count < RSS_V4L2_BUFFER_COUNT)
+        HAL_LOG_WARN("V4L2 buffer pool granted %u of %u buffers; using one-buffer mode",
+                     request.count, RSS_V4L2_BUFFER_COUNT);
+    backend->buffer_count =
+        request.count < RSS_V4L2_BUFFER_COUNT ? request.count : RSS_V4L2_BUFFER_COUNT;
 
     for (index = 0; index < backend->buffer_count; ++index) {
         struct v4l2_exportbuffer export;
         struct v4l2_buffer buffer;
 
+        failed_index = index;
         memset(&buffer, 0, sizeof(buffer));
         buffer.type = backend->type;
         buffer.memory = V4L2_MEMORY_MMAP;
         buffer.index = index;
+        stage = "querybuf";
         ret = v4l2_ioctl(backend->video_fd, VIDIOC_QUERYBUF, &buffer);
         if (ret)
             goto fail;
@@ -340,6 +458,7 @@ int rss_v4l2_h264_create(rss_v4l2_h264_t **backend_out, const char *video_device
         export.type = backend->type;
         export.index = index;
         export.flags = O_CLOEXEC;
+        stage = "expbuf";
         ret = v4l2_ioctl(backend->video_fd, VIDIOC_EXPBUF, &export);
         if (ret)
             goto fail;
@@ -349,9 +468,11 @@ int rss_v4l2_h264_create(rss_v4l2_h264_t **backend_out, const char *video_device
             mmap(NULL, buffer.length, PROT_READ, MAP_SHARED, export.fd, 0);
         if (backend->buffers[index].address == MAP_FAILED) {
             backend->buffers[index].address = NULL;
+            stage = "mmap";
             ret = -errno;
             goto fail;
         }
+        stage = "import_dmabuf";
         ret = OpenIMP_AVC_ImportDMABuf(export.fd, buffer.length,
                                        &backend->buffers[index].physical_address);
         if (ret)
@@ -384,6 +505,8 @@ int rss_v4l2_h264_create(rss_v4l2_h264_t **backend_out, const char *video_device
             .entropy_coding = config->profile != 0,
         };
 
+        failed_index = UINT32_MAX;
+        stage = "avc_create";
         ret = OpenIMP_AVC_Create(&backend->encoder, &avc);
         if (ret)
             goto fail;
@@ -395,6 +518,11 @@ int rss_v4l2_h264_create(rss_v4l2_h264_t **backend_out, const char *video_device
     return 0;
 
 fail:
+    HAL_LOG_ERR("V4L2 AVC create failed: stage=%s device=%s request=%ux%u "
+                "negotiated=%ux%u size=%u buffers=%u index=%u ret=%d",
+                stage, video_device ? video_device : "/dev/video0", config->width, config->height,
+                format.fmt.pix.width, format.fmt.pix.height, format.fmt.pix.sizeimage,
+                request.count, failed_index, ret);
     rss_v4l2_h264_destroy(backend);
     return ret;
 }
@@ -489,6 +617,15 @@ int rss_v4l2_h264_poll(rss_v4l2_h264_t *backend, uint32_t timeout_ms)
             backend->packet_valid = 1;
         return ret;
     }
+    ret = apply_pending_bitrate(backend);
+    if (ret)
+        return ret;
+    ret = apply_pending_gop(backend);
+    if (ret)
+        return ret;
+    ret = apply_pending_idr(backend);
+    if (ret)
+        return ret;
     poll_fd.fd = backend->video_fd;
     poll_fd.events = POLLIN;
     poll_fd.revents = 0;
@@ -524,7 +661,10 @@ int rss_v4l2_h264_poll(rss_v4l2_h264_t *backend, uint32_t timeout_ms)
     frame.virtual_address = (uintptr_t)backend->buffers[buffer.index].address;
     frame.timestamp =
         (uint64_t)buffer.timestamp.tv_sec * 1000000U + (uint64_t)buffer.timestamp.tv_usec;
-    frame.cookie = (void *)(uintptr_t)buffer.index;
+    /* OpenIMP carries this through its metadata FIFO as an opaque pointer.
+     * A small integer such as buffer index 1 collides with the FIFO's low
+     * sentinel range; the per-buffer object is stable for the session. */
+    frame.cookie = &backend->buffers[buffer.index];
     ret = OpenIMP_AVC_Submit(backend->encoder, &frame);
     if (ret) {
         int queue_ret = requeue_source(backend);
@@ -574,6 +714,7 @@ int rss_v4l2_h264_get_frame(rss_v4l2_h264_t *backend, rss_frame_t *frame)
     frame->seq = backend->sequence;
     frame->is_key = is_key != 0;
     frame->_priv = backend;
+    update_average_bitrate(backend);
     return 0;
 }
 
@@ -590,14 +731,390 @@ int rss_v4l2_h264_release_frame(rss_v4l2_h264_t *backend, rss_frame_t *frame)
     return ret;
 }
 
-/* Thread contract: called from RVD's ctrl thread while the encoder
- * thread is concurrently in poll/dequeue on the same handle. No
- * userspace lock on purpose: serialization is the AL codec command
- * path's job, the same interlock the vendor SDK's RequestIDR has
- * relied on in production for years. */
+/* The control thread only records the request.  The capture thread applies it
+ * alongside bitrate/GOP updates, so OpenIMP's codec command path remains
+ * single-threaded.  Repeated requests before the next poll coalesce. */
 int rss_v4l2_h264_request_idr(rss_v4l2_h264_t *backend)
 {
     if (!backend)
         return -EINVAL;
-    return OpenIMP_AVC_RequestIDR(backend->encoder);
+    atomic_store(&backend->pending_idr, 1);
+    return 0;
+}
+
+int rss_v4l2_h264_set_bitrate(rss_v4l2_h264_t *backend, uint32_t bitrate)
+{
+    if (!backend || !bitrate)
+        return -EINVAL;
+    if (!OpenIMP_AVC_SetBitrate)
+        return -ENOTSUP;
+    atomic_store(&backend->target_bitrate, bitrate);
+    atomic_store(&backend->pending_bitrate, bitrate);
+    return 0;
+}
+
+int rss_v4l2_h264_get_bitrate(rss_v4l2_h264_t *backend, uint32_t *target_bitrate,
+                              uint32_t *average_bitrate)
+{
+    if (!backend || (!target_bitrate && !average_bitrate))
+        return -EINVAL;
+    if (target_bitrate)
+        *target_bitrate = atomic_load(&backend->target_bitrate);
+    if (average_bitrate)
+        *average_bitrate = atomic_load(&backend->average_bitrate);
+    return 0;
+}
+
+int rss_v4l2_h264_set_gop(rss_v4l2_h264_t *backend, uint32_t gop_length)
+{
+    if (!backend || !gop_length)
+        return -EINVAL;
+    if (!OpenIMP_AVC_SetGopLength)
+        return -ENOTSUP;
+    atomic_store(&backend->target_gop, gop_length);
+    atomic_store(&backend->pending_gop, gop_length);
+    return 0;
+}
+
+int rss_v4l2_h264_get_gop(rss_v4l2_h264_t *backend, uint32_t *gop_length)
+{
+    if (!backend || !gop_length)
+        return -EINVAL;
+    *gop_length = atomic_load(&backend->target_gop);
+    return 0;
+}
+
+/* ================================================================
+ * The "v4l2" backend ops table
+ *
+ * Composed from the IMP table: ISP, sensor and system ops are
+ * inherited verbatim (on an OpenIMP system libimp IS OpenIMP, the
+ * same ABI the tuning path already talks), the encoder slots mount
+ * this file's capture/encode queue, and the subsystems this backend
+ * does not have (framesource graph, OSD, IVS, JPEG, the IMP encoder
+ * feature surface) are NULL so RSS_HAL_CALL answers RSS_ERR_NOTSUP
+ * without any caller-side allowlist.
+ * ================================================================ */
+
+static int v4l2_ops_enc_create_channel(void *vctx, int chn, const rss_video_config_t *cfg)
+{
+    rss_hal_ctx_t *c = (rss_hal_ctx_t *)vctx;
+
+    if (chn != 0)
+        return RSS_ERR_NOTSUP; /* single H.264 channel */
+    if (c->v4l2)
+        return -EBUSY;
+    return rss_v4l2_h264_create(&c->v4l2, c->v4l2_device[0] ? c->v4l2_device : "/dev/video0", cfg);
+}
+
+static int v4l2_ops_enc_destroy_channel(void *vctx, int chn)
+{
+    rss_hal_ctx_t *c = (rss_hal_ctx_t *)vctx;
+
+    if (chn != 0 || !c->v4l2)
+        return -EINVAL;
+    rss_v4l2_h264_destroy(c->v4l2);
+    c->v4l2 = NULL;
+    return 0;
+}
+
+#define V4L2_OPS_WRAP(name, call)                                                                  \
+    static int v4l2_ops_##name(void *vctx, int chn)                                                \
+    {                                                                                              \
+        rss_hal_ctx_t *c = (rss_hal_ctx_t *)vctx;                                                  \
+        if (chn != 0 || !c->v4l2)                                                                  \
+            return -EINVAL;                                                                        \
+        return call(c->v4l2);                                                                      \
+    }
+
+V4L2_OPS_WRAP(enc_start, rss_v4l2_h264_start)
+V4L2_OPS_WRAP(enc_stop, rss_v4l2_h264_stop)
+V4L2_OPS_WRAP(enc_request_idr, rss_v4l2_h264_request_idr)
+
+static int v4l2_ops_enc_poll(void *vctx, int chn, uint32_t timeout_ms)
+{
+    rss_hal_ctx_t *c = (rss_hal_ctx_t *)vctx;
+
+    if (chn != 0 || !c->v4l2)
+        return -EINVAL;
+    return rss_v4l2_h264_poll(c->v4l2, timeout_ms);
+}
+
+static int v4l2_ops_enc_get_frame(void *vctx, int chn, rss_frame_t *frame)
+{
+    rss_hal_ctx_t *c = (rss_hal_ctx_t *)vctx;
+
+    if (chn != 0 || !c->v4l2)
+        return -EINVAL;
+    return rss_v4l2_h264_get_frame(c->v4l2, frame);
+}
+
+static int v4l2_ops_enc_release_frame(void *vctx, int chn, rss_frame_t *frame)
+{
+    rss_hal_ctx_t *c = (rss_hal_ctx_t *)vctx;
+
+    if (chn != 0 || !c->v4l2)
+        return -EINVAL;
+    return rss_v4l2_h264_release_frame(c->v4l2, frame);
+}
+
+/* The deferred runtime controls: the setters publish atomic pending
+ * targets, the encoder thread applies them between completed
+ * ownership cycles, so a ctrl request never races Submit/Dequeue/
+ * Release on the single AVPU path. */
+static int v4l2_ops_enc_set_bitrate(void *vctx, int chn, uint32_t bitrate)
+{
+    rss_hal_ctx_t *c = (rss_hal_ctx_t *)vctx;
+
+    if (chn != 0 || !c->v4l2)
+        return -EINVAL;
+    return rss_v4l2_h264_set_bitrate(c->v4l2, bitrate);
+}
+
+static int v4l2_ops_enc_get_avg_bitrate(void *vctx, int chn, uint32_t *bitrate)
+{
+    rss_hal_ctx_t *c = (rss_hal_ctx_t *)vctx;
+
+    if (chn != 0 || !c->v4l2)
+        return -EINVAL;
+    return rss_v4l2_h264_get_bitrate(c->v4l2, NULL, bitrate);
+}
+
+static int v4l2_ops_enc_set_gop(void *vctx, int chn, uint32_t gop_length)
+{
+    rss_hal_ctx_t *c = (rss_hal_ctx_t *)vctx;
+
+    if (chn != 0 || !c->v4l2)
+        return -EINVAL;
+    return rss_v4l2_h264_set_gop(c->v4l2, gop_length);
+}
+
+static int v4l2_ops_enc_get_gop_attr(void *vctx, int chn, uint32_t *gop_length)
+{
+    rss_hal_ctx_t *c = (rss_hal_ctx_t *)vctx;
+
+    if (chn != 0 || !c->v4l2)
+        return -EINVAL;
+    return rss_v4l2_h264_get_gop(c->v4l2, gop_length);
+}
+
+/* The media clock this backend stamps frames with: CLOCK_MONOTONIC
+ * microseconds (V4L2 buffer timestamps), not IMP system time. The
+ * inherited IMP op would hand consumers a clock the frames are not
+ * on, skewing the UTC mapping rings publish. */
+static int v4l2_ops_sys_get_timestamp(void *vctx, int64_t *ts)
+{
+    struct timespec t;
+
+    (void)vctx;
+    if (!ts)
+        return -EINVAL;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    *ts = (int64_t)t.tv_sec * 1000000 + t.tv_nsec / 1000;
+    return 0;
+}
+
+/* deinit: the encoder instance goes first, then the inherited IMP
+ * teardown releases the sensor and ISP it brought up in init. */
+static int v4l2_ops_deinit(void *vctx)
+{
+    rss_hal_ctx_t *c = (rss_hal_ctx_t *)vctx;
+
+    if (c->v4l2) {
+        rss_v4l2_h264_destroy(c->v4l2);
+        c->v4l2 = NULL;
+    }
+    return hal_imp_ops()->deinit(vctx);
+}
+
+void rss_hal_v4l2_set_device(rss_hal_ctx_t *ctx, const char *device)
+{
+    if (ctx && device)
+        snprintf(ctx->v4l2_device, sizeof(ctx->v4l2_device), "%s", device);
+}
+
+const rss_hal_ops_t *hal_v4l2_backend_ops(void)
+{
+    static rss_hal_ops_t table;
+    static bool built;
+    rss_hal_ops_t *ops = &table;
+
+    if (built)
+        return &table;
+
+    table = *hal_imp_ops();
+
+    /* Absent subsystems answer RSS_ERR_NOTSUP via the NULL-slot rule. */
+    ops->bind = NULL;
+    ops->enc_create_group = NULL;
+    ops->enc_destroy_group = NULL;
+    ops->enc_flush_stream = NULL;
+    ops->enc_get_avg_bitrate = NULL;
+    ops->enc_get_channel_attr = NULL;
+    ops->enc_get_chn_ave_bitrate = NULL;
+    ops->enc_get_chn_enc_type = NULL;
+    ops->enc_get_chn_gop_attr = NULL;
+    ops->enc_get_color2grey = NULL;
+    ops->enc_get_crop = NULL;
+    ops->enc_get_denoise = NULL;
+    ops->enc_get_eval_info = NULL;
+    ops->enc_get_fd = NULL;
+    ops->enc_get_fps = NULL;
+    ops->enc_get_gdr = NULL;
+    ops->enc_get_gop_attr = NULL;
+    ops->enc_get_gop_mode = NULL;
+    ops->enc_get_h264_trans = NULL;
+    ops->enc_get_h264_vui = NULL;
+    ops->enc_get_h265_trans = NULL;
+    ops->enc_get_h265_vui = NULL;
+    ops->enc_get_jpeg_ql = NULL;
+    ops->enc_get_jpeg_qp = NULL;
+    ops->enc_get_max_same_scene_cnt = NULL;
+    ops->enc_get_max_stream_cnt = NULL;
+    ops->enc_get_mbrc = NULL;
+    ops->enc_get_pool = NULL;
+    ops->enc_get_pskip = NULL;
+    ops->enc_get_qpg_mode = NULL;
+    ops->enc_get_rc_options = NULL;
+    ops->enc_get_rmem_info = NULL;
+    ops->enc_get_roi = NULL;
+    ops->enc_get_srd = NULL;
+    ops->enc_get_stream_buf_size = NULL;
+    ops->enc_get_super_frame = NULL;
+    ops->enc_inject_stream_shm = NULL;
+    ops->enc_insert_userdata = NULL;
+    ops->enc_poll_module_stream = NULL;
+    ops->enc_query = NULL;
+    ops->enc_register_channel = NULL;
+    ops->enc_request_gdr = NULL;
+    ops->enc_request_pskip = NULL;
+    ops->enc_set_bitrate = NULL;
+    ops->enc_set_bufshare = NULL;
+    ops->enc_set_chn_entropy_mode = NULL;
+    ops->enc_set_chn_gop_attr = NULL;
+    ops->enc_set_color2grey = NULL;
+    ops->enc_set_crop = NULL;
+    ops->enc_set_denoise = NULL;
+    ops->enc_set_fps = NULL;
+    ops->enc_set_gdr = NULL;
+    ops->enc_set_gop = NULL;
+    ops->enc_set_gop_attr = NULL;
+    ops->enc_set_gop_mode = NULL;
+    ops->enc_set_h264_trans = NULL;
+    ops->enc_set_h264_vui = NULL;
+    ops->enc_set_h265_trans = NULL;
+    ops->enc_set_h265_vui = NULL;
+    ops->enc_set_jpeg_ql = NULL;
+    ops->enc_set_jpeg_qp = NULL;
+    ops->enc_set_map_roi = NULL;
+    ops->enc_set_max_pic_size = NULL;
+    ops->enc_set_max_psnr = NULL;
+    ops->enc_set_max_same_scene_cnt = NULL;
+    ops->enc_set_max_stream_cnt = NULL;
+    ops->enc_set_mbrc = NULL;
+    ops->enc_set_pool = NULL;
+    ops->enc_set_pskip = NULL;
+    ops->enc_set_qp = NULL;
+    ops->enc_set_qp_bounds = NULL;
+    ops->enc_set_qp_bounds_per_frame = NULL;
+    ops->enc_set_qp_ip_delta = NULL;
+    ops->enc_set_qp_pb_delta = NULL;
+    ops->enc_set_qpg_ai = NULL;
+    ops->enc_set_qpg_mode = NULL;
+    ops->enc_set_rc_mode = NULL;
+    ops->enc_set_rc_options = NULL;
+    ops->enc_set_resize_mode = NULL;
+    ops->enc_set_roi = NULL;
+    ops->enc_set_srd = NULL;
+    ops->enc_set_stream_buf_size = NULL;
+    ops->enc_set_super_frame = NULL;
+    ops->enc_unregister_channel = NULL;
+    ops->fs_chn_stat_query = NULL;
+    ops->fs_create_channel = NULL;
+    ops->fs_destroy_channel = NULL;
+    ops->fs_disable_channel = NULL;
+    ops->fs_disable_chn_undistort = NULL;
+    ops->fs_enable_channel = NULL;
+    ops->fs_enable_chn_undistort = NULL;
+    ops->fs_get_delay = NULL;
+    ops->fs_get_fifo = NULL;
+    ops->fs_get_frame = NULL;
+    ops->fs_get_frame_depth = NULL;
+    ops->fs_get_max_delay = NULL;
+    ops->fs_get_pool = NULL;
+    ops->fs_get_timed_frame = NULL;
+    ops->fs_release_frame = NULL;
+    ops->fs_set_channel_attr = NULL;
+    ops->fs_set_delay = NULL;
+    ops->fs_set_fifo = NULL;
+    ops->fs_set_frame_depth = NULL;
+    ops->fs_set_frame_offset = NULL;
+    ops->fs_set_max_delay = NULL;
+    ops->fs_set_pool = NULL;
+    ops->fs_set_rotation = NULL;
+    ops->fs_snap_frame = NULL;
+    ops->isp_osd_create_region = NULL;
+    ops->isp_osd_destroy_region = NULL;
+    ops->isp_osd_set_mask = NULL;
+    ops->isp_osd_set_pool_size = NULL;
+    ops->isp_osd_set_region_attr = NULL;
+    ops->isp_osd_show_region = NULL;
+    ops->ivs_create_base_move_interface = NULL;
+    ops->ivs_create_channel = NULL;
+    ops->ivs_create_group = NULL;
+    ops->ivs_create_jzdl_interface = NULL;
+    ops->ivs_create_move_interface = NULL;
+    ops->ivs_create_persondet_interface = NULL;
+    ops->ivs_destroy_base_move_interface = NULL;
+    ops->ivs_destroy_channel = NULL;
+    ops->ivs_destroy_group = NULL;
+    ops->ivs_destroy_jzdl_interface = NULL;
+    ops->ivs_destroy_move_interface = NULL;
+    ops->ivs_destroy_persondet_interface = NULL;
+    ops->ivs_get_param = NULL;
+    ops->ivs_get_result = NULL;
+    ops->ivs_poll_result = NULL;
+    ops->ivs_register_channel = NULL;
+    ops->ivs_release_data = NULL;
+    ops->ivs_release_result = NULL;
+    ops->ivs_set_param = NULL;
+    ops->ivs_start = NULL;
+    ops->ivs_stop = NULL;
+    ops->ivs_unregister_channel = NULL;
+    ops->osd_attach_to_group = NULL;
+    ops->osd_create_group = NULL;
+    ops->osd_create_region = NULL;
+    ops->osd_destroy_group = NULL;
+    ops->osd_destroy_region = NULL;
+    ops->osd_get_group_region_attr = NULL;
+    ops->osd_get_region_attr = NULL;
+    ops->osd_register_region = NULL;
+    ops->osd_set_pool_size = NULL;
+    ops->osd_set_region_attr = NULL;
+    ops->osd_set_region_attr_with_timestamp = NULL;
+    ops->osd_show = NULL;
+    ops->osd_show_region = NULL;
+    ops->osd_start = NULL;
+    ops->osd_stop = NULL;
+    ops->osd_unregister_region = NULL;
+    ops->osd_update_region_data = NULL;
+    ops->unbind = NULL;
+
+    ops->enc_create_channel = v4l2_ops_enc_create_channel;
+    ops->enc_destroy_channel = v4l2_ops_enc_destroy_channel;
+    ops->enc_start = v4l2_ops_enc_start;
+    ops->enc_stop = v4l2_ops_enc_stop;
+    ops->enc_poll = v4l2_ops_enc_poll;
+    ops->enc_get_frame = v4l2_ops_enc_get_frame;
+    ops->enc_release_frame = v4l2_ops_enc_release_frame;
+    ops->enc_request_idr = v4l2_ops_enc_request_idr;
+    ops->enc_set_bitrate = v4l2_ops_enc_set_bitrate;
+    ops->enc_get_avg_bitrate = v4l2_ops_enc_get_avg_bitrate;
+    ops->enc_set_gop = v4l2_ops_enc_set_gop;
+    ops->enc_get_gop_attr = v4l2_ops_enc_get_gop_attr;
+    ops->sys_get_timestamp = v4l2_ops_sys_get_timestamp;
+    ops->deinit = v4l2_ops_deinit;
+
+    built = true;
+    return &table;
 }

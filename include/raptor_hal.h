@@ -523,6 +523,18 @@ typedef struct {
     int stitch_mode;
 } rss_multi_sensor_config_t;
 
+/* Exposure fields whose reads succeeded.  A measured value of zero is data,
+ * not an availability sentinel (a black frame legitimately has ae_luma=0). */
+enum {
+    RSS_EXPOSURE_VALID_TOTAL_GAIN = 1U << 0,
+    RSS_EXPOSURE_VALID_TIME = 1U << 1,
+    RSS_EXPOSURE_VALID_AE_LUMA = 1U << 2,
+    RSS_EXPOSURE_VALID_EV = 1U << 3,
+    RSS_EXPOSURE_VALID_WB_RGAIN = 1U << 4,
+    RSS_EXPOSURE_VALID_WB_BGAIN = 1U << 5,
+    RSS_EXPOSURE_VALID_WB_GGAIN = 1U << 6,
+};
+
 /* Exposure info (for IR-cut control) */
 typedef struct {
     uint32_t total_gain;
@@ -533,11 +545,12 @@ typedef struct {
     uint16_t wb_bgain; /* AWB blue gain from GetWB_Statis (T20-T31) */
     /*
      * AWB green gain, where the backend has one. Ingenic reports the two ratios
-     * only and leaves this 0; MI's CUS3A status carries all three, and with
-     * nowhere to put the third the ctrl API was reporting a green gain it had
-     * never been given. 0 means "not reported", as it does for the two above.
+     * only and never sets its valid bit; MI's CUS3A status carries all three,
+     * and with nowhere to put the third the ctrl API was reporting a green gain
+     * it had never been given.
      */
     uint16_t wb_ggain;
+    uint32_t valid_mask;
 } rss_exposure_t;
 
 /* White balance mode (matches ISP_CORE_WB_MODE_* from libimp) */
@@ -732,6 +745,18 @@ typedef struct {
     bool has_mbrc;
     bool has_enc_denoise;
     bool has_gdr;
+
+    /* Backend surface: which subsystems this HAL backend provides at
+     * all. Set by rss_hal_create_backend(), not by the per-SoC tables
+     * above -- the surface is a property of the backend (the IMP graph
+     * has everything; the V4L2/OpenIMP backend is one H.264 channel
+     * with ISP tuning and no framesource graph), while the tables
+     * carry per-SoC feature nuance within a backend. */
+    bool has_framesource;
+    bool has_osd;
+    bool has_ivs;
+    bool has_jpeg;
+    bool single_video_channel;
     bool has_sei_userdata;
     bool has_h264_vui;
     bool has_h265_vui;
@@ -794,10 +819,10 @@ typedef struct {
 
 typedef struct rss_hal_ctx rss_hal_ctx_t;
 
-/* Optional standalone V4L2 capture -> OpenIMP AVC path. This API is kept
- * outside the IMP vtable because it owns a complete capture/encode queue and
- * is selected explicitly by consumers. It is available only when libimp
- * exports the OpenIMP_AVC interface. */
+/* Optional V4L2 capture -> OpenIMP AVC path. The primary consumer is the
+ * "v4l2" backend of rss_hal_create_backend(), which mounts these behind
+ * the encoder slots of the ops vtable; the raw API remains exported for
+ * tools. Available only when libimp exports the OpenIMP_AVC interface. */
 typedef struct rss_v4l2_h264 rss_v4l2_h264_t;
 
 int rss_v4l2_h264_create(rss_v4l2_h264_t **backend, const char *video_device,
@@ -809,6 +834,16 @@ int rss_v4l2_h264_poll(rss_v4l2_h264_t *backend, uint32_t timeout_ms);
 int rss_v4l2_h264_get_frame(rss_v4l2_h264_t *backend, rss_frame_t *frame);
 int rss_v4l2_h264_release_frame(rss_v4l2_h264_t *backend, rss_frame_t *frame);
 int rss_v4l2_h264_request_idr(rss_v4l2_h264_t *backend);
+int rss_v4l2_h264_set_bitrate(rss_v4l2_h264_t *backend, uint32_t bitrate);
+int rss_v4l2_h264_get_bitrate(rss_v4l2_h264_t *backend, uint32_t *target_bitrate,
+                              uint32_t *average_bitrate);
+int rss_v4l2_h264_set_gop(rss_v4l2_h264_t *backend, uint32_t gop_length);
+int rss_v4l2_h264_get_gop(rss_v4l2_h264_t *backend, uint32_t *gop_length);
+
+/* "v4l2" backend only: the capture node its encoder slot opens
+ * (default /dev/video0). Call between rss_hal_create_backend() and
+ * enc_create_channel. */
+void rss_hal_v4l2_set_device(rss_hal_ctx_t *ctx, const char *device);
 
 /* ================================================================
  * Operations Vtable
@@ -1338,7 +1373,18 @@ typedef struct rss_hal_ops {
  * Factory Functions
  * ================================================================ */
 
-rss_hal_ctx_t *rss_hal_create(void);
+rss_hal_ctx_t *rss_hal_create(void); /* = rss_hal_create_backend("imp") */
+
+/* Select the pipeline backend at creation. "imp" is the vendor (or
+ * OpenIMP) graph every device uses; "v4l2" composes the same ISP and
+ * sensor ops with V4L2 capture and the OpenIMP AVC encode adapter in
+ * the encoder slots -- on such systems libimp IS OpenIMP, so the
+ * inherited ISP ops are the same ABI the tuning path already uses.
+ * Ops a backend lacks are NULL and answer RSS_ERR_NOTSUP through
+ * RSS_HAL_CALL; caps document the surface. Returns NULL for an
+ * unknown backend or one this build does not carry ("v4l2" needs
+ * V4L2_OPENIMP=1). */
+rss_hal_ctx_t *rss_hal_create_backend(const char *backend);
 void rss_hal_destroy(rss_hal_ctx_t *ctx);
 const rss_hal_ops_t *rss_hal_get_ops(rss_hal_ctx_t *ctx);
 
