@@ -52,8 +52,36 @@
                    #row ": manual offset is not offsetof(" #type            \
                         ", stManual) -- writes land in stAuto");
 
+/*
+ * A gain run: one field taken across the sixteen gain-indexed stAuto entries,
+ * with enOpType left alone. Four numbers have to hold together for that, and
+ * the stride is the one worth spelling out -- a row that miscounts it writes
+ * into a different field of a *different gain's* entry, so the module
+ * misbehaves at one exposure and is correct at the next, which no picture makes
+ * obvious. AUTO_NUM is asserted against the vendor's own MI_ISP_AUTO_NUM rather
+ * than against 16, so a header drop that changed the number of entries is a
+ * build failure and not a partly-written run.
+ */
+#define IQ_GAINRUN_AT(row, type, param, field, elem, fieldoff)                                     \
+    IQ_FITS(row, type)                                                                             \
+    _Static_assert(I6_ISP_##row##_AUTO == offsetof(type, stAuto),                                  \
+                   #row ": the entry array does not start at offsetof(" #type ", stAuto)");        \
+    _Static_assert(I6_ISP_##row##_ENTRY == sizeof(param),                                          \
+                   #row ": the stride is not sizeof(" #param ") -- a write lands in another "      \
+                        "gain's entry");                                                           \
+    _Static_assert((fieldoff) == offsetof(param, field),                                           \
+                   #row ": the field is not at offsetof(" #param ", " #field ")");                 \
+    _Static_assert(sizeof(elem) == sizeof(((param *)0)->field),                                    \
+                   #row ": the table's field width is not " #field "'s");                          \
+    _Static_assert(I6_ISP_##row##_AUTO_NUM == MI_ISP_AUTO_NUM,                                     \
+                   #row ": the run is not one element per auto entry");                            \
+    _Static_assert(I6_ISP_##row##_AUTO + MI_ISP_AUTO_NUM * sizeof(param) ==                        \
+                       I6_ISP_##row##_MANUAL,                                                      \
+                   #row ": the entry array does not end where stManual begins");
+
 I6_ISP_IQ_AUTOMAN_ROWS(IQ_MANUAL_AT)
 I6_ISP_IQ_FLAT_ROWS(IQ_FITS)
+I6_ISP_IQ_GAINRUN_ROWS(IQ_GAINRUN_AT)
 
 /*
  * Not an IQ row, but the same rule and the reason the rule is written as

@@ -128,9 +128,36 @@ static void test_table_bounds(void)
                       "%s: a %u-byte field at %u runs past the %u-byte payload", p->name, p->width,
                       p->manual_off, p->payload);
             }
-        } else
+        } else if (p->shape == IQ_GAINRUN) {
+            /*
+             * A run addresses one field of stAuto[16], so its geometry is the
+             * same payload arithmetic read the other way: the stride is the
+             * block size, and the field has to land inside the *first* auto
+             * entry for the whole run to stay inside the array. A stride that
+             * is right by luck is the failure this catches -- a wrong one puts
+             * every write into a different gain's entry, which shows up as a
+             * knob that works at one exposure and not the next.
+             */
+            CHECK(p->count > 0 && p->count <= STAR_IQ_GAINRUN_MAX,
+                  "%s: a run of %u does not fit the %u-entry baseline", p->name, p->count,
+                  STAR_IQ_GAINRUN_MAX);
+            CHECK(p->stride > 0, "%s: a run needs a stride", p->name);
+            CHECK((size_t)8 + 17 * p->stride == p->payload,
+                  "%s: a %u-byte stride implies a payload of %zu, not %u", p->name, p->stride,
+                  (size_t)8 + 17 * p->stride, p->payload);
+            CHECK(p->manual_off >= 8 && p->manual_off < 8 + p->stride,
+                  "%s: the run starts at %u, outside the first auto entry [8, %u)", p->name,
+                  p->manual_off, 8 + p->stride);
+            CHECK((size_t)p->manual_off + (p->count - 1) * p->stride + p->width <= p->payload,
+                  "%s: the last entry of the run runs past the %u-byte payload", p->name,
+                  p->payload);
+        } else {
             CHECK(p->manual_off == 0, "%s: FLAT/BOOL must live at offset 0, not %u", p->name,
                   p->manual_off);
+            CHECK(p->stride == 0 && p->count == 1,
+                  "%s: only a gain run has a stride, got count %u stride %u", p->name, p->count,
+                  p->stride);
+        }
     }
 }
 
@@ -322,12 +349,23 @@ static void test_caps_describe_what_the_setter_accepts(void)
     CHECK(hal_isp_set_drc_strength(c, caps.max + 1) == RSS_ERR_INVAL, "above the maximum refused");
     CHECK(hal_isp_set_drc_strength(c, RSS_ISP_AUTO) == RSS_OK, "auto accepted where caps allow it");
 
-    /* Temper is not published on this SoC at all. Neither route to temporal
-     * denoise is a strength raptor can offer: the VPE channel level picks a
-     * reference bit depth rather than an amount, and the tuning's NR3D module
-     * costs its own per-gain curve to write. So no caps, not invented ones. */
-    CHECK(hal_isp_get_knob_caps(c, "temper", &caps) == RSS_ERR_NOTSUP,
-          "temper is not published on this SoC");
+    /*
+     * Temper is published, and its range is the vendor's field rather than an
+     * abstract scale: u8TfStr is 0..64 where Infinity6C's TfStrY is 0..127, and
+     * every shipped 6E tuning sits at the ceiling. So the neutral is the
+     * maximum here, which is a real asymmetry a client has to be told about
+     * rather than one to paper over -- a knob whose whole travel is downward.
+     */
+    CHECK(hal_isp_get_knob_caps(c, "temper", &caps) == RSS_OK, "temper is published");
+    CHECK(caps.min == 0 && caps.max == 64, "temper carries u8TfStr's own range, got %d..%d",
+          caps.min, caps.max);
+    CHECK(caps.neutral == caps.max, "the tuning ships TfStr at its ceiling, so unity is the max");
+    CHECK(caps.has_auto, "auto restores the tuning's own sixteen entries");
+    CHECK(hal_isp_set_temper_strength(c, caps.min) == RSS_OK, "the published minimum is accepted");
+    CHECK(hal_isp_set_temper_strength(c, caps.max) == RSS_OK, "the published maximum is accepted");
+    CHECK(hal_isp_set_temper_strength(c, caps.max + 1) == RSS_ERR_INVAL,
+          "above the maximum refused");
+    CHECK(hal_isp_set_temper_strength(c, RSS_ISP_AUTO) == RSS_OK, "auto accepted");
 
     /* A knob this platform does not publish has no caps rather than
      * invented ones -- 6E withdrew these because every shipped tuning
@@ -735,7 +773,7 @@ static void test_orientation_is_bringup_only(void)
  * lives on the sensor now and the level never moves, so neither half of that
  * pair can occur; this pins both.
  */
-static void test_vpe_level_is_fixed_and_temper_is_unpublished(void)
+static void test_vpe_level_is_fixed_and_temper_leaves_it_alone(void)
 {
     rss_hal_ctx_t ctx;
     star_state_t st;
@@ -760,10 +798,29 @@ static void test_vpe_level_is_fixed_and_temper_is_unpublished(void)
           "orientation stays off the channel however the sensor is set, got (%d,%d)", para.mirror,
           para.flip);
 
-    /* No op and no caps. rvd asks by name, so the name has to answer NOTSUP
-     * rather than a range nothing can honour. */
-    CHECK(hal_isp_get_knob_caps(c, "temper", &caps) == RSS_ERR_NOTSUP,
-          "temper publishes no caps on this SoC");
+    /*
+     * Temper is published, and it must not be published by way of this field.
+     * The knob writes the tuning's NR3D module; the channel level is a
+     * reference bit depth that mirror and flip depend on being non-zero. A
+     * future rewrite that "implements" temper by moving level3DNR would pass
+     * every other test in this file and stall the ISP on a flipped board, so
+     * the two are pinned together here: caps exist, and the level does not move
+     * when the knob is driven to either end.
+     */
+    CHECK(hal_isp_get_knob_caps(c, "temper", &caps) == RSS_OK, "temper publishes caps");
+    CHECK(hal_isp_set_temper_strength(c, caps.min) == RSS_OK, "temper accepts its minimum");
+    memset(&para, 0xA5, sizeof(para));
+    star_vpe_fill_param_long(&st, &para);
+    CHECK(para.level3DNR == STAR_VPE_NR3D_LEVEL, "temper at its floor left the level at %d, got %d",
+          STAR_VPE_NR3D_LEVEL, para.level3DNR);
+    CHECK(hal_isp_set_temper_strength(c, caps.max) == RSS_OK, "temper accepts its maximum");
+    memset(&para, 0xA5, sizeof(para));
+    star_vpe_fill_param_long(&st, &para);
+    CHECK(para.level3DNR == STAR_VPE_NR3D_LEVEL, "temper at its ceiling left the level at %d, got %d",
+          STAR_VPE_NR3D_LEVEL, para.level3DNR);
+
+    for (size_t i = 0; i < IQ_PARAM_COUNT; i++)
+        g_iq[i].has_pending = false;
 }
 
 /*
@@ -1688,7 +1745,7 @@ int main(void)
     test_antiflicker_translates_the_mains_frequency();
     test_pending_queue();
     test_orientation_is_bringup_only();
-    test_vpe_level_is_fixed_and_temper_is_unpublished();
+    test_vpe_level_is_fixed_and_temper_leaves_it_alone();
     test_channel_param_is_built_not_edited();
     test_sensor_fps_clamps_to_the_mode();
     test_recorded_values_survive_a_reload();

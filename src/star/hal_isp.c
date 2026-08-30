@@ -149,25 +149,6 @@
  *                         op scales a run of band gains and its brightness
  *                         is flat in every shipped bin -- so this is a
  *                         6E/6B0 withdrawal, not a family-wide one.
- *   isp_set_temper_strength / _get
- *                         Temporal denoise, and withdrawn for both of the
- *                         reasons above at once. MI's two routes to it are
- *                         the VPE channel's e3DNRLevel and the tuning's
- *                         NR3D module, and neither is a strength raptor can
- *                         publish honestly. The channel level is not a
- *                         strength at all -- it selects the 3DNR reference
- *                         frame's bit depth, and six of its eight values
- *                         mean "engine off" (see STAR_VPE_NR3D_LEVEL, which
- *                         now fixes it at 2 and never moves it). Its off
- *                         position is worse than useless here: mirror and
- *                         flip are carried out by that same DNR hardware,
- *                         so a flipped channel asking for level 0 stalls
- *                         the ISP outright. NR3D does carry a real strength
- *                         in TfStr, but writing it means going manual and
- *                         discarding the sixteen-entry gain curve -- the
- *                         same trade that withdrew the four above. So
- *                         temporal denoise belongs to the tuning binary on
- *                         this SoC, and has_temper is false.
  *   isp_set_sinter_strength / _get
  *                         Spatial luma denoise. NRLuma's manual block is
  *                         a blend weight and two filter selects, and the
@@ -260,10 +241,15 @@
  */
 #define STAR_ISP_READY_QUICK_MS 400
 
-/* Largest payload the table below touches (sharpness, 1268). Sized generously
+/* Largest payload the table below touches (NR3D, 1776). Sized generously
  * so a future entry does not silently overflow -- star_iq_call refuses
  * anything that does not fit rather than truncating. */
 #define STAR_IQ_PAYLOAD_MAX 2048
+
+/* Longest gain run a row can carry, which is MI's own MI_ISP_AUTO_NUM. The
+ * table's count is checked against it before any write, so a row that outgrew
+ * the array is refused rather than writing past base[]. */
+#define STAR_IQ_GAINRUN_MAX 16
 
 static void star_isp_sleep_ms(unsigned int ms)
 {
@@ -275,18 +261,34 @@ static void star_isp_sleep_ms(unsigned int ms)
 }
 
 typedef enum {
-    IQ_FLAT,   /* value at offset 0, no bEnable and no enOpType */
-    IQ_BOOL,   /* bEnable at offset 0 is itself the value */
-    IQ_AUTOMAN /* bEnable, enOpType, auto[16], manual at manual_off */
+    IQ_FLAT,    /* value at offset 0, no bEnable and no enOpType */
+    IQ_BOOL,    /* bEnable at offset 0 is itself the value */
+    IQ_AUTOMAN, /* bEnable, enOpType, auto[16], manual at manual_off */
+    IQ_GAINRUN  /* the run is one field across stAuto[16]; enOpType stays auto */
 } star_iq_shape_t;
+
+/*
+ * Rows with a { bEnable, enOpType } header, which is what makes auto a thing to
+ * hand a module back to. IQ_GAINRUN belongs here even though it never writes
+ * enOpType: its auto is a restore of the tuning's own entries rather than a mode
+ * change, and to a caller the two are the same offer.
+ */
+#define STAR_IQ_HAS_AUTO(p) ((p)->shape == IQ_AUTOMAN || (p)->shape == IQ_GAINRUN)
 
 typedef struct {
     const char *name; /* for diagnostics only */
     const char *get_sym;
     const char *set_sym;
     uint16_t payload;    /* wrapper's hardcoded payload size */
-    uint16_t manual_off; /* where the value lives (0 for FLAT/BOOL) */
+    uint16_t manual_off; /* where the value lives, or where the run starts */
     uint8_t width;       /* 1, 2 or 4 bytes */
+    /*
+     * IQ_GAINRUN only: how many fields the run has and how far apart they are.
+     * 1 and 0 for every other shape, which is what lets one expression address
+     * a single field and a run alike.
+     */
+    uint8_t count;
+    uint16_t stride;
     uint8_t shape;       /* star_iq_shape_t */
     int32_t mi_max;   /* MI's maximum for the field */
     int32_t mi_unity; /* the field's neutral: the value that leaves the picture alone */
@@ -350,6 +352,26 @@ typedef struct {
      */
     bool tuned_on;
     bool tuned_on_valid;
+
+    /*
+     * IQ_GAINRUN only: the tuning's own sixteen values, and whether they were
+     * read. This is the only shape whose auto cannot be a mode change -- the
+     * entries raptor overwrites are where the tuning's numbers *were*, so
+     * putting the module back means putting these back, and there is nowhere
+     * else they survive. base_valid false means a restore has nothing to write
+     * and says so rather than guessing.
+     */
+    uint16_t base[STAR_IQ_GAINRUN_MAX];
+    bool base_valid;
+    /*
+     * Whether raptor has written over the tuning's entries. A gain run is
+     * always in auto, so enOpType cannot answer "is this the tuner's value or
+     * ours" and only the row knows.
+     */
+    bool overridden;
+    /* Which field of the run answers a read and sets the published neutral.
+     * 0 for every other shape. */
+    uint8_t report;
 } star_iq_param_t;
 
 enum {
@@ -360,6 +382,7 @@ enum {
     IQ_DEFOG,
     IQ_DRC,
     IQ_GRAY,
+    IQ_NR3D,
     IQ_EVCOMP,
     IQ_FLICKER,
     IQ_PARAM_COUNT
@@ -416,18 +439,18 @@ enum {
 static star_iq_param_t g_iq[IQ_PARAM_COUNT] = {
     [IQ_BRIGHTNESS] = { "brightness", "MI_ISP_IQ_GetBrightness", "MI_ISP_IQ_SetBrightness",
                         I6_ISP_IQ_BRIGHTNESS_PAYLOAD, I6_ISP_IQ_BRIGHTNESS_MANUAL,
-                        4, IQ_AUTOMAN, 100, 50, 0, false, NULL, NULL },
+                        4, 1, 0, IQ_AUTOMAN, 100, 50, 0, false, NULL, NULL },
     [IQ_CONTRAST] = { "contrast", "MI_ISP_IQ_GetContrast", "MI_ISP_IQ_SetContrast",
-                      I6_ISP_IQ_CONTRAST_PAYLOAD, I6_ISP_IQ_CONTRAST_MANUAL, 4,
+                      I6_ISP_IQ_CONTRAST_PAYLOAD, I6_ISP_IQ_CONTRAST_MANUAL, 4, 1, 0,
                       IQ_AUTOMAN, 100, 50, 0, false, NULL, NULL },
     [IQ_SATURATION] = { "saturation", "MI_ISP_IQ_GetSaturation", "MI_ISP_IQ_SetSaturation",
                         I6_ISP_IQ_SATURATION_PAYLOAD, I6_ISP_IQ_SATURATION_MANUAL,
-                        1, IQ_AUTOMAN, 127, 32, 0, false, NULL, NULL },
+                        1, 1, 0, IQ_AUTOMAN, 127, 32, 0, false, NULL, NULL },
     [IQ_SHARPNESS] = { "sharpness", "MI_ISP_IQ_GetSharpness", "MI_ISP_IQ_SetSharpness",
                        I6_ISP_IQ_SHARPNESS_PAYLOAD, I6_ISP_IQ_SHARPNESS_MANUAL,
-                       1, IQ_AUTOMAN, 255, 128, 0, false, NULL, NULL },
+                       1, 1, 0, IQ_AUTOMAN, 255, 128, 0, false, NULL, NULL },
     [IQ_DEFOG] = { "defog", "MI_ISP_IQ_GetDefog", "MI_ISP_IQ_SetDefog",
-                   I6_ISP_IQ_DEFOG_PAYLOAD, 0, 4, IQ_BOOL, 1, 0, 0, false, NULL, NULL },
+                   I6_ISP_IQ_DEFOG_PAYLOAD, 0, 4, 1, 0, IQ_BOOL, 1, 0, 0, false, NULL, NULL },
     /*
      * DRC -- MI's WDR module, and the level is one byte of it.
      *
@@ -454,9 +477,44 @@ static star_iq_param_t g_iq[IQ_PARAM_COUNT] = {
      */
     [IQ_DRC] = { "drc", "MI_ISP_IQ_GetWDR", "MI_ISP_IQ_SetWDR",
                  I6_ISP_IQ_WDR_PAYLOAD, I6_ISP_IQ_WDR_MANUAL + I6_ISP_IQ_WDR_STRENGTH,
-                 1, IQ_AUTOMAN, 255, 0, 0, false, NULL, NULL },
+                 1, 1, 0, IQ_AUTOMAN, 255, 0, 0, false, NULL, NULL },
     [IQ_GRAY] = { "gray", "MI_ISP_IQ_GetColorToGray", "MI_ISP_IQ_SetColorToGray",
-                  I6_ISP_IQ_GRAY_PAYLOAD, 0, 4, IQ_BOOL, 1, 0, 0, false, NULL, NULL },
+                  I6_ISP_IQ_GRAY_PAYLOAD, 0, 4, 1, 0, IQ_BOOL, 1, 0, 0, false, NULL, NULL },
+    /*
+     * NR3D -- raptor's temper knob, and the only row that writes into stAuto.
+     *
+     * u8TfStr is the temporal denoise strength and it is the field that means
+     * what temper means. MdGain is the field that ramps with gain and it is
+     * *not* this knob: the vendor's tuning SOP calls it a motion scale -- 值越大
+     * motion information 越小，NR3D 越强 -- so it decides how much of the frame
+     * the filter is applied to, not how hard it filters. Both move noise; only
+     * one of them is a strength.
+     *
+     * IQ_GAINRUN, so the value goes into all sixteen stAuto entries and
+     * enOpType is never touched. stManual would have been one write instead of
+     * sixteen and would have cost the module its per-gain curve, which on this
+     * family is where the tuning does its work: every shipped 6E bin drops
+     * MdThd from 30 to 4 over the top five gain steps, and the manual entry
+     * they would be replaced by is a single flat value for the whole ladder.
+     *
+     * The range is 0..64 where Infinity6C's TfStrY is 0..127, and the two are
+     * the same multiplier -- 6C's isp_api.xml annotates 64 as x1 gain. So this
+     * family publishes no headroom above unity, and 6C's own tuning SOP advises
+     * against using the headroom it does publish (above 64 moving objects
+     * smear). The knobs are therefore nominally the same control on both SoCs:
+     * unity at 64, and useful travel downward.
+     *
+     * unity_from_tuning, because the neutral is whatever the binary left in the
+     * field rather than a constant this port can know. Every 6E tuning to hand
+     * ships 64 -- gc2053 ships 63 -- flat across all sixteen entries, which is
+     * what makes one scalar able to stand for the run. The 64 here is the
+     * fallback for a board with no tuning file, and it is the vendor's 1x
+     * rather than a midpoint.
+     */
+    [IQ_NR3D] = { "temper", "MI_ISP_IQ_GetNR3D", "MI_ISP_IQ_SetNR3D",
+                  I6_ISP_IQ_NR3D_PAYLOAD, I6_ISP_IQ_NR3D_AUTO + I6_ISP_IQ_NR3D_TFSTR,
+                  1, I6_ISP_IQ_NR3D_AUTO_NUM, I6_ISP_IQ_NR3D_ENTRY, IQ_GAINRUN,
+                  64, 64, 0, true, NULL, NULL },
     /*
      * The only knob whose neutral has to be learned, and the only one whose
      * MI field is signed. It is IQ_FLAT, so there is no auto mode to hand it
@@ -468,10 +526,10 @@ static star_iq_param_t g_iq[IQ_PARAM_COUNT] = {
      * left in the field, which is 0 on the sensor binaries we ship.
      */
     [IQ_EVCOMP] = { "ae_comp", "MI_ISP_AE_GetEVComp", "MI_ISP_AE_SetEVComp",
-                    I6_ISP_AE_EVCOMP_PAYLOAD, 0, 4, IQ_FLAT, STAR_AE_EV_SPAN, 0,
+                    I6_ISP_AE_EVCOMP_PAYLOAD, 0, 4, 1, 0, IQ_FLAT, STAR_AE_EV_SPAN, 0,
                     -STAR_AE_EV_SPAN, true, NULL, NULL },
     [IQ_FLICKER] = { "antiflicker", "MI_ISP_AE_GetFlicker", "MI_ISP_AE_SetFlicker",
-                     I6_ISP_AE_FLICKER_PAYLOAD, 0, 4, IQ_FLAT, 3, 0, 0, false, NULL, NULL },
+                     I6_ISP_AE_FLICKER_PAYLOAD, 0, 4, 1, 0, IQ_FLAT, 3, 0, 0, false, NULL, NULL },
 };
 
 /* ================================================================
@@ -571,7 +629,50 @@ static int star_iq_resolve(star_state_t *st, star_iq_param_t *p)
  */
 static int32_t star_iq_read_field(const star_iq_param_t *p, const uint8_t *buf)
 {
-    return (int32_t)star_iq_read(buf, p->manual_off, p->width);
+    return (int32_t)star_iq_read(buf, (uint16_t)(p->manual_off + p->report * p->stride), p->width);
+}
+
+/*
+ * Which field of a run answers for the whole of it.
+ *
+ * The one with the most room on both sides of its own baseline, so the knob a
+ * client draws around the reported neutral has somewhere to travel in each
+ * direction. It matters only for a tuning whose run is not flat -- every 6E
+ * tuning to hand ships TfStr flat, and for a flat run this is entry 0.
+ */
+static void star_iq_pick_report_field(star_iq_param_t *p)
+{
+    int32_t best_room = -1;
+    unsigned int i;
+
+    p->report = 0;
+    for (i = 0; i < p->count; i++) {
+        int32_t base = p->base[i];
+        int32_t below = base - p->mi_floor;
+        int32_t above = p->mi_max - base;
+        int32_t room = below < above ? below : above;
+
+        if (room > best_room) {
+            best_room = room;
+            p->report = (uint8_t)i;
+        }
+    }
+}
+
+/*
+ * What raptor's neutral means for one field of a run.
+ *
+ * mi_unity for every other shape, and for a run whose baseline could not be
+ * learned -- a board with no tuning file, or a header drop that moved the
+ * module. That is a poor neutral, but it is a knob that still moves, which
+ * beats one pinned to a field that was misread.
+ */
+static int32_t star_iq_baseline(const star_iq_param_t *p, unsigned int i)
+{
+    if (p->shape != IQ_GAINRUN || !p->base_valid)
+        return p->mi_unity;
+
+    return p->base[i];
 }
 
 static void star_iq_learn_from_tuning(star_iq_param_t *p, const uint8_t *buf)
@@ -586,13 +687,66 @@ static void star_iq_learn_from_tuning(star_iq_param_t *p, const uint8_t *buf)
      * later turns it on and this is the only chance to see what it was. A flat
      * row has no { bEnable, enOpType } header to read: offset 0 is its value.
      */
-    if (p->shape == IQ_AUTOMAN) {
+    if (STAR_IQ_HAS_AUTO(p)) {
         p->tuned_on = star_iq_read(buf, STAR_ISP_ENABLE_OFF, 4) != 0;
         p->tuned_on_valid = true;
     }
 
     if (!p->unity_from_tuning) {
         p->tuning_stale = false;
+        return;
+    }
+
+    /*
+     * A run learns all sixteen at once, and all or nothing: one entry out of
+     * range means the offset or the stride is wrong for the module, not that
+     * one gain is unusual, so adopting the rest would report a neutral read
+     * from a field that is not the one being written.
+     *
+     * All-zero is not out of range and is not rejected. A tuning is entitled to
+     * turn temporal denoise off, and if it has, then raptor's neutral is off
+     * too -- which is the correct reading of a baseline of zero, not a failure
+     * to find one.
+     */
+    if (p->shape == IQ_GAINRUN) {
+        unsigned int i;
+
+        if (p->count > STAR_IQ_GAINRUN_MAX) {
+            HAL_LOG_ERR("isp: %s has %u entries, more than the %u this holds", p->name, p->count,
+                        STAR_IQ_GAINRUN_MAX);
+            p->base_valid = false;
+            p->tuning_stale = false;
+            return;
+        }
+
+        for (i = 0; i < p->count; i++) {
+            base = (int32_t)star_iq_read(buf, (uint16_t)(p->manual_off + i * p->stride), p->width);
+            if (base > p->mi_max || base < p->mi_floor) {
+                HAL_LOG_WARN("isp: %s entry %u reads MI %d, outside its %d..%d range -- not "
+                             "adopting the tuning's run as the neutral, keeping %d throughout",
+                             p->name, i, base, p->mi_floor, p->mi_max, p->mi_unity);
+                p->base_valid = false;
+                p->report = 0;
+                p->tuning_stale = false;
+                return;
+            }
+            p->base[i] = (uint16_t)base;
+        }
+
+        p->base_valid = true;
+        p->tuning_stale = false;
+        /*
+         * A load has put the tuner's own entries back underneath us, so the run
+         * is no longer carrying a value of raptor's. Cleared here rather than at
+         * the load, because this is the point at which the new baseline is the
+         * thing that was read.
+         */
+        p->overridden = false;
+        star_iq_pick_report_field(p);
+        HAL_LOG_INFO("isp: %s baseline from the tuning is MI %u..%u over %u entries in %d..%d, "
+                     "reporting from entry %u (MI %u)",
+                     p->name, p->base[0], p->base[p->count - 1], p->count, p->mi_floor, p->mi_max,
+                     p->report, p->base[p->report]);
         return;
     }
 
@@ -752,6 +906,102 @@ static int star_iq_apply_scalar(star_state_t *st, int idx, int val)
 }
 
 /*
+ * Apply a knob whose run is one field across MI's sixteen gain entries.
+ *
+ * The difference from every other shape here is what it does not do: enOpType
+ * is never written, so the module stays in auto and MI goes on interpolating
+ * stAuto by gain. What changes is the value it interpolates *between* -- all
+ * sixteen entries get the same number, so the answer is that number at every
+ * gain, while every other field in the module keeps the curve the tuner gave
+ * it. On this family that curve is the motion detector, which is the half of
+ * NR3D the shipped tunings actually differ in.
+ *
+ * All sixteen or none. A write that missed an entry would leave one gain step
+ * running the tuner's value and the rest running raptor's, which reads as a
+ * knob that stops working at one exposure and is the least debuggable failure
+ * this could have.
+ */
+static int star_iq_apply_gainrun(star_state_t *st, int idx, int val)
+{
+    star_iq_param_t *p = &g_iq[idx];
+    uint8_t buf[STAR_IQ_PAYLOAD_MAX];
+    unsigned int i;
+    int ret;
+
+    /* Which is also what learns the baseline, on the first fetch after a load. */
+    ret = star_iq_fetch(st, idx, buf);
+    if (ret != RSS_OK)
+        return ret;
+
+    if (p->count > STAR_IQ_GAINRUN_MAX)
+        return RSS_ERR_INVAL;
+
+    /*
+     * Auto is a restore rather than a mode change, because the module was never
+     * taken out of auto: the tuning's own sixteen values go back into the
+     * entries this knob overwrote. Every other shape hands a module back by
+     * setting enOpType and leaving its manual field stale, and this one cannot
+     * -- there is nowhere else the tuning's numbers still are.
+     *
+     * So without a baseline there is nothing to put back, and saying so beats
+     * writing a guess over the entries. A tuning reload is the way out, and it
+     * is also what re-arms the baseline.
+     */
+    if (val == RSS_ISP_AUTO) {
+        if (!p->base_valid) {
+            HAL_LOG_WARN("isp: %s has no baseline read from the tuning, so there is nothing to "
+                         "restore -- reload the tuning file to put its own entries back",
+                         p->name);
+            return RSS_ERR_NOTSUP;
+        }
+        for (i = 0; i < p->count; i++)
+            star_iq_write(buf, (uint16_t)(p->manual_off + i * p->stride), p->width, p->base[i]);
+        star_iq_restore_switch(p, buf);
+        ret = star_iq_store(st, idx, buf);
+        if (ret == RSS_OK) {
+            p->overridden = false;
+            HAL_LOG_DBG("isp: %s left to the tuning file (auto), %u entries restored", p->name,
+                        p->count);
+        }
+        return ret;
+    }
+
+    /*
+     * A tuning that ships the module in manual is reading stManual, so these
+     * entries are not the ones in use and the knob would write and do nothing.
+     * Said rather than corrected: forcing auto here would overrule a tuning
+     * decision on the strength of a knob nobody has to set.
+     */
+    if (star_iq_read(buf, STAR_ISP_OPTYPE_OFF, 4) != STAR_ISP_OP_AUTO)
+        HAL_LOG_WARN("isp: %s -- this sensor's tuning has the module in manual, so the per-gain "
+                     "entries this writes are not the ones the ISP is reading",
+                     p->name);
+
+    for (i = 0; i < p->count; i++)
+        star_iq_write(buf, (uint16_t)(p->manual_off + i * p->stride), p->width, (uint32_t)val);
+    star_iq_switch_on(p, buf);
+
+    ret = star_iq_store(st, idx, buf);
+    if (ret == RSS_OK) {
+        p->overridden = true;
+        HAL_LOG_DBG("isp: %s = %d across %u gain entries (in %d..%d)", p->name, val, p->count,
+                    p->mi_floor, p->mi_max);
+    }
+
+    return ret;
+}
+
+/* The one place a row's shape chooses its apply, so the flush and the direct
+ * path cannot disagree about which one a row gets. */
+static int star_iq_apply(star_state_t *st, int idx, int val)
+{
+    if (g_iq[idx].shape == IQ_GAINRUN)
+        return star_iq_apply_gainrun(st, idx, val);
+
+    return star_iq_apply_scalar(st, idx, val);
+}
+
+/*
  * Queue-or-apply. Splitting this from star_iq_apply_scalar lets the
  * flush drain the queue without re-entering it, and keeps the "is the
  * ISP reachable yet" question in exactly one place per direction.
@@ -771,7 +1021,7 @@ static int star_iq_set_scalar(void *ctx, int idx, int val)
      * same two numbers by construction.
      */
     if (val == RSS_ISP_AUTO) {
-        if (p->shape != IQ_AUTOMAN)
+        if (!STAR_IQ_HAS_AUTO(p))
             return RSS_ERR_INVAL;
     } else if (val < p->mi_floor || val > p->mi_max) {
         return RSS_ERR_INVAL;
@@ -788,7 +1038,7 @@ static int star_iq_set_scalar(void *ctx, int idx, int val)
         return RSS_OK;
     }
 
-    return star_iq_apply_scalar(st, idx, val);
+    return star_iq_apply(st, idx, val);
 }
 
 static int star_iq_get_scalar(void *ctx, int idx, int *out)
@@ -807,7 +1057,7 @@ static int star_iq_get_scalar(void *ctx, int idx, int *out)
      * with an auto mode is auto and otherwise is its tuned neutral. */
     if (!st->isp_tuned) {
         *out = p->has_pending ? p->pending
-                              : (p->shape == IQ_AUTOMAN ? RSS_ISP_AUTO : p->mi_unity);
+                              : (STAR_IQ_HAS_AUTO(p) ? RSS_ISP_AUTO : p->mi_unity);
         return RSS_OK;
     }
 
@@ -824,6 +1074,16 @@ static int star_iq_get_scalar(void *ctx, int idx, int *out)
      */
     if (p->shape == IQ_AUTOMAN &&
         star_iq_read(buf, STAR_ISP_OPTYPE_OFF, 4) == STAR_ISP_OP_AUTO) {
+        *out = RSS_ISP_AUTO;
+        return RSS_OK;
+    }
+
+    /*
+     * A gain run is always in auto -- that is the point of the shape -- so
+     * enOpType cannot answer this. What distinguishes the two cases is whether
+     * raptor has written over the tuning's entries, which only the row knows.
+     */
+    if (p->shape == IQ_GAINRUN && !p->overridden) {
         *out = RSS_ISP_AUTO;
         return RSS_OK;
     }
@@ -1446,6 +1706,10 @@ void star_isp_teardown(star_state_t *st)
         g_iq[i].fn_set = NULL;
         g_iq[i].has_pending = false;
         g_iq[i].tuning_stale = false;
+        /* The learned run belongs to the tuning that is going away with the
+         * handle; a later load re-arms and re-reads it. */
+        g_iq[i].base_valid = false;
+        g_iq[i].overridden = false;
     }
 
     i6_isp_unload(&st->isp);
@@ -1502,6 +1766,26 @@ int hal_isp_get_drc_strength(void *ctx, int *val)
     return star_iq_get_scalar(ctx, IQ_DRC, val);
 }
 
+/*
+ * Temporal denoise.
+ *
+ * The tuning's NR3D module, written across its sixteen gain entries -- not the
+ * VPE channel's e3DNRLevel, which is not a strength at all: it selects the 3DNR
+ * reference frame's bit depth, six of its eight values mean "engine off", and
+ * mirror and flip are carried out by that same engine here, so its off position
+ * can stall the ISP outright. That level stays fixed at STAR_VPE_NR3D_LEVEL and
+ * nothing moves it; this knob does not go near it.
+ */
+int hal_isp_set_temper_strength(void *ctx, int val)
+{
+    return star_iq_set_scalar(ctx, IQ_NR3D, val);
+}
+
+int hal_isp_get_temper_strength(void *ctx, int *val)
+{
+    return star_iq_get_scalar(ctx, IQ_NR3D, val);
+}
+
 int hal_isp_set_defog(void *ctx, int enable)
 {
     return star_iq_set_raw(ctx, IQ_DEFOG, enable ? 1u : 0u);
@@ -1547,6 +1831,7 @@ static const struct {
 } star_knob_keys[] = {
     {"drc_strength", IQ_DRC},
     {"ae_comp", IQ_EVCOMP},
+    {"temper", IQ_NR3D},
 };
 
 int hal_isp_get_knob_caps(void *ctx, const char *name, rss_isp_knob_t *caps)
@@ -1569,7 +1854,7 @@ int hal_isp_get_knob_caps(void *ctx, const char *name, rss_isp_knob_t *caps)
     caps->min = p->mi_floor;
     caps->max = p->mi_max;
     caps->neutral = p->mi_unity;
-    caps->has_auto = p->shape == IQ_AUTOMAN;
+    caps->has_auto = STAR_IQ_HAS_AUTO(p);
     caps->enabled = true;
 
     /*
@@ -1586,9 +1871,17 @@ int hal_isp_get_knob_caps(void *ctx, const char *name, rss_isp_knob_t *caps)
      * read as one it reports "disabled" for every tuning that leaves EV at 0,
      * which is all of them.
      */
-    if (p->shape == IQ_AUTOMAN && st->isp_tuned &&
+    if (STAR_IQ_HAS_AUTO(p) && st->isp_tuned &&
         star_iq_fetch(st, star_knob_keys[i].idx, buf) == RSS_OK)
         caps->enabled = star_iq_read(buf, STAR_ISP_ENABLE_OFF, 4) != 0;
+
+    /*
+     * A row whose neutral is the tuning's own value can only answer once there
+     * is a tuning to read; before that the table's fallback stands. The fetch
+     * above is what learns it, so this follows it rather than leading.
+     */
+    if (p->unity_from_tuning && st->isp_tuned)
+        caps->neutral = star_iq_baseline(p, p->report);
 
     return RSS_OK;
 }
@@ -1696,7 +1989,7 @@ static void star_isp_flush_pending(star_state_t *st)
         if (p->pending_is_raw)
             (void)star_iq_apply_raw(st, (int)i, (uint32_t)p->pending);
         else
-            (void)star_iq_apply_scalar(st, (int)i, p->pending);
+            (void)star_iq_apply(st, (int)i, p->pending);
     }
 }
 

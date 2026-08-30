@@ -164,28 +164,32 @@ const rss_hal_caps_t g_hal_caps = {
      * and raptor's keys carry Ingenic gain codes, which is not a unit
      * mismatch a HAL can convert away.
      *
-     * has_temper is false here, and no longer for a reason that holds across the
-     * family -- Infinity6C publishes it, see that block below.
+     * has_temper is true, and it does not reach temporal denoise the way the
+     * name suggests. The VPE channel's e3DNRLevel is not a strength at all and
+     * never will be: it picks the 3DNR reference frame's bit depth, six of its
+     * eight values mean "engine off", and that engine is what mirror and flip
+     * run on here, so its off position can stall the ISP outright. The level is
+     * fixed at STAR_VPE_NR3D_LEVEL and nothing moves it at runtime.
      *
-     * The VPE channel's e3DNRLevel is not a strength at all and never will be:
-     * it picks the 3DNR reference frame's bit depth, six of its eight values
-     * mean "engine off", and that engine is what mirror and flip run on here, so
-     * its off position can stall the ISP outright. The level is fixed at
-     * STAR_VPE_NR3D_LEVEL and nothing moves it at runtime.
+     * What this knob writes is the tuning's own NR3D strength, u8TfStr, into all
+     * sixteen gain entries with enOpType left in auto -- the shape Infinity6C
+     * arrived at first, ported here once the layout was pinned down. The
+     * objection that used to stand in the way was that 6E's NR3D is a different
+     * struct (1776 bytes against 1912, a 104-byte parameter block against 112)
+     * and none of it had been checked against a 6E tuning. It has been now: the
+     * vendor's pudding header, MI_ISP_IQ_SetNR3D's own declared payload, the
+     * XML field list and the six shipped 6E bins all agree, and tests/abi_iq.c
+     * asserts the four numbers against the vendor structs.
      *
-     * The tuning's NR3D module does have a strength, u8TfStrY, and the objection
-     * to it was that reaching it meant setting enOpType to manual and discarding
-     * the sixteen-entry gain curve. That objection is answered on 6C by writing
-     * the field into the sixteen entries instead, which leaves the module in
-     * auto -- and the same thing should work here. It has not been done: this
-     * family's NR3D is a different layout (1776 bytes against 1912, a 104-byte
-     * parameter block against 112) and none of it has been verified against a 6E
-     * tuning yet. So this stays false until it is measured, not because it
-     * cannot be done.
+     * One difference from 6C survives the port and belongs in the caps a client
+     * reads rather than in a comment: the field is bounded at 64 here against
+     * 6C's 127, and every 6E tuning ships it at that ceiling, so the knob's
+     * whole travel is downward from unity. See the NR3D row in
+     * src/star/hal_isp.c.
      */
     .has_sinter = false,
     .has_drc = true,
-    .has_temper = false,
+    .has_temper = true,
     .has_ae_comp = true,
     .has_max_gain = false,
 #endif
@@ -426,7 +430,7 @@ const rss_hal_caps_t g_hal_caps = {
      * way to reach the tuning's own NR3D strength, u8TfStrY, without paying for
      * it: IQ_GAINRUN writes the field into all sixteen gain entries and leaves
      * enOpType in auto, so the module's curve is still the one MI interpolates.
-     * The same thing is possible on 6E and has not been done there yet.
+     * Infinity6E now does the same, through its own u8TfStr and its own layout.
      */
     .has_temper = true,
     .has_ae_comp = true,

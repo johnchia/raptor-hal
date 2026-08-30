@@ -1302,6 +1302,15 @@ static const rss_hal_ops_t g_ops = {
      * the control at all. Neutral 128 hands the curve back.
      */
     .isp_set_drc_strength = hal_isp_set_drc_strength,
+    /*
+     * Temper is published where brightness and the rest are not, and for the
+     * same reason DRC is: there is a way to reach it that does not cost the
+     * tuning. The value goes into NR3D's sixteen gain entries with enOpType
+     * left in auto, so MI keeps interpolating the module by gain and only the
+     * one field raptor names differs from what the tuner wrote. Auto restores
+     * the tuner's own entries.
+     */
+    .isp_set_temper_strength = hal_isp_set_temper_strength,
     .isp_set_antiflicker = hal_isp_set_antiflicker,
     .isp_set_running_mode = hal_isp_set_running_mode,
     .isp_set_hflip = hal_isp_set_hflip,
@@ -1310,6 +1319,7 @@ static const rss_hal_ops_t g_ops = {
 
     .isp_get_knob_caps = hal_isp_get_knob_caps,
     .isp_get_drc_strength = hal_isp_get_drc_strength,
+    .isp_get_temper_strength = hal_isp_get_temper_strength,
     .isp_get_ae_comp = hal_isp_get_ae_comp,
     .isp_get_antiflicker = hal_isp_get_antiflicker,
     .isp_get_running_mode = hal_isp_get_running_mode,
