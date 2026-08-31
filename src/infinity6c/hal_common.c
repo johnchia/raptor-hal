@@ -817,7 +817,32 @@ static const rss_hal_ops_t g_ops = {
 
 rss_hal_ctx_t *rss_hal_create(void)
 {
+    return rss_hal_create_backend("imp");
+}
+
+/*
+ * rss_hal_create_backend -- pick a pipeline backend by name.
+ *
+ * This build carries one, and it is the vendor's: MI is how a SigmaStar Infinity6C
+ * part talks to its ISP and encoder at all. "imp" is the name the config's
+ * default carries on every platform, so it means "the built-in one" here
+ * rather than Ingenic's library. Any other name -- v4l2, composed on the
+ * Ingenic side out of parts that have no counterpart here -- gets NULL,
+ * because a caller that asked for a different pipeline is better told it is
+ * missing than handed this one under its name.
+ *
+ * The backend surface fields are set here rather than in the per-SoC caps
+ * table, because they describe the pipeline rather than the part: this one
+ * has a framesource graph, regions and a JPEG encoder, and no IVS at all.
+ * A context that leaves has_framesource false gets no framesource created,
+ * so nothing ever reaches the encoder.
+ */
+rss_hal_ctx_t *rss_hal_create_backend(const char *backend)
+{
     rss_hal_ctx_t *ctx;
+
+    if (backend && strcmp(backend, "imp") != 0)
+        return NULL;
 
     ctx = (rss_hal_ctx_t *)calloc(1, sizeof(*ctx));
     if (!ctx)
@@ -826,26 +851,11 @@ rss_hal_ctx_t *rss_hal_create(void)
     ctx->ops = &g_ops;
     memcpy(&ctx->caps, &g_hal_caps, sizeof(ctx->caps));
 
+    ctx->caps.has_framesource = true;
+    ctx->caps.has_osd = true;
+    ctx->caps.has_jpeg = true;
+
     return ctx;
-}
-
-/*
- * rss_hal_create_backend -- pick a pipeline backend by name.
- *
- * This build carries one, and it is the vendor's: MI is how a SigmaStar Infinity6C
- * part talks to its ISP and encoder at all. "imp" is the name the config's default
- * carries on every platform, so it means "the built-in one" here rather
- * than Ingenic's library. Any other name -- v4l2, composed on the Ingenic
- * side out of parts that have no counterpart here -- gets NULL, because a
- * caller that asked for a different pipeline is better told it is missing
- * than handed this one under its name.
- */
-rss_hal_ctx_t *rss_hal_create_backend(const char *backend)
-{
-    if (backend && strcmp(backend, "imp") != 0)
-        return NULL;
-
-    return rss_hal_create();
 }
 
 /*
