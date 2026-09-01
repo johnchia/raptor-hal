@@ -400,8 +400,18 @@ static int hisi_enc_start_recv(hisi_state_t *st, int chn, hisi_venc_chn_t *enc)
  * P-frames after it got what was left. Per-frame acutance through the GOP
  * ran 11.17 at the I-frame down to 7.03 at the worst P-frame -- a 1.95x
  * sawtooth, visible as a picture that sharpens and softens once per GOP.
- * The vendor's own majestic, with the bounds set, holds 1.01x on less than
- * half the bitrate.
+ * Setting the bounds takes that to 1.00-1.01x.
+ *
+ * It does not, however, explain it. Majestic reconfigured onto the same
+ * wide bounds -- 24..51, and u32MaxIprop loosened to the driver's 20 as
+ * well -- stays flat at 1.01-1.03x on the same board and scene. raptor is
+ * sensitive to loose bounds where the vendor's streamer is not, so
+ * something else here destabilises the rate controller and this call only
+ * constrains it enough that the difference stops showing. Writing the
+ * bounds is still correct: a configured bound that goes nowhere is a
+ * defect on its own. Treat it as a mitigation, and see docs/hisilicon.md
+ * for the open trail -- stat_time, which fill_rc sets to 1 against
+ * majestic's 4, is the leading candidate.
  *
  * GET-MODIFY-SET, not build-and-write. Three quarters of this structure is
  * the macroblock-level texture thresholds (three 16-entry Mad tables) plus
