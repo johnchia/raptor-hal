@@ -42,9 +42,9 @@ LDFLAGS = -fsanitize=$(SAN) -lpthread
 # rests on it and its behaviour is which file gets written in what order,
 # which a host can check once the sysfs root is redirected.
 SUITES = osd isp audio gpio enc
-BINS = $(addprefix t_,$(SUITES)) t_isp_i6c t_enc_i6c t_isp_imp t_enc_imp
+BINS = $(addprefix t_,$(SUITES)) t_isp_i6c t_enc_i6c t_isp_imp t_enc_imp t_hisi_iq
 
-test: $(addprefix test-,$(SUITES)) test-isp_i6c test-enc_i6c test-isp_imp test-enc_imp
+test: $(addprefix test-,$(SUITES)) test-isp_i6c test-enc_i6c test-isp_imp test-enc_imp test-hisi_iq
 
 $(addprefix test-,$(SUITES)): test-%: t_%
 	@./$<
@@ -83,6 +83,25 @@ I6C_DEPS = $(wildcard ../src/infinity6c/*.c ../src/infinity6c/*.h ../src/*.c ../
 
 t_isp_i6c t_enc_i6c: t_%: t_%.c $(I6C_DEPS)
 	$(CC) $(I6C_CFLAGS) -o $@ $< $(LDFLAGS)
+
+# HiSilicon gen4: a fourth PLATFORM_ define and no vendor headers at all --
+# the backend declares the HiMPP ABI itself in src/hisi_v4/v4_*.h, so the
+# suite needs only the tree. _Static_assert is defined away for the same
+# reason as the SigmaStar suites: the audio structs carry pointers whose
+# ARM32 offsets are asserted (the tuning structs would hold on the host,
+# but the state header pulls in both).
+HISI_CFLAGS = -Wall -Wextra -std=c11 -D_GNU_SOURCE -g -fsanitize=$(SAN) \
+	      -D'_Static_assert(c,m)=' -DPLATFORM_HI3516EV300=1 \
+	      -I../src -I../include -I../../raptor-common/include
+
+HISI_DEPS = $(wildcard ../src/hisi_v4/*.c ../src/hisi_v4/*.h ../src/*.c ../src/*.h \
+		       ../include/*.h ../../raptor-common/include/*.h)
+
+t_hisi_iq: t_hisi_iq.c $(HISI_DEPS)
+	$(CC) $(HISI_CFLAGS) -o $@ $< $(LDFLAGS) -ldl
+
+test-hisi_iq: t_hisi_iq
+	@./$<
 
 # Ingenic, which needs neither of the above: a third PLATFORM_ define, the
 # vendor's own headers out of ingenic-headers, and -- unlike the SigmaStar
