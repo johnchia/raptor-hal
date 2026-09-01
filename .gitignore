@@ -13,3 +13,4 @@ tests/t_enc_i6c
 tests/t_isp_imp
 tests/t_enc_imp
 .build-config
+tests/t_hisi_iq
