@@ -45,9 +45,14 @@
  *   volume  ACODEC_SET_INPUT_VOL, which the codec takes in dB [-87..86]
  *           (-87 = mute). rad's scale is [-30..120] with 60 = unity, so
  *           the mapping is dB = vol - 60, clamped -- unity in, 0 dB out.
- *   gain    ACODEC_SET_GAIN_MIC{L,R}, the mic preamp steps. rad's
- *           [0..31] passes through; the driver owns the actual step
- *           table.
+ *   gain    ACODEC_SET_GAIN_MIC{L,R}, the mic preamp steps, usable
+ *           range [0..15] -- see V4_ACODEC_GAIN_MIC_MAX, where the
+ *           measurement behind that number is written down. The driver
+ *           itself would take 16, so clamping to what it accepts is the
+ *           wrong rule; 16 all but mutes the mic. rad's default gain is
+ *           25, so the request is clamped rather than passed through,
+ *           and the clamp is logged once so a config asking for more is
+ *           not silently ignored.
  *   mute    ACODEC_SET_MIC{L,R}_MUTE.
  *
  * Everything else stays NULL in the vtable -> RSS_ERR_NOTSUP. Per op:
@@ -505,8 +510,14 @@ int hal_audio_set_gain(void *ctx, int dev, int chn, int gain)
         return RSS_ERR_INVAL;
     if (gain < 0)
         gain = 0;
-    if (gain > 31)
-        gain = 31;
+    if (gain > V4_ACODEC_GAIN_MIC_MAX) {
+        if (!st->aud_gain_clamped) {
+            st->aud_gain_clamped = true;
+            HAL_LOG_WARN("audio: mic gain %d exceeds the inner codec's max %d -- clamping",
+                         gain, V4_ACODEC_GAIN_MIC_MAX);
+        }
+        gain = V4_ACODEC_GAIN_MIC_MAX;
+    }
     g = (unsigned int)gain;
 
     /* Both mics: the inner codec is one stereo front end and rad's gain

@@ -178,6 +178,26 @@ static inline int v4_acodec_fs(int rate)
  * mic path the vendor sample selects. */
 #define V4_ACODEC_MIXER_IN1 0x1
 
+/*
+ * The mic preamp's usable range, which is NOT what the driver's own
+ * error checking implies. The header states no range -- the vendor
+ * sample never touches these ioctls, it sets only the input volume --
+ * so it was measured on an EV300, twice over:
+ *
+ *   - by ioctl: SET_GAIN_MICL accepts 0..16 and GET_GAIN_MICL reads
+ *     every one of them back unchanged; 17 and up fail with EPERM.
+ *   - acoustically, recording the RTSP audio at each step: the level
+ *     rises monotonically from -64 dBFS at 0 to -36 dBFS at 15, and
+ *     then *collapses* to -67 dBFS at 16 -- 31 dB below the step
+ *     before it and quieter than gain 0.
+ *
+ * So the hardware field is 4 bits, 0..15, and 16 spills out of it into
+ * something that all but mutes the preamp. The driver takes 16 and its
+ * readback reports 16, because that readback is a software shadow, not
+ * the codec register. Trust the measurement: the last good step is 15.
+ */
+#define V4_ACODEC_GAIN_MIC_MAX 15
+
 /* ================================================================
  * LOADER
  * ================================================================ */

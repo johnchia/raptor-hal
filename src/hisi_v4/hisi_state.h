@@ -439,6 +439,7 @@ typedef struct {
     int aud_rate;
     int aud_volume; /* cached, rad's scale; the codec answers in dB */
     int aud_gain;
+    bool aud_gain_clamped; /* the "gain exceeds the codec max" warning is once-only */
     v4_audio_frame aud_frame;
     v4_aec_frame aud_aec;
     bool aud_frame_held;
