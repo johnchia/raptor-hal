@@ -56,8 +56,9 @@
 #include "hal_internal_sigmastar.h"
 #endif
 
-/* Vendor selection: the SigmaStar half is set above, Ingenic by elimination. */
-#ifndef HAL_SIGMASTAR_SDK
+/* Vendor selection: the non-Ingenic vendors are set above, Ingenic by
+ * elimination. Each additional vendor adds one term here and nothing else. */
+#if !defined(HAL_SIGMASTAR_SDK) && !defined(HAL_HISILICON_SDK)
 #define HAL_INGENIC_SDK
 #endif
 

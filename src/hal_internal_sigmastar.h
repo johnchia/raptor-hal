@@ -60,5 +60,7 @@
 #define HAL_PLATFORM_NAME "INFINITY6C"
 #define HAL_SIGMASTAR_SDK
 #else
-#error "No PLATFORM_* defined"
+/* HiSilicon platforms, and the unknown-platform #error; chained here rather
+ * than from hal_internal.h so a third vendor costs the shared file nothing. */
+#include "hal_internal_hisilicon.h"
 #endif

@@ -17,7 +17,10 @@
 #   V               - Set to 1 for verbose output
 
 # Fork-local vendor backends (absent upstream, hence -include); see FORK.md.
+# Each fragment claims the platforms it owns and sets VENDOR; a PLATFORM no
+# fragment claims leaves VENDOR empty and takes the Ingenic path throughout.
 -include mk/sigmastar.mk
+-include mk/hisilicon.mk
 
 ifeq ($(filter clean,$(MAKECMDGOALS)),)
 ifndef PLATFORM
@@ -25,7 +28,8 @@ $(error PLATFORM not set. Use: make PLATFORM=T31)
 endif
 
 # Validate platform
-VALID_PLATFORMS := T10 T20 T21 T23 T30 T31 T32 T33 T40 T41 $(SIGMASTAR_PLATFORMS)
+VALID_PLATFORMS := T10 T20 T21 T23 T30 T31 T32 T33 T40 T41 $(SIGMASTAR_PLATFORMS) \
+                   $(HISILICON_PLATFORMS)
 ifeq ($(filter $(PLATFORM),$(VALID_PLATFORMS)),)
 $(error Invalid PLATFORM=$(PLATFORM). Valid: $(VALID_PLATFORMS))
 endif
@@ -87,9 +91,14 @@ CFLAGS  += -DPLATFORM_$(PLATFORM)
 ifneq ($(SOC_MODEL),)
 CFLAGS  += -DSOC_MODEL_$(shell echo $(SOC_MODEL) | tr '[:lower:]' '[:upper:]')
 endif
+# A vendor fragment may leave SDK_INCLUDE empty -- HiSilicon does, because the
+# backend declares its own ABI and dlopens the libraries -- and a bare -I would
+# swallow the next argument.
+ifneq ($(SDK_INCLUDE),)
 CFLAGS  += -I$(SDK_INCLUDE)
-ifneq ($(VENDOR),sigmastar)   # IMP headers sit in an imp/ subdir; MI headers are flat
+ifeq ($(filter $(VENDOR),sigmastar hisilicon),)  # IMP headers sit in an imp/ subdir; vendor headers are flat
 CFLAGS  += -I$(SDK_INCLUDE)/imp
+endif
 endif
 CFLAGS  += -Iinclude
 CFLAGS  += -Isrc
@@ -115,7 +124,7 @@ endif
 CORE_SRCS := src/hal_caps.c
 
 # VIDEO_SRCS/AUDIO_SRCS/HAL_COMMON_SRC may already be set by a vendor fragment.
-ifneq ($(VENDOR),sigmastar)
+ifeq ($(filter $(VENDOR),sigmastar hisilicon),)
 VIDEO_SRCS := src/hal_encoder.c \
               src/hal_framesource.c \
               src/hal_isp.c \

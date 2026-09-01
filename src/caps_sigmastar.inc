@@ -468,6 +468,7 @@ const rss_hal_caps_t g_hal_caps = {
 };
 
 #else
-#error                                                                                             \
-    "No PLATFORM_* defined. Set one of: PLATFORM_T10 T20 T21 T23 T30 T31 T32 T33 T40 T41 INFINITY6E INFINITY6B0 INFINITY6C"
+/* HiSilicon platforms, and the unknown-platform #error; chained here so that
+ * hal_caps.c keeps exactly one hook however many vendors arrive. */
+#include "caps_hisilicon.inc"
 #endif
