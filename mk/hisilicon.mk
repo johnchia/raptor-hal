@@ -75,8 +75,8 @@ VIDEO_SRCS := $(BACKEND_DIR)/hisi_sensor.c \
               $(BACKEND_DIR)/hal_isp.c \
               src/hal_gpio.c
 
-# No AUDIO_SRCS yet. The audio archive still builds: hal_common.c is compiled
-# into both, and rad gets a context whose audio ops are all NULL.
-AUDIO_SRCS :=
+# Phase 4: AI capture plus the inner codec. hal_common.c is compiled into
+# both archives; hal_audio.c only into this one.
+AUDIO_SRCS := $(BACKEND_DIR)/hal_audio.c
 
 endif # hisilicon platform

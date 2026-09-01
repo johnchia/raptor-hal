@@ -21,6 +21,7 @@
 
 #include "v4_common.h"
 #include "v4_isp.h"
+#include "v4_aud.h"
 #include "v4_isp_tune.h"
 #include "v4_snr.h"
 #include "v4_sys.h"
@@ -416,6 +417,34 @@ typedef struct {
     v4_isp_tune_impl tune;
 
     /*
+     * Phase 4 -- audio. One AI device, one channel, one frame in flight;
+     * the codec fd is /dev/acodec, held open because volume, gain and
+     * mute all go through it at runtime.
+     *
+     * aud_owns_sys records that audio_init did the SYS attach itself
+     * (rad's normal path -- it never calls hal_init). Note what it does
+     * NOT drive: an Exit. SYS and VB state are kernel-global on HiMPP
+     * and rvd may be streaming in another process, so the audio archive
+     * never calls HI_MPI_SYS_Exit -- the process's own exit is the real
+     * detach. See the audit note in the plan ("One MPP consumer per
+     * system") and hal_audio.c's OP COVERAGE.
+     */
+    v4_aud_impl aud;
+    bool aud_loaded;
+    bool aud_owns_sys;
+    bool aud_dev_enabled;
+    bool aud_chn_enabled;
+    int aud_dev;
+    int acodec_fd;
+    int aud_rate;
+    int aud_volume; /* cached, rad's scale; the codec answers in dB */
+    int aud_gain;
+    v4_audio_frame aud_frame;
+    v4_aec_frame aud_aec;
+    bool aud_frame_held;
+    int aud_last_err;
+
+    /*
      * Unwind flags -- one per bring-up step, set only once that step has
      * succeeded, so hisi_teardown undoes exactly what was done and no more.
      *
@@ -573,6 +602,23 @@ void hisi_enc_release_all(hisi_state_t *st);
 int hal_isp_get_sensor_attr(void *ctx, uint32_t *width, uint32_t *height);
 void hisi_isp_resolve_iq(hisi_state_t *st);
 void hisi_isp_note_frame(hisi_state_t *st);
+
+/* The __ctype_b/mmap trampoline verification in hal_common.c. Exposed
+ * because there are two entry points that reach the first vendor dlopen:
+ * hal_init, and hal_audio.c's audio_init, which rad calls without ever
+ * running hal_init. */
+void hisi_check_trampolines(void);
+
+/* Audio -- Phase 4, hal_audio.c (the HAL_MODULE_AUDIO archive). */
+int hal_audio_init(void *ctx, const rss_audio_config_t *cfg);
+int hal_audio_deinit(void *ctx);
+int hal_audio_read_frame(void *ctx, int dev, int chn, rss_audio_frame_t *frame, bool block);
+int hal_audio_release_frame(void *ctx, int dev, int chn, rss_audio_frame_t *frame);
+int hal_audio_set_volume(void *ctx, int dev, int chn, int vol);
+int hal_audio_get_volume(void *ctx, int dev, int chn, int *vol);
+int hal_audio_set_gain(void *ctx, int dev, int chn, int gain);
+int hal_audio_get_gain(void *ctx, int dev, int chn, int *gain);
+int hal_audio_set_mute(void *ctx, int dev, int chn, int mute);
 
 /* Bind, shared by hal_common.c's ops and by the encoder's register path --
  * both express "this VPSS channel feeds this VENC channel". */

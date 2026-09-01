@@ -556,8 +556,12 @@ __attribute__((used)) void *hisi_mmap_shim(void *addr, size_t len, int prot, int
  * Non-fatal by design: a build that gets this wrong should say so loudly
  * and then fail where the failure is, rather than refusing to start and
  * leaving no evidence.
+ *
+ * Not static: hal_audio.c's audio_init is a second entry point that
+ * reaches the first vendor dlopen without ever running hal_init -- rad
+ * calls it directly -- and it needs the same check for the same reason.
  */
-static void hisi_check_trampolines(void)
+void hisi_check_trampolines(void)
 {
     void *found;
 
@@ -2499,6 +2503,12 @@ static int hal_deinit(void *ctx)
     if (!st)
         return RSS_OK;
 
+#ifdef HAL_MODULE_AUDIO
+    /* A caller that skips the audio_deinit op still must not free state
+     * under a running AI device or an open /dev/acodec. Idempotent. */
+    hal_audio_deinit(ctx);
+#endif
+
     hisi_teardown(st);
 
     /*
@@ -2706,6 +2716,20 @@ static const rss_hal_ops_t g_ops = {
     .gpio_set = hal_gpio_set,
     .gpio_get = hal_gpio_get,
     .ircut_set = hal_ircut_set,
+#endif
+
+#ifdef HAL_MODULE_AUDIO
+    /* AI capture + the inner codec (src/hisi_v4/hal_audio.c). The OP
+     * COVERAGE block there argues each absence -- VQE, AENC, AO. */
+    .audio_init = hal_audio_init,
+    .audio_deinit = hal_audio_deinit,
+    .audio_read_frame = hal_audio_read_frame,
+    .audio_release_frame = hal_audio_release_frame,
+    .audio_set_volume = hal_audio_set_volume,
+    .audio_get_volume = hal_audio_get_volume,
+    .audio_set_gain = hal_audio_set_gain,
+    .audio_get_gain = hal_audio_get_gain,
+    .audio_set_mute = hal_audio_set_mute,
 #endif
 };
 
