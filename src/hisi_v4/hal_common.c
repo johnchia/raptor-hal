@@ -2695,6 +2695,7 @@ static const rss_hal_ops_t g_ops = {
     .enc_set_bitrate = hal_enc_set_bitrate,
     .enc_set_gop = hal_enc_set_gop,
     .enc_set_fps = hal_enc_set_fps,
+    .enc_set_qp_bounds = hal_enc_set_qp_bounds,
     .enc_set_jpeg_qp = hal_enc_set_jpeg_qp,
     .enc_get_jpeg_qp = hal_enc_get_jpeg_qp,
     .enc_get_channel_attr = hal_enc_get_channel_attr,

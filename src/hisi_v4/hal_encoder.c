@@ -18,18 +18,20 @@
  *     copies into pstPack, so QueryStatus has to run first to learn
  *     u32CurPacks. Getting that wrong writes past the array.
  *
- *  3. **Rate control is set at channel creation.** There is no per-knob
- *     setter: enc_set_bitrate, enc_set_gop and enc_set_fps are all
- *     read-modify-writes of the whole VENC_CHN_ATTR_S, which is why the
- *     channel's rate state is tracked in hisi_venc_chn_t rather than
- *     re-derived from rvd's config each time.
+ *  3. **Rate control is set at channel creation, through two structures.**
+ *     There is no per-knob setter: enc_set_bitrate, enc_set_gop and
+ *     enc_set_fps are all read-modify-writes of the whole VENC_CHN_ATTR_S,
+ *     which is why the channel's rate state is tracked in hisi_venc_chn_t
+ *     rather than re-derived from rvd's config each time. The QP bounds are
+ *     not in that structure at all -- they live in VENC_RC_PARAM_S behind a
+ *     second call, which hisi_enc_apply_rc_param makes.
  *
  * OP COVERAGE
  *
  * Published: create/destroy group (bookkeeping -- see below), create/destroy
  * channel, register/unregister channel, start, stop, poll, get/release
  * frame, request IDR, set rc_mode/bitrate/gop/fps, get channel attr, get
- * fps, get avg bitrate, query, get fd.
+ * fps, get avg bitrate, query, get fd, set QP bounds.
  *
  * Absent, and why:
  *
@@ -46,12 +48,15 @@
  *    produces. Anyone implementing them has to measure the buffer's reuse
  *    first.
  *
- *  - The QP knobs (enc_set_qp, enc_set_qp_bounds, the delta pair) and the
- *    RC-option bitmask. gen4 puts these in VENC_RC_PARAM_S, a separate
- *    structure from the channel attribute, with a per-codec union of its
- *    own. They are a coherent group and belong in one commit that
- *    transcribes that structure, not scattered into whichever ops happen to
- *    map onto its leading fields.
+ *  - enc_set_qp, the QP delta pair, and the RC-option bitmask. These share
+ *    VENC_RC_PARAM_S with the QP bounds, which are now written
+ *    (hisi_enc_apply_rc_param), so the structure is transcribed and the
+ *    remaining knobs are a matter of mapping rather than ABI work. They are
+ *    left out because rvd does not ask for them on this SoC and because
+ *    each needs its own argument about what the mapping should be: a single
+ *    "the QP" has no field to land in on a bounded controller, and the
+ *    deltas interact with the GOP attribute's ip_qp_delta that is already
+ *    set.
  *
  *  - ROI, GDR, p-skip, super-frame, entropy mode, colour-to-grey, buffer
  *    pools, crop. Each exists on gen4 through its own SetParam structure;
@@ -379,6 +384,162 @@ static int hisi_enc_start_recv(hisi_state_t *st, int chn, hisi_venc_chn_t *enc)
     return RSS_OK;
 }
 
+/*
+ * hisi_enc_apply_rc_param -- the QP bounds, written through VENC_RC_PARAM_S.
+ *
+ * Rate control on gen4 is two structures behind two calls. The channel
+ * attribute set at create time carries the *target* -- mode, bitrate, GOP,
+ * frame rate. The bounds the controller must respect while chasing that
+ * target are here, and a backend that never makes this call gets the
+ * driver's defaults for every one of them.
+ *
+ * That is not a cosmetic gap. Measured on an EV300 at 2592x1944, H.265,
+ * 5 Mbps VBR, GOP 100 with the bounds unwritten: I-frames came out at
+ * 1,008,235 bytes each against a 625 KB whole-second budget, because the
+ * driver's QP floor of 24 let the I-frame spend whatever it wanted and the
+ * P-frames after it got what was left. Per-frame acutance through the GOP
+ * ran 11.17 at the I-frame down to 7.03 at the worst P-frame -- a 1.95x
+ * sawtooth, visible as a picture that sharpens and softens once per GOP.
+ * The vendor's own majestic, with the bounds set, holds 1.01x on less than
+ * half the bitrate.
+ *
+ * GET-MODIFY-SET, not build-and-write. Three quarters of this structure is
+ * the macroblock-level texture thresholds (three 16-entry Mad tables) plus
+ * the row QP delta and the first-frame start QP -- all of them tuned
+ * defaults that belong to the driver. Zeroing them to write two fields
+ * would silently retune macroblock-level rate control. So the structure is
+ * read back, the fields raptor owns are patched, and the rest is handed
+ * straight back. This is the same discipline the ISP tuning loader uses,
+ * and for the same reason.
+ *
+ * The union is discriminated by the channel's RC mode, so the shape is
+ * chosen through v4_venc_rc_mode_for -- the same function that tagged
+ * VENC_RC_ATTR_S. Choosing it any other way is how the two halves come to
+ * disagree, and the H.264 and H.265 VBR layouts differ in a way that makes
+ * disagreement silent rather than fatal (see v4_venc.h).
+ *
+ * The I-frame bounds get the same pair as the P/B bounds. A config that
+ * says "keep this stream between QP 28 and 42" is not asking for an
+ * exemption for one frame in forty, and the I-frame running below the floor
+ * is precisely the measured defect. The I/P relationship the caller *did*
+ * ask for is ip_qp_delta, which still operates, inside the bounds.
+ *
+ * Modes without QP bounds -- FIXQP, which is all QP, and the two MJPEG
+ * modes, whose quality is a Qfactor -- return OK having done nothing.
+ */
+static int hisi_enc_apply_rc_param(hisi_state_t *st, int chn, hisi_venc_chn_t *enc)
+{
+    v4_venc_rc_param param;
+    unsigned int *p_max, *p_min, *p_max_i, *p_min_i;
+    unsigned int *p_min_iprop, *p_max_iprop;
+    unsigned int min_qp, max_qp;
+    v4_venc_rc_mode mode;
+    int ret;
+
+    if (!enc->created)
+        return RSS_OK;
+    /* Nothing configured: leave the driver's defaults alone rather than
+     * writing our idea of them back over the vendor's. */
+    if (enc->min_qp < 0 && enc->max_qp < 0)
+        return RSS_OK;
+
+    mode = v4_venc_rc_mode_for(enc->payload, enc->rc_mode == RSS_RC_CBR,
+                               enc->rc_mode == RSS_RC_FIXQP);
+
+    /* Modes with no QP bounds to set are answered before the driver is
+     * touched, so a JPEG channel carrying a stray min_qp does not produce a
+     * GetRcParam error about a structure that does not apply to it. */
+    if (mode != V4_RC_MODE_H264CBR && mode != V4_RC_MODE_H265CBR &&
+        mode != V4_RC_MODE_H264VBR && mode != V4_RC_MODE_H265VBR)
+        return RSS_OK;
+
+    if (!st->venc.fnGetRcParam || !st->venc.fnSetRcParam) {
+        HAL_LOG_WARN("venc chn %d: QP bounds unavailable -- libmpi exports no "
+                     "HI_MPI_VENC_%sRcParam",
+                     chn, st->venc.fnGetRcParam ? "Set" : "Get");
+        return RSS_ERR_NOTSUP;
+    }
+
+    ret = st->venc.fnGetRcParam(chn, &param);
+    if (ret) {
+        HAL_LOG_ERR("HI_MPI_VENC_GetRcParam(%d) failed: 0x%x", chn, ret);
+        return RSS_ERR_IO;
+    }
+
+    switch (mode) {
+    case V4_RC_MODE_H264CBR:
+    case V4_RC_MODE_H265CBR:
+        p_max = &param.cbr.max_qp;
+        p_min = &param.cbr.min_qp;
+        p_max_i = &param.cbr.max_iqp;
+        p_min_i = &param.cbr.min_iqp;
+        p_min_iprop = &param.cbr.min_iprop;
+        p_max_iprop = &param.cbr.max_iprop;
+        break;
+    case V4_RC_MODE_H264VBR:
+        p_max = &param.h264_vbr.max_qp;
+        p_min = &param.h264_vbr.min_qp;
+        p_max_i = &param.h264_vbr.max_iqp;
+        p_min_i = &param.h264_vbr.min_iqp;
+        p_min_iprop = &param.h264_vbr.min_iprop;
+        p_max_iprop = &param.h264_vbr.max_iprop;
+        break;
+    case V4_RC_MODE_H265VBR:
+        p_max = &param.h265_vbr.max_qp;
+        p_min = &param.h265_vbr.min_qp;
+        p_max_i = &param.h265_vbr.max_iqp;
+        p_min_i = &param.h265_vbr.min_iqp;
+        p_min_iprop = &param.h265_vbr.min_iprop;
+        p_max_iprop = &param.h265_vbr.max_iprop;
+        break;
+    default:
+        /* Unreachable -- filtered above. Present because the switch is over
+         * an enum and a silent fallthrough here would use p_* uninitialised. */
+        return RSS_OK;
+    }
+
+    /*
+     * Whichever bound the caller left unset keeps the driver's value, which
+     * is why this reads through the pointers rather than defaulting to a
+     * number of raptor's own.
+     */
+    min_qp = enc->min_qp >= 0 ? (unsigned int)enc->min_qp : *p_min;
+    max_qp = enc->max_qp >= 0 ? (unsigned int)enc->max_qp : *p_max;
+
+    if (min_qp > V4_VENC_QP_MAX)
+        min_qp = V4_VENC_QP_MAX;
+    if (max_qp > V4_VENC_QP_MAX)
+        max_qp = V4_VENC_QP_MAX;
+    /* The driver rejects the whole call if min > max, naming no field.
+     * A caller who inverted them meant a range, so widen to the pair
+     * rather than refuse. */
+    if (min_qp > max_qp) {
+        unsigned int t = min_qp;
+
+        min_qp = max_qp;
+        max_qp = t;
+    }
+
+    HAL_LOG_INFO("venc chn %d: QP bounds %u..%u (driver had %u..%u, I %u..%u), "
+                 "iprop %u..%u, scene-change detect %d insert-idr %d",
+                 chn, min_qp, max_qp, *p_min, *p_max, *p_min_i, *p_max_i, *p_min_iprop,
+                 *p_max_iprop, param.scene_change.detect_scene_change,
+                 param.scene_change.adaptive_insert_idr);
+
+    *p_min = min_qp;
+    *p_max = max_qp;
+    *p_min_i = min_qp;
+    *p_max_i = max_qp;
+
+    ret = st->venc.fnSetRcParam(chn, &param);
+    if (ret) {
+        HAL_LOG_ERR("HI_MPI_VENC_SetRcParam(%d) QP %u..%u failed: 0x%x", chn, min_qp, max_qp, ret);
+        return RSS_ERR_IO;
+    }
+
+    return RSS_OK;
+}
+
 int hal_enc_create_channel(void *ctx, int chn, const rss_video_config_t *cfg)
 {
     v4_venc_chn_attr attr;
@@ -413,6 +574,8 @@ int hal_enc_create_channel(void *ctx, int chn, const rss_video_config_t *cfg)
     enc->fd = -1;
     enc->init_qp = cfg->init_qp;
     enc->ip_qp_delta = cfg->ip_delta >= 0 ? cfg->ip_delta : 2;
+    enc->min_qp = cfg->min_qp;
+    enc->max_qp = cfg->max_qp;
 
     /*
      * The encoder's output ring. Undersizing it is the classic gen4 encoder
@@ -460,6 +623,18 @@ int hal_enc_create_channel(void *ctx, int chn, const rss_video_config_t *cfg)
     }
 
     enc->created = true;
+
+    /*
+     * QP bounds, once the channel exists -- VENC_RC_PARAM_S is per-channel
+     * state the driver only has somewhere to keep after CreateChn.
+     *
+     * A failure here is logged and not fatal. The channel is a working
+     * channel without its bounds; it just runs at the driver's, which is
+     * what every gen4 channel did before this call existed. Refusing the
+     * create would trade a slightly worse stream for no stream.
+     */
+    if (hisi_enc_apply_rc_param(st, chn, enc) != RSS_OK)
+        HAL_LOG_WARN("venc chn %d: continuing at the driver's QP bounds", chn);
 
     /*
      * Start receiving here, as part of create, for the same structural
@@ -1033,6 +1208,16 @@ static int hisi_enc_reconfigure(hisi_state_t *st, int chn, hisi_venc_chn_t *enc)
         return RSS_ERR_IO;
     }
 
+    /*
+     * The bounds are re-applied after every attribute write. Whether
+     * SetChnAttr resets VENC_RC_PARAM_S is undocumented and differs by mode
+     * -- a mode change certainly re-tags the union, which makes the fields
+     * this backend owns land somewhere else. Rewriting them is one MPI call
+     * on a path that already does one, and it is the same "rebuild from
+     * tracked state" rule the attribute itself follows.
+     */
+    (void)hisi_enc_apply_rc_param(st, chn, enc);
+
     return RSS_OK;
 }
 
@@ -1080,6 +1265,38 @@ int hal_enc_set_bitrate(void *ctx, int chn, uint32_t bitrate)
     ret = hisi_enc_reconfigure(st, chn, enc);
     if (ret)
         enc->bitrate = old;
+    return ret;
+}
+
+/*
+ * hal_enc_set_qp_bounds -- the one setter that is not a channel-attribute
+ * read-modify-write, because its fields are not in the channel attribute.
+ *
+ * -1 in either argument means "leave the driver's", matching
+ * rss_video_config_t's convention and hisi_enc_apply_rc_param's.
+ */
+int hal_enc_set_qp_bounds(void *ctx, int chn, int min_qp, int max_qp)
+{
+    int16_t old_min, old_max;
+    int ret;
+
+    HISI_ENC_ENTER(ctx, chn, st, enc);
+
+    if (!enc->created)
+        return RSS_ERR_INVAL;
+    if (min_qp > (int)V4_VENC_QP_MAX || max_qp > (int)V4_VENC_QP_MAX)
+        return RSS_ERR_INVAL;
+
+    old_min = enc->min_qp;
+    old_max = enc->max_qp;
+    enc->min_qp = (int16_t)min_qp;
+    enc->max_qp = (int16_t)max_qp;
+
+    ret = hisi_enc_apply_rc_param(st, chn, enc);
+    if (ret) {
+        enc->min_qp = old_min;
+        enc->max_qp = old_max;
+    }
     return ret;
 }
 
@@ -1236,6 +1453,8 @@ int hal_enc_get_channel_attr(void *ctx, int chn, rss_video_config_t *cfg)
     cfg->gop_length = enc->gop;
     cfg->fps_num = enc->fps_num;
     cfg->fps_den = enc->fps_den;
+    cfg->min_qp = enc->min_qp;
+    cfg->max_qp = enc->max_qp;
 
     return RSS_OK;
 }

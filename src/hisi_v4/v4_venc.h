@@ -392,6 +392,155 @@ static inline v4_venc_rc_mode v4_venc_rc_mode_for(v4_payload_type codec, bool cb
 }
 
 /* ================================================================
+ * RATE-CONTROL PARAMETERS
+ * ================================================================ */
+
+/*
+ * VENC_RC_PARAM_S -- the QP bounds, and everything else the channel
+ * attribute has no room for.
+ *
+ * This is the second half of gen4 rate control and the non-obvious one.
+ * VENC_CHN_ATTR_S carries the target (mode, bitrate, GOP, frame rate);
+ * everything about *how* the controller is allowed to reach that target --
+ * the QP floor and ceiling, the I-frame budget ratio, scene-change
+ * detection -- lives here, behind a separate MPI call. A backend that sets
+ * only the channel attribute gets the driver's defaults for all of it,
+ * which on this silicon means QP 24..51 no matter what the caller asked
+ * for, and an I-frame free to consume a whole second's bitrate.
+ *
+ * THE TRAP. The union is discriminated by the *channel's* RC mode, the one
+ * already set in VENC_RC_ATTR_S, and it is not the same shape across
+ * codecs. Probed offsets:
+ *
+ *              H.264 VBR    H.265 VBR
+ *   ChangePos    +0           +0
+ *   MinIprop     +4           +4
+ *   MaxIprop     +8           +8
+ *   ReEncode    +12          +12
+ *   QpMapEn     +16          +32     <- H.265 puts MaxQp here
+ *   MaxQp       +20          +16
+ *   MinQp       +24          +20
+ *   MaxIQp      +28          +24
+ *   MinIQp      +32          +28
+ *   QpMapMode    --          +36
+ *
+ * So the H.265 form written into an H.264 channel lands MaxQp in bQpMapEn
+ * and shifts all four QP bounds one word late -- a channel that enables an
+ * unwanted QP map and clamps to garbage, with the call returning success.
+ * Two separate types, not one with a flag.
+ *
+ * CBR is the exception that is genuinely shared: H.264 and H.265 agree on
+ * all eight of H.264's fields, and H.265 appends enQpMapMode at +32. One
+ * type covers both; the extra word is written as zero on an H.264 channel,
+ * where it is union padding the driver ignores.
+ *
+ * MJPEG has its own two forms, which raptor never writes: a JPEG channel's
+ * quality is the Qfactor in the channel attribute, and it has no QP.
+ *
+ * PROVENANCE. mpp/include/hi_comm_rc.h from the Hi3516EV200 SDK
+ * V1.0.1.0. Offsets and sizes from a probe compiled with
+ * arm-openipc-linux-musleabi-gcc and read back with nm -S.
+ */
+
+/* RC_TEXTURE_THR_SIZE, from hi_defines.h. */
+#define V4_RC_TEXTURE_THR_SIZE 16
+
+/* Every QP field in this structure is documented Range:[0, 51]. */
+#define V4_VENC_QP_MAX 51u
+
+typedef struct {
+    int detect_scene_change;      /* bDetectSceneChange */
+    int adaptive_insert_idr;      /* bAdaptiveInsertIDRFrame */
+} v4_venc_scene_change;
+
+_Static_assert(sizeof(v4_venc_scene_change) == 8, "VENC_SCENE_CHANGE_DETECT_S is 8 bytes");
+
+/* The CBR shape, H.264 and H.265 alike. qp_map_mode exists only on the
+ * H.265 form; see the block comment. */
+typedef struct {
+    unsigned int min_iprop;
+    unsigned int max_iprop;
+    unsigned int max_qp;
+    unsigned int min_qp;
+    unsigned int max_iqp;
+    unsigned int min_iqp;
+    int max_reencode_times;
+    int qp_map_en;
+    unsigned int qp_map_mode; /* H.265 only; union padding on H.264 */
+} v4_venc_rc_param_cbr;
+
+_Static_assert(sizeof(v4_venc_rc_param_cbr) == 36, "VENC_PARAM_H265_CBR_S is 36 bytes");
+_Static_assert(offsetof(v4_venc_rc_param_cbr, max_qp) == 8, "u32MaxQp at +8");
+_Static_assert(offsetof(v4_venc_rc_param_cbr, min_qp) == 12, "u32MinQp at +12");
+_Static_assert(offsetof(v4_venc_rc_param_cbr, max_iqp) == 16, "u32MaxIQp at +16");
+_Static_assert(offsetof(v4_venc_rc_param_cbr, min_iqp) == 20, "u32MinIQp at +20");
+_Static_assert(offsetof(v4_venc_rc_param_cbr, qp_map_en) == 28, "bQpMapEn at +28");
+
+typedef struct {
+    int change_pos;
+    unsigned int min_iprop;
+    unsigned int max_iprop;
+    int max_reencode_times;
+    int qp_map_en; /* +16 -- where H.265 keeps u32MaxQp */
+    unsigned int max_qp;
+    unsigned int min_qp;
+    unsigned int max_iqp;
+    unsigned int min_iqp;
+} v4_venc_rc_param_h264_vbr;
+
+_Static_assert(sizeof(v4_venc_rc_param_h264_vbr) == 36, "VENC_PARAM_H264_VBR_S is 36 bytes");
+_Static_assert(offsetof(v4_venc_rc_param_h264_vbr, qp_map_en) == 16, "bQpMapEn at +16");
+_Static_assert(offsetof(v4_venc_rc_param_h264_vbr, max_qp) == 20, "u32MaxQp at +20");
+_Static_assert(offsetof(v4_venc_rc_param_h264_vbr, min_iqp) == 32, "u32MinIQp at +32");
+
+typedef struct {
+    int change_pos;
+    unsigned int min_iprop;
+    unsigned int max_iprop;
+    int max_reencode_times;
+    unsigned int max_qp; /* +16 -- where H.264 keeps bQpMapEn */
+    unsigned int min_qp;
+    unsigned int max_iqp;
+    unsigned int min_iqp;
+    int qp_map_en;
+    unsigned int qp_map_mode;
+} v4_venc_rc_param_h265_vbr;
+
+_Static_assert(sizeof(v4_venc_rc_param_h265_vbr) == 40, "VENC_PARAM_H265_VBR_S is 40 bytes");
+_Static_assert(offsetof(v4_venc_rc_param_h265_vbr, max_qp) == 16, "u32MaxQp at +16");
+_Static_assert(offsetof(v4_venc_rc_param_h265_vbr, min_iqp) == 28, "u32MinIQp at +28");
+_Static_assert(offsetof(v4_venc_rc_param_h265_vbr, qp_map_en) == 32, "bQpMapEn at +32");
+
+/* The union's size is set by AVBR, the longest mode, at fifteen words.
+ * raptor writes none of the long forms; raw exists so the struct is the
+ * size the driver copies. */
+typedef struct {
+    unsigned int thrd_i[V4_RC_TEXTURE_THR_SIZE];
+    unsigned int thrd_p[V4_RC_TEXTURE_THR_SIZE];
+    unsigned int thrd_b[V4_RC_TEXTURE_THR_SIZE];
+    unsigned int direction_thrd;
+    unsigned int row_qp_delta;
+    int first_frame_start_qp;
+    v4_venc_scene_change scene_change;
+    union {
+        v4_venc_rc_param_cbr cbr;
+        v4_venc_rc_param_h264_vbr h264_vbr;
+        v4_venc_rc_param_h265_vbr h265_vbr;
+        unsigned int raw[15]; /* AVBR is the longest member */
+    };
+} v4_venc_rc_param;
+
+_Static_assert(sizeof(v4_venc_rc_param) == 272, "VENC_RC_PARAM_S is 272 bytes");
+_Static_assert(offsetof(v4_venc_rc_param, thrd_p) == 64, "u32ThrdP at +64");
+_Static_assert(offsetof(v4_venc_rc_param, thrd_b) == 128, "u32ThrdB at +128");
+_Static_assert(offsetof(v4_venc_rc_param, direction_thrd) == 192, "u32DirectionThrd at +192");
+_Static_assert(offsetof(v4_venc_rc_param, row_qp_delta) == 196, "u32RowQpDelta at +196");
+_Static_assert(offsetof(v4_venc_rc_param, first_frame_start_qp) == 200,
+               "s32FirstFrameStartQp at +200");
+_Static_assert(offsetof(v4_venc_rc_param, scene_change) == 204, "stSceneChangeDetect at +204");
+_Static_assert(offsetof(v4_venc_rc_param, cbr) == 212, "the RC-param union at +212");
+
+/* ================================================================
  * LOADER
  * ================================================================ */
 
@@ -407,6 +556,8 @@ typedef struct {
     int (*fnGetStream)(int chn, v4_venc_stream *stream, int milli_sec);
     int (*fnReleaseStream)(int chn, v4_venc_stream *stream);
     int (*fnRequestIDR)(int chn, int instant);
+    int (*fnSetRcParam)(int chn, const v4_venc_rc_param *param);
+    int (*fnGetRcParam)(int chn, v4_venc_rc_param *param);
     int (*fnGetFd)(int chn);
     int (*fnCloseFd)(int chn);
 } v4_venc_impl;
@@ -442,6 +593,10 @@ static inline int v4_venc_load(v4_venc_impl *lib, const v4_mpi_libs *libs)
         libs, "HI_MPI_VENC_GetChnAttr", "GK_API_VENC_GetChnAttr");
     lib->fnRequestIDR =
         (int (*)(int, int))v4_symbol_opt(libs, "HI_MPI_VENC_RequestIDR", "GK_API_VENC_RequestIDR");
+    lib->fnSetRcParam = (int (*)(int, const v4_venc_rc_param *))v4_symbol_opt(
+        libs, "HI_MPI_VENC_SetRcParam", "GK_API_VENC_SetRcParam");
+    lib->fnGetRcParam = (int (*)(int, v4_venc_rc_param *))v4_symbol_opt(
+        libs, "HI_MPI_VENC_GetRcParam", "GK_API_VENC_GetRcParam");
     lib->fnCloseFd =
         (int (*)(int))v4_symbol_opt(libs, "HI_MPI_VENC_CloseFd", "GK_API_VENC_CloseFd");
 

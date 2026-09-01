@@ -250,6 +250,19 @@ typedef struct {
     int ip_qp_delta;
     int init_qp;
 
+    /*
+     * QP bounds, -1 for "the driver's default".
+     *
+     * These do not live in VENC_CHN_ATTR_S at all -- they are the
+     * VENC_RC_PARAM_S half of rate control, written through a second MPI
+     * call (hisi_enc_apply_rc_param). Tracked here for the same reason the
+     * rate knobs are: the apply is a get-modify-set of a structure whose
+     * other fields belong to the driver, so raptor has to remember which
+     * fields are its own.
+     */
+    int16_t min_qp;
+    int16_t max_qp;
+
     /* One outstanding stream per channel. HiMPP wants the same descriptor
      * back at ReleaseStream, and rss_frame_t has nowhere to keep it. */
     bool frame_held;
@@ -584,6 +597,7 @@ int hal_enc_release_frame(void *ctx, int chn, rss_frame_t *frame);
 int hal_enc_request_idr(void *ctx, int chn);
 int hal_enc_set_rc_mode(void *ctx, int chn, rss_rc_mode_t mode, uint32_t bitrate);
 int hal_enc_set_jpeg_qp(void *ctx, int chn, int qp);
+int hal_enc_set_qp_bounds(void *ctx, int chn, int min_qp, int max_qp);
 int hal_enc_get_jpeg_qp(void *ctx, int chn, int *qp);
 void hisi_enc_refresh_rc(hisi_state_t *st, int enc_chn);
 int hal_enc_set_bitrate(void *ctx, int chn, uint32_t bitrate);
