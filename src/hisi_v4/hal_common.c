@@ -2401,6 +2401,10 @@ static int hal_init(void *ctx, const rss_multi_sensor_config_t *cfg)
     ret = hisi_video_bringup(st, &c->sensors[0]);
     if (ret)
         goto err_teardown;
+
+    /* Settle which IQ tuning file applies; the load itself waits for the
+     * first encoded frame. Never a failure -- see hal_isp.c. */
+    hisi_isp_resolve_iq(st);
 #endif
 
     c->initialized = true;

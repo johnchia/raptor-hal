@@ -717,33 +717,6 @@ void hisi_fs_release_all(hisi_state_t *st)
     }
 }
 
-/* ================================================================
- * SENSOR GEOMETRY
- * ================================================================ */
-
-/*
- * hal_isp_get_sensor_attr -- the sensor's output size.
- *
- * Lives here rather than in a hal_isp.c because Phase 2 publishes no other
- * ISP op and a translation unit with one accessor in it would be a file
- * named after a phase that has not happened. Phase 3 moves it.
- *
- * Answers from the mode INI rather than from HI_MPI_ISP_GetPubAttr: rvd
- * asks before the pipeline is up, and the INI is where the number came from
- * in the first place.
- */
-int hal_isp_get_sensor_attr(void *ctx, uint32_t *width, uint32_t *height)
-{
-    hisi_state_t *st = hisi_state(ctx);
-
-    if (!st)
-        return RSS_ERR_INVAL;
-    if (!width || !height)
-        return RSS_ERR_INVAL;
-    if (!st->mode.dev_rect.width || !st->mode.dev_rect.height)
-        return RSS_ERR_NOTSUP;
-
-    *width = st->mode.dev_rect.width;
-    *height = st->mode.dev_rect.height;
-    return RSS_OK;
-}
+/* hal_isp_get_sensor_attr lived here through Phase 2; Phase 3 moved it to
+ * hal_isp.c with the rest of the ISP surface, as the note that used to sit
+ * in its place promised. */

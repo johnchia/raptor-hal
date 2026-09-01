@@ -926,6 +926,10 @@ int hal_enc_get_frame(void *ctx, int chn, rss_frame_t *frame)
 
     enc->frame_held = true;
 
+    /* First encoded frame anywhere = the ISP is demonstrably running;
+     * one atomic test per frame after that. See hal_isp.c. */
+    hisi_isp_note_frame(st);
+
     memset(frame, 0, sizeof(*frame));
     frame->codec = enc->codec;
     frame->seq = enc->stream.seq;

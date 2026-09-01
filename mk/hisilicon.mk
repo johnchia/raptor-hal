@@ -66,12 +66,13 @@ HAL_COMMON_SRC := $(BACKEND_DIR)/hal_common.c
 # RSS_ERR_NOTSUP. So a Phase 1 build links, runs, and declines the pipeline,
 # which is exactly what its acceptance test asks for.
 #
-# Phase 2 adds hal_framesource.c, hal_encoder.c and hal_isp.c in datapath
-# order; Phase 4 hal_audio.c; Phase 5 hal_osd.c. hal_gpio is vendor-neutral
-# and reused here as the SigmaStar backends reuse it.
+# Phase 2 added hal_framesource.c and hal_encoder.c; Phase 3 hal_isp.c (the
+# IQ tuning load); Phase 4 adds hal_audio.c; Phase 5 hal_osd.c. hal_gpio is
+# vendor-neutral and reused here as the SigmaStar backends reuse it.
 VIDEO_SRCS := $(BACKEND_DIR)/hisi_sensor.c \
               $(BACKEND_DIR)/hal_framesource.c \
               $(BACKEND_DIR)/hal_encoder.c \
+              $(BACKEND_DIR)/hal_isp.c \
               src/hal_gpio.c
 
 # No AUDIO_SRCS yet. The audio archive still builds: hal_common.c is compiled

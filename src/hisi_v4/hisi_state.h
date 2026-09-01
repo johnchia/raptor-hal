@@ -21,6 +21,7 @@
 
 #include "v4_common.h"
 #include "v4_isp.h"
+#include "v4_isp_tune.h"
 #include "v4_snr.h"
 #include "v4_sys.h"
 #include "v4_venc.h"
@@ -401,6 +402,20 @@ typedef struct {
     bool isp_thread_leaked;
 
     /*
+     * Phase 3 -- IQ tuning. The file is settled at bring-up
+     * (hisi_isp_resolve_iq), the load happens on the first encoded frame
+     * (hisi_isp_note_frame); iq_load_started is the atomic latch that
+     * makes exactly one encoder thread do it. The entry points live in
+     * `tune` and are resolved lazily inside the load, all optional --
+     * see hal_isp.c's OP COVERAGE block.
+     */
+    char iq_file[128];
+    char iq_load_started;
+    bool tune_resolved; /* hisi_isp_tune_resolve ran; also lets the host
+                         * tests pre-install stub entry points */
+    v4_isp_tune_impl tune;
+
+    /*
      * Unwind flags -- one per bring-up step, set only once that step has
      * succeeded, so hisi_teardown undoes exactly what was done and no more.
      *
@@ -552,9 +567,12 @@ int hal_enc_get_fd(void *ctx, int chn);
 
 void hisi_enc_release_all(hisi_state_t *st);
 
-/* ISP -- the read-only sensor geometry accessor Phase 2 publishes. The
- * tuning ops are Phase 3 and live in a hal_isp.c that does not exist yet. */
+/* ISP -- the sensor geometry accessor, plus Phase 3's tuning load. All
+ * three live in hal_isp.c; resolve runs once from hal_init, note_frame is
+ * the per-frame latch the encoder's frame loop pays one atomic test for. */
 int hal_isp_get_sensor_attr(void *ctx, uint32_t *width, uint32_t *height);
+void hisi_isp_resolve_iq(hisi_state_t *st);
+void hisi_isp_note_frame(hisi_state_t *st);
 
 /* Bind, shared by hal_common.c's ops and by the encoder's register path --
  * both express "this VPSS channel feeds this VENC channel". */
