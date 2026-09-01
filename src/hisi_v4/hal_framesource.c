@@ -256,22 +256,48 @@ static int hisi_fs_apply_crop(hisi_state_t *st, int chn, const rss_fs_config_t *
             crop.crop_rect.y = (int)cy;
             crop.crop_rect.width = cw;
             crop.crop_rect.height = chh;
+        } else {
+            /* Asked for, produced nothing: say so rather than silently
+             * running uncropped with the aspect error the crop was meant
+             * to fix. */
+            HAL_LOG_ERR("vpss chn %d: crop %dx%d+%d+%d collapses to zero after alignment; "
+                        "running uncropped",
+                        chn, cfg->crop.w, cfg->crop.h, cfg->crop.x, cfg->crop.y);
+            return RSS_ERR_INVAL;
         }
     }
 
-    /* One window per group: only a channel that actually wants a crop gets
-     * to set it, and only if nothing else already has. A channel with no
-     * crop must not clear a window another channel is relying on. */
+    /*
+     * One window per group, with an owner rather than a latch. The channel
+     * whose request set the window may move or clear it -- a resolution
+     * change from a 16:9 stream back to 4:3 must not keep the old 16:9
+     * window -- while a non-owner is held to the window that exists: the
+     * identical rect is the normal two-streams-same-aspect case and
+     * succeeds silently, a different rect is refused out loud.
+     */
     if (!crop.enable) {
-        if (st->vpss_grp_cropped)
-            HAL_LOG_DBG("vpss chn %d: no crop; keeping the group window", chn);
-        return RSS_OK;
-    }
-
-    if (st->vpss_grp_cropped) {
-        HAL_LOG_WARN("vpss chn %d: crop %ux%u+%d+%d ignored; the group window is already set",
+        if (st->vpss_crop_owner < 0)
+            return RSS_OK;
+        if (st->vpss_crop_owner != chn) {
+            HAL_LOG_DBG("vpss chn %d: no crop; keeping chn %d's group window", chn,
+                        st->vpss_crop_owner);
+            return RSS_OK;
+        }
+        /* The owner turning its crop off: restore the full frame. The rect
+         * already carries it -- see the fill above. */
+    } else if (st->vpss_crop_owner >= 0 && st->vpss_crop_owner != chn) {
+        if (crop.crop_rect.x == st->vpss_crop_x && crop.crop_rect.y == st->vpss_crop_y &&
+            crop.crop_rect.width == st->vpss_crop_w && crop.crop_rect.height == st->vpss_crop_h)
+            return RSS_OK;
+        HAL_LOG_WARN("vpss chn %d: crop %ux%u+%d+%d refused; chn %d holds the group window "
+                     "%ux%u+%d+%d",
                      chn, crop.crop_rect.width, crop.crop_rect.height, crop.crop_rect.x,
-                     crop.crop_rect.y);
+                     crop.crop_rect.y, st->vpss_crop_owner, st->vpss_crop_w, st->vpss_crop_h,
+                     st->vpss_crop_x, st->vpss_crop_y);
+        return RSS_OK;
+    } else if (st->vpss_crop_owner == chn && crop.crop_rect.x == st->vpss_crop_x &&
+               crop.crop_rect.y == st->vpss_crop_y && crop.crop_rect.width == st->vpss_crop_w &&
+               crop.crop_rect.height == st->vpss_crop_h) {
         return RSS_OK;
     }
 
@@ -283,9 +309,18 @@ static int hisi_fs_apply_crop(hisi_state_t *st, int chn, const rss_fs_config_t *
         return RSS_ERR_IO;
     }
 
-    st->vpss_grp_cropped = true;
-    HAL_LOG_INFO("vpss: group crop %ux%u+%d+%d (requested by chn %d)", crop.crop_rect.width,
-                 crop.crop_rect.height, crop.crop_rect.x, crop.crop_rect.y, chn);
+    if (crop.enable) {
+        st->vpss_crop_owner = chn;
+        st->vpss_crop_x = crop.crop_rect.x;
+        st->vpss_crop_y = crop.crop_rect.y;
+        st->vpss_crop_w = crop.crop_rect.width;
+        st->vpss_crop_h = crop.crop_rect.height;
+        HAL_LOG_INFO("vpss: group crop %ux%u+%d+%d (owner chn %d)", crop.crop_rect.width,
+                     crop.crop_rect.height, crop.crop_rect.x, crop.crop_rect.y, chn);
+    } else {
+        st->vpss_crop_owner = -1;
+        HAL_LOG_INFO("vpss: group crop cleared (chn %d)", chn);
+    }
     return RSS_OK;
 }
 
@@ -312,6 +347,12 @@ int hal_fs_create_channel(void *ctx, int chn, const rss_fs_config_t *cfg)
         HAL_LOG_ERR("vpss chn %d: zero geometry", chn);
         return RSS_ERR_INVAL;
     }
+    /* The channel always emits NV12 -- see hisi_fs_fill_attr -- so a caller
+     * asking for anything else (rvd's raw-grab recreates the channel with a
+     * RAW request) must hear that the bytes it dumps will be NV12. */
+    if (cfg->pixfmt != RSS_PIXFMT_NV12)
+        HAL_LOG_WARN("vpss chn %d: pixfmt %d not supported; output is NV12", chn,
+                     (int)cfg->pixfmt);
 
     fs->width = cfg->width;
     fs->height = cfg->height;
@@ -385,18 +426,29 @@ int hal_fs_set_channel_attr(void *ctx, int chn, const rss_fs_config_t *cfg)
     if (!fs->configured)
         return hal_fs_create_channel(ctx, chn, cfg);
 
-    if (cfg->width && cfg->height) {
-        fs->width = cfg->width;
-        fs->height = cfg->height;
-    }
-    hisi_fs_frame_rate(st, cfg->fps_num, cfg->fps_den, &fs->frame_rate);
+    {
+        /* Restore on refusal: the tracked geometry is what fills the next
+         * reconfigure, so a value the driver rejected must not survive to
+         * be silently re-applied by a later successful call. */
+        unsigned int old_w = fs->width, old_h = fs->height;
+        v4_frame_rate old_fr = fs->frame_rate;
 
-    hisi_fs_fill_attr(fs, &attr);
-    ret = st->vpss.fnSetChnAttr(HISI_VPSS_GRP, hisi_vpss_phy(chn), &attr);
-    if (ret) {
-        HAL_LOG_ERR("HI_MPI_VPSS_SetChnAttr(%d, %d) %ux%u failed: 0x%x", HISI_VPSS_GRP, chn,
-                    fs->width, fs->height, ret);
-        return RSS_ERR_IO;
+        if (cfg->width && cfg->height) {
+            fs->width = cfg->width;
+            fs->height = cfg->height;
+        }
+        hisi_fs_frame_rate(st, cfg->fps_num, cfg->fps_den, &fs->frame_rate);
+
+        hisi_fs_fill_attr(fs, &attr);
+        ret = st->vpss.fnSetChnAttr(HISI_VPSS_GRP, hisi_vpss_phy(chn), &attr);
+        if (ret) {
+            HAL_LOG_ERR("HI_MPI_VPSS_SetChnAttr(%d, %d) %ux%u failed: 0x%x", HISI_VPSS_GRP, chn,
+                        fs->width, fs->height, ret);
+            fs->width = old_w;
+            fs->height = old_h;
+            fs->frame_rate = old_fr;
+            return RSS_ERR_IO;
+        }
     }
 
     /* The crop belongs to the geometry, so a live geometry change carries
@@ -652,7 +704,7 @@ void hisi_fs_release_all(hisi_state_t *st)
         hisi_vpss_chn_t *fs = &st->fs[i];
 
         if (fs->frame_held && st->vpss.fnReleaseChnFrame) {
-            st->vpss.fnReleaseChnFrame(HISI_VPSS_GRP, i, &fs->frame);
+            st->vpss.fnReleaseChnFrame(HISI_VPSS_GRP, hisi_vpss_phy(i), &fs->frame);
             fs->frame_held = false;
         }
         if (fs->enabled && st->vpss.fnDisableChn) {

@@ -36,6 +36,7 @@
 #include "v4_video.h"
 
 #include <sys/ioctl.h>
+#include <unistd.h>
 
 /* ================================================================
  * THE SENSOR DRIVER VTABLE
@@ -302,6 +303,17 @@ static inline int v4_snr_load(v4_snr_impl *lib, const char *name, const char *ob
         snprintf(lib->path, sizeof(lib->path), "%s%s", dirs[d], name);
         if ((lib->handle = dlopen(lib->path, RTLD_LAZY | RTLD_GLOBAL)))
             break;
+        /* The file exists and still would not load: that is the real
+         * error, and this dlerror names it -- an unresolved symbol, most
+         * likely, which is precisely what the GK_API_* forwarders exist
+         * for. Trying the remaining directories would bury it under two
+         * ENOENTs and send the user hunting for a file that is plainly
+         * there. */
+        if (access(lib->path, F_OK) == 0) {
+            HAL_LOG_ERR("%s: %s exists but did not load: %s", mod, lib->path, dlerror());
+            lib->path[0] = '\0';
+            return RSS_ERR_NOENT;
+        }
     }
 
     if (!lib->handle) {

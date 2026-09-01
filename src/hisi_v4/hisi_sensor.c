@@ -36,6 +36,7 @@
 #include <dirent.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <unistd.h>
 
 /* ================================================================
  * A SMALL INI READER
@@ -105,6 +106,19 @@ static int hisi_ini_read(hisi_ini *ini, const char *path)
         char *p = line;
         char *eq;
         char *comment;
+
+        /* A line longer than the buffer arrives in pieces, and a later
+         * piece containing '=' would be parsed as a fresh entry -- a
+         * comment marker in an earlier piece no longer protects it. Take
+         * the first piece (truncated, warned) and consume the remainder. */
+        if (!strchr(line, '\n') && !feof(f)) {
+            int c;
+
+            HAL_LOG_WARN("sensor ini: %s: line over %d bytes truncated", path,
+                         HISI_INI_MAX_LINE - 1);
+            while ((c = fgetc(f)) != EOF && c != '\n')
+                ;
+        }
 
         /* Comments run to end of line and may follow a value. Both ';' and
          * '#' appear in the shipped files. */
@@ -187,7 +201,12 @@ static int hisi_ini_int(const hisi_ini *ini, const char *section, const char *ke
     if (hisi_ci_eq(v, "false"))
         return 0;
 
-    n = strtol(v, &end, 0);
+    /* strtoul, not strtol: the shipped files carry full-width hex masks --
+     * Mask_0 = 0xFFF00000 in 5M_imx335.ini -- and on the 32-bit target
+     * strtol saturates those to LONG_MAX, silently contradicting the file.
+     * The x86-64 host tests cannot catch that, because long is 64 bits
+     * there. The cast wraps to the intended bit pattern. */
+    n = (long)strtoul(v, &end, 0);
     if (end == v)
         return def;
     return (int)n;
@@ -210,8 +229,10 @@ static int hisi_ini_enum_val(const hisi_ini *ini, const char *section, const cha
     /* A bare number in a field the vendor usually spells symbolically is
      * legal and appears in some files -- InputDataType=1 next to
      * Input_mod=VI_MODE_MIPI in the same section. */
-    if (v[0] == '-' || isdigit((unsigned char)v[0]))
+    if (v[0] == '-')
         return (int)strtol(v, NULL, 0);
+    if (isdigit((unsigned char)v[0]))
+        return (int)strtoul(v, NULL, 0); /* full-width hex; see hisi_ini_int */
 
     HAL_LOG_WARN("sensor ini: [%s] %s = \"%s\" is not a value this backend knows; using %d",
                  section, key, v, def);
@@ -408,6 +429,16 @@ static const hisi_ini_enum hisi_enum_scan_mode[] = {
     {NULL, 0},
 };
 
+/* comm_vi.h's VI_DATA_SEQ_E, in declaration order. The shipped files spell
+ * this one symbolically too (Data_seq = VI_DATA_SEQ_YUYV in 5M_imx335.ini),
+ * and reading it as an integer silently produced 0 (VUVU). Dead for a
+ * RAW/MIPI sensor, wrong the day a BT.656 one is configured. */
+static const hisi_ini_enum hisi_enum_data_seq[] = {
+    {"VI_DATA_SEQ_VUVU", 0}, {"VI_DATA_SEQ_UVUV", 1}, {"VI_DATA_SEQ_UYVY", 2},
+    {"VI_DATA_SEQ_VYUY", 3}, {"VI_DATA_SEQ_YUYV", 4}, {"VI_DATA_SEQ_YVYU", 5},
+    {NULL, 0},
+};
+
 /*
  * The MIPI RAW bit depth appears twice in the vendor's own data: as
  * raw_bitness in the INI and as the pixel format the VI pipe carries. Both
@@ -502,10 +533,20 @@ static void hisi_parse_lane_map(const char *s, short *lane, int n)
  * "gc4653_i2c_4M.ini". So this scans the directory for any .ini whose name
  * contains the sensor name, rather than composing a path.
  *
- * When several match, the first in sorted order wins and every candidate is
- * logged. Deterministic beats clever here: the alternative is a heuristic
- * about which mode is "best", which is a decision the person who put two
- * modes on the board already made and can express by removing one.
+ * Selection, when several match:
+ *
+ *   1. /etc/majestic.yaml's sensorConfig: path, when it exists and names
+ *      this sensor. On an OpenIPC image that line is written by the image's
+ *      own sensor autodetect, so it is the one place the *module* variant
+ *      -- 5 MP against 4 MP IMX335, 2-lane against 4-lane IMX307 -- is
+ *      already decided. Nothing else on the filesystem encodes it.
+ *   2. A file whose name *starts with* the sensor name (stem-equal or
+ *      "<sensor>_"/"<sensor>.") beats a mere substring match. The stock
+ *      IMX307 board ships camhi_imx307_i2c_4l_1080p.ini beside
+ *      imx307_i2c_2l_1080p.ini, and plain sorted order picks the camhi
+ *      4-lane file ('c' < 'i') for a 2-lane module -- MIPI never locks.
+ *   3. Sorted order within a rank, deterministic and logged, and the
+ *      warning still says how to settle it for good.
  *
  * /etc/sensors/iq/ holds the IQ tuning INIs, a different thing with names
  * that would also match; only the top level of each directory is read.
@@ -515,6 +556,7 @@ static int hisi_sensor_ini_find(const char *sensor_name, char *out, size_t out_l
     static const char *dirs[] = {"/etc/sensors", "/usr/share/sensors"};
     char lower[64];
     char best[192] = "";
+    int best_rank = 2;
     int matches = 0;
     size_t d, i;
 
@@ -523,6 +565,45 @@ static int hisi_sensor_ini_find(const char *sensor_name, char *out, size_t out_l
     lower[i] = '\0';
     if (!lower[0])
         return RSS_ERR_INVAL;
+
+    /* Step 1: the image's own answer. A stale yaml naming some other
+     * sensor is ignored; one naming a missing file is ignored too. */
+    {
+        FILE *f = fopen("/etc/majestic.yaml", "r");
+
+        if (f) {
+            char line[256];
+
+            while (fgets(line, sizeof(line), f)) {
+                char *k = strstr(line, "sensorConfig:");
+                char pathlow[192];
+                char *v, *e;
+                size_t j;
+
+                if (!k)
+                    continue;
+                v = k + strlen("sensorConfig:");
+                while (*v == ' ' || *v == '\t')
+                    v++;
+                for (e = v; *e && *e != ' ' && *e != '\t' && *e != '\r' && *e != '\n'; e++)
+                    ;
+                *e = '\0';
+                if (!*v)
+                    break;
+                for (j = 0; j + 1 < sizeof(pathlow) && v[j]; j++)
+                    pathlow[j] = (char)tolower((unsigned char)v[j]);
+                pathlow[j] = '\0';
+                if (strstr(pathlow, lower) && access(v, R_OK) == 0) {
+                    HAL_LOG_INFO("sensor ini: %s (named by /etc/majestic.yaml)", v);
+                    snprintf(out, out_len, "%s", v);
+                    fclose(f);
+                    return RSS_OK;
+                }
+                break;
+            }
+            fclose(f);
+        }
+    }
 
     for (d = 0; d < sizeof(dirs) / sizeof(dirs[0]); d++) {
         struct dirent *de;
@@ -560,10 +641,24 @@ static int hisi_sensor_ini_find(const char *sensor_name, char *out, size_t out_l
 
             snprintf(path, sizeof(path), "%s/%s", dirs[d], entry);
             matches++;
-            if (!best[0] || strcmp(path, best) < 0)
-                snprintf(best, sizeof(best), "%s", path);
-            else
-                HAL_LOG_INFO("sensor ini: %s also matches \"%s\"", path, sensor_name);
+            {
+                /* Rank 0: the name *is* the sensor ("imx335.ini") or leads
+                 * with it ("imx335_i2c_2l_..."). Rank 1: it only contains
+                 * it ("camhi_imx307_...", "5M_imx335."). */
+                size_t ll = strlen(lower);
+                int rank = (strncmp(name, lower, ll) == 0 &&
+                            (name[ll] == '_' || name[ll] == '.'))
+                               ? 0
+                               : 1;
+
+                if (rank < best_rank ||
+                    (rank == best_rank && (!best[0] || strcmp(path, best) < 0))) {
+                    best_rank = rank;
+                    snprintf(best, sizeof(best), "%s", path);
+                } else {
+                    HAL_LOG_INFO("sensor ini: %s also matches \"%s\"", path, sensor_name);
+                }
+            }
         }
         closedir(dir);
     }
@@ -663,7 +758,8 @@ int hisi_sensor_mode_load(hisi_sensor_mode_t *m, const char *sensor_name)
     m->component_mask[1] = (unsigned int)hisi_ini_int(&ini, "vi_dev", "Mask_1", 0);
     m->scan_mode = (v4_vi_scan_mode)hisi_ini_enum_val(&ini, "vi_dev", "Scan_mode",
                                                       hisi_enum_scan_mode, V4_VI_SCAN_PROGRESSIVE);
-    m->data_seq = (unsigned int)hisi_ini_int(&ini, "vi_dev", "Data_seq", 0);
+    m->data_seq =
+        (unsigned int)hisi_ini_enum_val(&ini, "vi_dev", "Data_seq", hisi_enum_data_seq, 0);
     m->input_data_type = (v4_vi_data_type)hisi_ini_int(&ini, "vi_dev", "InputDataType",
                                                        V4_VI_DATA_TYPE_RGB);
     m->data_reverse = hisi_ini_int(&ini, "vi_dev", "DataRev", 0);

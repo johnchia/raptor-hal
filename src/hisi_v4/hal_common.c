@@ -453,13 +453,19 @@ static void *hisi_mmap_pages(void *addr, size_t len, int prot, int flags, int fd
 static const char *hisi_own_object(void)
 {
     static const char *name;
-    static bool asked;
+    static int resolved;
     hisi_dl_info info;
 
-    if (!asked) {
-        asked = true;
-        if (dladdr((const void *)(uintptr_t)&hisi_mmap_pages, &info))
+    /* Acquire/release around the pair, because the first call need not be
+     * the only call in flight: two threads racing here both run dladdr and
+     * store the same loader-owned string, which is benign, but a reader
+     * must never see `resolved` without the store to `name` it covers.
+     * hal_init resolves this single-threaded before any vendor library
+     * loads, so the race window is closed in practice as well. */
+    if (!__atomic_load_n(&resolved, __ATOMIC_ACQUIRE)) {
+        if (dladdr((const void *)(uintptr_t)&hisi_mmap_pages, &info) && info.dli_fname)
             name = info.dli_fname;
+        __atomic_store_n(&resolved, 1, __ATOMIC_RELEASE);
     }
     return name;
 }
@@ -485,9 +491,15 @@ static bool hisi_caller_is_vendor(const void *ra)
     hisi_dl_info info;
     const char *base;
 
+    /* No name for our own object means the executable's callers cannot be
+     * recognized below, and the basename rule would then classify them --
+     * "rvd", not "librss_" -- as vendor: the silent SIGBUS side. Fail the
+     * whole classification toward "ours" instead, per the rule above. */
+    if (!own)
+        return false;
     if (!dladdr(ra, &info) || !info.dli_fname)
         return false;
-    if (own && strcmp(info.dli_fname, own) == 0)
+    if (strcmp(info.dli_fname, own) == 0)
         return false;
 
     base = strrchr(info.dli_fname, '/');
@@ -548,6 +560,13 @@ __attribute__((used)) void *hisi_mmap_shim(void *addr, size_t len, int prot, int
 static void hisi_check_trampolines(void)
 {
     void *found;
+
+#if defined(__arm__)
+    /* Resolve the mmap shim's own-object name here, single-threaded and
+     * before any vendor library can call mmap, so the lazy init in
+     * hisi_own_object never races. */
+    hisi_own_object();
+#endif
 
     __ctype_b = *__ctype_b_loc();
 
@@ -1204,7 +1223,7 @@ static void *hisi_isp_thread(void *arg)
 #define HISI_ISP_JOIN_TIMEOUT_MS 2000
 #define HISI_ISP_JOIN_POLL_MS 10
 
-static void hisi_isp_thread_stop(hisi_state_t *st)
+static bool hisi_isp_thread_stop(hisi_state_t *st)
 {
     int waited;
 
@@ -1213,7 +1232,7 @@ static void hisi_isp_thread_stop(hisi_state_t *st)
 
         if (__atomic_load_n(&st->isp_thread_done, __ATOMIC_ACQUIRE)) {
             pthread_join(st->isp_thread, NULL);
-            return;
+            return true;
         }
 
         /* select with no descriptors is the sleep this file can reach:
@@ -1229,6 +1248,7 @@ static void hisi_isp_thread_stop(hisi_state_t *st)
                 "3A thread rather than blocking shutdown",
                 HISI_ISP_JOIN_TIMEOUT_MS);
     pthread_detach(st->isp_thread);
+    return false;
 }
 
 static int hisi_isp_bringup(hisi_state_t *st)
@@ -1461,6 +1481,33 @@ int hisi_bind_vpss_venc(hisi_state_t *st, int fs_chn, int enc_chn)
     if (!st->sys.fnBind)
         return RSS_ERR_NOTSUP;
 
+    /*
+     * Idempotence, because rvd asks twice per stream: once through
+     * enc_register_channel and once through the FS -> ENC bind chain.
+     * Without this the second SYS_Bind of the same edge returns NOT_PERM,
+     * which the recovery below misreads as another process's leftovers --
+     * it would unbind the edge made a moment ago and remake it, turning
+     * every normal stream start into a spurious stale-bind warning with a
+     * sourceless window in the middle.
+     */
+    if (st->enc[enc_chn].bound_fs == fs_chn)
+        return RSS_OK;
+
+    /*
+     * An MJPEG channel that is not yet receiving records the edge instead
+     * of making it. rvd binds its snapshot channels while they are idle,
+     * and an idle-but-bound destination is the VB wedge enc_stop's comment
+     * describes -- so the bind waits for enc_start, which makes the
+     * channel receive and then calls back here. idle_fs carries the edge
+     * across the wait.
+     */
+    if (st->enc[enc_chn].payload == V4_PT_MJPEG && !st->enc[enc_chn].receiving) {
+        st->enc[enc_chn].idle_fs = fs_chn;
+        HAL_LOG_DBG("bind: VPSS(%d,%d) -> VENC(%d) deferred until the channel receives",
+                    HISI_VPSS_GRP, hisi_vpss_phy(fs_chn), enc_chn);
+        return RSS_OK;
+    }
+
     memset(&src, 0, sizeof(src));
     src.module = V4_MOD_VPSS;
     src.device = HISI_VPSS_GRP;
@@ -1520,6 +1567,10 @@ int hisi_bind_vpss_venc(hisi_state_t *st, int fs_chn, int enc_chn)
     }
 
     st->enc[enc_chn].bound_fs = fs_chn;
+    /* The rc attribute written at create predates the bind and so named the
+     * sensor's frame rate as its source; now that the source channel is
+     * known, re-derive it. See hisi_enc_refresh_rc. */
+    hisi_enc_refresh_rc(st, enc_chn);
     HAL_LOG_DBG("bind: VPSS(%d,%d) -> VENC(%d)", HISI_VPSS_GRP, hisi_vpss_phy(fs_chn), enc_chn);
     return RSS_OK;
 }
@@ -1687,6 +1738,49 @@ static int hisi_video_bringup(hisi_state_t *st, const rss_sensor_config_t *cfg)
             return ret;
     }
 
+    /*
+     * Fill the GK_API_* forwarder targets, now that the libraries defining
+     * the real entry points are loaded. Without this the forwarders answer
+     * every Goke-tier sensor driver with HI_FAILURE and the driver declines
+     * to register -- the trampolines exist for exactly these callers, so an
+     * empty target set makes them decorative. Resolved through the ISP's
+     * own handle list, never RTLD_DEFAULT, so the GK_API_* spelling cannot
+     * find the executable's forwarder and loop.
+     *
+     * Absent is survivable for the same reason the forwarders tolerate a
+     * NULL target: a board whose sensor driver never calls them loses
+     * nothing. One warning covers the set -- per-symbol noise would fire on
+     * every HiSilicon board for the GK spellings it rightly lacks.
+     */
+    {
+        v4_mpi_libs cb_search;
+
+        memset(&cb_search, 0, sizeof(cb_search));
+        memcpy(cb_search.search, st->isp.search,
+               sizeof(cb_search.search) < sizeof(st->isp.search) ? sizeof(cb_search.search)
+                                                                 : sizeof(st->isp.search));
+
+        st->fn_isp_sensor_reg_cb = (int (*)(int, void *, void *))v4_symbol_opt(
+            &cb_search, "HI_MPI_ISP_SensorRegCallBack", "GK_API_ISP_SensorRegCallBack");
+        st->fn_isp_sensor_unreg_cb = (int (*)(int, int))v4_symbol_opt(
+            &cb_search, "HI_MPI_ISP_SensorUnRegCallBack", "GK_API_ISP_SensorUnRegCallBack");
+        st->fn_isp_get_mod_param = (int (*)(void *))v4_symbol_opt(
+            &cb_search, "HI_MPI_ISP_GetModParam", "GK_API_ISP_GetModParam");
+        st->fn_ae_sensor_reg_cb = (int (*)(int, void *, void *, void *))v4_symbol_opt(
+            &cb_search, "HI_MPI_AE_SensorRegCallBack", "GK_API_AE_SensorRegCallBack");
+        st->fn_ae_sensor_unreg_cb = (int (*)(int, void *, int))v4_symbol_opt(
+            &cb_search, "HI_MPI_AE_SensorUnRegCallBack", "GK_API_AE_SensorUnRegCallBack");
+        st->fn_awb_sensor_reg_cb = (int (*)(int, void *, void *, void *))v4_symbol_opt(
+            &cb_search, "HI_MPI_AWB_SensorRegCallBack", "GK_API_AWB_SensorRegCallBack");
+        st->fn_awb_sensor_unreg_cb = (int (*)(int, void *, int))v4_symbol_opt(
+            &cb_search, "HI_MPI_AWB_SensorUnRegCallBack", "GK_API_AWB_SensorUnRegCallBack");
+
+        if (!st->fn_isp_sensor_reg_cb || !st->fn_ae_sensor_reg_cb || !st->fn_awb_sensor_reg_cb)
+            HAL_LOG_WARN("sensor-callback registrars incomplete (isp=%c ae=%c awb=%c); "
+                         "drivers routed through the GK_API_* forwarders cannot register",
+                         st->fn_isp_sensor_reg_cb ? 'y' : 'n', st->fn_ae_sensor_reg_cb ? 'y' : 'n',
+                         st->fn_awb_sensor_reg_cb ? 'y' : 'n');
+    }
 
     ret = hisi_mipi_configure(st);
     if (ret)
@@ -1782,9 +1876,33 @@ static void hisi_reclaim_pipeline(hisi_state_t *st)
             st->venc.fnDestroyChn(chn);
     }
 
+    /* Physical channels 0..N-1, no phy() mapping: this loop is already in
+     * the physical domain, and the previous owner may have used channel 0
+     * as an output -- majestic does, in the board's default VPSS-online
+     * mode. Skipping 0 leaves it enabled, DestroyGrp then fails, and this
+     * process's own CreateGrp fails after it. */
     for (chn = 0; chn < HISI_VPSS_CHN_NUM; chn++)
         if (st->vpss.fnDisableChn)
-            st->vpss.fnDisableChn(HISI_VPSS_GRP, hisi_vpss_phy(chn));
+            st->vpss.fnDisableChn(HISI_VPSS_GRP, chn);
+
+    /* The stale VI -> VPSS edge is kernel state like the VENC edges above,
+     * and VPSS(0, chn 0) as a destination yields the same NOT_PERM to the
+     * next bind. Same unchecked contract as the rest of this function. */
+    if (st->sys.fnUnbind) {
+        v4_mpp_chn from, to;
+
+        memset(&from, 0, sizeof(from));
+        from.module = V4_MOD_VI;
+        from.device = HISI_VI_PIPE;
+        from.channel = HISI_VI_CHN;
+
+        memset(&to, 0, sizeof(to));
+        to.module = V4_MOD_VPSS;
+        to.device = HISI_VPSS_GRP;
+        to.channel = 0;
+
+        st->sys.fnUnbind(&from, &to);
+    }
 
     if (st->vpss.fnStopGrp)
         st->vpss.fnStopGrp(HISI_VPSS_GRP);
@@ -1855,8 +1973,8 @@ static void hisi_video_teardown(hisi_state_t *st)
             HAL_LOG_WARN("HI_MPI_ISP_Exit(pipe %d) failed: 0x%x", HISI_VI_PIPE, ret);
         st->isp_inited = false;
 
-        if (st->isp_thread_started)
-            hisi_isp_thread_stop(st);
+        if (st->isp_thread_started && !hisi_isp_thread_stop(st))
+            st->isp_thread_leaked = true;
         st->isp_thread_started = false;
     }
 
@@ -1923,8 +2041,35 @@ static void hisi_video_teardown(hisi_state_t *st)
 
     hisi_mipi_shutdown(st);
 
-    v4_snr_unload(&st->snr);
-    hisi_isp_close(&st->isp);
+    /*
+     * A detached 3A thread is still executing inside libisp and libsns.
+     * dlclose is a no-op on musl but unmaps on the glibc host builds, and
+     * either way the thread will eventually write into whatever occupies
+     * this state -- so when the join timed out, deliberately keep the
+     * libraries mapped and let hal_deinit leak the state block. A leak in
+     * an already-wedged shutdown is diagnosable; a write into freed heap is
+     * not.
+     */
+    if (st->isp_thread_leaked) {
+        HAL_LOG_ERR("isp: 3A thread still running; leaking libisp/libsns handles and state");
+    } else {
+        v4_snr_unload(&st->snr);
+        hisi_isp_close(&st->isp);
+    }
+
+    /* The forwarder targets point into libraries this function just closed
+     * (or abandoned). The forwarders tolerate NULL; a dangling pointer they
+     * would call through. */
+    st->fn_isp_sensor_reg_cb = NULL;
+    st->fn_isp_sensor_unreg_cb = NULL;
+    st->fn_isp_get_mod_param = NULL;
+    st->fn_ae_sensor_reg_cb = NULL;
+    st->fn_ae_sensor_unreg_cb = NULL;
+    st->fn_awb_sensor_reg_cb = NULL;
+    st->fn_awb_sensor_unreg_cb = NULL;
+    st->fn_alg_register_drc = NULL;
+    st->fn_alg_register_dehaze = NULL;
+    st->fn_alg_register_ldci = NULL;
 }
 
 #endif /* HAL_MODULE_VIDEO */
@@ -1958,6 +2103,27 @@ static unsigned int hisi_vb_nv12_size(unsigned int width, unsigned int height)
     unsigned int rows = (height + 1u) & ~1u;
 
     return stride * rows * 3u / 2u;
+}
+
+/*
+ * VI_GetRawBufferSize, transcribed for the uncompressed case (hi_buffer.h,
+ * the RAW branch): bits per row rounded to whole bytes, the byte stride
+ * aligned to 16, times the row count.
+ *
+ * At RAW12 this equals the NV12 number for any geometry -- both are 1.5
+ * bytes per pixel -- which is why one pool covers the raw and the picture
+ * on this board. The equality is a property of 12-bit raws, not of pools:
+ * RAW14 and RAW16 are wider than NV12, and a pool sized only by the NV12
+ * formula would then never satisfy VI, reproducing exactly the silent
+ * no-frames failure the transcription note above warns about.
+ */
+static unsigned int hisi_vb_raw_size(unsigned int width, unsigned int height,
+                                     unsigned int raw_bitness)
+{
+    unsigned int row_bytes = (width * raw_bitness + 7u) / 8u;
+    unsigned int stride = (row_bytes + 15u) & ~15u;
+
+    return stride * height;
 }
 #endif /* HAL_MODULE_VIDEO */
 
@@ -2026,9 +2192,12 @@ static int hisi_vb_bringup(hisi_state_t *st)
         unsigned int cw = sw < HISI_VB_STREAM_MAX_W ? sw : HISI_VB_STREAM_MAX_W;
         unsigned int ch = sh < HISI_VB_STREAM_MAX_H ? sh : HISI_VB_STREAM_MAX_H;
 
+        unsigned int nv12 = hisi_vb_nv12_size(sw, sh);
+        unsigned int raw = hisi_vb_raw_size(sw, sh, (unsigned int)st->mode.raw_bitness);
+
         conf.max_pool_cnt = 2;
 
-        conf.pool[0].blk_size = hisi_vb_nv12_size(sw, sh);
+        conf.pool[0].blk_size = raw > nv12 ? raw : nv12;
         conf.pool[0].blk_cnt = HISI_VB_BLK_CNT;
         /* NOCACHE: nothing in userspace reads these blocks on the streaming
          * path, and a cached mapping would need explicit maintenance at
@@ -2134,9 +2303,11 @@ static int hal_init(void *ctx, const rss_multi_sensor_config_t *cfg)
 
         for (i = 0; i < HISI_VENC_CHN_NUM; i++) {
             st->enc[i].bound_fs = -1;
+            st->enc[i].idle_fs = -1;
             st->enc[i].fd = -1;
             st->osd_src_fs[i] = -1;
         }
+        st->vpss_crop_owner = -1;
     }
 
     /*
@@ -2253,7 +2424,13 @@ err_unload:
     v4_sys_unload(&st->sys);
     hisi_mpi_close(&st->libs);
 err_free:
-    free(st);
+    /* Same rule as hal_deinit: a 3A thread that outlived its join still
+     * writes into this block, so a wedged partial bring-up leaks it. */
+    if (st->isp_thread_leaked)
+        HAL_LOG_ERR("isp: leaking HAL state (%zu bytes) to a still-running 3A thread",
+                    sizeof(*st));
+    else
+        free(st);
     c->platform = NULL;
     return ret;
 }
@@ -2344,7 +2521,14 @@ static int hal_deinit(void *ctx)
     v4_sys_unload(&st->sys);
     hisi_mpi_close(&st->libs);
 
-    free(st);
+    /* The detached 3A thread still writes isp_thread_done into this block
+     * whenever HI_MPI_ISP_Run finally returns; freeing it converts a wedged
+     * shutdown into silent heap corruption. Leak it and say so. */
+    if (st->isp_thread_leaked)
+        HAL_LOG_ERR("isp: leaking HAL state (%zu bytes) to a still-running 3A thread",
+                    sizeof(*st));
+    else
+        free(st);
     c->platform = NULL;
     c->initialized = false;
 
@@ -2497,6 +2681,8 @@ static const rss_hal_ops_t g_ops = {
     .enc_set_bitrate = hal_enc_set_bitrate,
     .enc_set_gop = hal_enc_set_gop,
     .enc_set_fps = hal_enc_set_fps,
+    .enc_set_jpeg_qp = hal_enc_set_jpeg_qp,
+    .enc_get_jpeg_qp = hal_enc_get_jpeg_qp,
     .enc_get_channel_attr = hal_enc_get_channel_attr,
     .enc_get_fps = hal_enc_get_fps,
     .enc_get_avg_bitrate = hal_enc_get_avg_bitrate,

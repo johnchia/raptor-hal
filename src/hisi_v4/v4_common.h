@@ -287,6 +287,8 @@ static inline void *v4_symbol_opt(const v4_mpi_libs *libs, const char *hi_name,
  * wrong one. A missing MPI library is fatal, because nothing works without
  * it.
  */
+static inline void hisi_mpi_close(v4_mpi_libs *libs);
+
 static inline int hisi_mpi_open(v4_mpi_libs *libs)
 {
     static const int flags = RTLD_LAZY | RTLD_GLOBAL;
@@ -314,6 +316,10 @@ static inline int hisi_mpi_open(v4_mpi_libs *libs)
         libs->mpi = dlopen("libhi_mpi.so", flags);
     } else {
         HAL_LOG_ERR("hisi_mpi: no MPI library found (libmpi.so, libgk_api.so): %s", dlerror());
+        /* The support handles opened above are already held; a caller that
+         * retries hal_init would otherwise accumulate a reference per
+         * attempt. */
+        hisi_mpi_close(libs);
         return RSS_ERR_NOENT;
     }
 

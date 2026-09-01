@@ -211,6 +211,12 @@ typedef struct {
     bool created;
     bool receiving;
     int bound_fs;
+    /* Where a duty-cycled MJPEG channel rebinds when it restarts. enc_stop
+     * unbinds those channels -- a stopped-but-bound destination queues the
+     * source's pictures without ever releasing them, and four queued 5 MP
+     * frames are pool 0 in its entirety -- so the edge to remake has to
+     * survive the unbind that cleared bound_fs. -1 otherwise. */
+    int idle_fs;
     int fd;
 
     rss_codec_t codec;
@@ -388,6 +394,11 @@ typedef struct {
     bool isp_thread_started;
     int isp_thread_running;
     int isp_thread_done;
+    /* Set when the join timed out and the thread was detached: it is still
+     * executing inside libisp/libsns, so teardown must not dlclose those
+     * handles and hal_deinit must leak this state block rather than free
+     * memory the thread will still write to. */
+    bool isp_thread_leaked;
 
     /*
      * Unwind flags -- one per bring-up step, set only once that step has
@@ -417,8 +428,20 @@ typedef struct {
 
     bool vpss_grp_created;
     bool vpss_grp_started;
-    bool vpss_grp_cropped;
     bool vi_vpss_bound;
+
+    /*
+     * The group crop is one window shared by every channel, so it carries
+     * an owner: the framesource channel whose request set it, or -1. The
+     * owner may move or clear its window (a resolution change from 16:9
+     * back to 4:3 must not keep the old 16:9 window latched); a non-owner
+     * asking for the identical rect is the normal two-streams-same-aspect
+     * case and succeeds silently; a non-owner asking for a different rect
+     * is refused with a warning, because one window cannot serve both.
+     */
+    int vpss_crop_owner;
+    int vpss_crop_x, vpss_crop_y;
+    unsigned int vpss_crop_w, vpss_crop_h;
 } hisi_state_t;
 
 static inline hisi_state_t *hisi_state(void *ctx)
@@ -515,6 +538,9 @@ int hal_enc_get_frame(void *ctx, int chn, rss_frame_t *frame);
 int hal_enc_release_frame(void *ctx, int chn, rss_frame_t *frame);
 int hal_enc_request_idr(void *ctx, int chn);
 int hal_enc_set_rc_mode(void *ctx, int chn, rss_rc_mode_t mode, uint32_t bitrate);
+int hal_enc_set_jpeg_qp(void *ctx, int chn, int qp);
+int hal_enc_get_jpeg_qp(void *ctx, int chn, int *qp);
+void hisi_enc_refresh_rc(hisi_state_t *st, int enc_chn);
 int hal_enc_set_bitrate(void *ctx, int chn, uint32_t bitrate);
 int hal_enc_set_gop(void *ctx, int chn, uint32_t gop_length);
 int hal_enc_set_fps(void *ctx, int chn, uint32_t fps_num, uint32_t fps_den);

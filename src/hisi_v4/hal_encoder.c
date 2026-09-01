@@ -67,6 +67,8 @@
 
 #include "hisi_state.h"
 
+#include <stdlib.h>
+
 #include <sys/select.h>
 #include <unistd.h>
 
@@ -97,8 +99,17 @@ static v4_payload_type hisi_enc_payload(rss_codec_t codec)
     case RSS_CODEC_H265:
         return V4_PT_H265;
     case RSS_CODEC_JPEG:
-        return V4_PT_JPEG;
     case RSS_CODEC_MJPEG:
+        /*
+         * Both on PT_MJPEG, which is divinus's choice too -- the one
+         * reference that runs snapshots on this silicon never creates a
+         * PT_JPEG channel; its snapshot channels are MJPEG, pulsed one
+         * frame at a time, which is also rvd's model. An MJPEG channel
+         * emits the same JPEG bytes a snapshot wants, and its FIXQP rc
+         * carries the qfactor, so quality works through the ordinary
+         * reconfigure path where PT_JPEG would need the separate
+         * HI_MPI_VENC_SetJpegParam surface.
+         */
         return V4_PT_MJPEG;
     case RSS_CODEC_H264:
     default:
@@ -159,43 +170,72 @@ static unsigned int hisi_enc_kbps(unsigned int bps)
     return kbps;
 }
 
-static void hisi_enc_fill_rc(const hisi_venc_chn_t *enc, v4_venc_rc_attr *rc)
+/*
+ * The JPEG quality scale, from rvd's init_qp. rvd stores JPEG *quality*,
+ * 1..100 with higher better (rvd_pipeline.c fills it from jpeg_quality),
+ * and the driver's Qfactor runs 1..99 the same way up -- so this is a
+ * clamp, not a QP inversion. An earlier version here treated the value as
+ * an H.264 QP and inverted it, which collapsed qualities 60..100 to one
+ * number and made 45 come out *worse* than 30.
+ */
+static unsigned int hisi_enc_qfactor(int init_qp)
 {
-    unsigned int src_fps = enc->fps_num && enc->fps_den ? enc->fps_num / enc->fps_den : 25;
+    unsigned int q = init_qp > 0 ? (unsigned int)init_qp : 80u;
+
+    if (q > 99u)
+        q = 99u;
+    return q;
+}
+
+static void hisi_enc_fill_rc(const hisi_state_t *st, const hisi_venc_chn_t *enc,
+                             v4_venc_rc_attr *rc)
+{
+    /*
+     * src is the rate frames actually arrive at, dst the rate asked for.
+     * The VPSS channel is the pipeline's one frame dropper, so the delivery
+     * rate is its dst when it drops and the sensor's rate when it does not;
+     * writing the *requested* rate into src -- what this function did first
+     * -- makes the encoder's frame-rate control drop nothing and the rate
+     * controller budget bitrate for a rate the pipeline is not delivering,
+     * so a CBR stream overshoots by src/dst. dst is clamped to src because
+     * the encoder cannot invent frames the pipeline does not carry.
+     */
+    unsigned int src_fps = st->mode.frame_rate > 0 ? (unsigned int)st->mode.frame_rate : 25u;
+    unsigned int req, dst_fps;
     bool fixqp = enc->rc_mode == RSS_RC_FIXQP;
     bool cbr = enc->rc_mode == RSS_RC_CBR;
 
-    memset(rc, 0, sizeof(*rc));
-
+    if (enc->bound_fs >= 0 && enc->bound_fs < HISI_FS_CHN_NUM &&
+        st->fs[enc->bound_fs].frame_rate.dst_frame_rate > 0)
+        src_fps = (unsigned int)st->fs[enc->bound_fs].frame_rate.dst_frame_rate;
     if (!src_fps)
-        src_fps = 25;
+        src_fps = 25u;
+
+    /* Rounded, not truncated: 30000/1001 is 30, not 29. */
+    req = enc->fps_num && enc->fps_den ? (enc->fps_num + enc->fps_den / 2u) / enc->fps_den
+                                       : src_fps;
+    if (!req)
+        req = 1u;
+    dst_fps = req < src_fps ? req : src_fps;
+
+    memset(rc, 0, sizeof(*rc));
 
     rc->mode = v4_venc_rc_mode_for(enc->payload, cbr, fixqp);
 
     if (enc->payload == V4_PT_JPEG || enc->payload == V4_PT_MJPEG) {
         if (fixqp) {
+            /* src == dst on purpose: a snapshot channel is paced by rvd's
+             * pulse loop (start, one frame, stop), and a frame-rate
+             * controller in front of it would make the first frame after a
+             * start wait out the drop pattern -- a /snap.jpg latency of up
+             * to a second at 1 fps. */
             rc->mjpeg_fixqp.src_frame_rate = src_fps;
             rc->mjpeg_fixqp.dst_frame_rate = src_fps;
-            /* Qfactor, not a QP: JPEG's quality scale runs 1..99 and higher
-             * is better, the inverse of a QP. rvd carries a QP, so a
-             * configured init_qp is mapped rather than passed through. */
-            rc->mjpeg_fixqp.qfactor = 80u;
-            if (enc->init_qp > 0 && enc->init_qp < 51) {
-                int q = 100 - enc->init_qp * 2;
-
-                /* Clamp into JPEG's own 1..99: a QP of 50 maps to 0, which
-                 * is not a quality factor at all, and the driver rejects
-                 * the channel rather than clamping for us. */
-                if (q < 1)
-                    q = 1;
-                if (q > 99)
-                    q = 99;
-                rc->mjpeg_fixqp.qfactor = (unsigned int)q;
-            }
+            rc->mjpeg_fixqp.qfactor = hisi_enc_qfactor(enc->init_qp);
         } else {
             rc->mjpeg_cbr.stat_time = 1;
             rc->mjpeg_cbr.src_frame_rate = src_fps;
-            rc->mjpeg_cbr.dst_frame_rate = src_fps;
+            rc->mjpeg_cbr.dst_frame_rate = dst_fps;
             rc->mjpeg_cbr.bit_rate = hisi_enc_kbps(enc->bitrate);
         }
         return;
@@ -204,7 +244,7 @@ static void hisi_enc_fill_rc(const hisi_venc_chn_t *enc, v4_venc_rc_attr *rc)
     if (fixqp) {
         rc->fixqp.gop = enc->gop;
         rc->fixqp.src_frame_rate = src_fps;
-        rc->fixqp.dst_frame_rate = src_fps;
+        rc->fixqp.dst_frame_rate = dst_fps;
         rc->fixqp.i_qp = enc->init_qp > 0 ? (unsigned int)enc->init_qp : 28u;
         rc->fixqp.p_qp = rc->fixqp.i_qp + 2u;
         rc->fixqp.b_qp = rc->fixqp.p_qp;
@@ -216,7 +256,7 @@ static void hisi_enc_fill_rc(const hisi_venc_chn_t *enc, v4_venc_rc_attr *rc)
      * and the only one raptor has evidence for. */
     rc->cbr.stat_time = 1;
     rc->cbr.src_frame_rate = src_fps;
-    rc->cbr.dst_frame_rate = src_fps;
+    rc->cbr.dst_frame_rate = dst_fps;
     rc->cbr.bit_rate = hisi_enc_kbps(enc->bitrate);
 }
 
@@ -231,7 +271,8 @@ static void hisi_enc_fill_rc(const hisi_venc_chn_t *enc, v4_venc_rc_attr *rc)
  * with it false the encoder emits slices and every consumer downstream
  * would have to reassemble them.
  */
-static void hisi_enc_fill_attr(const hisi_venc_chn_t *enc, v4_venc_chn_attr *attr)
+static void hisi_enc_fill_attr(const hisi_state_t *st, const hisi_venc_chn_t *enc,
+                               v4_venc_chn_attr *attr)
 {
     memset(attr, 0, sizeof(*attr));
 
@@ -259,7 +300,7 @@ static void hisi_enc_fill_attr(const hisi_venc_chn_t *enc, v4_venc_chn_attr *att
     if (enc->payload == V4_PT_H264 || enc->payload == V4_PT_H265)
         attr->venc_attr.codec.rcn_ref_share_buf = 1;
 
-    hisi_enc_fill_rc(enc, &attr->rc_attr);
+    hisi_enc_fill_rc(st, enc, &attr->rc_attr);
 
     /*
      * NORMALP: every frame after the I is a P referencing the one before.
@@ -368,6 +409,7 @@ int hal_enc_create_channel(void *ctx, int chn, const rss_video_config_t *cfg)
     enc->fps_num = cfg->fps_num;
     enc->fps_den = cfg->fps_den ? cfg->fps_den : 1;
     enc->bound_fs = -1;
+    enc->idle_fs = -1;
     enc->fd = -1;
     enc->init_qp = cfg->init_qp;
     enc->ip_qp_delta = cfg->ip_delta >= 0 ? cfg->ip_delta : 2;
@@ -382,6 +424,19 @@ int hal_enc_create_channel(void *ctx, int chn, const rss_video_config_t *cfg)
      * cannot act on.
      */
     enc->buf_size = cfg->buf_size ? cfg->buf_size : (unsigned int)enc->width * enc->height;
+    /* The JPEG encoder refuses a buffer smaller than the picture at
+     * 16-aligned dimensions -- measured: 640x360 is rejected with
+     * "Buffer [230400] not enough! At least 235520" in /dev/logmpp, and
+     * 235520 is exactly 640 x 368. (This, not the payload type, was the
+     * 0xa0088003 the whole create returned; VENC_CreateChn reports the
+     * jpege module's refusal as ILLEGAL_PARAM and names no field.) */
+    if (enc->payload == V4_PT_MJPEG) {
+        unsigned int min = (((unsigned int)enc->width + 15u) & ~15u) *
+                           (((unsigned int)enc->height + 15u) & ~15u);
+
+        if (enc->buf_size < min)
+            enc->buf_size = min;
+    }
     enc->buf_size = (enc->buf_size + 63u) & ~63u;
 
     /*
@@ -396,7 +451,7 @@ int hal_enc_create_channel(void *ctx, int chn, const rss_video_config_t *cfg)
     else
         enc->profile = 0;
 
-    hisi_enc_fill_attr(enc, &attr);
+    hisi_enc_fill_attr(st, enc, &attr);
     ret = st->venc.fnCreateChn(chn, &attr);
     if (ret) {
         HAL_LOG_ERR("HI_MPI_VENC_CreateChn(%d) %ux%u codec %d failed: 0x%x", chn, enc->width,
@@ -421,12 +476,24 @@ int hal_enc_create_channel(void *ctx, int chn, const rss_video_config_t *cfg)
      * idempotent for a channel already receiving, and rvd's JPEG loop still
      * stops and restarts channels as consumers come and go.
      */
-    ret = hisi_enc_start_recv(st, chn, enc);
-    if (ret) {
-        if (st->venc.fnDestroyChn)
-            st->venc.fnDestroyChn(chn);
-        enc->created = false;
-        return ret;
+    /*
+     * MJPEG channels start nothing here. rvd manages a snapshot channel's
+     * whole duty cycle through enc_start/enc_stop and believes a fresh
+     * channel is idle -- a channel receiving from create is one rvd will
+     * never stop, and with no consumer draining it the encoder's output
+     * fills, it stalls holding its input pictures, and four queued 5 MP
+     * frames are VB pool 0 in its entirety (measured -- VI starved within
+     * a second). The bind is deferred with the receive; see
+     * hisi_bind_vpss_venc.
+     */
+    if (enc->payload != V4_PT_MJPEG) {
+        ret = hisi_enc_start_recv(st, chn, enc);
+        if (ret) {
+            if (st->venc.fnDestroyChn)
+                st->venc.fnDestroyChn(chn);
+            enc->created = false;
+            return ret;
+        }
     }
 
     HAL_LOG_INFO("venc chn %d: %ux%u codec %d, %u bps (%u kbps to the driver), gop %u, buf %u",
@@ -468,6 +535,7 @@ int hal_enc_destroy_channel(void *ctx, int chn)
 
     memset(enc, 0, sizeof(*enc));
     enc->bound_fs = -1;
+    enc->idle_fs = -1;
     enc->fd = -1;
     return RSS_OK;
 }
@@ -538,7 +606,33 @@ int hal_enc_start(void *ctx, int chn)
     if (!enc->created)
         return RSS_ERR_INVAL;
 
-    return hisi_enc_start_recv(st, chn, enc);
+    /* Receive first, so the channel is a legal bind destination, then the
+     * other half of enc_stop's unbind: remake the deferred edge. Divinus's
+     * snapshot lifecycle (bind - receive - unbind), expressed through
+     * rvd's start/stop pair. */
+    {
+        int ret = hisi_enc_start_recv(st, chn, enc);
+
+        if (ret)
+            return ret;
+    }
+    if (enc->bound_fs < 0 && enc->idle_fs >= 0) {
+        int fs = enc->idle_fs;
+        int ret;
+
+        enc->idle_fs = -1;
+        ret = hisi_bind_vpss_venc(st, fs, chn);
+        if (ret) {
+            enc->idle_fs = fs;
+            if (st->venc.fnStopRecvFrame) {
+                st->venc.fnStopRecvFrame(chn);
+                enc->receiving = false;
+            }
+            return ret;
+        }
+    }
+
+    return RSS_OK;
 }
 
 int hal_enc_stop(void *ctx, int chn)
@@ -557,6 +651,28 @@ int hal_enc_stop(void *ctx, int chn)
         HAL_LOG_WARN("HI_MPI_VENC_StopRecvFrame(%d) failed: 0x%x", chn, ret);
 
     enc->receiving = false;
+
+    /*
+     * A duty-cycled MJPEG channel must not stay bound while stopped.
+     * Measured: the VPSS source keeps queueing pictures at a stopped
+     * destination and nothing releases them -- four queued 5 MP frames
+     * held the whole of VB pool 0 and starved VI within a second of the
+     * pipeline starting. Unbind, remember the edge in idle_fs, and let
+     * enc_start remake it; ResetChn then flushes whatever was queued
+     * before the unbind. This is divinus's snapshot lifecycle
+     * (bind - receive one - unbind) mapped onto rvd's start/stop pair.
+     * H.26x channels stay bound across a stop, as they always did.
+     */
+    if (enc->payload == V4_PT_MJPEG && enc->bound_fs >= 0) {
+        enc->idle_fs = enc->bound_fs;
+        hisi_unbind_vpss_venc(st, enc->bound_fs, chn);
+        if (!enc->frame_held && st->venc.fnResetChn) {
+            ret = st->venc.fnResetChn(chn);
+            if (ret)
+                HAL_LOG_WARN("HI_MPI_VENC_ResetChn(%d) failed: 0x%x", chn, ret);
+        }
+    }
+
     return RSS_OK;
 }
 
@@ -740,10 +856,13 @@ static void hisi_enc_fill_nals(hisi_venc_chn_t *enc, rss_frame_t *frame)
  * Report it as -EAGAIN, the same "no frame this time" the other backends
  * return and the only value rvd's encoder thread treats as non-fatal.
  *
- * A frame with more packs than the array holds is clamped rather than
- * refused, so the array cannot be overrun -- which is the failure GetStream
- * would otherwise cause, and it would corrupt the state struct rather than
- * fail.
+ * A frame with more packs than the per-channel array holds is drained into
+ * a temporary array and dropped. Clamping does not work: with bByFrame set,
+ * GetStream refuses a pack array smaller than the frame (VENC / NOMEM)
+ * rather than partially filling it, so a clamp leaves the frame queued, the
+ * descriptor ready, and this op failing identically forever -- a dead
+ * stream with a busy poll loop in front of it. Draining loses one frame and
+ * keeps the channel.
  */
 int hal_enc_get_frame(void *ctx, int chn, rss_frame_t *frame)
 {
@@ -774,8 +893,23 @@ int hal_enc_get_frame(void *ctx, int chn, rss_frame_t *frame)
         return -EAGAIN;
 
     packs = status.cur_packs;
-    if (packs > HISI_VENC_MAX_PACKS)
-        packs = HISI_VENC_MAX_PACKS;
+    if (packs > HISI_VENC_MAX_PACKS) {
+        v4_venc_pack *tmp = (v4_venc_pack *)calloc(packs, sizeof(*tmp));
+        v4_venc_stream drain;
+
+        HAL_LOG_ERR("venc chn %d: frame carries %u packs, array holds %d; dropping the frame",
+                    chn, packs, HISI_VENC_MAX_PACKS);
+        if (!tmp)
+            return RSS_ERR_NOMEM;
+        memset(&drain, 0, sizeof(drain));
+        drain.pack = tmp;
+        drain.pack_count = packs;
+        ret = st->venc.fnGetStream(chn, &drain, 0);
+        if (!ret)
+            st->venc.fnReleaseStream(chn, &drain);
+        free(tmp);
+        return ret ? RSS_ERR_IO : -EAGAIN;
+    }
 
     memset(&enc->stream, 0, sizeof(enc->stream));
     memset(enc->packs, 0, sizeof(enc->packs));
@@ -888,7 +1022,7 @@ static int hisi_enc_reconfigure(hisi_state_t *st, int chn, hisi_venc_chn_t *enc)
     if (!st->venc.fnSetChnAttr)
         return RSS_ERR_NOTSUP;
 
-    hisi_enc_fill_attr(enc, &attr);
+    hisi_enc_fill_attr(st, enc, &attr);
     ret = st->venc.fnSetChnAttr(chn, &attr);
     if (ret) {
         HAL_LOG_ERR("HI_MPI_VENC_SetChnAttr(%d) failed: 0x%x", chn, ret);
@@ -898,49 +1032,160 @@ static int hisi_enc_reconfigure(hisi_state_t *st, int chn, hisi_venc_chn_t *enc)
     return RSS_OK;
 }
 
+/*
+ * Every setter below restores the tracked value when the driver refuses the
+ * write. Tracked state the driver rejected is not merely a wrong answer
+ * from enc_get_channel_attr: hisi_enc_reconfigure rebuilds the whole
+ * attribute from tracked state, so a phantom value would be silently
+ * re-applied by the next setter that succeeds.
+ */
 int hal_enc_set_rc_mode(void *ctx, int chn, rss_rc_mode_t mode, uint32_t bitrate)
 {
+    rss_rc_mode_t old_mode;
+    uint32_t old_bitrate;
+    int ret;
+
     HISI_ENC_ENTER(ctx, chn, st, enc);
 
+    old_mode = enc->rc_mode;
+    old_bitrate = enc->bitrate;
     enc->rc_mode = mode;
     if (bitrate)
         enc->bitrate = bitrate;
 
-    return hisi_enc_reconfigure(st, chn, enc);
+    ret = hisi_enc_reconfigure(st, chn, enc);
+    if (ret) {
+        enc->rc_mode = old_mode;
+        enc->bitrate = old_bitrate;
+    }
+    return ret;
 }
 
 int hal_enc_set_bitrate(void *ctx, int chn, uint32_t bitrate)
 {
+    uint32_t old;
+    int ret;
+
     HISI_ENC_ENTER(ctx, chn, st, enc);
 
     if (!bitrate)
         return RSS_ERR_INVAL;
 
+    old = enc->bitrate;
     enc->bitrate = bitrate;
-    return hisi_enc_reconfigure(st, chn, enc);
+    ret = hisi_enc_reconfigure(st, chn, enc);
+    if (ret)
+        enc->bitrate = old;
+    return ret;
 }
 
 int hal_enc_set_gop(void *ctx, int chn, uint32_t gop_length)
 {
+    uint32_t old;
+    int ret;
+
     HISI_ENC_ENTER(ctx, chn, st, enc);
 
     if (!gop_length)
         return RSS_ERR_INVAL;
 
+    old = enc->gop;
     enc->gop = gop_length;
-    return hisi_enc_reconfigure(st, chn, enc);
+    ret = hisi_enc_reconfigure(st, chn, enc);
+    if (ret)
+        enc->gop = old;
+    return ret;
 }
 
 int hal_enc_set_fps(void *ctx, int chn, uint32_t fps_num, uint32_t fps_den)
 {
+    uint32_t old_num, old_den;
+    int ret;
+
     HISI_ENC_ENTER(ctx, chn, st, enc);
 
     if (!fps_num || !fps_den)
         return RSS_ERR_INVAL;
 
+    old_num = enc->fps_num;
+    old_den = enc->fps_den;
     enc->fps_num = fps_num;
     enc->fps_den = fps_den;
-    return hisi_enc_reconfigure(st, chn, enc);
+    ret = hisi_enc_reconfigure(st, chn, enc);
+    if (ret) {
+        enc->fps_num = old_num;
+        enc->fps_den = old_den;
+    }
+    return ret;
+}
+
+/*
+ * enc_set/get_jpeg_qp -- rvd passes JPEG *quality*, 1..100 higher-better
+ * (rvd_ctrl.c's set-jpeg-quality hands the config value straight through),
+ * so despite the op's name there is no QP inversion here. Every JPEG-class
+ * channel on this backend is PT_MJPEG -- see hisi_enc_payload -- and its
+ * FIXQP rc carries the qfactor, so this is tracked state plus the ordinary
+ * reconfigure. Publishing the op is what spares rvd its stop/recreate
+ * fallback for a one-field change.
+ */
+int hal_enc_set_jpeg_qp(void *ctx, int chn, int qp)
+{
+    int old, ret;
+
+    HISI_ENC_ENTER(ctx, chn, st, enc);
+
+    if (qp < 1 || qp > 100)
+        return RSS_ERR_INVAL;
+    if (!enc->created)
+        return RSS_ERR_INVAL;
+    if (enc->payload != V4_PT_MJPEG)
+        return RSS_ERR_NOTSUP;
+
+    old = enc->init_qp;
+    enc->init_qp = qp;
+    ret = hisi_enc_reconfigure(st, chn, enc);
+    if (ret)
+        enc->init_qp = old;
+    return ret;
+}
+
+int hal_enc_get_jpeg_qp(void *ctx, int chn, int *qp)
+{
+    HISI_ENC_ENTER(ctx, chn, st, enc);
+
+    if (!qp)
+        return RSS_ERR_INVAL;
+    if (!enc->created || enc->payload != V4_PT_MJPEG)
+        return RSS_ERR_NOTSUP;
+
+    *qp = (int)hisi_enc_qfactor(enc->init_qp);
+    return RSS_OK;
+}
+
+/*
+ * hisi_enc_refresh_rc -- re-derive the rc attribute after the bind exists.
+ *
+ * hisi_enc_fill_rc computes the source frame rate from the bound VPSS
+ * channel, and a channel is created before it is bound -- so the attribute
+ * written at create names the sensor's rate. The frame-rate controller
+ * derives its drop pattern from src:dst, and a src above the true delivery
+ * rate makes it drop frames it should keep. Called from
+ * hisi_bind_vpss_venc once bound_fs is recorded.
+ */
+void hisi_enc_refresh_rc(hisi_state_t *st, int enc_chn)
+{
+    hisi_venc_chn_t *enc;
+    int ret;
+
+    if (!st || enc_chn < 0 || enc_chn >= HISI_VENC_CHN_NUM)
+        return;
+    enc = &st->enc[enc_chn];
+    if (!enc->created)
+        return;
+
+    ret = hisi_enc_reconfigure(st, enc_chn, enc);
+    if (ret)
+        HAL_LOG_WARN("venc chn %d: rc refresh after bind failed (%d)", enc_chn, ret);
 }
 
 int hal_enc_request_idr(void *ctx, int chn)

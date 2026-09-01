@@ -107,6 +107,22 @@ const rss_hal_caps_t g_hal_caps = {
     .has_capped_rc = false,
     .has_smart_rc = false,
 
+    /*
+     * JPEG. Snapshot channels are PT_MJPEG -- PT_JPEG refuses this
+     * attribute set outright (0xa0088003 at CreateChn, measured), divinus
+     * never creates one either, and an MJPEG channel emits the same JPEG
+     * bytes. Quality is the FIXQP rc's qfactor, which is what
+     * enc_set_jpeg_qp drives -- despite the op's name, the value is rvd's
+     * 1..100 quality, mapped onto the driver's 1..99 Qfactor. jpeg_pulse
+     * because a FIXQP MJPEG channel has no rate limiter: without rvd's
+     * start-one-frame-stop pacing, a held snapshot consumer would have the
+     * channel encoding full-size JPEGs at the pipeline's full rate.
+     * max_jpeg_pixels stays 0 -- unmeasured, per the rule above.
+     */
+    .has_jpeg = true,
+    .has_jpeg_qp = true,
+    .jpeg_pulse = true,
+
     /* ISP -- Phase 3. No ops, so no flags. */
     .has_color2grey = false,
     .has_defog = false,
