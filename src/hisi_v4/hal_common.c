@@ -2166,7 +2166,7 @@ static unsigned int hisi_vb_raw_size(unsigned int width, unsigned int height,
  * smaller pools is therefore not only tighter, it is likelier to be
  * satisfiable at all.
  */
-#define HISI_VB_BLK_CNT 6u
+#define HISI_VB_BLK_CNT 7u
 
 /*
  * Pool 1's geometry: the sensor's, capped at 1920x1080.
