@@ -142,9 +142,28 @@ const rss_hal_caps_t g_hal_caps = {
     .max_fs_channels = 2,
     .max_enc_pixel_rate = 0,
 
-    /* OSD -- Phase 5. RGN exists on this silicon; nothing drives it yet. */
-    .max_osd_regions = 0,
-    .max_osd_groups = 0,
+    /*
+     * OSD -- Phase 5, over HI_MPI_RGN.
+     *
+     * max_osd_regions is HISI_OSD_REGION_MAX from src/hisi_v4/hisi_state.h,
+     * the backend's own tracking bound. Not the vendor's RGN_HANDLE_MAX
+     * (128): the limit a caller runs into is OVERLAY_MAX_NUM_VENC, 8
+     * overlays per encoder channel (hi_defines.h), and 16 is two channels'
+     * worth. Not referenced symbolically because this file is compiled for
+     * every platform and must not pull in the gen4 headers.
+     *
+     * max_osd_groups is 3 because a group here *is* an encoder channel --
+     * regions attach to VENC, which is the only stage with a non-zero
+     * overlay budget on gen4 -- so it matches max_enc_channels above rather
+     * than being a number of its own.
+     *
+     * The has_osd_* flags stay false. gen4's RGN does have MOSAIC regions
+     * and an invert-colour sub-struct, but rss_osd_region_t has no field to
+     * drive either, and there is no group callback at all; claiming a
+     * capability raptor cannot ask for would promise nothing.
+     */
+    .max_osd_regions = 16,
+    .max_osd_groups = 3,
 
     .uses_xburst2 = false,
     .uses_new_sdk = false,

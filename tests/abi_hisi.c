@@ -23,6 +23,7 @@
 #include "v4_vpss.h"
 #include "v4_isp.h"
 #include "v4_isp_tune.h"
+#include "v4_rgn.h"
 #include "v4_snr.h"
 #include "v4_venc.h"
 #include "v4_aud.h"

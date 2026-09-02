@@ -23,6 +23,7 @@
 #include "v4_isp.h"
 #include "v4_aud.h"
 #include "v4_isp_tune.h"
+#include "v4_rgn.h"
 #include "v4_snr.h"
 #include "v4_sys.h"
 #include "v4_venc.h"
@@ -280,6 +281,73 @@ typedef struct {
     rss_nal_unit_t nals[HISI_VENC_MAX_PACKS];
 } hisi_venc_chn_t;
 
+/*
+ * OSD regions the backend will track at once.
+ *
+ * Not the vendor's RGN_HANDLE_MAX (128): the limit a caller runs into is
+ * OVERLAY_MAX_NUM_VENC, which is 8 overlays per *encoder channel*, and the
+ * handle space is only how those are numbered. 16 is two channels' worth
+ * and matches rvd's largest per-platform region budget in hal_caps.c, so a
+ * config that works on Ingenic is not silently truncated here. A region
+ * costs a handle and its conversion buffer, nothing per-slot, so the array
+ * is cheap. hal_osd.c enforces the per-channel 8 at register time.
+ */
+#define HISI_OSD_REGION_MAX 16
+
+/*
+ * One OSD region.
+ *
+ * Everything is tracked rather than read back from RGN, for the reason the
+ * SigmaStar backend gives and one more of its own: the values raptor asks
+ * for are split between the region attr (geometry) and the *per-channel*
+ * display attr (position, alpha, layer, show), and the display attr does
+ * not exist until the region is attached -- which on this family cannot
+ * happen until the VENC channel exists, which is later than rvd sets them.
+ *
+ * `attached` is the distinction that matters. Registered means rvd asked
+ * for the region to appear on a group; attached means HI_MPI_RGN_AttachToChn
+ * has actually been called. See hisi_osd_flush_pending.
+ *
+ * `grp` is the VENC channel, and carrying it here is the fix for divinus's
+ * per-stream OSD defect -- see hal_osd.c.
+ */
+typedef struct {
+    bool used;
+    rss_osd_type_t type;
+
+    int x;
+    int y;
+    /* The region as RGN sees it: even, at least 2. */
+    unsigned int width;
+    unsigned int height;
+    /* The bitmap as the caller renders it, which may be a pixel narrower or
+     * shorter than the above. Kept separately so the conversion never reads
+     * past the caller's buffer; see hisi_osd_convert. */
+    unsigned int src_w;
+    unsigned int src_h;
+    int layer;
+
+    bool global_alpha_en;
+    unsigned char fg_alpha;
+    unsigned char bg_alpha;
+
+    /* Registered VENC channel, or -1. */
+    int grp;
+    bool attached;
+    bool show;
+
+    /* ARGB1555 conversion buffer handed to HI_MPI_RGN_SetBitMap. Kept per
+     * region so a per-frame update does not allocate, and resized only when
+     * the geometry changes. */
+    void *bmp;
+    size_t bmp_size;
+
+    /* Set once the first bitmap has been accepted, so that fact can be
+     * logged exactly once per region: without it "attached but never fed"
+     * and "fed but not composited" look identical in the log. */
+    bool bmp_logged;
+} hisi_osd_region_t;
+
 typedef struct {
     /* Loaded vendor libraries, and the tables resolved out of them.
      * Layout order follows star_state.h: vtables first, then descriptors,
@@ -291,6 +359,12 @@ typedef struct {
     v4_venc_impl venc;
     v4_isp_impl isp;
     v4_snr_impl snr;
+    /* RGN, and whether its entry points resolved. Unlike the tables above,
+     * a failure to resolve is not fatal: it costs the OSD ops and nothing
+     * else, so every one of them tests this flag rather than hal_init
+     * refusing to come up. */
+    v4_rgn_impl rgn;
+    bool rgn_loaded;
 
     /*
      * SoC identity, read once during hal_init.
@@ -397,6 +471,20 @@ typedef struct {
     int osd_src_fs[HISI_VENC_CHN_NUM];
 
     /*
+     * Phase 5 -- OSD. The regions themselves, and which groups rvd has
+     * asked for.
+     *
+     * A group is an encoder channel and has no RGN object of its own, so
+     * osd_grp only records that rvd created one -- what it buys is a
+     * destroy_group that knows which regions to detach. osd_pool_logged
+     * makes the "there is no pool to size" line once per process rather
+     * than once per rvd osd-restart.
+     */
+    hisi_osd_region_t osd[HISI_OSD_REGION_MAX];
+    bool osd_grp[HISI_VENC_CHN_NUM];
+    bool osd_pool_logged;
+
+    /*
      * The ISP thread.
      *
      * HI_MPI_ISP_Run does not return: it is the ISP's own service loop and
@@ -437,6 +525,10 @@ typedef struct {
     bool tune_resolved; /* hisi_isp_tune_resolve ran; also lets the host
                          * tests pre-install stub entry points */
     v4_isp_tune_impl tune;
+    /* [static_3dnr]: the VPSS NRX ladder, parsed and packed by hal_nrx.c.
+     * Heap, and kept for the process's life, because the AUTO form hands
+     * the driver pointers into it. */
+    struct hisi_nrx_set *nrx;
 
     /*
      * Phase 4 -- audio. One AI device, one channel, one frame in flight;
@@ -525,10 +617,6 @@ static inline hisi_state_t *hisi_state(void *ctx)
 
 /*
  * SCSYSID0, the chip identification register, and the gen4 IDs read out of
-    /* [static_3dnr]: the VPSS NRX ladder, parsed and packed by hal_nrx.c.
-     * Heap, and kept for the process's life, because the AUTO form hands
-     * the driver pointers into it. */
-    struct hisi_nrx_set *nrx;
  * it.
  *
  * 0x12020000 is the system controller block; the ID word sits at +0xEE0.
@@ -625,12 +713,46 @@ int hal_enc_get_fd(void *ctx, int chn);
 
 void hisi_enc_release_all(hisi_state_t *st);
 
+/* OSD == RGN overlays attached to a VENC channel -- src/hisi_v4/hal_osd.c.
+ * The OP COVERAGE block at the top of that file argues each absence. */
+int hal_osd_set_pool_size(void *ctx, uint32_t bytes);
+int hal_osd_create_group(void *ctx, int grp);
+int hal_osd_destroy_group(void *ctx, int grp);
+int hal_osd_start(void *ctx, int grp);
+int hal_osd_stop(void *ctx, int grp);
+int hal_osd_create_region(void *ctx, int *handle, const rss_osd_region_t *attr);
+int hal_osd_destroy_region(void *ctx, int handle);
+int hal_osd_register_region(void *ctx, int handle, int grp);
+int hal_osd_unregister_region(void *ctx, int handle, int grp);
+int hal_osd_set_region_attr(void *ctx, int handle, const rss_osd_region_t *attr);
+int hal_osd_update_region_data(void *ctx, int handle, const uint8_t *data);
+int hal_osd_show_region(void *ctx, int handle, int grp, int show, int layer);
+
+/*
+ * The registered-versus-attached deferral. flush_pending attaches every
+ * region waiting on a VENC channel and is called from hal_bind and from
+ * hal_enc_create_channel; detach_chn is called from hal_enc_destroy_channel
+ * *before* the channel is destroyed, because HiMPP refuses to destroy a
+ * VENC channel that still carries regions. Between the two, a region
+ * survives an encoder restart. release_all runs from hisi_video_teardown,
+ * ahead of the encoders.
+ */
+void hisi_osd_flush_pending(hisi_state_t *st, int chn);
+void hisi_osd_detach_chn(hisi_state_t *st, int chn);
+void hisi_osd_release_all(hisi_state_t *st);
+
 /* ISP -- the sensor geometry accessor, plus Phase 3's tuning load. All
  * three live in hal_isp.c; resolve runs once from hal_init, note_frame is
  * the per-frame latch the encoder's frame loop pays one atomic test for. */
 int hal_isp_get_sensor_attr(void *ctx, uint32_t *width, uint32_t *height);
 void hisi_isp_resolve_iq(hisi_state_t *st);
 void hisi_isp_note_frame(hisi_state_t *st);
+
+/* hal_nrx.c -- the [static_3dnr] section (VPSS 3DNR X-params). */
+bool hisi_nrx_key(hisi_state_t *st, const char *key, const char *val);
+int hisi_nrx_apply(hisi_state_t *st, char *note, size_t note_len);
+void hisi_nrx_tick(hisi_state_t *st);
+void hisi_nrx_free(hisi_state_t *st);
 
 /* The __ctype_b/mmap trampoline verification in hal_common.c. Exposed
  * because there are two entry points that reach the first vendor dlopen:
@@ -655,9 +777,3 @@ int hisi_bind_vpss_venc(hisi_state_t *st, int fs_chn, int enc_chn);
 int hisi_unbind_vpss_venc(hisi_state_t *st, int fs_chn, int enc_chn);
 
 #endif /* HISI_V4_STATE_H */
-/* hal_nrx.c -- the [static_3dnr] section (VPSS 3DNR X-params). */
-bool hisi_nrx_key(hisi_state_t *st, const char *key, const char *val);
-int hisi_nrx_apply(hisi_state_t *st, char *note, size_t note_len);
-void hisi_nrx_tick(hisi_state_t *st);
-void hisi_nrx_free(hisi_state_t *st);
-

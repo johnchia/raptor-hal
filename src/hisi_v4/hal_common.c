@@ -1676,7 +1676,22 @@ static int hal_bind(void *ctx, const rss_cell_t *src, const rss_cell_t *dst)
     if (collapsed)
         return RSS_OK; /* Recorded; the OSD -> ENC step does the work. */
 
-    return hisi_bind_vpss_venc(st, fs_chn, enc_chn);
+    ret = hisi_bind_vpss_venc(st, fs_chn, enc_chn);
+    if (ret)
+        return ret;
+
+    /*
+     * Attach any region registered on this encoder channel before the
+     * channel could take one. rvd sets region attributes before the bind
+     * exists on every platform, which is why the SigmaStar backend calls
+     * its own star_osd_flush_pending from here; see hal_osd.c's WHY ATTACH
+     * IS DEFERRED. Deliberately after the bind and deliberately not
+     * checked: a region that will not attach costs an overlay, and failing
+     * the bind over it would cost the stream.
+     */
+    hisi_osd_flush_pending(st, enc_chn);
+
+    return RSS_OK;
 }
 
 static int hal_unbind(void *ctx, const rss_cell_t *src, const rss_cell_t *dst)
@@ -1926,6 +1941,12 @@ static void hisi_reclaim_pipeline(hisi_state_t *st)
 static void hisi_video_teardown(hisi_state_t *st)
 {
     int ret;
+
+    /* Overlays before the encoders they are attached to: HiMPP refuses to
+     * destroy a VENC channel that still carries regions (HI_ERR_RGN_BUSY is
+     * documented as exactly that case), so this is ordering rather than
+     * tidiness. */
+    hisi_osd_release_all(st);
 
     /* Encoders first: they are downstream of the VPSS channels, and a VENC
      * channel left bound to a channel that is about to be disabled is what
@@ -2352,6 +2373,17 @@ static int hal_init(void *ctx, const rss_multi_sensor_config_t *cfg)
     ret = v4_venc_load(&st->venc, &st->libs);
     if (ret)
         goto err_unload;
+    /*
+     * RGN is the exception to the pattern above: its failure is recorded,
+     * not propagated. A board whose libmpi has no RGN is a board without
+     * overlays, and the supported way to say that is for the osd_* ops to
+     * answer RSS_ERR_NOTSUP -- which rvd turns into "overlays disabled" and
+     * keeps streaming. Refusing hal_init would take the video down over the
+     * text drawn on top of it.
+     */
+    st->rgn_loaded = v4_rgn_load(&st->rgn, &st->libs) == RSS_OK;
+    if (!st->rgn_loaded)
+        HAL_LOG_WARN("osd: HI_MPI_RGN unavailable; overlays disabled");
 #endif
 
     hisi_read_chip_id(st);
@@ -2437,6 +2469,8 @@ err_teardown:
         g_hisi = NULL;
 err_unload:
 #ifdef HAL_MODULE_VIDEO
+    v4_rgn_unload(&st->rgn);
+    st->rgn_loaded = false;
     v4_venc_unload(&st->venc);
     v4_vpss_unload(&st->vpss);
     v4_vi_unload(&st->vi);
@@ -2452,6 +2486,7 @@ err_free:
     else {
         hisi_nrx_free(st);
         free(st);
+    }
     c->platform = NULL;
     return ret;
 }
@@ -2541,6 +2576,8 @@ static int hal_deinit(void *ctx)
         g_hisi = NULL;
 
 #ifdef HAL_MODULE_VIDEO
+    v4_rgn_unload(&st->rgn);
+    st->rgn_loaded = false;
     v4_venc_unload(&st->venc);
     v4_vpss_unload(&st->vpss);
     v4_vi_unload(&st->vi);
@@ -2557,6 +2594,7 @@ static int hal_deinit(void *ctx)
     else {
         hisi_nrx_free(st);
         free(st);
+    }
     c->platform = NULL;
     c->initialized = false;
 
@@ -2727,6 +2765,25 @@ static const rss_hal_ops_t g_ops = {
      */
     .isp_get_sensor_attr = hal_isp_get_sensor_attr,
 
+    /*
+     * OSD == RGN overlays attached to a VENC channel
+     * (src/hisi_v4/hal_osd.c). Twelve ops, which is what rvd calls; the OP
+     * COVERAGE block there argues each absence, and RSS_OSD_COVER's, which
+     * is a region type rather than an op.
+     */
+    .osd_set_pool_size = hal_osd_set_pool_size,
+    .osd_create_group = hal_osd_create_group,
+    .osd_destroy_group = hal_osd_destroy_group,
+    .osd_start = hal_osd_start,
+    .osd_stop = hal_osd_stop,
+    .osd_create_region = hal_osd_create_region,
+    .osd_destroy_region = hal_osd_destroy_region,
+    .osd_register_region = hal_osd_register_region,
+    .osd_unregister_region = hal_osd_unregister_region,
+    .osd_set_region_attr = hal_osd_set_region_attr,
+    .osd_update_region_data = hal_osd_update_region_data,
+    .osd_show_region = hal_osd_show_region,
+
     /* GPIO / IR-cut — vendor-neutral sysfs, works as-is */
     .gpio_set = hal_gpio_set,
     .gpio_get = hal_gpio_get,
@@ -2794,13 +2851,16 @@ rss_hal_ctx_t *rss_hal_create_backend(const char *backend)
      * because they describe the *pipeline* rather than the part: this one
      * has a framesource graph and a JPEG encoder, and no IVS at all.
      *
-     * has_osd stays false until Phase 5. It is load-bearing rather than
-     * cosmetic: a context that leaves it false gets no regions created, so
-     * rvd reports overlays as unavailable instead of configuring an OSD
-     * stage whose ops all answer NOTSUP.
+     * has_osd is true from Phase 5, and it says the *backend* has an OSD
+     * rather than that this board does: whether HI_MPI_RGN resolved is not
+     * known until hal_init, and rvd reads caps before that. The honest
+     * report of a board without RGN is the ops answering RSS_ERR_NOTSUP,
+     * which rvd already handles -- rvd_osd.c takes a NOTSUP from
+     * osd_create_region as "overlays disabled" and carries on.
      */
     ctx->caps.has_framesource = true;
     ctx->caps.has_jpeg = true;
+    ctx->caps.has_osd = true;
 #endif
 
     return ctx;

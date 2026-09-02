@@ -42,9 +42,10 @@ LDFLAGS = -fsanitize=$(SAN) -lpthread
 # rests on it and its behaviour is which file gets written in what order,
 # which a host can check once the sysfs root is redirected.
 SUITES = osd isp audio gpio enc
-BINS = $(addprefix t_,$(SUITES)) t_isp_i6c t_enc_i6c t_isp_imp t_enc_imp t_hisi_iq
+BINS = $(addprefix t_,$(SUITES)) t_isp_i6c t_enc_i6c t_isp_imp t_enc_imp t_hisi_iq t_hisi_osd
 
-test: $(addprefix test-,$(SUITES)) test-isp_i6c test-enc_i6c test-isp_imp test-enc_imp test-hisi_iq
+test: $(addprefix test-,$(SUITES)) test-isp_i6c test-enc_i6c test-isp_imp test-enc_imp \
+      test-hisi_iq test-hisi_osd
 
 $(addprefix test-,$(SUITES)): test-%: t_%
 	@./$<
@@ -97,10 +98,18 @@ HISI_CFLAGS = -Wall -Wextra -std=c11 -D_GNU_SOURCE -g -fsanitize=$(SAN) \
 HISI_DEPS = $(wildcard ../src/hisi_v4/*.c ../src/hisi_v4/*.h ../src/*.c ../src/*.h \
 		       ../include/*.h ../../raptor-common/include/*.h)
 
-t_hisi_iq: t_hisi_iq.c $(HISI_DEPS)
+t_hisi_iq t_hisi_osd: t_%: t_%.c $(HISI_DEPS)
 	$(CC) $(HISI_CFLAGS) -o $@ $< $(LDFLAGS) -ldl
 
 test-hisi_iq: t_hisi_iq
+	@./$<
+
+# t_hisi_osd includes src/hisi_v4/hal_osd.c and stubs RGN through
+# hisi_state_t's v4_rgn_impl. Its point is the attach descriptor -- the
+# divinus defect the plan names is a .channel that is never set -- plus the
+# registered-before-bound deferral and the ARGB1555 conversion, which is
+# the one place a host suite can catch an over-read of the caller's bitmap.
+test-hisi_osd: t_hisi_osd
 	@./$<
 
 # Ingenic, which needs neither of the above: a third PLATFORM_ define, the
@@ -208,4 +217,4 @@ clean:
 	rm -f $(BINS)
 
 .PHONY: test clean abi-check abi-check-i6c abi-check-hisi test-isp_i6c test-enc_i6c \
-	$(addprefix test-,$(SUITES))
+	test-hisi_iq test-hisi_osd $(addprefix test-,$(SUITES))
