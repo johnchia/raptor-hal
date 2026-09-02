@@ -61,11 +61,38 @@
  *
  * hisi_sensor.c's INI reader holds 128 entries of 80 bytes each, which is
  * right for the sensor mode files and hopeless for this dialect: the IQ
- * file carries backslash-continued tables up to 7 KB per value (the
- * 1025-node gamma LUT). The reader here streams entry by entry instead of
- * building a table, and the value scanner treats anything that is not a
- * number as a separator, which quietly handles the dialect's quoting
- * ("64, 72"), bare lists, trailing commas and mixed whitespace alike.
+ * file carries backslash-continued tables of several KB per value (the
+ * 1025-node gamma LUT; the shipped imx335.ini's longest assembled value
+ * is 6034 bytes, see HISI_IQ_VAL_MAX). The reader here streams entry by
+ * entry instead of building a table, and the value scanner treats
+ * anything that is not a number as a separator, which quietly handles the
+ * dialect's quoting ("64, 72"), bare lists, trailing commas and mixed
+ * whitespace alike.
+ *
+ * WHOLE TABLES ARE ALL-OR-NOTHING
+ *
+ * Get-modify-set makes a partial *file* safe -- a field the INI never
+ * names keeps the running default. It does not make a partial *table*
+ * safe: a curve or LUT is one field, and filling its first n entries from
+ * the INI leaves the tail on whatever the Get returned, which is a
+ * different curve. Worse for gamma, where applying also flips
+ * enGammaCurveType to USER_DEFINE, so nodes past n are read back under a
+ * curve type they were never sampled for. So the three whole-table values
+ * -- gamma Table_0 (1025), DRCToneMappingValue (200) and DehazeLut (256)
+ * -- are applied only at their exact node count, and a short or truncated
+ * one is dropped with a WARN naming the count.
+ *
+ * The per-ISO arrays (the ISP_AUTO_ISO_STRENGTH_NUM=16 columns in NR,
+ * LDCI, sharpen and DPC) are deliberately *not* under that rule: those are
+ * sixteen independent per-gain scalars rather than one curve, so a short
+ * list leaves the higher-ISO columns on the running default, which is the
+ * ordinary partial-file contract. Same for the AE route, whose used length
+ * is TotalNum rather than the array bound.
+ *
+ * A malformed section header -- a '[' with no ']' -- is not treated as
+ * more of the previous section, which would silently file its keys under
+ * the wrong module. It clears the current section instead, so its keys
+ * apply to nothing until the next well-formed header.
  *
  * Copyright (C) 2026 Thingino Project
  * SPDX-License-Identifier: GPL-3.0-or-later
@@ -169,7 +196,20 @@ void hisi_isp_resolve_iq(hisi_state_t *st)
  * ================================================================ */
 
 #define HISI_IQ_LINE_MAX 512
-#define HISI_IQ_VAL_MAX 8192
+
+/*
+ * The assembled value, continuations and all. The longest one in the
+ * board's own /etc/sensors/iq/imx335.ini is 6034 bytes (Table_1 in
+ * [dynamic_gamma]; the longest *physical* line in that file is 196). The
+ * arithmetic bound for the widest thing this dialect can carry is a
+ * 1025-node 12-bit table written "4095, " -- 6150 bytes, plus one joining
+ * space per continuation -- so 8 KB was inside a factor of 1.3 of a real
+ * file, and any vendor who pads to a wider column would run into it. That
+ * matters more since truncation stopped being cosmetic: a truncated table
+ * now fails the exact-node-count rule above and drops its module. 16 KB is
+ * one short-lived malloc per load and puts the margin out of reach.
+ */
+#define HISI_IQ_VAL_MAX 16384
 
 typedef struct {
     FILE *f;
@@ -179,6 +219,7 @@ typedef struct {
     char *val; /* HISI_IQ_VAL_MAX, heap */
     bool long_line_warned;
     bool truncated_warned;
+    bool bad_sect_warned;
 } hisi_iq_reader;
 
 static int iq_ci_eq(const char *a, const char *b)
@@ -291,10 +332,22 @@ static bool iq_next(hisi_iq_reader *r)
 
         if (*p == '[') {
             char *close = strchr(p, ']');
+
             if (close) {
                 *close = '\0';
                 snprintf(r->sect, sizeof(r->sect), "%s", iq_trim(p + 1));
+                continue;
             }
+            /* No ']'. Keeping the previous section would file this one's
+             * keys under the wrong module, which is worse than losing
+             * them; drop to no section until a well-formed header. */
+            if (!r->bad_sect_warned) {
+                HAL_LOG_WARN("isp tuning: %s: unterminated section header \"%s\" -- "
+                             "its keys are ignored until the next [section]",
+                             r->path, p);
+                r->bad_sect_warned = true;
+            }
+            r->sect[0] = '\0';
             continue;
         }
 
@@ -692,10 +745,14 @@ static void iq_sect_static_drc(hisi_state_t *st, hisi_iq_load *ld, const char *k
     else if (iq_ci_eq(key, "DRCToneMappingValue")) {
         int n = iq_nums(val, ld->nums, V4_ISP_DRC_TM_NODES);
 
+        /* Whole table or none -- see the header. */
+        if (n != V4_ISP_DRC_TM_NODES) {
+            HAL_LOG_WARN("isp tuning: DRCToneMappingValue has %d of %d nodes -- not "
+                         "applied; a partial curve would splice onto the running one",
+                         n, V4_ISP_DRC_TM_NODES);
+            return;
+        }
         iq_fill_u16(d->tone_mapping, V4_ISP_DRC_TM_NODES, ld->nums, n);
-        if (n != V4_ISP_DRC_TM_NODES)
-            HAL_LOG_WARN("isp tuning: DRCToneMappingValue has %d of %d nodes", n,
-                         V4_ISP_DRC_TM_NODES);
     } else {
         HAL_LOG_DBG("isp tuning: [static_drc] %s: no mapping", key);
         return;
@@ -803,9 +860,14 @@ static void iq_sect_dehaze(hisi_state_t *st, hisi_iq_load *ld, const char *key, 
     else if (iq_ci_eq(key, "DehazeLut")) {
         int n = iq_nums(val, ld->nums, V4_ISP_DEHAZE_LUT);
 
+        /* Whole table or none -- see the header. */
+        if (n != V4_ISP_DEHAZE_LUT) {
+            HAL_LOG_WARN("isp tuning: DehazeLut has %d of %d entries -- not applied; a "
+                         "partial LUT would splice onto the running one",
+                         n, V4_ISP_DEHAZE_LUT);
+            return;
+        }
         iq_fill_u8(dh->lut, V4_ISP_DEHAZE_LUT, ld->nums, n);
-        if (n != V4_ISP_DEHAZE_LUT)
-            HAL_LOG_WARN("isp tuning: DehazeLut has %d of %d entries", n, V4_ISP_DEHAZE_LUT);
     } else if (iq_ci_eq(key, "AutoDehazeStr")) {
         /* dynamic_dehaze: the lowest-ISO column, statically. */
         dh->auto_strength = (unsigned char)iq_clamp(iq_num(val, 0), 0, 255);
@@ -914,10 +976,17 @@ static void iq_sect_gamma(hisi_state_t *st, hisi_iq_load *ld, const char *key, c
         int n = iq_nums(val, ld->nums, V4_ISP_GAMMA_NODES);
         int i;
 
+        /* Whole table or none. Applying would also flip the curve type to
+         * USER_DEFINE, under which nodes past n -- still holding whatever
+         * GetGammaAttr returned for a different curve -- become live. */
+        if (n != V4_ISP_GAMMA_NODES) {
+            HAL_LOG_WARN("isp tuning: gamma Table_0 has %d of %d nodes -- module skipped; "
+                         "a partial user curve would run on a stale tail",
+                         n, V4_ISP_GAMMA_NODES);
+            return;
+        }
         for (i = 0; i < n; i++)
             ld->gamma.table[i] = (unsigned short)iq_clamp(ld->nums[i], 0, 4095);
-        if (n != V4_ISP_GAMMA_NODES)
-            HAL_LOG_WARN("isp tuning: gamma Table_0 has %d of %d nodes", n, V4_ISP_GAMMA_NODES);
     }
     ld->gamma.enable = 1;
     ld->gamma.curve_type = V4_ISP_GAMMA_CURVE_USER;
@@ -940,6 +1009,11 @@ static void iq_note_skip(hisi_iq_load *ld, const char *sect)
 static void iq_dispatch(hisi_state_t *st, hisi_iq_load *ld, hisi_iq_reader *r)
 {
     const char *s = r->sect;
+
+    /* No section: either keys before the first header or the fallout of a
+     * malformed one. Either way they belong to no module. */
+    if (!s[0])
+        return;
 
     /* The ir_* mirror is the night-mode set; day is what this load is. */
     if (tolower((unsigned char)s[0]) == 'i' && tolower((unsigned char)s[1]) == 'r' &&

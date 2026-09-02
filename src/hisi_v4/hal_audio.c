@@ -34,6 +34,21 @@
  * VB was never configured. rad on this backend expects to run beside
  * rvd; the error message says as much when it happens.
  *
+ * MONO ONLY, AND WHY THAT IS NOT A SHORTCUT
+ *
+ * audio_init takes one channel and refuses anything else with
+ * RSS_ERR_NOTSUP. HiMPP hands a stereo AI frame back as two planes --
+ * AUDIO_FRAME_S.u64VirAddr[0] and [1], with u32Len counting bytes *per
+ * channel* -- while rss_audio_frame_t is one pointer and one length, so
+ * publishing plane 0 alone would quietly deliver the left channel and
+ * call it the stream. The alternative, interleaving the two planes on
+ * every read, needs a scratch buffer and a per-frame copy the vendor
+ * frame has no room for. It would be paying for a path the hardware does
+ * not have: the EV300's inner codec is a single mic front end, and rad
+ * asks for mono. If an external stereo codec ever turns up, the honest
+ * change is a real interleave here plus the buffer to do it in -- not
+ * relaxing the check.
+ *
  * OP COVERAGE
  *
  * Implemented: audio_init, audio_deinit, audio_read_frame,
@@ -174,7 +189,6 @@ int hal_audio_init(void *ctx, const rss_audio_config_t *cfg)
     rss_hal_ctx_t *c = (rss_hal_ctx_t *)ctx;
     hisi_state_t *st;
     v4_aio_attr attr;
-    unsigned int chn_count;
     unsigned int samples;
     int ret;
 
@@ -186,10 +200,13 @@ int hal_audio_init(void *ctx, const rss_audio_config_t *cfg)
         return RSS_ERR_INVAL;
     }
 
-    chn_count = cfg->chn_count > 0 ? (unsigned int)cfg->chn_count : 1;
-    if (chn_count > 2) {
-        HAL_LOG_WARN("audio: %u PCM channels requested, capping at 2 (stereo)", chn_count);
-        chn_count = 2;
+    /* Mono only -- read_frame publishes one plane; see the file comment. */
+    if (cfg->chn_count > 1) {
+        HAL_LOG_ERR("audio: %d PCM channels requested; this backend captures mono only "
+                    "(the inner codec is one mic path and read_frame publishes a single "
+                    "plane, so a stereo frame's right channel would be dropped)",
+                    cfg->chn_count);
+        return RSS_ERR_NOTSUP;
     }
 
     /*
@@ -268,21 +285,21 @@ int hal_audio_init(void *ctx, const rss_audio_config_t *cfg)
     hisi_acodec_setup(st, st->aud_rate);
 
     /*
-     * I2S master against the inner codec, 16-bit. The config carries no
-     * bus-role or codec-type fields, so these are defaults rather than
+     * I2S master against the inner codec, 16-bit mono. The config carries
+     * no bus-role or codec-type fields, so those are defaults rather than
      * policy: what the vendor sample uses and what the inner codec
-     * requires. Rate, width (mono/stereo), period and depth all come
-     * from the config.
+     * requires. Rate, period and depth come from the config; the channel
+     * count does not -- it is fixed at one, checked above.
      */
     memset(&attr, 0, sizeof(attr));
     attr.sample_rate = st->aud_rate;
     attr.bit_width = V4_AUD_BIT_WIDTH_16;
     attr.work_mode = V4_AUD_MODE_I2S_MASTER;
-    attr.sound_mode = chn_count == 2 ? V4_AUD_SOUND_STEREO : V4_AUD_SOUND_MONO;
+    attr.sound_mode = V4_AUD_SOUND_MONO;
     attr.ex_flag = 0;
     attr.frm_num = 30; /* device-side ring, frames; the sample's number */
     attr.pt_num_per_frm = samples;
-    attr.chn_cnt = chn_count;
+    attr.chn_cnt = 1;
     attr.clk_sel = 0;
     attr.i2s_type = V4_AUD_I2S_INNERCODEC;
 
@@ -334,8 +351,8 @@ int hal_audio_init(void *ctx, const rss_audio_config_t *cfg)
     if (cfg->ai_gain)
         hal_audio_set_gain(ctx, st->aud_dev, 0, cfg->ai_gain);
 
-    HAL_LOG_INFO("audio: AI dev %d up, %d Hz %s, %u samples/frame", st->aud_dev, st->aud_rate,
-                 chn_count == 2 ? "stereo" : "mono", samples);
+    HAL_LOG_INFO("audio: AI dev %d up, %d Hz mono, %u samples/frame", st->aud_dev, st->aud_rate,
+                 samples);
     return RSS_OK;
 }
 
@@ -454,7 +471,6 @@ int hal_audio_set_volume(void *ctx, int dev, int chn, int vol)
 {
     hisi_state_t *st = hisi_state(ctx);
     int db;
-    int ret;
 
     (void)dev;
     (void)chn;
@@ -469,12 +485,11 @@ int hal_audio_set_volume(void *ctx, int dev, int chn, int vol)
     if (db > 86)
         db = 86;
 
-    ret = hisi_acodec_ioctl(st, V4_ACODEC_SET_INPUT_VOL, &db, "set input volume");
-    if (ret)
-        return ret;
-
-    st->aud_volume = vol;
-    return RSS_OK;
+    /* No cached copy: the setter only gets this far when /dev/acodec is
+     * open, which is exactly when the getter can read the real value
+     * back, so a cache could never answer a question the codec could not.
+     */
+    return hisi_acodec_ioctl(st, V4_ACODEC_SET_INPUT_VOL, &db, "set input volume");
 }
 
 int hal_audio_get_volume(void *ctx, int dev, int chn, int *vol)
@@ -527,7 +542,7 @@ int hal_audio_set_gain(void *ctx, int dev, int chn, int gain)
         return ret;
     hisi_acodec_ioctl(st, V4_ACODEC_SET_GAIN_MICR, &g, "set mic gain R");
 
-    st->aud_gain = gain;
+    /* Not cached, for the same reason as the volume. */
     return RSS_OK;
 }
 
