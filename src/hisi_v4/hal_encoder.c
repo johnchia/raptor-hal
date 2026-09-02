@@ -257,9 +257,16 @@ static void hisi_enc_fill_rc(const hisi_state_t *st, const hisi_venc_chn_t *enc,
     }
 
     rc->cbr.gop = enc->gop;
-    /* Seconds the controller averages over. 1 is the vendor sample's value
-     * and the only one raptor has evidence for. */
-    rc->cbr.stat_time = 1;
+    /* Seconds the controller averages over. 4 is majestic's value, and it
+     * is what raptor's sawtooth and doubled IDRs turned out to be. With 1
+     * -- the vendor sample's value -- an unbounded channel at gop 40 /
+     * 20 fps sawtoothed 1.64-1.71x and emitted every IDR twice; at 4 the
+     * same channel with the same bounds is flat at 1.02x with clean single
+     * IDRs 40 frames apart. The plausible mechanism is that a 1 s window is
+     * shorter than the 2 s GOP, so the controller never accounts a whole
+     * GOP; /proc/umap/rc shows IPRatio at 2-4 with 1 and 39-57 with 4. Not
+     * proven -- a gop-20 cell at stat_time 1 would be the test. */
+    rc->cbr.stat_time = 4;
     rc->cbr.src_frame_rate = src_fps;
     rc->cbr.dst_frame_rate = dst_fps;
     rc->cbr.bit_rate = hisi_enc_kbps(enc->bitrate);
@@ -404,14 +411,12 @@ static int hisi_enc_start_recv(hisi_state_t *st, int chn, hisi_venc_chn_t *enc)
  *
  * It does not, however, explain it. Majestic reconfigured onto the same
  * wide bounds -- 24..51, and u32MaxIprop loosened to the driver's 20 as
- * well -- stays flat at 1.01-1.03x on the same board and scene. raptor is
- * sensitive to loose bounds where the vendor's streamer is not, so
- * something else here destabilises the rate controller and this call only
- * constrains it enough that the difference stops showing. Writing the
- * bounds is still correct: a configured bound that goes nowhere is a
- * defect on its own. Treat it as a mitigation, and see docs/hisilicon.md
- * for the open trail -- stat_time, which fill_rc sets to 1 against
- * majestic's 4, is the leading candidate.
+ * well -- stays flat at 1.01-1.03x on the same board and scene. The cause
+ * was stat_time: hisi_enc_fill_rc wrote 1 where majestic writes 4, and
+ * with 4 the unbounded channel is flat too (1.02x, single IDRs). Writing
+ * the bounds is still correct -- a configured bound that goes nowhere is
+ * a defect on its own -- but it is a mitigation of that, not a fix for
+ * it. See docs/hisilicon.md for the measurements.
  *
  * GET-MODIFY-SET, not build-and-write. Three quarters of this structure is
  * the macroblock-level texture thresholds (three 16-entry Mad tables) plus
