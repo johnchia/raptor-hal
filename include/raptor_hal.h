@@ -173,8 +173,8 @@ typedef struct {
     uint32_t bitrate; /* target bitrate in bps */
     uint32_t max_bitrate;
     int16_t init_qp;   /* -1 for SDK default */
-    int16_t min_qp;    /* [0..51] */
-    int16_t max_qp;    /* [0..51] */
+    int16_t min_qp;    /* [0..51]; -1 for SDK default */
+    int16_t max_qp;    /* [0..51]; -1 for SDK default */
     int16_t ip_delta;  /* QP delta I vs P frame; -1 = SDK default (T31+) */
     int16_t pb_delta;  /* QP delta P vs B frame; -1 = SDK default (T31+) */
     uint16_t max_psnr; /* PSNR quality cap for capped_vbr/capped_quality; 0 = SDK default (T31+) */
@@ -925,6 +925,8 @@ typedef struct rss_hal_ops {
     int (*enc_query)(void *ctx, int chn, bool *busy);
     int (*enc_get_fd)(void *ctx, int chn);
     int (*enc_set_qp)(void *ctx, int chn, int qp);
+    /* min_qp/max_qp: [0..51], or -1 to restore the SDK's own bound on
+     * that side. Out of range is RSS_ERR_INVAL, not clamped. */
     int (*enc_set_qp_bounds)(void *ctx, int chn, int min_qp, int max_qp);
     int (*enc_set_qp_ip_delta)(void *ctx, int chn, int delta);
     int (*enc_set_qp_pb_delta)(void *ctx, int chn, int delta);

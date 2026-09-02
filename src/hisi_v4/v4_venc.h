@@ -469,7 +469,13 @@ typedef struct {
     unsigned int qp_map_mode; /* H.265 only; union padding on H.264 */
 } v4_venc_rc_param_cbr;
 
+/* H.264's CBR form is the first 32 bytes of this, identically laid out; the
+ * H.265 form appends qp_map_mode. The 36 is H.265's, and the qp_map_mode
+ * offset is what pins H.264's size. */
 _Static_assert(sizeof(v4_venc_rc_param_cbr) == 36, "VENC_PARAM_H265_CBR_S is 36 bytes");
+_Static_assert(offsetof(v4_venc_rc_param_cbr, qp_map_mode) == 32, "VENC_PARAM_H264_CBR_S is 32 bytes");
+_Static_assert(offsetof(v4_venc_rc_param_cbr, min_iprop) == 0, "u32MinIprop at +0");
+_Static_assert(offsetof(v4_venc_rc_param_cbr, max_iprop) == 4, "u32MaxIprop at +4");
 _Static_assert(offsetof(v4_venc_rc_param_cbr, max_qp) == 8, "u32MaxQp at +8");
 _Static_assert(offsetof(v4_venc_rc_param_cbr, min_qp) == 12, "u32MinQp at +12");
 _Static_assert(offsetof(v4_venc_rc_param_cbr, max_iqp) == 16, "u32MaxIQp at +16");
@@ -489,6 +495,9 @@ typedef struct {
 } v4_venc_rc_param_h264_vbr;
 
 _Static_assert(sizeof(v4_venc_rc_param_h264_vbr) == 36, "VENC_PARAM_H264_VBR_S is 36 bytes");
+_Static_assert(offsetof(v4_venc_rc_param_h264_vbr, change_pos) == 0, "s32ChangePos at +0");
+_Static_assert(offsetof(v4_venc_rc_param_h264_vbr, min_iprop) == 4, "u32MinIprop at +4");
+_Static_assert(offsetof(v4_venc_rc_param_h264_vbr, max_iprop) == 8, "u32MaxIprop at +8");
 _Static_assert(offsetof(v4_venc_rc_param_h264_vbr, qp_map_en) == 16, "bQpMapEn at +16");
 _Static_assert(offsetof(v4_venc_rc_param_h264_vbr, max_qp) == 20, "u32MaxQp at +20");
 _Static_assert(offsetof(v4_venc_rc_param_h264_vbr, min_iqp) == 32, "u32MinIQp at +32");
@@ -507,6 +516,11 @@ typedef struct {
 } v4_venc_rc_param_h265_vbr;
 
 _Static_assert(sizeof(v4_venc_rc_param_h265_vbr) == 40, "VENC_PARAM_H265_VBR_S is 40 bytes");
+_Static_assert(offsetof(v4_venc_rc_param_h265_vbr, change_pos) == 0, "s32ChangePos at +0");
+_Static_assert(offsetof(v4_venc_rc_param_h265_vbr, min_iprop) == 4, "u32MinIprop at +4");
+_Static_assert(offsetof(v4_venc_rc_param_h265_vbr, max_iprop) == 8, "u32MaxIprop at +8");
+_Static_assert(offsetof(v4_venc_rc_param_h265_vbr, min_qp) == 20, "u32MinQp at +20");
+_Static_assert(offsetof(v4_venc_rc_param_h265_vbr, max_iqp) == 24, "u32MaxIQp at +24");
 _Static_assert(offsetof(v4_venc_rc_param_h265_vbr, max_qp) == 16, "u32MaxQp at +16");
 _Static_assert(offsetof(v4_venc_rc_param_h265_vbr, min_iqp) == 28, "u32MinIQp at +28");
 _Static_assert(offsetof(v4_venc_rc_param_h265_vbr, qp_map_en) == 32, "bQpMapEn at +32");

@@ -453,9 +453,11 @@ static int hisi_enc_apply_rc_param(hisi_state_t *st, int chn, hisi_venc_chn_t *e
 
     if (!enc->created)
         return RSS_OK;
-    /* Nothing configured: leave the driver's defaults alone rather than
-     * writing our idea of them back over the vendor's. */
-    if (enc->min_qp < 0 && enc->max_qp < 0)
+    /* Nothing configured and nothing ever written: leave the driver's
+     * defaults alone rather than writing our idea of them back over the
+     * vendor's. Nothing configured after something was written is a reset,
+     * and falls through to put the driver's own values back. */
+    if (enc->min_qp < 0 && enc->max_qp < 0 && !enc->rc_written)
         return RSS_OK;
 
     mode = v4_venc_rc_mode_for(enc->payload, enc->rc_mode == RSS_RC_CBR,
@@ -514,12 +516,32 @@ static int hisi_enc_apply_rc_param(hisi_state_t *st, int chn, hisi_venc_chn_t *e
     }
 
     /*
-     * Whichever bound the caller left unset keeps the driver's value, which
-     * is why this reads through the pointers rather than defaulting to a
+     * The driver's values as found, captured the first time through for
+     * this mode -- before the write below, so they are not raptor's own
+     * previous write. On this board a fresh rvd reads the vendor's 24..51
+     * back after the SoC-global teardown in hal_init, so "as found" and
+     * "the vendor's" have agreed every time it was checked; the wording is
+     * cautious because nothing here can tell the two apart. A mode change
+     * reshapes the union and may change the values, so the capture is
+     * keyed on the mode.
+     */
+    if (!enc->rc_drv_known || enc->rc_drv_mode != mode) {
+        enc->rc_drv_min_qp = *p_min;
+        enc->rc_drv_max_qp = *p_max;
+        enc->rc_drv_min_iqp = *p_min_i;
+        enc->rc_drv_max_iqp = *p_max_i;
+        enc->rc_drv_mode = mode;
+        enc->rc_drv_known = true;
+    }
+
+    /*
+     * Whichever bound the caller left unset gets the driver's value back,
+     * which is why this reads the captured defaults rather than the
+     * structure's current contents (possibly raptor's last write) or a
      * number of raptor's own.
      */
-    min_qp = enc->min_qp >= 0 ? (unsigned int)enc->min_qp : *p_min;
-    max_qp = enc->max_qp >= 0 ? (unsigned int)enc->max_qp : *p_max;
+    min_qp = enc->min_qp >= 0 ? (unsigned int)enc->min_qp : enc->rc_drv_min_qp;
+    max_qp = enc->max_qp >= 0 ? (unsigned int)enc->max_qp : enc->rc_drv_max_qp;
 
     if (min_qp > V4_VENC_QP_MAX)
         min_qp = V4_VENC_QP_MAX;
@@ -543,14 +565,22 @@ static int hisi_enc_apply_rc_param(hisi_state_t *st, int chn, hisi_venc_chn_t *e
 
     *p_min = min_qp;
     *p_max = max_qp;
-    *p_min_i = min_qp;
-    *p_max_i = max_qp;
+    /* The I-frame pair follows the configured pair, and goes back to the
+     * driver's own I-frame pair -- not the P pair -- when both are reset. */
+    if (enc->min_qp < 0 && enc->max_qp < 0) {
+        *p_min_i = enc->rc_drv_min_iqp;
+        *p_max_i = enc->rc_drv_max_iqp;
+    } else {
+        *p_min_i = min_qp;
+        *p_max_i = max_qp;
+    }
 
     ret = st->venc.fnSetRcParam(chn, &param);
     if (ret) {
         HAL_LOG_ERR("HI_MPI_VENC_SetRcParam(%d) QP %u..%u failed: 0x%x", chn, min_qp, max_qp, ret);
         return RSS_ERR_IO;
     }
+    enc->rc_written = true;
 
     return RSS_OK;
 }
@@ -589,6 +619,10 @@ int hal_enc_create_channel(void *ctx, int chn, const rss_video_config_t *cfg)
     enc->fd = -1;
     enc->init_qp = cfg->init_qp;
     enc->ip_qp_delta = cfg->ip_delta >= 0 ? cfg->ip_delta : 2;
+    /* Fresh channel: the driver's bounds get captured again on the first
+     * apply, and nothing has been written to them yet. */
+    enc->rc_drv_known = false;
+    enc->rc_written = false;
     enc->min_qp = cfg->min_qp;
     enc->max_qp = cfg->max_qp;
 
@@ -1108,6 +1142,14 @@ int hal_enc_get_frame(void *ctx, int chn, rss_frame_t *frame)
 
     /* Zero timeout: the descriptor already said a frame is ready, and this
      * call moves descriptors rather than pixels. */
+    /* First encoded frame anywhere = the ISP is demonstrably running; the
+     * descriptor said so, and that is enough. One atomic test per frame
+     * after that. Before GetStream on purpose: the first time through this
+     * runs the whole IQ load -- file parse plus a Get/Set round trip per
+     * module -- and doing that with a stream buffer checked out held the
+     * first frame for the duration. See hal_isp.c. */
+    hisi_isp_note_frame(st);
+
     ret = st->venc.fnGetStream(chn, &enc->stream, 0);
     if (ret) {
         HAL_LOG_ERR("HI_MPI_VENC_GetStream(%d) failed: 0x%x", chn, ret);
@@ -1115,10 +1157,6 @@ int hal_enc_get_frame(void *ctx, int chn, rss_frame_t *frame)
     }
 
     enc->frame_held = true;
-
-    /* First encoded frame anywhere = the ISP is demonstrably running;
-     * one atomic test per frame after that. See hal_isp.c. */
-    hisi_isp_note_frame(st);
 
     memset(frame, 0, sizeof(*frame));
     frame->codec = enc->codec;
@@ -1287,8 +1325,14 @@ int hal_enc_set_bitrate(void *ctx, int chn, uint32_t bitrate)
  * hal_enc_set_qp_bounds -- the one setter that is not a channel-attribute
  * read-modify-write, because its fields are not in the channel attribute.
  *
- * -1 in either argument means "leave the driver's", matching
- * rss_video_config_t's convention and hisi_enc_apply_rc_param's.
+ * -1 in either argument puts the driver's own bound back on that side,
+ * matching rss_video_config_t's convention; -1 in both restores the
+ * driver's P and I pairs as they were before raptor first wrote them.
+ * Anything else outside [0..51] is refused, where create_channel clamps a
+ * config value: a config is a wish and gets the nearest legal thing, a
+ * runtime call is an instruction and gets told no. The range check runs
+ * on the int, before the narrowing store. "The driver's own" means as found at the
+ * first apply; see hisi_enc_apply_rc_param.
  */
 int hal_enc_set_qp_bounds(void *ctx, int chn, int min_qp, int max_qp)
 {
@@ -1299,7 +1343,8 @@ int hal_enc_set_qp_bounds(void *ctx, int chn, int min_qp, int max_qp)
 
     if (!enc->created)
         return RSS_ERR_INVAL;
-    if (min_qp > (int)V4_VENC_QP_MAX || max_qp > (int)V4_VENC_QP_MAX)
+    if (min_qp < -1 || min_qp > (int)V4_VENC_QP_MAX || max_qp < -1 ||
+        max_qp > (int)V4_VENC_QP_MAX)
         return RSS_ERR_INVAL;
 
     old_min = enc->min_qp;

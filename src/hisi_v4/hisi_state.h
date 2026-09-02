@@ -262,6 +262,15 @@ typedef struct {
      */
     int16_t min_qp;
     int16_t max_qp;
+    /* The driver's own QP bounds, read once before anything of raptor's
+     * was written over them, so an unset or reset side can go back to
+     * them rather than to whatever the last write left. Per RC mode,
+     * because the union shape and the defaults both change with it. */
+    bool rc_drv_known;
+    v4_venc_rc_mode rc_drv_mode;
+    unsigned int rc_drv_min_qp, rc_drv_max_qp;
+    unsigned int rc_drv_min_iqp, rc_drv_max_iqp;
+    bool rc_written; /* raptor has written the bounds at least once */
 
     /* One outstanding stream per channel. HiMPP wants the same descriptor
      * back at ReleaseStream, and rss_frame_t has nowhere to keep it. */
@@ -450,8 +459,9 @@ typedef struct {
     int aud_dev;
     int acodec_fd;
     int aud_rate;
-    int aud_volume; /* cached, rad's scale; the codec answers in dB */
-    int aud_gain;
+    /* No cached volume/gain here on purpose: both analog controls are
+     * pure /dev/acodec pass-throughs, so the getters read the codec and
+     * a cache would only ever hold what the codec already knows. */
     bool aud_gain_clamped; /* the "gain exceeds the codec max" warning is once-only */
     v4_audio_frame aud_frame;
     v4_aec_frame aud_aec;
