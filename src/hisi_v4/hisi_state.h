@@ -130,6 +130,9 @@ static inline int hisi_vpss_phy(int fs_chn)
  * ================================================================ */
 
 typedef struct {
+    /* As configured, or as detected from the loaded sys_config module's
+     * sensors= parameter when the config leaves it out. */
+    char name[32];
     char ini_path[192];
     char dll_file[64];
     char obj_name[64];
@@ -383,10 +386,10 @@ typedef struct {
     char mpp_version[V4_VERSION_NAME_MAXLEN];
 
     /*
-     * The sensor as named by the config. gen4 has no /proc/jz/sensor
-     * equivalent -- identity is whichever libsns_*.so gets dlopened -- so
-     * this is copied from rss_sensor_config_t and never probed for.
-     * hal_caps.c publishes has_sensor_detect = false for the same reason.
+     * The sensor as named by the config, or as the mode load resolved it
+     * from the sys_config module's sensors= parameter when the config left
+     * it out (hisi_sensor_detect). gen4 has no /proc/jz/sensor; identity is
+     * whichever libsns_*.so gets dlopened, and that is chosen by this name.
      */
     char sensor_name[32];
 

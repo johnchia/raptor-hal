@@ -2417,6 +2417,8 @@ static int hal_init(void *ctx, const rss_multi_sensor_config_t *cfg)
     ret = hisi_sensor_mode_load(&st->mode, cfg->sensors[0].name);
     if (ret)
         goto err_unload;
+    /* The mode load is where a name the config left out gets resolved. */
+    snprintf(st->sensor_name, sizeof(st->sensor_name), "%s", st->mode.name);
 #endif
 
 #ifdef HAL_MODULE_VIDEO

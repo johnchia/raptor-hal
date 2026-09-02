@@ -686,6 +686,65 @@ static int hisi_sensor_ini_find(const char *sensor_name, char *out, size_t out_l
  * something else, and a mode file that omits a key is asking for the usual
  * answer rather than for no answer.
  */
+/*
+ * hisi_sensor_detect -- the sensor the kernel side was loaded for.
+ *
+ * gen4 has no /proc/jz/sensor: the driver is a userspace libsns_*.so and
+ * the kernel never probes the bus. What the kernel side does carry is the
+ * name the module loader was given -- sys_config.ko takes `sensors=imx335`
+ * (the vendor's load3516ev300 and OpenIPC's load_hisilicon both pass it,
+ * OpenIPC from U-Boot's `sensor=` variable, which its own autodetect wrote)
+ * -- and a module parameter is readable back from sysfs. The module is
+ * sys_config on a vendor kernel and open_sys_config on OpenIPC's, so this
+ * takes any module whose name ends in "sys_config".
+ *
+ * Only the first name is used: the parameter is a list on a dual-sensor
+ * board, and this backend drives one. "unknown" is what load_hisilicon
+ * passes when it has no answer, and is treated as none.
+ */
+static int hisi_sensor_detect(char *out, size_t out_len, char *src, size_t src_len)
+{
+    static const char *suffix = "sys_config";
+    DIR *dir = opendir("/sys/module");
+    struct dirent *de;
+    int ret = RSS_ERR_NOENT;
+
+    if (!dir)
+        return RSS_ERR_NOENT;
+
+    while (ret != RSS_OK && (de = readdir(dir))) {
+        char path[192];
+        char line[128];
+        size_t n = strlen(de->d_name);
+        size_t len;
+        FILE *f;
+        char *v, *e;
+
+        if (n < strlen(suffix) || strcmp(de->d_name + n - strlen(suffix), suffix) != 0)
+            continue;
+        snprintf(path, sizeof(path), "/sys/module/%s/parameters/sensors", de->d_name);
+        if (!(f = fopen(path, "r")))
+            continue;
+        if (!fgets(line, sizeof(line), f))
+            line[0] = '\0';
+        fclose(f);
+
+        for (v = line; *v == ' ' || *v == '\t'; v++)
+            ;
+        for (e = v; *e && *e != ',' && *e != ' ' && *e != '\t' && *e != '\r' && *e != '\n'; e++)
+            ;
+        len = (size_t)(e - v);
+        if (!len || (len == 7 && strncmp(v, "unknown", 7) == 0) || len >= out_len)
+            continue;
+        memcpy(out, v, len);
+        out[len] = '\0';
+        snprintf(src, src_len, "%s", path);
+        ret = RSS_OK;
+    }
+    closedir(dir);
+    return ret;
+}
+
 int hisi_sensor_mode_load(hisi_sensor_mode_t *m, const char *sensor_name)
 {
     hisi_ini ini;
@@ -694,11 +753,20 @@ int hisi_sensor_mode_load(hisi_sensor_mode_t *m, const char *sensor_name)
 
     memset(m, 0, sizeof(*m));
 
-    if (!sensor_name || !sensor_name[0]) {
-        HAL_LOG_ERR("sensor: [sensor] name is required on gen4 -- there is no /proc/jz/sensor "
-                    "equivalent and identity is whichever libsns_*.so is loaded");
-        return RSS_ERR_INVAL;
+    if (sensor_name && sensor_name[0]) {
+        snprintf(m->name, sizeof(m->name), "%s", sensor_name);
+    } else {
+        char src[192];
+
+        if (hisi_sensor_detect(m->name, sizeof(m->name), src, sizeof(src)) != RSS_OK) {
+            HAL_LOG_ERR("sensor: no [sensor] name in the config and no sys_config module "
+                        "loaded with a sensors= parameter -- on gen4 the kernel never probes "
+                        "the sensor, so those are the only two places its name can come from");
+            return RSS_ERR_INVAL;
+        }
+        HAL_LOG_INFO("sensor: \"%s\", from %s (no [sensor] name in the config)", m->name, src);
     }
+    sensor_name = m->name;
 
     ret = hisi_sensor_ini_find(sensor_name, m->ini_path, sizeof(m->ini_path));
     if (ret != RSS_OK) {
