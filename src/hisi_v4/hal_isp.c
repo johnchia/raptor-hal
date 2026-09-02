@@ -33,10 +33,10 @@
  * than hidden here.
  *
  * Sections skipped, and why:
- *   static_3dnr    the vendor's 3DNR X-param text. It configures VPSS NRX
- *                  (HI_MPI_VPSS_SetGrpNRXParam), not an ISP module, and
- *                  needs its own parser for a ~100-field versioned struct.
- *                  Deferred; the skip is logged.
+ *   (static_3dnr is not skipped any more: it is the VPSS NRX X-param
+ *   text, not an ISP module, and hal_nrx.c owns it -- the parser, the
+ *   per-ISO rung selection and the HI_MPI_VPSS_SetGrpNRXParam write. The
+ *   dispatch below hands its keys over and the apply loop calls it last.)
  *   ir_*           the night-mode mirror of the whole set. Day/night
  *                  switching is not this backend's to drive yet.
  *   all_param, dynamic_ae/fps/nr/...
@@ -1044,8 +1044,10 @@ static void iq_dispatch(hisi_state_t *st, hisi_iq_load *ld, hisi_iq_reader *r)
         iq_sect_dpc(st, ld, r->key, r->val);
     else if (iq_ci_eq(s, "dynamic_gamma"))
         iq_sect_gamma(st, ld, r->key, r->val);
-    else if (iq_ci_eq(s, "static_3dnr"))
-        iq_note_skip(ld, "static_3dnr(NRX,deferred)");
+    else if (iq_ci_eq(s, "static_3dnr")) {
+        if (!hisi_nrx_key(st, r->key, r->val))
+            HAL_LOG_DBG("isp tuning: [static_3dnr] %s: no mapping", r->key);
+    }
     else
         iq_note_skip(ld, s);
 }
@@ -1107,6 +1109,8 @@ static void hisi_isp_tune_resolve(hisi_state_t *st)
             "GK_API_ISP_GetGammaAttr");
     V4_TUNE(set_gamma, int (*)(int, const v4_isp_gamma_attr *), "HI_MPI_ISP_SetGammaAttr",
             "GK_API_ISP_SetGammaAttr");
+    V4_TUNE(query_exp, int (*)(int, v4_isp_exp_info *), "HI_MPI_ISP_QueryExposureInfo",
+            "GK_API_ISP_QueryExposureInfo");
 
 #undef V4_TUNE
 }
@@ -1205,6 +1209,19 @@ static void hisi_isp_apply_tuning(hisi_state_t *st)
         }
     }
 
+    /* The VPSS half: the 3DNR ladder, written through its own call. */
+    {
+        char note[64];
+        int nrx = hisi_nrx_apply(st, note, sizeof(note));
+
+        if (nrx > 0)
+            applied++;
+        else if (nrx < 0) {
+            failed++;
+            iq_note_skip(ld, note);
+        }
+    }
+
     if (failed)
         HAL_LOG_WARN("isp tuning: %s: %d modules applied, %d failed%s%s", st->iq_file, applied,
                      failed, ld->skipped[0] ? "; skipped: " : "", ld->skipped);
@@ -1226,8 +1243,13 @@ static void hisi_isp_apply_tuning(hisi_state_t *st)
  */
 void hisi_isp_note_frame(hisi_state_t *st)
 {
-    if (__atomic_test_and_set(&st->iq_load_started, __ATOMIC_ACQ_REL))
+    if (__atomic_test_and_set(&st->iq_load_started, __ATOMIC_ACQ_REL)) {
+        /* Every frame after the load: the 3DNR ladder's ISO tick, which
+         * rate-limits itself and does nothing until the load has finished
+         * building the ladder. */
+        hisi_nrx_tick(st);
         return;
+    }
 
     if (st->iq_file[0])
         hisi_isp_apply_tuning(st);

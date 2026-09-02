@@ -525,6 +525,10 @@ static inline hisi_state_t *hisi_state(void *ctx)
 
 /*
  * SCSYSID0, the chip identification register, and the gen4 IDs read out of
+    /* [static_3dnr]: the VPSS NRX ladder, parsed and packed by hal_nrx.c.
+     * Heap, and kept for the process's life, because the AUTO form hands
+     * the driver pointers into it. */
+    struct hisi_nrx_set *nrx;
  * it.
  *
  * 0x12020000 is the system controller block; the ID word sits at +0xEE0.
@@ -651,3 +655,9 @@ int hisi_bind_vpss_venc(hisi_state_t *st, int fs_chn, int enc_chn);
 int hisi_unbind_vpss_venc(hisi_state_t *st, int fs_chn, int enc_chn);
 
 #endif /* HISI_V4_STATE_H */
+/* hal_nrx.c -- the [static_3dnr] section (VPSS 3DNR X-params). */
+bool hisi_nrx_key(hisi_state_t *st, const char *key, const char *val);
+int hisi_nrx_apply(hisi_state_t *st, char *note, size_t note_len);
+void hisi_nrx_tick(hisi_state_t *st);
+void hisi_nrx_free(hisi_state_t *st);
+

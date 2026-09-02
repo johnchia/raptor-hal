@@ -2449,7 +2449,8 @@ err_free:
     if (st->isp_thread_leaked)
         HAL_LOG_ERR("isp: leaking HAL state (%zu bytes) to a still-running 3A thread",
                     sizeof(*st));
-    else
+    else {
+        hisi_nrx_free(st);
         free(st);
     c->platform = NULL;
     return ret;
@@ -2553,7 +2554,8 @@ static int hal_deinit(void *ctx)
     if (st->isp_thread_leaked)
         HAL_LOG_ERR("isp: leaking HAL state (%zu bytes) to a still-running 3A thread",
                     sizeof(*st));
-    else
+    else {
+        hisi_nrx_free(st);
         free(st);
     c->platform = NULL;
     c->initialized = false;

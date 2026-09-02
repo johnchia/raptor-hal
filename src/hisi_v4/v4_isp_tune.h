@@ -446,6 +446,47 @@ _Static_assert(offsetof(v4_isp_gamma_attr, curve_type) == 2056, "enCurveType at 
  * never a pipeline requirement.
  * ================================================================ */
 
+/*
+ * ISP_EXP_INFO_S -- what AE is doing right now. Read-only, and read for
+ * one field: u32ISO. Transcribed up to the routes, which are two pairs of
+ * ISP_AE_ROUTE_S/_EX_S the ladder never looks at and which are carried
+ * as bytes so the size the driver copies is right. Probed: 5476 bytes,
+ * u32ISO at +4160.
+ */
+typedef struct {
+    unsigned int exp_time;         /* u32ExpTime */
+    unsigned int short_exp_time;
+    unsigned int median_exp_time;
+    unsigned int long_exp_time;
+    unsigned int again;            /* u32AGain, 22.10 */
+    unsigned int dgain;
+    unsigned int again_sf;
+    unsigned int dgain_sf;
+    unsigned int isp_dgain;
+    unsigned int exposure;         /* u32Exposure, 26.6 */
+    int exposure_is_max;           /* bExposureIsMAX */
+    short hist_error;              /* s16HistError */
+    unsigned int ae_hist[1024];    /* au32AE_Hist1024Value */
+    unsigned char ave_lum;         /* u8AveLum */
+    unsigned int lines_per_500ms;
+    unsigned int piris_fno;
+    unsigned int fps;              /* u32Fps */
+    unsigned int iso;              /* u32ISO */
+    unsigned int iso_sf;
+    unsigned int iso_calibrate;
+    unsigned int ref_exp_ratio;
+    unsigned int first_stable_time;
+    unsigned char routes[5476 - 4180]; /* stAERoute, stAERouteEx, stAERouteSF, stAERouteSFEx */
+} v4_isp_exp_info;
+
+_Static_assert(sizeof(v4_isp_exp_info) == 5476, "ISP_EXP_INFO_S is 5476 bytes");
+_Static_assert(offsetof(v4_isp_exp_info, again) == 16, "u32AGain at +16");
+_Static_assert(offsetof(v4_isp_exp_info, exposure_is_max) == 40, "bExposureIsMAX at +40");
+_Static_assert(offsetof(v4_isp_exp_info, ae_hist) == 48, "au32AE_Hist1024Value at +48");
+_Static_assert(offsetof(v4_isp_exp_info, ave_lum) == 4144, "u8AveLum at +4144");
+_Static_assert(offsetof(v4_isp_exp_info, fps) == 4156, "u32Fps at +4156");
+_Static_assert(offsetof(v4_isp_exp_info, iso) == 4160, "u32ISO at +4160");
+
 typedef struct {
     int (*get_exp)(int vi_pipe, v4_isp_exp_attr *a);
     int (*set_exp)(int vi_pipe, const v4_isp_exp_attr *a);
@@ -467,6 +508,9 @@ typedef struct {
     int (*set_dpc)(int vi_pipe, const v4_isp_dp_dyn_attr *a);
     int (*get_gamma)(int vi_pipe, v4_isp_gamma_attr *a);
     int (*set_gamma)(int vi_pipe, const v4_isp_gamma_attr *a);
+    /* HI_MPI_ISP_QueryExposureInfo, exported by lib_hiae.so rather than
+     * libmpi; the 3DNR ladder's ISO source (hal_nrx.c). */
+    int (*query_exp)(int vi_pipe, v4_isp_exp_info *info);
 } v4_isp_tune_impl;
 
 #endif /* HISI_V4_ISP_TUNE_H */

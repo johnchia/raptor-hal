@@ -34,12 +34,14 @@
  */
 
 #include "../src/hisi_v4/hal_isp.c"
+#include "../src/hisi_v4/hal_nrx.c"
 
 #include <assert.h>
 #include <limits.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
+#include <unistd.h>
 
 static v4_isp_exp_attr g_exp;
 static v4_isp_ae_route_ex g_route;
@@ -131,6 +133,214 @@ static int log_count(const char *needle)
     return n;
 }
 
+/* ---------------- the VPSS NRX pair, hal_nrx.c's two vendor calls ---------------- */
+
+static int g_nrx_get_calls, g_nrx_set_calls;
+static bool g_nrx_get_fail, g_nrx_set_fail;
+static unsigned g_iso; /* what the stubbed AE query reports */
+static int g_nrx_mode;
+static unsigned g_nrx_num;
+static unsigned g_nrx_iso[V4_VPSS_NRX_MAX_BLOCKS];
+static v4_vpss_nrx_v3 g_nrx_blk[V4_VPSS_NRX_MAX_BLOCKS];
+
+static int get_nrx(int grp, v4_vpss_grp_nrx_param *p)
+{
+    int i;
+
+    (void)grp;
+    g_nrx_get_calls++;
+    if (g_nrx_get_fail)
+        return 0xA0078003;
+    assert(p->nr_ver == V4_VPSS_NR_V3);
+    /* Fields the text never names, which the pack must carry through. */
+    for (i = 0; i < 5; i++) {
+        p->v3.manual.sfy[i].sbsk[0] = 1234;
+        p->v3.manual.sfy[i].sdsk[31] = 4321;
+        p->v3.manual.sfy[i].nry_en = 1;
+        p->v3.manual.iey[i].ie_en = 1;
+    }
+    p->v3.manual.mdy[0].madz0 = 300;
+    p->v3.manual.tfy[0].dzmode0 = 1;
+    /* And one the text does name, to prove it is overwritten. */
+    p->v3.manual.nrc.sfc = 7;
+    return 0;
+}
+
+static int set_nrx(int grp, const v4_vpss_grp_nrx_param *p)
+{
+    unsigned i;
+
+    (void)grp;
+    g_nrx_set_calls++;
+    assert(p->nr_ver == V4_VPSS_NR_V3);
+    if (g_nrx_set_fail)
+        return 0xA0078006;
+    g_nrx_mode = p->v3.opt_mode;
+    if (p->v3.opt_mode == V4_OPERATION_MODE_AUTO) {
+        g_nrx_num = p->v3.auto_.param_num;
+        assert(g_nrx_num <= V4_VPSS_NRX_MAX_BLOCKS);
+        for (i = 0; i < g_nrx_num; i++) {
+            g_nrx_iso[i] = p->v3.auto_.iso[i];
+            g_nrx_blk[i] = p->v3.auto_.params[i];
+        }
+    } else {
+        g_nrx_num = 1;
+        g_nrx_blk[0] = p->v3.manual;
+    }
+    return 0;
+}
+
+static int query_exp(int pipe, v4_isp_exp_info *info)
+{
+    (void)pipe;
+    memset(info, 0, sizeof(*info));
+    info->iso = g_iso;
+    return 0;
+}
+
+/* Block 0 of the shipped imx335.ini, verbatim: the ISO 100 rung. */
+static const char NRX_ROWS_A[] =
+    "-nXsf1      18:  0:128 |     20:  0:128 |     20:  0:128 |          30:  0:128           \\\n"
+    "-nXsf2      20:  0:128 |     30:  0:128 |     20:  0:128 |          30:  0:128           \\\n"
+    "-nXsf4      18:  0:128 |     25:  0:128 |     20:  0:128 |          30:  0:128           \\\n"
+    "-SelRt          16: 16 |                | -kmode       1 |                   1           \\\n"
+    "-DeRt            0:  4 |                |                |                               \\\n"
+    "-sfs5                  |                |                |          60: 60: 60           \\\n"
+    "-nXsf5  64: 64: 64: 64 | 64: 64: 64: 64 | 64: 64: 64: 64 |110: 90: 64: 64| 96: 72: 64: 64\\\n"
+    "-dzsf5               0 |              0 |              0 |              0|              0\\\n"
+    "-nXsf6   0:  0:  0:  0 |  4:  2:  0:  4 |  4:  2:  0:  4 |  4:  5:  0:  4|  1:  5:  0:  4\\\n"
+    "-nXsfr6  0:  0:  0:  0 |  0:  0:  8:  0 |  0:  0:  8:  0 | 10: 10:  0:  0| 20: 20:  0:  0\\\n"
+    "-nXsbr6         15: 15 |         12: 12 |         12: 12 |         12: 15|         12: 15\\\n"
+    "                       |                |                |               |               \\\n"
+    "-nXsfn       1:  2:  4 |      6:  6:  4 |      6:  6:  4 |      6:  6:  4|      6:  6:  4\\\n"
+    "-nXsth          20: 40 |         30: 30 |         32: 36 |         36: 40|         36: 40\\\n"
+    "-nXsthd         15: 20 |         20: 20 |         24: 28 |         28: 30|         24: 30\\\n"
+    "-sfr    (0)     31     |         31     |         31     |         31    |         31    \\\n"
+    "                       |                |                |                               \\\n"
+    "-ref             0     |          1     |                |                               \\\n"
+    "-tedge                 |          0     |          0     | -mXmath       90              \\\n"
+    "                       |                |                | -mXmathd      60              \\\n"
+    "-nXstr  (1)     31     |         31: 31 |         31     | -mXmate        2              \\\n"
+    "-nXsdz           0     |          0:  0 |          0     | -mXmabw        5              \\\n"
+    "                       |                |                |                               \\\n"
+    "-nXtss           0     |          0:  0 |          0     |                               \\\n"
+    "-nXtsi           1     |          1:  1 |          1     |                               \\\n"
+    "-nXtfs           0     |          7: 11 |         10     |                               \\\n"
+    "-nXtdz  (3)      0     |          0:  0 |          0     |**************NRc**************\\\n"
+    "-nXtdx           2     |          2:  2 |          2     | -mode          0              \\\n"
+    "-nXtfrs         15     |                |                | -presfc        0              \\\n"
+    "-nXtfr0 (2) 16:  8: 16 |      8:  4:  0 |     16:  8: 16 | -sfc          60              \\\n"
+    "             8:  0:  0 |      0:  0:  0 |      8:  0:  0 | -tfc          10              \\\n"
+    "-nXtfr1 (2)            |     16:  8: 16 |                | -tpc          10              \\\n"
+    "                       |      8:  0:  0 |                | -trc          12              \\\n"
+    "                       |                |                |                               \\\n"
+    "-mXid0                 |      1:  1:  2 |      1:  1:  2 |                               \\\n"
+    "-mXid1                 |      2:  2:  2 |                |                               \\\n"
+    "-mXmabr                |          0:  0 |          0     |                               \\\n"
+    "-AdvMath               |          1     |                |                               \\\n"
+    "-AdvTh                 |          0     |                |                               \\\n"
+    "-mXmath                |         40:150 |        150     |                               \\\n"
+    "-mXmathd               |         20:120 |        100     |                               \\\n"
+    "-mXmate                |          2:  2 |          2     |                               \\\n"
+    "-mXmabw                |          4:  9 |          5     |                               \\\n"
+    "-mXmatw                |              3 |          3     |                               \\\n"
+    ";;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;\n";
+
+/* The same rung with -sfc 60 -> 61 and -nXtfs "7: 11" -> "9: 13". */
+static const char NRX_ROWS_B[] =
+    "-nXsf1      18:  0:128 |     20:  0:128 |     20:  0:128 |          30:  0:128           \\\n"
+    "-nXsf2      20:  0:128 |     30:  0:128 |     20:  0:128 |          30:  0:128           \\\n"
+    "-nXsf4      18:  0:128 |     25:  0:128 |     20:  0:128 |          30:  0:128           \\\n"
+    "-SelRt          16: 16 |                | -kmode       1 |                   1           \\\n"
+    "-DeRt            0:  4 |                |                |                               \\\n"
+    "-sfs5                  |                |                |          60: 60: 60           \\\n"
+    "-nXsf5  64: 64: 64: 64 | 64: 64: 64: 64 | 64: 64: 64: 64 |110: 90: 64: 64| 96: 72: 64: 64\\\n"
+    "-dzsf5               0 |              0 |              0 |              0|              0\\\n"
+    "-nXsf6   0:  0:  0:  0 |  4:  2:  0:  4 |  4:  2:  0:  4 |  4:  5:  0:  4|  1:  5:  0:  4\\\n"
+    "-nXsfr6  0:  0:  0:  0 |  0:  0:  8:  0 |  0:  0:  8:  0 | 10: 10:  0:  0| 20: 20:  0:  0\\\n"
+    "-nXsbr6         15: 15 |         12: 12 |         12: 12 |         12: 15|         12: 15\\\n"
+    "                       |                |                |               |               \\\n"
+    "-nXsfn       1:  2:  4 |      6:  6:  4 |      6:  6:  4 |      6:  6:  4|      6:  6:  4\\\n"
+    "-nXsth          20: 40 |         30: 30 |         32: 36 |         36: 40|         36: 40\\\n"
+    "-nXsthd         15: 20 |         20: 20 |         24: 28 |         28: 30|         24: 30\\\n"
+    "-sfr    (0)     31     |         31     |         31     |         31    |         31    \\\n"
+    "                       |                |                |                               \\\n"
+    "-ref             0     |          1     |                |                               \\\n"
+    "-tedge                 |          0     |          0     | -mXmath       90              \\\n"
+    "                       |                |                | -mXmathd      60              \\\n"
+    "-nXstr  (1)     31     |         31: 31 |         31     | -mXmate        2              \\\n"
+    "-nXsdz           0     |          0:  0 |          0     | -mXmabw        5              \\\n"
+    "                       |                |                |                               \\\n"
+    "-nXtss           0     |          0:  0 |          0     |                               \\\n"
+    "-nXtsi           1     |          1:  1 |          1     |                               \\\n"
+    "-nXtfs           0     |          9: 13 |         10     |                               \\\n"
+    "-nXtdz  (3)      0     |          0:  0 |          0     |**************NRc**************\\\n"
+    "-nXtdx           2     |          2:  2 |          2     | -mode          0              \\\n"
+    "-nXtfrs         15     |                |                | -presfc        0              \\\n"
+    "-nXtfr0 (2) 16:  8: 16 |      8:  4:  0 |     16:  8: 16 | -sfc          61              \\\n"
+    "             8:  0:  0 |      0:  0:  0 |      8:  0:  0 | -tfc          10              \\\n"
+    "-nXtfr1 (2)            |     16:  8: 16 |                | -tpc          10              \\\n"
+    "                       |      8:  0:  0 |                | -trc          12              \\\n"
+    "                       |                |                |                               \\\n"
+    "-mXid0                 |      1:  1:  2 |      1:  1:  2 |                               \\\n"
+    "-mXid1                 |      2:  2:  2 |                |                               \\\n"
+    "-mXmabr                |          0:  0 |          0     |                               \\\n"
+    "-AdvMath               |          1     |                |                               \\\n"
+    "-AdvTh                 |          0     |                |                               \\\n"
+    "-mXmath                |         40:150 |        150     |                               \\\n"
+    "-mXmathd               |         20:120 |        100     |                               \\\n"
+    "-mXmate                |          2:  2 |          2     |                               \\\n"
+    "-mXmabw                |          4:  9 |          5     |                               \\\n"
+    "-mXmatw                |              3 |          3     |                               \\\n"
+    ";;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;\n";
+
+/* Block A without its last row (-mXmatw): incomplete, must be skipped. */
+static const char NRX_ROWS_SHORT[] =
+    "-nXsf1      18:  0:128 |     20:  0:128 |     20:  0:128 |          30:  0:128           \\\n"
+    "-nXsf2      20:  0:128 |     30:  0:128 |     20:  0:128 |          30:  0:128           \\\n"
+    "-nXsf4      18:  0:128 |     25:  0:128 |     20:  0:128 |          30:  0:128           \\\n"
+    "-SelRt          16: 16 |                | -kmode       1 |                   1           \\\n"
+    "-DeRt            0:  4 |                |                |                               \\\n"
+    "-sfs5                  |                |                |          60: 60: 60           \\\n"
+    "-nXsf5  64: 64: 64: 64 | 64: 64: 64: 64 | 64: 64: 64: 64 |110: 90: 64: 64| 96: 72: 64: 64\\\n"
+    "-dzsf5               0 |              0 |              0 |              0|              0\\\n"
+    "-nXsf6   0:  0:  0:  0 |  4:  2:  0:  4 |  4:  2:  0:  4 |  4:  5:  0:  4|  1:  5:  0:  4\\\n"
+    "-nXsfr6  0:  0:  0:  0 |  0:  0:  8:  0 |  0:  0:  8:  0 | 10: 10:  0:  0| 20: 20:  0:  0\\\n"
+    "-nXsbr6         15: 15 |         12: 12 |         12: 12 |         12: 15|         12: 15\\\n"
+    "                       |                |                |               |               \\\n"
+    "-nXsfn       1:  2:  4 |      6:  6:  4 |      6:  6:  4 |      6:  6:  4|      6:  6:  4\\\n"
+    "-nXsth          20: 40 |         30: 30 |         32: 36 |         36: 40|         36: 40\\\n"
+    "-nXsthd         15: 20 |         20: 20 |         24: 28 |         28: 30|         24: 30\\\n"
+    "-sfr    (0)     31     |         31     |         31     |         31    |         31    \\\n"
+    "                       |                |                |                               \\\n"
+    "-ref             0     |          1     |                |                               \\\n"
+    "-tedge                 |          0     |          0     | -mXmath       90              \\\n"
+    "                       |                |                | -mXmathd      60              \\\n"
+    "-nXstr  (1)     31     |         31: 31 |         31     | -mXmate        2              \\\n"
+    "-nXsdz           0     |          0:  0 |          0     | -mXmabw        5              \\\n"
+    "                       |                |                |                               \\\n"
+    "-nXtss           0     |          0:  0 |          0     |                               \\\n"
+    "-nXtsi           1     |          1:  1 |          1     |                               \\\n"
+    "-nXtfs           0     |          7: 11 |         10     |                               \\\n"
+    "-nXtdz  (3)      0     |          0:  0 |          0     |**************NRc**************\\\n"
+    "-nXtdx           2     |          2:  2 |          2     | -mode          0              \\\n"
+    "-nXtfrs         15     |                |                | -presfc        0              \\\n"
+    "-nXtfr0 (2) 16:  8: 16 |      8:  4:  0 |     16:  8: 16 | -sfc          60              \\\n"
+    "             8:  0:  0 |      0:  0:  0 |      8:  0:  0 | -tfc          10              \\\n"
+    "-nXtfr1 (2)            |     16:  8: 16 |                | -tpc          10              \\\n"
+    "                       |      8:  0:  0 |                | -trc          12              \\\n"
+    "                       |                |                |                               \\\n"
+    "-mXid0                 |      1:  1:  2 |      1:  1:  2 |                               \\\n"
+    "-mXid1                 |      2:  2:  2 |                |                               \\\n"
+    "-mXmabr                |          0:  0 |          0     |                               \\\n"
+    "-AdvMath               |          1     |                |                               \\\n"
+    "-AdvTh                 |          0     |                |                               \\\n"
+    "-mXmath                |         40:150 |        150     |                               \\\n"
+    "-mXmathd               |         20:120 |        100     |                               \\\n"
+    "-mXmate                |          2:  2 |          2     |                               \\\n"
+    "-mXmabw                |          4:  9 |          5     |                               \\\n"
+    ";;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;\n";
+
 /* ---------------- fixture ---------------- */
 
 static void reset_all(hisi_state_t *st)
@@ -152,8 +362,22 @@ static void reset_all(hisi_state_t *st)
     g_log[0] = '\0';
     g_log_len = 0;
 
+    g_nrx_get_calls = 0;
+    g_nrx_set_calls = 0;
+    g_nrx_get_fail = false;
+    g_nrx_set_fail = false;
+    g_iso = 100;
+    g_nrx_mode = -1;
+    g_nrx_num = 0;
+    memset(g_nrx_iso, 0, sizeof(g_nrx_iso));
+    memset(g_nrx_blk, 0, sizeof(g_nrx_blk));
+
+    hisi_nrx_free(st); /* the previous load's ladder, before the memset loses it */
     memset(st, 0, sizeof(*st));
     st->tune_resolved = true; /* keep the stubs; nothing to dlsym here */
+    st->vpss.fnGetGrpNRXParam = get_nrx;
+    st->vpss.fnSetGrpNRXParam = set_nrx;
+    st->tune.query_exp = query_exp;
     st->tune.get_exp = get_exp;
     st->tune.set_exp = set_exp;
     st->tune.get_route_ex = get_route;
@@ -262,6 +486,16 @@ static void write_ini_good(char *path)
     for (i = 0; i < V4_ISP_GAMMA_NODES; i++)
         fprintf(f, "%d%s", i % 4096,
                 i == V4_ISP_GAMMA_NODES - 1 ? "\n" : (i % 30 == 29 ? ",\\\n" : ","));
+    fputs("[static_3dnr]\n"
+          "3DNRCount            = \"2\"\n"
+          "IsoThresh            = \"100, 400\"\n"
+          "\n"
+          ";ISO 100\n"
+          "3DnrParam_0 = \\\n",
+          f);
+    fputs(NRX_ROWS_A, f);
+    fputs("\n;ISO 400\n3DnrParam_1 = \\\n", f);
+    fputs(NRX_ROWS_B, f);
     fclose(f);
 }
 
@@ -334,6 +568,122 @@ static void load_good(void)
     /* [dynamic_gamma] Table_0, all 1025 nodes through the continuations */
     assert(g_gamma.enable == 1);
     assert(g_gamma.curve_type == V4_ISP_GAMMA_CURVE_USER);
+
+    /* [static_3dnr]: two rungs; AE says ISO 100, so the first goes in MANUAL */
+    {
+        const v4_vpss_nrx_v3 *b = &g_nrx_blk[0];
+
+        assert(g_nrx_get_calls == 1);
+        assert(g_nrx_set_calls == 1);
+        assert(g_nrx_mode == V4_OPERATION_MODE_MANUAL);
+        assert(log_count("2 rungs, ISO 100..400; AE at ISO 100, rung written") == 1);
+
+        /* the sample's mapping, row by row, on the ISO 100 block */
+        assert(b->sfy[0].sfs1 == 18 && b->sfy[0].sft1 == 0 && b->sfy[0].sbr1 == 128);
+        assert(b->sfy[1].sfs2 == 30 && b->sfy[3].sfs4 == 30);
+        assert(b->sfy[0].srt0 == 16 && b->sfy[0].srt1 == 16);       /* -SelRt */
+        assert(b->sfy[2].kmode == 1 && b->sfy[3].kmode == 1);      /* -kmode, embedded */
+        assert(b->sfy[0].derate == 0 && b->sfy[0].deidx == 4);      /* -DeRt */
+        assert(b->sfy[4].sfs1 == 60 && b->sfy[4].sfs2 == 60 && b->sfy[4].sfs4 == 60); /* -sfs5 */
+        assert(b->iey[3].ies0 == 110 && b->iey[3].ies1 == 90 && b->iey[4].ies0 == 96); /* -nXsf5 */
+        assert(b->iey[2].iedz == 0);                                 /* -dzsf5 */
+        assert(b->sfy[1].spn6 == 4 && b->sfy[1].sbn6 == 2 && b->sfy[1].pbr6 == 0 &&
+               b->sfy[1].jmode == 4);                                /* -nXsf6 */
+        assert(b->sfy[1].sfr6[2] == 8 && b->sfy[3].sfr6[0] == 10);   /* -nXsfr6 */
+        assert(b->sfy[0].sbr6[0] == 15 && b->sfy[3].sbr6[1] == 15);  /* -nXsbr6 */
+        assert(b->sfy[0].sfn0 == 1 && b->sfy[0].sfn1 == 2 && b->sfy[0].sfn2 == 4); /* -nXsfn */
+        assert(b->sfy[0].sth1 == 20 && b->sfy[0].sth2 == 40 && b->sfy[4].sthd2 == 30);
+        assert(b->sfy[0].sfr == 31 && b->sfy[4].sfr == 31);          /* -sfr (0) */
+        assert(b->tfy[0].bref == 0 && b->tfy[1].bref == 1);          /* -ref */
+        assert(b->tfy[1].ted == 0 && b->tfy[2].ted == 0);            /* -tedge */
+        assert(b->mdy[1].math1 == 90);                               /* -mXmath, embedded */
+        assert(b->mdy[1].mathd1 == 60);                              /* -mXmathd, embedded */
+        assert(b->tfy[0].str0 == 31 && b->tfy[1].str0 == 31 && b->tfy[1].str1 == 31 &&
+               b->tfy[2].str0 == 31);                                /* -nXstr (1) */
+        assert(b->mdy[1].mate1 == 2);                                /* -mXmate, embedded */
+        assert(b->mdy[1].mabw1 == 5);                                /* -mXmabw, embedded */
+        assert(b->tfy[0].tsi0 == 1 && b->tfy[1].tsi1 == 1);          /* -nXtsi */
+        assert(b->tfy[0].tfs0 == 0 && b->tfy[1].tfs0 == 7 && b->tfy[1].tfs1 == 11 &&
+               b->tfy[2].tfs0 == 10);                                /* -nXtfs */
+        assert(b->tfy[0].tdx0 == 2 && b->tfy[1].tdx1 == 2);          /* -nXtdx; -mode ignored */
+        assert(b->tfy[0].tfrs == 15);                                /* -nXtfrs; -presfc ignored */
+        assert(b->tfy[0].tfr0[0] == 16 && b->tfy[0].tfr0[1] == 8 && b->tfy[0].tfr0[2] == 16 &&
+               b->tfy[0].tfr0[3] == 8 && b->tfy[0].tfr0[4] == 0 && b->tfy[0].tfr0[5] == 0);
+        assert(b->tfy[1].tfr0[0] == 8 && b->tfy[1].tfr0[1] == 4 && b->tfy[1].tfr0[3] == 0);
+        assert(b->tfy[2].tfr0[0] == 16 && b->tfy[2].tfr0[3] == 8);   /* -nXtfr0, two lines */
+        assert(b->nrc.sfc == 60 && b->nrc.tfc == 10);                /* embedded in tfr0 */
+        assert(b->tfy[1].tfr1[0] == 16 && b->tfy[1].tfr1[1] == 8 && b->tfy[1].tfr1[2] == 16 &&
+               b->tfy[1].tfr1[3] == 8 && b->tfy[1].tfr1[4] == 0);    /* -nXtfr1 */
+        assert(b->nrc.tpc == 10 && b->nrc.trc == 12);                /* embedded in tfr1 */
+        assert(b->mdy[0].mai00 == 1 && b->mdy[0].mai01 == 1 && b->mdy[0].mai02 == 2 &&
+               b->mdy[1].mai00 == 1 && b->mdy[1].mai02 == 2);        /* -mXid0 */
+        assert(b->mdy[0].mai10 == 2 && b->mdy[0].mai11 == 2 && b->mdy[0].mai12 == 2); /* -mXid1 */
+        assert(b->mdy[0].mabr0 == 0 && b->mdy[0].mabr1 == 0 && b->mdy[1].mabr0 == 0);
+        assert(b->mdy[0].advmath == 1 && b->mdy[0].advth == 0);
+        assert(b->mdy[0].math0 == 40 && b->mdy[0].math1 == 150 && b->mdy[1].math0 == 150);
+        assert(b->mdy[0].mathd0 == 20 && b->mdy[0].mathd1 == 120 && b->mdy[1].mathd0 == 100);
+        assert(b->mdy[0].mate0 == 2 && b->mdy[0].mate1 == 2 && b->mdy[1].mate0 == 2);
+        assert(b->mdy[0].mabw0 == 4 && b->mdy[0].mabw1 == 9 && b->mdy[1].mabw0 == 5);
+        assert(b->mdy[0].matw == 3 && b->mdy[1].matw == 3);
+
+        /* get-modify-set: what the text never names is the driver's */
+        assert(b->sfy[0].sbsk[0] == 1234 && b->sfy[4].sdsk[31] == 4321);
+        assert(b->sfy[2].nry_en == 1 && b->iey[1].ie_en == 1);
+        assert(b->mdy[0].madz0 == 300 && b->tfy[0].dzmode0 == 1);
+        /* column 4's SFT/SBR are not in the text either */
+        assert(b->sfy[4].sft1 == 0 && b->sfy[4].sbr1 == 0);
+
+        /* the tick: ISO 200 sits halfway between the rungs in stops, so the
+         * blend is the sample's rounding midpoint of 60/61 and 7/9, 11/13 */
+        g_iso = 200;
+        nrx_tick_now(&st, st.nrx);
+        assert(g_nrx_set_calls == 2);
+        assert(b->nrc.sfc == 61);
+        assert(b->tfy[1].tfs0 == 8 && b->tfy[1].tfs1 == 12);
+        assert(b->sfy[0].sfs1 == 18 && b->sfy[0].sbsk[0] == 1234); /* unchanged, and kept */
+
+        /* the second rung, where the fixture changed it and only there */
+        g_iso = 400;
+        nrx_tick_now(&st, st.nrx);
+        assert(g_nrx_set_calls == 3);
+        assert(b->nrc.sfc == 61);
+        assert(b->tfy[1].tfs0 == 9 && b->tfy[1].tfs1 == 13);
+        assert(b->sfy[0].sfs1 == 18 && b->mdy[0].math1 == 150);
+
+        /* past the top rung is the top rung; the same step is no write */
+        g_iso = 50000;
+        nrx_tick_now(&st, st.nrx);
+        assert(g_nrx_set_calls == 4 && b->nrc.sfc == 61 && b->tfy[1].tfs0 == 9);
+        nrx_tick_now(&st, st.nrx);
+        assert(g_nrx_set_calls == 4);
+        g_iso = 50500; /* same MapISO step */
+        nrx_tick_now(&st, st.nrx);
+        assert(g_nrx_set_calls == 4);
+
+        /* and back down to the first */
+        g_iso = 100;
+        nrx_tick_now(&st, st.nrx);
+        assert(g_nrx_set_calls == 5 && b->nrc.sfc == 60 && b->tfy[1].tfs0 == 7);
+
+        /* the clocked entry point is armed and rate-limited: two calls in
+         * the same second are one query at most, and a stopped engine is
+         * silent */
+        g_iso = 400;
+        hisi_nrx_tick(&st);
+        hisi_nrx_tick(&st);
+        assert(g_nrx_set_calls == 6);
+        g_nrx_set_fail = true;
+        g_iso = 100;
+        nrx_tick_now(&st, st.nrx);
+        nrx_tick_now(&st, st.nrx);
+        nrx_tick_now(&st, st.nrx);
+        assert(log_count("failed three times running") == 1);
+        assert(st.nrx->engine == 0);
+        g_nrx_set_fail = false;
+        st.nrx->next_tick_ns = 0;
+        hisi_nrx_tick(&st);
+        assert(g_nrx_set_calls == 9); /* the three failed writes, none after */
+    }
     assert(g_gamma.table[0] == 0);
     assert(g_gamma.table[1024] == 1024 % 4096);
     assert(g_gamma.table[512] == 512);
@@ -529,7 +879,7 @@ static void load_vendor_failures(void)
      * seven are attempted, of which exp fails. */
     assert(g_set_calls == 7);
     assert(g_sets == 6);
-    assert(log_count("6 modules applied, 2 failed") == 1);
+    assert(log_count("7 modules applied, 2 failed") == 1);
 
     /* The undisturbed ones still went through */
     assert(g_nr.enable == 1);
@@ -539,11 +889,101 @@ static void load_vendor_failures(void)
     unlink(path);
 }
 
+/* ================================================================
+ * LOAD 4 -- [static_3dnr] edges: a short block, a bad ladder, AUTO refused
+ * ================================================================ */
+
+static void write_ini_nrx(char *path, bool short_second, const char *iso, bool no_count)
+{
+    FILE *f = open_tmp(path);
+
+    fputs("[static_3dnr]\n", f);
+    if (!no_count)
+        fputs("3DNRCount = \"2\"\n", f);
+    fprintf(f, "IsoThresh = \"%s\"\n", iso);
+    fputs("3DnrParam_0 = \\\n", f);
+    fputs(NRX_ROWS_A, f);
+    fputs("3DnrParam_1 = \\\n", f);
+    fputs(short_second ? NRX_ROWS_SHORT : NRX_ROWS_B, f);
+    fclose(f);
+}
+
+static void load_nrx_edges(void)
+{
+    static hisi_state_t st;
+    char path[32];
+
+    /* A second rung one row short: skipped by name, the ladder shortens to
+     * one rung, and AE's ISO 400 lands on that rung. */
+    reset_all(&st);
+    g_iso = 400;
+    write_ini_nrx(path, true, "100, 400", false);
+    snprintf(st.iq_file, sizeof(st.iq_file), "%s", path);
+    hisi_isp_note_frame(&st);
+    assert(log_count("3DnrParam_1: 1 rows short, first missing -mXmatw; block skipped") == 1);
+    assert(log_count("3DNRCount is 2 but 3DnrParam_1 is missing or malformed; using the 1") == 1);
+    assert(g_nrx_mode == V4_OPERATION_MODE_MANUAL && g_nrx_set_calls == 1);
+    assert(g_nrx_blk[0].nrc.sfc == 60);
+    assert(log_count("1 rungs, ISO 100..100; AE at ISO 400") == 1);
+    unlink(path);
+
+    /* A ladder that is not ascending is cut at the fault, and with no way
+     * to ask AE the first rung goes in once and the engine stays off. */
+    reset_all(&st);
+    st.tune.query_exp = NULL;
+    write_ini_nrx(path, false, "400, 100", false);
+    snprintf(st.iq_file, sizeof(st.iq_file), "%s", path);
+    hisi_isp_note_frame(&st);
+    assert(log_count("IsoThresh not ascending at entry 1 (100 after 400); truncating to 1") == 1);
+    assert(g_nrx_set_calls == 1);
+    assert(g_nrx_mode == V4_OPERATION_MODE_MANUAL);
+    assert(g_nrx_blk[0].nrc.sfc == 60 && g_nrx_blk[0].sfy[0].sbsk[0] == 1234);
+    assert(log_count("no ISO query") == 1);
+    assert(st.nrx->engine == 0);
+    st.nrx->next_tick_ns = 0;
+    hisi_nrx_tick(&st);
+    assert(g_nrx_set_calls == 1);
+    unlink(path);
+
+    /* The write itself failing counts as a failed module. */
+    reset_all(&st);
+    g_nrx_set_fail = true;
+    write_ini_nrx(path, false, "100, 400", false);
+    snprintf(st.iq_file, sizeof(st.iq_file), "%s", path);
+    hisi_isp_note_frame(&st);
+    assert(log_count("skipped: static_3dnr(Set failed)") == 1);
+    unlink(path);
+
+    /* No 3DNRCount at all: nothing is written, and the summary does not
+     * count a failure either -- the section was never complete. */
+    reset_all(&st);
+    write_ini_nrx(path, false, "100, 400", true);
+    snprintf(st.iq_file, sizeof(st.iq_file), "%s", path);
+    hisi_isp_note_frame(&st);
+    assert(g_nrx_set_calls == 0 && g_nrx_get_calls == 0);
+    unlink(path);
+
+    /* The Get half failing keeps the driver's defaults and counts as a
+     * failed module. */
+    reset_all(&st);
+    g_nrx_get_fail = true;
+    write_ini_nrx(path, false, "100, 400", false);
+    snprintf(st.iq_file, sizeof(st.iq_file), "%s", path);
+    hisi_isp_note_frame(&st);
+    assert(g_nrx_set_calls == 0);
+    assert(log_count("GetGrpNRXParam(0) failed") == 1);
+    assert(log_count("skipped: static_3dnr(Get failed)") == 1);
+    unlink(path);
+
+    hisi_nrx_free(&st);
+}
+
 int main(void)
 {
     load_good();
     load_bad();
     load_vendor_failures();
+    load_nrx_edges();
 
     printf("t_hisi_iq: OK\n");
     return 0;
