@@ -2484,8 +2484,12 @@ err_free:
         HAL_LOG_ERR("isp: leaking HAL state (%zu bytes) to a still-running 3A thread",
                     sizeof(*st));
     else {
+#ifdef HAL_MODULE_VIDEO
+        /* The tuning engines' ladders: video-only state, and hal_nrx.c and
+         * hal_dyn.c are in the video archive only. */
         hisi_nrx_free(st);
         hisi_dyn_free(st);
+#endif
         free(st);
     }
     c->platform = NULL;
@@ -2593,8 +2597,12 @@ static int hal_deinit(void *ctx)
         HAL_LOG_ERR("isp: leaking HAL state (%zu bytes) to a still-running 3A thread",
                     sizeof(*st));
     else {
+#ifdef HAL_MODULE_VIDEO
+        /* The tuning engines' ladders: video-only state, and hal_nrx.c and
+         * hal_dyn.c are in the video archive only. */
         hisi_nrx_free(st);
         hisi_dyn_free(st);
+#endif
         free(st);
     }
     c->platform = NULL;
