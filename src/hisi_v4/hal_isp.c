@@ -23,20 +23,25 @@
  * names, write it back. Fields the INI does not mention keep the running
  * defaults, which is what makes a partial file safe to apply.
  *
- * Sections applied: static_ae, static_aerouteex, static_aeweight,
- * static_ldci, static_drc, static_nr, static_dehaze, static_sharpen,
- * static_dpc, and -- statically, at their lowest-ISO column --
- * dynamic_dehaze, dynamic_linear_drc and dynamic_gamma (Table_0). The
- * dynamic sections describe per-ISO interpolation majestic performs at
- * runtime; applying the daylight column gives the daylight baseline and
- * defers the interpolation engine, which is recorded in the plan rather
- * than hidden here.
+ * Sections applied here: static_ae, static_aerouteex, static_aeweight,
+ * static_ldci, static_drc, static_nr, static_dehaze, static_sharpen and
+ * static_dpc -- the ones that are values.
+ *
+ * Sections handed to an engine, because they are tables over an axis
+ * majestic walks at runtime:
+ *   dynamic_linear_drc, dynamic_dehaze, dynamic_gamma
+ *                  hal_dyn.c: per-ISO columns (DRC, dehaze) and
+ *                  per-exposure curves (gamma), written for the ISO AE
+ *                  reports and re-written as it moves, off a once-a-second
+ *                  tick on the encoder's frame hook. The dispatch below
+ *                  hands their keys over and the apply loop calls it after
+ *                  the static modules, so its get-modify-set lays the
+ *                  column over the static values.
+ *   static_3dnr    hal_nrx.c: the VPSS NRX X-param text, not an ISP
+ *                  module -- the parser, the per-ISO rung selection and
+ *                  the HI_MPI_VPSS_SetGrpNRXParam write, on the same tick.
  *
  * Sections skipped, and why:
- *   (static_3dnr is not skipped any more: it is the VPSS NRX X-param
- *   text, not an ISP module, and hal_nrx.c owns it -- the parser, the
- *   per-ISO rung selection and the HI_MPI_VPSS_SetGrpNRXParam write. The
- *   dispatch below hands its keys over and the apply loop calls it last.)
  *   ir_*           the night-mode mirror of the whole set. Day/night
  *                  switching is not this backend's to drive yet.
  *   all_param, dynamic_ae/fps/nr/...
@@ -78,9 +83,9 @@
  * different curve. Worse for gamma, where applying also flips
  * enGammaCurveType to USER_DEFINE, so nodes past n are read back under a
  * curve type they were never sampled for. So the three whole-table values
- * -- gamma Table_0 (1025), DRCToneMappingValue (200) and DehazeLut (256)
- * -- are applied only at their exact node count, and a short or truncated
- * one is dropped with a WARN naming the count.
+ * -- the gamma tables (1025, in hal_dyn.c), DRCToneMappingValue (200) and
+ * DehazeLut (256) -- are applied only at their exact node count, and a
+ * short or truncated one is dropped with a WARN naming the count.
  *
  * The per-ISO arrays (the ISP_AUTO_ISO_STRENGTH_NUM=16 columns in NR,
  * LDCI, sharpen and DPC) are deliberately *not* under that rule: those are
@@ -455,7 +460,6 @@ enum {
     IQ_DEHAZE = 1 << 6,
     IQ_SHARPEN = 1 << 7,
     IQ_DPC = 1 << 8,
-    IQ_GAMMA = 1 << 9,
 };
 
 typedef struct {
@@ -468,14 +472,13 @@ typedef struct {
     v4_isp_dehaze_attr dehaze;
     v4_isp_sharpen_attr sharpen;
     v4_isp_dp_dyn_attr dpc;
-    v4_isp_gamma_attr gamma;
 
     unsigned int have;    /* fetched via Get */
     unsigned int unavail; /* Get failed or symbol missing; do not retry */
     unsigned int dirty;   /* INI touched it; Set on completion */
     bool route_seen;      /* static_aerouteex present -> bAERouteExValid */
 
-    long nums[V4_ISP_GAMMA_NODES];
+    long nums[V4_ISP_DEHAZE_LUT]; /* the largest table parsed here */
     char skipped[192]; /* section names for the summary line */
 } hisi_iq_load;
 
@@ -500,8 +503,6 @@ static const char *iq_mod_name(unsigned int bit)
         return "IspSharpenAttr";
     case IQ_DPC:
         return "DPDynamicAttr";
-    case IQ_GAMMA:
-        return "GammaAttr";
     }
     return "?";
 }
@@ -527,8 +528,6 @@ static void *iq_struct_of(hisi_iq_load *ld, unsigned int bit)
         return &ld->sharpen;
     case IQ_DPC:
         return &ld->dpc;
-    case IQ_GAMMA:
-        return &ld->gamma;
     }
     return NULL;
 }
@@ -571,9 +570,6 @@ static bool iq_fetch(hisi_state_t *st, hisi_iq_load *ld, unsigned int bit)
         break;
     case IQ_DPC:
         get = (int (*)(int, void *))st->tune.get_dpc;
-        break;
-    case IQ_GAMMA:
-        get = (int (*)(int, void *))st->tune.get_gamma;
         break;
     }
 
@@ -760,63 +756,6 @@ static void iq_sect_static_drc(hisi_state_t *st, hisi_iq_load *ld, const char *k
     ld->dirty |= IQ_DRC;
 }
 
-/* dynamic_linear_drc, applied at its lowest-ISO column (see the header). */
-static void iq_sect_dynamic_drc(hisi_state_t *st, hisi_iq_load *ld, const char *key,
-                                const char *val)
-{
-    v4_isp_drc_attr *d = &ld->drc;
-    long v0 = iq_num(val, -1);
-
-    if (!iq_fetch(st, ld, IQ_DRC))
-        return;
-    if (v0 < 0 && !iq_ci_eq(key, "DetailAdjustFactor")) {
-        HAL_LOG_DBG("isp tuning: [dynamic_linear_drc] %s: empty", key);
-        return;
-    }
-
-    if (iq_ci_eq(key, "Enable"))
-        d->enable = v0 ? 1 : 0;
-    else if (iq_ci_eq(key, "LocalMixingBrightMax"))
-        d->local_mixing_bright_max = (unsigned char)iq_clamp(v0, 0, 0x80);
-    else if (iq_ci_eq(key, "LocalMixingBrightMin"))
-        d->local_mixing_bright_min = (unsigned char)iq_clamp(v0, 0, 0x40);
-    else if (iq_ci_eq(key, "LocalMixingDarkMax"))
-        d->local_mixing_dark_max = (unsigned char)iq_clamp(v0, 0, 0x80);
-    else if (iq_ci_eq(key, "LocalMixingDarkMin"))
-        d->local_mixing_dark_min = (unsigned char)iq_clamp(v0, 0, 0x40);
-    else if (iq_ci_eq(key, "BrightGainLmt"))
-        d->bright_gain_lmt = (unsigned char)iq_clamp(v0, 0, 0xF);
-    else if (iq_ci_eq(key, "BrightGainLmtStep"))
-        d->bright_gain_lmt_step = (unsigned char)iq_clamp(v0, 0, 0xF);
-    else if (iq_ci_eq(key, "DarkGainLmtY"))
-        d->dark_gain_lmt_y = (unsigned char)iq_clamp(v0, 0, 0x85);
-    else if (iq_ci_eq(key, "DarkGainLmtC"))
-        d->dark_gain_lmt_c = (unsigned char)iq_clamp(v0, 0, 0x85);
-    else if (iq_ci_eq(key, "FltScaleCoarse"))
-        d->flt_scale_coarse = (unsigned char)iq_clamp(v0, 0, 0xF);
-    else if (iq_ci_eq(key, "FltScaleFine"))
-        d->flt_scale_fine = (unsigned char)iq_clamp(v0, 0, 0xF);
-    else if (iq_ci_eq(key, "ContrastControl"))
-        d->contrast_control = (unsigned char)iq_clamp(v0, 0, 0xF);
-    else if (iq_ci_eq(key, "DetailAdjustFactor"))
-        d->detail_adjust_factor = (signed char)iq_clamp(iq_num(val, 0), -15, 15);
-    else if (iq_ci_eq(key, "Asymmetry"))
-        d->asym.asymmetry = (unsigned char)iq_clamp(v0, 0x1, 0x1E);
-    else if (iq_ci_eq(key, "SecondPole"))
-        d->asym.second_pole = (unsigned char)iq_clamp(v0, 0x96, 0xD2);
-    else if (iq_ci_eq(key, "Stretch"))
-        d->asym.stretch = (unsigned char)iq_clamp(v0, 0x1E, 0x3C);
-    else if (iq_ci_eq(key, "Compress"))
-        d->asym.compress = (unsigned char)iq_clamp(v0, 0x64, 0xC8);
-    else if (iq_ci_eq(key, "Strength"))
-        d->auto_strength = (unsigned short)iq_clamp(v0, 0, 0x3FF);
-    else {
-        HAL_LOG_DBG("isp tuning: [dynamic_linear_drc] %s: per-ISO engine only; skipped", key);
-        return;
-    }
-    ld->dirty |= IQ_DRC;
-}
-
 static void iq_sect_nr(hisi_state_t *st, hisi_iq_load *ld, const char *key, const char *val)
 {
     v4_isp_nr_attr *nr = &ld->nr;
@@ -868,11 +807,8 @@ static void iq_sect_dehaze(hisi_state_t *st, hisi_iq_load *ld, const char *key, 
             return;
         }
         iq_fill_u8(dh->lut, V4_ISP_DEHAZE_LUT, ld->nums, n);
-    } else if (iq_ci_eq(key, "AutoDehazeStr")) {
-        /* dynamic_dehaze: the lowest-ISO column, statically. */
-        dh->auto_strength = (unsigned char)iq_clamp(iq_num(val, 0), 0, 255);
     } else {
-        HAL_LOG_DBG("isp tuning: [dehaze] %s: no mapping", key);
+        HAL_LOG_DBG("isp tuning: [static_dehaze] %s: no mapping", key);
         return;
     }
     ld->dirty |= IQ_DEHAZE;
@@ -963,36 +899,6 @@ static void iq_sect_dpc(hisi_state_t *st, hisi_iq_load *ld, const char *key, con
     ld->dirty |= IQ_DPC;
 }
 
-static void iq_sect_gamma(hisi_state_t *st, hisi_iq_load *ld, const char *key, const char *val)
-{
-    if (!iq_ci_eq(key, "Table_0")) {
-        HAL_LOG_DBG("isp tuning: [dynamic_gamma] %s: per-exposure engine only; skipped", key);
-        return;
-    }
-    if (!iq_fetch(st, ld, IQ_GAMMA))
-        return;
-
-    {
-        int n = iq_nums(val, ld->nums, V4_ISP_GAMMA_NODES);
-        int i;
-
-        /* Whole table or none. Applying would also flip the curve type to
-         * USER_DEFINE, under which nodes past n -- still holding whatever
-         * GetGammaAttr returned for a different curve -- become live. */
-        if (n != V4_ISP_GAMMA_NODES) {
-            HAL_LOG_WARN("isp tuning: gamma Table_0 has %d of %d nodes -- module skipped; "
-                         "a partial user curve would run on a stale tail",
-                         n, V4_ISP_GAMMA_NODES);
-            return;
-        }
-        for (i = 0; i < n; i++)
-            ld->gamma.table[i] = (unsigned short)iq_clamp(ld->nums[i], 0, 4095);
-    }
-    ld->gamma.enable = 1;
-    ld->gamma.curve_type = V4_ISP_GAMMA_CURVE_USER;
-    ld->dirty |= IQ_GAMMA;
-}
-
 /* Sections with no static application, remembered once for the summary. */
 static void iq_note_skip(hisi_iq_load *ld, const char *sect)
 {
@@ -1032,23 +938,22 @@ static void iq_dispatch(hisi_state_t *st, hisi_iq_load *ld, hisi_iq_reader *r)
         iq_sect_ldci(st, ld, r->key, r->val);
     else if (iq_ci_eq(s, "static_drc"))
         iq_sect_static_drc(st, ld, r->key, r->val);
-    else if (iq_ci_eq(s, "dynamic_linear_drc"))
-        iq_sect_dynamic_drc(st, ld, r->key, r->val);
     else if (iq_ci_eq(s, "static_nr"))
         iq_sect_nr(st, ld, r->key, r->val);
-    else if (iq_ci_eq(s, "static_dehaze") || iq_ci_eq(s, "dynamic_dehaze"))
+    else if (iq_ci_eq(s, "static_dehaze"))
         iq_sect_dehaze(st, ld, r->key, r->val);
     else if (iq_ci_eq(s, "static_sharpen"))
         iq_sect_sharpen(st, ld, r->key, r->val);
     else if (iq_ci_eq(s, "static_dpc"))
         iq_sect_dpc(st, ld, r->key, r->val);
-    else if (iq_ci_eq(s, "dynamic_gamma"))
-        iq_sect_gamma(st, ld, r->key, r->val);
-    else if (iq_ci_eq(s, "static_3dnr")) {
+    else if (iq_ci_eq(s, "dynamic_linear_drc") || iq_ci_eq(s, "dynamic_dehaze") ||
+             iq_ci_eq(s, "dynamic_gamma")) {
+        if (!hisi_dyn_key(st, s, r->key, r->val))
+            HAL_LOG_DBG("isp tuning: [%s] %s: no mapping", s, r->key);
+    } else if (iq_ci_eq(s, "static_3dnr")) {
         if (!hisi_nrx_key(st, r->key, r->val))
             HAL_LOG_DBG("isp tuning: [static_3dnr] %s: no mapping", r->key);
-    }
-    else
+    } else
         iq_note_skip(ld, s);
 }
 
@@ -1117,9 +1022,8 @@ static void hisi_isp_tune_resolve(hisi_state_t *st)
 
 static void hisi_isp_apply_tuning(hisi_state_t *st)
 {
-    static const unsigned int apply_order[] = {IQ_EXP,    IQ_ROUTE,   IQ_STAT, IQ_NR,
-                                               IQ_SHARPEN, IQ_LDCI,   IQ_DRC,  IQ_DEHAZE,
-                                               IQ_DPC,    IQ_GAMMA};
+    static const unsigned int apply_order[] = {IQ_EXP,     IQ_ROUTE, IQ_STAT, IQ_NR,     IQ_SHARPEN,
+                                               IQ_LDCI,    IQ_DRC,   IQ_DEHAZE, IQ_DPC};
     hisi_iq_reader r;
     hisi_iq_load *ld;
     int applied = 0, failed = 0;
@@ -1187,9 +1091,6 @@ static void hisi_isp_apply_tuning(hisi_state_t *st)
         case IQ_DPC:
             set = (int (*)(int, const void *))st->tune.set_dpc;
             break;
-        case IQ_GAMMA:
-            set = (int (*)(int, const void *))st->tune.set_gamma;
-            break;
         }
 
         if (!set) {
@@ -1209,7 +1110,20 @@ static void hisi_isp_apply_tuning(hisi_state_t *st)
         }
     }
 
-    /* The VPSS half: the 3DNR ladder, written through its own call. */
+    /* The engines, over the static values just written: the dynamic ISP
+     * sections for the ISO AE is at now... */
+    {
+        char note[96];
+        int dyn_failed = 0;
+
+        applied += hisi_dyn_apply(st, &dyn_failed, note, sizeof(note));
+        if (dyn_failed) {
+            failed += dyn_failed;
+            iq_note_skip(ld, note);
+        }
+    }
+
+    /* ...and the VPSS half: the 3DNR ladder, written through its own call. */
     {
         char note[64];
         int nrx = hisi_nrx_apply(st, note, sizeof(note));
@@ -1244,10 +1158,10 @@ static void hisi_isp_apply_tuning(hisi_state_t *st)
 void hisi_isp_note_frame(hisi_state_t *st)
 {
     if (__atomic_test_and_set(&st->iq_load_started, __ATOMIC_ACQ_REL)) {
-        /* Every frame after the load: the 3DNR ladder's ISO tick, which
-         * rate-limits itself and does nothing until the load has finished
-         * building the ladder. */
-        hisi_nrx_tick(st);
+        /* Every frame after the load: the ISO tick behind the 3DNR ladder
+         * and the dynamic ISP sections, which rate-limits itself and does
+         * nothing until the load has armed an engine. */
+        hisi_dyn_tick(st);
         return;
     }
 

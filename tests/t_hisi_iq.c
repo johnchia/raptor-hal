@@ -35,6 +35,7 @@
 
 #include "../src/hisi_v4/hal_isp.c"
 #include "../src/hisi_v4/hal_nrx.c"
+#include "../src/hisi_v4/hal_dyn.c"
 
 #include <assert.h>
 #include <limits.h>
@@ -137,7 +138,8 @@ static int log_count(const char *needle)
 
 static int g_nrx_get_calls, g_nrx_set_calls;
 static bool g_nrx_get_fail, g_nrx_set_fail;
-static unsigned g_iso; /* what the stubbed AE query reports */
+static unsigned g_iso;      /* what the stubbed AE query reports */
+static unsigned g_exp_time; /* ...and its integration time, us */
 static int g_nrx_mode;
 static unsigned g_nrx_num;
 static unsigned g_nrx_iso[V4_VPSS_NRX_MAX_BLOCKS];
@@ -195,6 +197,7 @@ static int query_exp(int pipe, v4_isp_exp_info *info)
     (void)pipe;
     memset(info, 0, sizeof(*info));
     info->iso = g_iso;
+    info->exp_time = g_exp_time;
     return 0;
 }
 
@@ -367,12 +370,14 @@ static void reset_all(hisi_state_t *st)
     g_nrx_get_fail = false;
     g_nrx_set_fail = false;
     g_iso = 100;
+    g_exp_time = 1000; /* ISO 100 at 1 ms: exposure 1000, the first gamma band */
     g_nrx_mode = -1;
     g_nrx_num = 0;
     memset(g_nrx_iso, 0, sizeof(g_nrx_iso));
     memset(g_nrx_blk, 0, sizeof(g_nrx_blk));
 
     hisi_nrx_free(st); /* the previous load's ladder, before the memset loses it */
+    hisi_dyn_free(st);
     memset(st, 0, sizeof(*st));
     st->tune_resolved = true; /* keep the stubs; nothing to dlsym here */
     st->vpss.fnGetGrpNRXParam = get_nrx;
@@ -462,10 +467,15 @@ static void write_ini_good(char *path)
     for (i = 0; i < V4_ISP_DEHAZE_LUT; i++)
         fprintf(f, "%d%s", i, i == V4_ISP_DEHAZE_LUT - 1 ? "\n" : (i % 20 == 19 ? ",\\\n" : ","));
     fputs("[dynamic_dehaze]\n"
-          "AutoDehazeStr = \"58,65,90\"\n" /* first column applies */
+          "ExpThreshCnt = \"2\"\n" /* the shipped file's off-by-one: noted, not obeyed */
+          "IsoThresh = \"100, 200, 400\"\n"
+          "AutoDehazeStr = \"58,65,90\"\n"
           "[dynamic_linear_drc]\n"
+          "IsoCnt = \"3\"\n"
+          "IsoLevel = \"100, 200, 400\"\n"
           "Strength = \"420, 380, 100\"\n"
           "Asymmetry = \"4, 4, 6\"\n"
+          "DetailAdjustFactor = \"8, 8, -4\"\n"
           "[static_sharpen]\n"
           "Enable = \"1\"\n"
           "AutoLumaWgt_2 = \"31, 30\"\n"
@@ -480,11 +490,18 @@ static void write_ini_good(char *path)
           "[ir_static_ae]\n"
           "AutoSpeed = 250\n" /* must NOT override the day value */
           "[dynamic_gamma]\n"
-          "TotalNum = \"3\"\n"
+          "TotalNum = \"2\"\n"
+          "Interval = \"4\"\n"
+          "gammaExpThreshLtoH = \"3200, 6400\"\n" /* read, not used */
+          "gammaExpThreshHtoL = \"400000, 800000\"\n"
           "Table_0 = \\\n",
           f);
     for (i = 0; i < V4_ISP_GAMMA_NODES; i++)
         fprintf(f, "%d%s", i % 4096,
+                i == V4_ISP_GAMMA_NODES - 1 ? "\n" : (i % 30 == 29 ? ",\\\n" : ","));
+    fputs("Table_1 = \\\n", f);
+    for (i = 0; i < V4_ISP_GAMMA_NODES; i++)
+        fprintf(f, "%d%s", i / 2,
                 i == V4_ISP_GAMMA_NODES - 1 ? "\n" : (i % 30 == 29 ? ",\\\n" : ","));
     fputs("[static_3dnr]\n"
           "3DNRCount            = \"2\"\n"
@@ -535,24 +552,34 @@ static void load_good(void)
     assert(g_ldci.gauss_lpf_sigma == 28);
     assert(g_ldci.auto_he[1].pos.wgt == 21);
 
-    /* [static_drc] + [dynamic_linear_drc] daylight column; the whole
+    /* [static_drc] + [dynamic_linear_drc] at AE's ISO 100; the whole
      * 200-node tone-mapping curve arrives through its continuations */
     assert(g_drc.enable == 1);
     assert(g_drc.op_type == 1);
     assert(g_drc.tone_mapping[0] == 0);
     assert(g_drc.tone_mapping[7] == 140);
     assert(g_drc.tone_mapping[V4_ISP_DRC_TM_NODES - 1] == (V4_ISP_DRC_TM_NODES - 1) * 20);
-    assert(g_drc.auto_strength == 420); /* dynamic wins over the static 512 */
+    /* DRCOpType = 1 is manual, so the column's Strength lands in the
+     * manual field the driver reads and the static DRCAutoStr stays where
+     * it was put -- the dead-letter bug the engine fixed */
+    assert(g_drc.auto_strength == 512);
+    assert(g_drc.manual_strength == 420);
     assert(g_drc.asym.asymmetry == 4);
+    assert(g_drc.detail_adjust_factor == 8);
+    assert(log_count("[dynamic_linear_drc] 3 columns, ISO 100..400; AE at ISO 100, strength 420; "
+                     "tracking ISO") == 1);
 
     /* [static_nr] */
     assert(g_nr.enable == 1);
     assert(g_nr.auto_fine_str[1] == 72);
 
-    /* [static_dehaze] + [dynamic_dehaze] daylight column, whole LUT */
+    /* [static_dehaze] + [dynamic_dehaze] at ISO 100, whole LUT */
     assert(g_dehaze.enable == 1);
     assert(g_dehaze.user_lut_enable == 1);
+    assert(g_dehaze.op_type == 0);
     assert(g_dehaze.auto_strength == 58);
+    assert(log_count("[dynamic_dehaze] 3 columns, ISO 100..400; AE at ISO 100, strength 58; "
+                     "tracking ISO") == 1);
     assert(g_dehaze.lut[0] == 0);
     assert(g_dehaze.lut[V4_ISP_DEHAZE_LUT - 1] == V4_ISP_DEHAZE_LUT - 1);
 
@@ -565,9 +592,24 @@ static void load_good(void)
     assert(g_dpc.enable == 1);
     assert(g_dpc.auto_strength[1] == 100);
 
-    /* [dynamic_gamma] Table_0, all 1025 nodes through the continuations */
+    /* [dynamic_gamma]: exposure 1000 is the first band, so Table_0, all
+     * 1025 nodes through the continuations, straight in */
     assert(g_gamma.enable == 1);
     assert(g_gamma.curve_type == V4_ISP_GAMMA_CURVE_USER);
+    assert(g_gamma.table[0] == 0);
+    assert(g_gamma.table[1024] == 1024 % 4096);
+    assert(g_gamma.table[512] == 512);
+    assert(log_count("[dynamic_gamma] 2 tables; AE at exposure 1000, table 0 written; tracking "
+                     "exposure") == 1);
+
+    /* one Set per touched module -- nine static, three dynamic -- and
+     * only touched modules; with the 3DNR ladder that is thirteen. A
+     * well-formed file trips none of the refusals load 2 is about */
+    assert(g_sets == 12);
+    assert(log_count("13 modules applied") == 1);
+    assert(log_count("truncated") == 0);
+    assert(log_count("not applied") == 0);
+    assert(log_count("module skipped") == 0);
 
     /* [static_3dnr]: two rungs; AE says ISO 100, so the first goes in MANUAL */
     {
@@ -636,7 +678,7 @@ static void load_good(void)
         /* the tick: ISO 200 sits halfway between the rungs in stops, so the
          * blend is the sample's rounding midpoint of 60/61 and 7/9, 11/13 */
         g_iso = 200;
-        nrx_tick_now(&st, st.nrx);
+        hisi_nrx_on_iso(&st, g_iso);
         assert(g_nrx_set_calls == 2);
         assert(b->nrc.sfc == 61);
         assert(b->tfy[1].tfs0 == 8 && b->tfy[1].tfs1 == 12);
@@ -644,7 +686,7 @@ static void load_good(void)
 
         /* the second rung, where the fixture changed it and only there */
         g_iso = 400;
-        nrx_tick_now(&st, st.nrx);
+        hisi_nrx_on_iso(&st, g_iso);
         assert(g_nrx_set_calls == 3);
         assert(b->nrc.sfc == 61);
         assert(b->tfy[1].tfs0 == 9 && b->tfy[1].tfs1 == 13);
@@ -652,52 +694,54 @@ static void load_good(void)
 
         /* past the top rung is the top rung; the same step is no write */
         g_iso = 50000;
-        nrx_tick_now(&st, st.nrx);
+        hisi_nrx_on_iso(&st, g_iso);
         assert(g_nrx_set_calls == 4 && b->nrc.sfc == 61 && b->tfy[1].tfs0 == 9);
-        nrx_tick_now(&st, st.nrx);
+        hisi_nrx_on_iso(&st, g_iso);
         assert(g_nrx_set_calls == 4);
         g_iso = 50500; /* same MapISO step */
-        nrx_tick_now(&st, st.nrx);
+        hisi_nrx_on_iso(&st, g_iso);
         assert(g_nrx_set_calls == 4);
 
         /* and back down to the first */
         g_iso = 100;
-        nrx_tick_now(&st, st.nrx);
+        hisi_nrx_on_iso(&st, g_iso);
         assert(g_nrx_set_calls == 5 && b->nrc.sfc == 60 && b->tfy[1].tfs0 == 7);
 
         /* the clocked entry point is armed and rate-limited: two calls in
          * the same second are one query at most, and a stopped engine is
-         * silent */
+         * silent. The same tick feeds the ISP engines: ISO 400 is their
+         * top column too. */
         g_iso = 400;
-        hisi_nrx_tick(&st);
-        hisi_nrx_tick(&st);
+        hisi_dyn_tick(&st);
+        hisi_dyn_tick(&st);
         assert(g_nrx_set_calls == 6);
+        assert(g_drc.manual_strength == 100 && g_drc.detail_adjust_factor == -4);
+        assert(g_dehaze.auto_strength == 90);
+        assert(log_count("drc: ISO 100 -> 400, now on column 2 (ISO 400); strength 100") == 1);
+        assert(log_count("dehaze: ISO 100 -> 400, now on column 2 (ISO 400); strength 90") == 1);
         g_nrx_set_fail = true;
         g_iso = 100;
-        nrx_tick_now(&st, st.nrx);
-        nrx_tick_now(&st, st.nrx);
-        nrx_tick_now(&st, st.nrx);
+        hisi_nrx_on_iso(&st, g_iso);
+        hisi_nrx_on_iso(&st, g_iso);
+        hisi_nrx_on_iso(&st, g_iso);
         assert(log_count("failed three times running") == 1);
         assert(st.nrx->engine == 0);
         g_nrx_set_fail = false;
-        st.nrx->next_tick_ns = 0;
-        hisi_nrx_tick(&st);
+        st.iso_tick_ns = 0;
+        hisi_dyn_tick(&st);
         assert(g_nrx_set_calls == 9); /* the three failed writes, none after */
+        /* ...while the ISP engines, untroubled, followed AE back down */
+        assert(g_drc.manual_strength == 420 && g_dehaze.auto_strength == 58);
     }
-    assert(g_gamma.table[0] == 0);
-    assert(g_gamma.table[1024] == 1024 % 4096);
-    assert(g_gamma.table[512] == 512);
 
-    /* one Set per touched module, and only touched modules */
-    assert(g_sets == 10);
-    /* a well-formed file trips none of the refusals load 2 is about */
-    assert(log_count("truncated") == 0);
-    assert(log_count("not applied") == 0);
-    assert(log_count("module skipped") == 0);
+    /* the latch is one-shot: a second frame reloads nothing, and the tick
+     * behind it is not due */
+    {
+        int sets = g_sets;
 
-    /* the latch is one-shot: a second frame reloads nothing */
-    hisi_isp_note_frame(&st);
-    assert(g_sets == 10);
+        hisi_isp_note_frame(&st);
+        assert(g_sets == sets);
+    }
 
     unlink(path);
 }
@@ -875,11 +919,14 @@ static void load_vendor_failures(void)
     assert(g_exp.auto_attr.speed == 0);
     assert(g_dpc.enable == 0);
 
-    /* Eight modules were fetched and dirtied; dpc has no Set to call, so
-     * seven are attempted, of which exp fails. */
-    assert(g_set_calls == 7);
-    assert(g_sets == 6);
-    assert(log_count("7 modules applied, 2 failed") == 1);
+    /* Eight static modules were fetched and dirtied; dpc has no Set to
+     * call, so seven are attempted, of which exp fails. Then the engines:
+     * DRC and dehaze write, gamma's Get fails before its Set. With the
+     * 3DNR ladder that is nine applied, and exp, dpc, gamma failed. */
+    assert(g_set_calls == 9);
+    assert(g_sets == 8);
+    assert(log_count("9 modules applied, 3 failed") == 1);
+    assert(log_count("skipped: all_param ir_* dynamic_gamma(Get failed)") == 1);
 
     /* The undisturbed ones still went through */
     assert(g_nr.enable == 1);
@@ -940,8 +987,8 @@ static void load_nrx_edges(void)
     assert(g_nrx_blk[0].nrc.sfc == 60 && g_nrx_blk[0].sfy[0].sbsk[0] == 1234);
     assert(log_count("no ISO query") == 1);
     assert(st.nrx->engine == 0);
-    st.nrx->next_tick_ns = 0;
-    hisi_nrx_tick(&st);
+    st.iso_tick_ns = 0;
+    hisi_dyn_tick(&st);
     assert(g_nrx_set_calls == 1);
     unlink(path);
 
@@ -976,6 +1023,212 @@ static void load_nrx_edges(void)
     unlink(path);
 
     hisi_nrx_free(&st);
+    hisi_dyn_free(&st);
+}
+
+/* ================================================================
+ * LOAD 5 -- the dynamic ISP sections: blends, the gamma fade, the stops
+ * ================================================================ */
+
+static void write_ini_dyn(char *path, const char *iso_level, const char *strength)
+{
+    FILE *f = open_tmp(path);
+    int i;
+
+    fprintf(f,
+            "[static_drc]\n"
+            "DRCOpType = \"0\"\n" /* auto: Strength goes to the auto field */
+            "[dynamic_linear_drc]\n"
+            "Enable = \"1\"\n"
+            "IsoLevel = \"%s\"\n"
+            "Strength = \"%s\"\n"
+            "DetailAdjustFactor = \"8, 8, -4\"\n"
+            "[dynamic_dehaze]\n"
+            "IsoThresh = \"100, 200, 400\"\n"
+            "AutoDehazeStr = \"58, 65, 90\"\n"
+            "[dynamic_gamma]\n"
+            "TotalNum = \"3\"\n"
+            "Interval = \"4\"\n"
+            "gammaExpThreshHtoL = \"400000, 800000, 1600000\"\n",
+            iso_level, strength);
+    fputs("Table_0 = \\\n", f);
+    for (i = 0; i < V4_ISP_GAMMA_NODES; i++)
+        fprintf(f, "%d%s", i % 4096, i == V4_ISP_GAMMA_NODES - 1 ? "\n" : (i % 30 == 29 ? ",\\\n" : ","));
+    fputs("Table_1 = \\\n", f);
+    for (i = 0; i < V4_ISP_GAMMA_NODES; i++)
+        fprintf(f, "%d%s", i / 2, i == V4_ISP_GAMMA_NODES - 1 ? "\n" : (i % 30 == 29 ? ",\\\n" : ","));
+    fputs("Table_2 = \\\n", f);
+    for (i = 0; i < V4_ISP_GAMMA_NODES; i++)
+        fprintf(f, "%d%s", i / 4, i == V4_ISP_GAMMA_NODES - 1 ? "\n" : (i % 30 == 29 ? ",\\\n" : ","));
+    fclose(f);
+}
+
+static void load_dyn(void)
+{
+    static hisi_state_t st;
+    char path[32];
+    int sets;
+
+    /* The blends: the sample's rounding linear interpolation in ISO, the
+     * end columns holding past the ends, and no write for an ISO on the
+     * same MapISO step. */
+    reset_all(&st);
+    write_ini_dyn(path, "100, 200, 400", "420, 380, 100");
+    snprintf(st.iq_file, sizeof(st.iq_file), "%s", path);
+    hisi_isp_note_frame(&st);
+    assert(g_drc.enable == 1 && g_drc.op_type == 0);
+    assert(g_drc.auto_strength == 420 && g_drc.manual_strength == 0);
+    assert(g_dehaze.auto_strength == 58);
+    assert(g_gamma.table[1024] == 1024 && g_gamma.curve_type == V4_ISP_GAMMA_CURVE_USER);
+    assert(g_sets == 4 && st.dyn->engine == 1); /* static_drc, and the three engines */
+    assert(log_count("4 modules applied") == 1);
+
+    hisi_dyn_on_exposure(&st, 150, 1500); /* halfway in ISO between the first two */
+    assert(g_drc.auto_strength == 400 && g_drc.detail_adjust_factor == 8);
+    assert(g_dehaze.auto_strength == 62);
+    assert(g_sets == 6);
+    hisi_dyn_on_exposure(&st, 300, 3000); /* halfway between the last two; signed row */
+    assert(g_drc.auto_strength == 240 && g_drc.detail_adjust_factor == 2);
+    assert(g_dehaze.auto_strength == 78);
+    assert(log_count("drc: ISO 150 -> 300, now below column 2 (ISO 400); strength 240") == 1);
+    sets = g_sets;
+    hisi_dyn_on_exposure(&st, 305, 3050); /* same step: nothing */
+    assert(g_sets == sets);
+    hisi_dyn_on_exposure(&st, 50000, 500); /* past the top: the top column */
+    assert(g_drc.auto_strength == 100 && g_drc.detail_adjust_factor == -4);
+    assert(g_dehaze.auto_strength == 90);
+
+    /* The gamma fade: exposure into the second band starts a four-step
+     * fade from the curve on the wire toward Table_1, one step per call;
+     * the last step lands exactly. A retarget mid-fade fades from where
+     * the curve got to. */
+    assert(g_gamma.table[1024] == 1024);
+    hisi_dyn_on_exposure(&st, 50000, 500000);
+    assert(log_count("gamma: exposure 500 -> 500000, table 0 -> 1, fading over 4 steps") == 1);
+    assert(g_gamma.table[1024] == 896 && g_gamma.table[0] == 0);
+    assert(st.dyn->gamma.fade_i == 1);
+    hisi_dyn_on_exposure(&st, 50000, 500000);
+    assert(g_gamma.table[1024] == 768);
+    hisi_dyn_on_exposure(&st, 50000, 500000);
+    assert(g_gamma.table[1024] == 640);
+    hisi_dyn_on_exposure(&st, 50000, 500000);
+    assert(g_gamma.table[1024] == 512 && st.dyn->gamma.fade_i == 0);
+    sets = g_sets;
+    hisi_dyn_on_exposure(&st, 50000, 500000); /* settled: no write */
+    assert(g_sets == sets);
+    hisi_dyn_on_exposure(&st, 50000, 2000000); /* the third band */
+    assert(g_gamma.table[1024] == 448);
+    hisi_dyn_on_exposure(&st, 50000, 1000); /* back to the first, mid-fade */
+    assert(log_count("table 2 -> 0, fading over 4 steps") == 1);
+    assert(g_gamma.table[1024] == 592); /* 448 + (1024 - 448) / 4 */
+    /* the tick runs the fade at 100 ms rather than a second */
+    st.iso_tick_ns = 0;
+    g_iso = 50000;
+    g_exp_time = 2; /* exposure 1000 */
+    hisi_dyn_tick(&st);
+    assert(g_gamma.table[1024] == 736);
+    assert(st.iso_tick_ns > 0);
+    {
+        struct timespec ts;
+        long long now;
+
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        now = (long long)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+        assert(st.iso_tick_ns - now < 200000000LL);
+    }
+    hisi_dyn_on_exposure(&st, 50000, 1000);
+    hisi_dyn_on_exposure(&st, 50000, 1000);
+    assert(g_gamma.table[1024] == 1024 && st.dyn->gamma.fade_i == 0);
+
+    /* Three failed writes running stop that engine and only that one. */
+    g_set_fail[M_DRC] = true;
+    hisi_dyn_on_exposure(&st, 100, 1000);
+    hisi_dyn_on_exposure(&st, 200, 2000);
+    hisi_dyn_on_exposure(&st, 400, 4000);
+    assert(log_count("drc: HI_MPI_ISP_SetDRCAttr failed three times running") == 1);
+    assert(st.dyn->drc.engine == 0 && st.dyn->dehaze.engine == 1 && st.dyn->engine == 1);
+    assert(g_dehaze.auto_strength == 90);
+    g_set_fail[M_DRC] = false;
+    sets = g_sets;
+    hisi_dyn_on_exposure(&st, 100, 1000);
+    assert(g_dehaze.auto_strength == 58 && g_drc.auto_strength == 100); /* DRC stayed */
+    g_get_fail[M_GAMMA] = true;
+    hisi_dyn_on_exposure(&st, 100, 500000);
+    hisi_dyn_on_exposure(&st, 100, 500000);
+    hisi_dyn_on_exposure(&st, 100, 500000);
+    assert(log_count("gamma: HI_MPI_ISP_GetGammaAttr failed three times running") == 1);
+    assert(st.dyn->gamma.engine == 0 && st.dyn->engine == 1);
+    g_get_fail[M_GAMMA] = false;
+    g_set_fail[M_DEHAZE] = true;
+    hisi_dyn_on_exposure(&st, 200, 1000);
+    hisi_dyn_on_exposure(&st, 400, 1000);
+    hisi_dyn_on_exposure(&st, 800, 1000);
+    assert(st.dyn->dehaze.engine == 0 && st.dyn->engine == 0);
+    st.iso_tick_ns = 0;
+    sets = g_sets;
+    hisi_dyn_tick(&st); /* every engine stopped: the tick does not even ask */
+    assert(g_sets == sets);
+    unlink(path);
+
+    /* No way to ask AE: the first column and the first table go in once,
+     * nothing is armed. */
+    reset_all(&st);
+    st.tune.query_exp = NULL;
+    write_ini_dyn(path, "100, 200, 400", "420, 380, 100");
+    snprintf(st.iq_file, sizeof(st.iq_file), "%s", path);
+    hisi_isp_note_frame(&st);
+    assert(g_drc.auto_strength == 420 && g_dehaze.auto_strength == 58);
+    assert(g_gamma.table[1024] == 1024);
+    assert(log_count("no ISO query, first column at ISO 100, strength 420") == 1);
+    assert(log_count("no ISO query, first at exposure 0, table 0 written") == 1);
+    assert(st.dyn->engine == 0);
+    unlink(path);
+
+    /* A ladder that is not ascending is cut at the fault; a row shorter
+     * than the ladder shortens it. */
+    reset_all(&st);
+    write_ini_dyn(path, "100, 400, 200", "420, 380");
+    snprintf(st.iq_file, sizeof(st.iq_file), "%s", path);
+    hisi_isp_note_frame(&st);
+    assert(log_count("IsoLevel not ascending at entry 2 (200 after 400); truncating to 2") == 1);
+    assert(log_count("Strength has 2 of 2 columns") == 0);
+    assert(st.dyn->drc.n == 2);
+    hisi_dyn_on_exposure(&st, 50000, 1000);
+    assert(g_drc.auto_strength == 380 && g_drc.detail_adjust_factor == 8);
+    unlink(path);
+
+    reset_all(&st);
+    write_ini_dyn(path, "100, 200, 400", "420");
+    snprintf(st.iq_file, sizeof(st.iq_file), "%s", path);
+    hisi_isp_note_frame(&st);
+    assert(log_count("Strength has 1 of 3 columns; using 1") == 1);
+    assert(st.dyn->drc.n == 1 && st.dyn->drc.engine == 0);
+    assert(st.dyn->dehaze.engine == 1); /* the other engines are unaffected */
+    unlink(path);
+
+    /* A load-time write failing counts as a failed module by name, and
+     * the engines that did write still run. */
+    reset_all(&st);
+    g_set_fail[M_DEHAZE] = true;
+    write_ini_dyn(path, "100, 200, 400", "420, 380, 100");
+    snprintf(st.iq_file, sizeof(st.iq_file), "%s", path);
+    hisi_isp_note_frame(&st);
+    assert(log_count("[dynamic_dehaze] SetDehazeAttr failed") == 1);
+    assert(log_count("3 modules applied, 1 failed; skipped: dynamic_dehaze(Set failed)") == 1);
+    assert(st.dyn->dehaze.engine == 0 && st.dyn->drc.engine == 1);
+    unlink(path);
+
+    /* No dynamic section at all: nothing allocated, nothing counted. */
+    reset_all(&st);
+    write_ini_nrx(path, false, "100, 400", false);
+    snprintf(st.iq_file, sizeof(st.iq_file), "%s", path);
+    hisi_isp_note_frame(&st);
+    assert(st.dyn == NULL);
+    assert(g_sets == 0);
+    unlink(path);
+
+    hisi_nrx_free(&st);
+    hisi_dyn_free(&st);
 }
 
 int main(void)
@@ -984,6 +1237,7 @@ int main(void)
     load_bad();
     load_vendor_failures();
     load_nrx_edges();
+    load_dyn();
 
     printf("t_hisi_iq: OK\n");
     return 0;

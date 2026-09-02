@@ -45,17 +45,15 @@
  * The SDK's own scene_auto sample never tries it; it reads the ISO from AE
  * (HI_MPI_ISP_QueryExposureInfo), interpolates between the two rungs
  * either side of it, and writes MANUAL. That is what this does, from
- * hisi_nrx_tick off the encoder's frame hook, once a second, and only when
- * the ISO has moved a step (the sample's MapISO, about six per stop).
- * Without the query symbol the ISO 100 rung goes in once and stays, which
- * is the daylight baseline hal_isp.c applies to the dynamic ISP sections.
+ * hal_dyn.c's once-a-second ISO tick off the encoder's frame hook
+ * (hisi_nrx_on_iso), and only when the ISO has moved a step (the sample's
+ * MapISO, about six per stop -- hisi_iso_map, which lives there with the
+ * query and the blend the dynamic ISP sections share). Without the query
+ * symbol the ISO 100 rung goes in once and stays.
  *
  * Copyright (C) 2026 Thingino Project
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
-
-/* clock_gettime and CLOCK_MONOTONIC, under -std=c11. */
-#define _POSIX_C_SOURCE 200809L
 
 #include <ctype.h>
 #include <stdbool.h>
@@ -64,7 +62,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
-#include <time.h>
 
 #include "hisi_state.h"
 
@@ -249,8 +246,6 @@ struct hisi_nrx_set {
     unsigned int last_iso;
     int last_lvl;              /* rung index the ISO fell on or below; -1 = none */
     int set_failures;          /* consecutive; three stops the engine */
-    long long next_tick_ns;
-    char busy;                 /* one tick at a time, across encoder threads */
     char engine;
     nrx_x cur;                 /* interpolation scratch */
     v4_vpss_nrx_v3 cur_blk;
@@ -599,43 +594,8 @@ bool hisi_nrx_key(hisi_state_t *st, const char *key, const char *val)
 }
 
 /* ================================================================
- * THE ISO AXIS -- the sample's MapISO and its interpolation, verbatim
- * ================================================================
- *
- * MapISO turns an ISO into a step index, about six steps per stop with
- * ISO 100 at 0, so interpolation is linear in stops rather than in ISO.
- * SCENE_Interpulate is the sample's rounding linear blend.
- */
-
-static unsigned nrx_map_iso(unsigned iso)
-{
-    unsigned i, j;
-
-    if (iso < 100)
-        iso = 100; /* the driver's own floor for u32ISO */
-    i = (iso >= 200);
-    i += (iso >= (200u << 1)) + (iso >= (400u << 1)) + (iso >= (400u << 2)) + (iso >= (400u << 3)) +
-         (iso >= (400u << 4));
-    i += (iso >= (400u << 5)) + (iso >= (400u << 6)) + (iso >= (400u << 7)) + (iso >= (400u << 8)) +
-         (iso >= (400u << 9));
-    i += (iso >= (400u << 10)) + (iso >= (400u << 11)) + (iso >= (400u << 12)) +
-         (iso >= (400u << 13)) + (iso >= (400u << 14));
-    j = (iso > (112u << i)) + (iso > (125u << i)) + (iso > (141u << i)) + (iso > (158u << i)) +
-        (iso > (178u << i));
-    return i * 6 + j + (iso >= 80) + (iso >= 90) + (iso >= 100) - 3;
-}
-
-static unsigned nrx_lerp(unsigned mid, unsigned left, unsigned lv, unsigned right, unsigned rv)
-{
-    unsigned k;
-
-    if (mid <= left)
-        return lv;
-    if (mid >= right)
-        return rv;
-    k = right - left;
-    return ((right - mid) * lv + (mid - left) * rv + (k >> 1)) / k;
-}
+ * SELECTION -- on hal_dyn.c's ISO axis (hisi_iso_map, hisi_iso_lerp)
+ * ================================================================ */
 
 /*
  * nrx_select -- the parsed shape for this ISO: a rung, or the blend of the
@@ -660,32 +620,14 @@ static int nrx_select(struct hisi_nrx_set *set, unsigned iso, nrx_x *out)
         *out = set->x[n - 1];
         return n - 1;
     }
-    mid = nrx_map_iso(iso);
-    left = nrx_map_iso(set->iso[lvl - 1]);
-    right = nrx_map_iso(set->iso[lvl]);
+    mid = hisi_iso_map(iso);
+    left = hisi_iso_map(set->iso[lvl - 1]);
+    right = hisi_iso_map(set->iso[lvl]);
     lo = (const unsigned *)&set->x[lvl - 1];
     hi = (const unsigned *)&set->x[lvl];
     for (i = 0; i < sizeof(nrx_x) / sizeof(unsigned); i++)
-        o[i] = nrx_lerp(mid, left, lo[i], right, hi[i]);
+        o[i] = hisi_iso_lerp(mid, left, lo[i], right, hi[i]);
     return lvl;
-}
-
-/* The ISO AE is at now, or 0 when there is no way to ask. */
-static unsigned nrx_query_iso(hisi_state_t *st)
-{
-    v4_isp_exp_info *info;
-    unsigned iso = 0;
-
-    if (!st->tune.query_exp)
-        return 0;
-    /* 5 KB, most of it a histogram; not a stack frame for an encoder thread. */
-    info = calloc(1, sizeof(*info));
-    if (!info)
-        return 0;
-    if (st->tune.query_exp(HISI_VI_PIPE, info) == 0)
-        iso = info->iso;
-    free(info);
-    return iso;
 }
 
 /* Blend, pack over the base, write. */
@@ -712,7 +654,7 @@ static int nrx_write(hisi_state_t *st, struct hisi_nrx_set *set, unsigned iso)
                          set->iso[lvl], set->cur_blk.nrc.sfc, set->cur_blk.tfy[1].tfs0);
         set->last_lvl = lvl;
         set->last_iso = iso;
-        set->last_map = nrx_map_iso(iso);
+        set->last_map = hisi_iso_map(iso);
         set->set_failures = 0;
     }
     return ret;
@@ -795,7 +737,8 @@ int hisi_nrx_apply(hisi_state_t *st, char *note, size_t note_len)
     set->base = base.v3.manual;
     set->last_lvl = -1;
 
-    iso = nrx_query_iso(st);
+    if (!hisi_iso_query(st, &iso, NULL))
+        iso = 0;
     ret = nrx_write(st, set, iso ? iso : set->iso[0]);
     if (ret) {
         HAL_LOG_WARN("isp tuning: [static_3dnr] HI_MPI_VPSS_SetGrpNRXParam(%d) failed: 0x%x; "
@@ -819,21 +762,25 @@ int hisi_nrx_apply(hisi_state_t *st, char *note, size_t note_len)
     return 1;
 }
 
-static long long nrx_now_ns(void)
+/* Whether the tick has anything to feed here. */
+bool hisi_nrx_armed(hisi_state_t *st)
 {
-    struct timespec ts;
-
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (long long)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+    return st->nrx && __atomic_load_n(&st->nrx->engine, __ATOMIC_ACQUIRE);
 }
 
-/* The tick's body, without the clock: the host test calls this directly. */
-static void nrx_tick_now(hisi_state_t *st, struct hisi_nrx_set *set)
+/*
+ * hisi_nrx_on_iso -- the ladder, given AE's ISO: from hal_dyn.c's tick
+ * once a second, or the host test directly. A write when the ISO has
+ * moved a MapISO step; three failed writes running stop the engine.
+ */
+void hisi_nrx_on_iso(hisi_state_t *st, unsigned iso)
 {
-    unsigned iso = nrx_query_iso(st);
+    struct hisi_nrx_set *set = st->nrx;
     int ret;
 
-    if (!iso || nrx_map_iso(iso) == set->last_map)
+    if (!set || !__atomic_load_n(&set->engine, __ATOMIC_ACQUIRE))
+        return;
+    if (!iso || hisi_iso_map(iso) == set->last_map)
         return;
     ret = nrx_write(st, set, iso);
     if (ret == 0) {
@@ -847,26 +794,4 @@ static void nrx_tick_now(hisi_state_t *st, struct hisi_nrx_set *set)
                      ret, set->last_iso);
         __atomic_store_n(&set->engine, 0, __ATOMIC_RELEASE);
     }
-}
-
-/*
- * hisi_nrx_tick -- from the encoder's frame hook, every frame, every
- * thread. Cheap until a second has passed; then one thread asks AE for
- * the ISO and moves the rung if it has stepped.
- */
-void hisi_nrx_tick(hisi_state_t *st)
-{
-    struct hisi_nrx_set *set = st->nrx;
-    long long now;
-
-    if (!set || !__atomic_load_n(&set->engine, __ATOMIC_ACQUIRE))
-        return;
-    now = nrx_now_ns();
-    if (now < set->next_tick_ns)
-        return;
-    if (__atomic_test_and_set(&set->busy, __ATOMIC_ACQ_REL))
-        return;
-    set->next_tick_ns = now + 1000000000LL;
-    nrx_tick_now(st, set);
-    __atomic_clear(&set->busy, __ATOMIC_RELEASE);
 }

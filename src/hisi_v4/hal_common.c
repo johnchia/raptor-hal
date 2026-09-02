@@ -2485,6 +2485,7 @@ err_free:
                     sizeof(*st));
     else {
         hisi_nrx_free(st);
+        hisi_dyn_free(st);
         free(st);
     }
     c->platform = NULL;
@@ -2593,6 +2594,7 @@ static int hal_deinit(void *ctx)
                     sizeof(*st));
     else {
         hisi_nrx_free(st);
+        hisi_dyn_free(st);
         free(st);
     }
     c->platform = NULL;

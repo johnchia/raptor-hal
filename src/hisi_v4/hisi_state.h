@@ -529,6 +529,12 @@ typedef struct {
      * Heap, and kept for the process's life, because the AUTO form hands
      * the driver pointers into it. */
     struct hisi_nrx_set *nrx;
+    /* [dynamic_linear_drc], [dynamic_dehaze], [dynamic_gamma]: the per-ISO
+     * ISP engines, hal_dyn.c. Its tick is the one clock for every engine
+     * that follows AE -- the 3DNR ladder above included. */
+    struct hisi_dyn_set *dyn;
+    long long iso_tick_ns; /* the tick's next due time, CLOCK_MONOTONIC */
+    char iso_busy;         /* one tick at a time, across encoder threads */
 
     /*
      * Phase 4 -- audio. One AI device, one channel, one frame in flight;
@@ -751,8 +757,20 @@ void hisi_isp_note_frame(hisi_state_t *st);
 /* hal_nrx.c -- the [static_3dnr] section (VPSS 3DNR X-params). */
 bool hisi_nrx_key(hisi_state_t *st, const char *key, const char *val);
 int hisi_nrx_apply(hisi_state_t *st, char *note, size_t note_len);
-void hisi_nrx_tick(hisi_state_t *st);
+bool hisi_nrx_armed(hisi_state_t *st);
+void hisi_nrx_on_iso(hisi_state_t *st, unsigned iso);
 void hisi_nrx_free(hisi_state_t *st);
+
+/* hal_dyn.c -- the dynamic ISP sections, and the ISO tick that drives
+ * them and the ladder above. The axis helpers are the SDK sample's. */
+unsigned hisi_iso_map(unsigned iso);
+unsigned hisi_iso_lerp(unsigned mid, unsigned left, unsigned lv, unsigned right, unsigned rv);
+bool hisi_iso_query(hisi_state_t *st, unsigned *iso, unsigned long long *exposure);
+bool hisi_dyn_key(hisi_state_t *st, const char *sect, const char *key, const char *val);
+int hisi_dyn_apply(hisi_state_t *st, int *failed, char *note, size_t note_len);
+void hisi_dyn_on_exposure(hisi_state_t *st, unsigned iso, unsigned long long exposure);
+void hisi_dyn_tick(hisi_state_t *st);
+void hisi_dyn_free(hisi_state_t *st);
 
 /* The __ctype_b/mmap trampoline verification in hal_common.c. Exposed
  * because there are two entry points that reach the first vendor dlopen:
