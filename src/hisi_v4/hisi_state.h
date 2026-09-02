@@ -721,6 +721,7 @@ int hal_enc_query(void *ctx, int chn, bool *busy);
 int hal_enc_get_fd(void *ctx, int chn);
 
 void hisi_enc_release_all(hisi_state_t *st);
+int hisi_venc_max_chn(char *src, size_t src_len);
 
 /* OSD == RGN overlays attached to a VENC channel -- src/hisi_v4/hal_osd.c.
  * The OP COVERAGE block at the top of that file argues each absence. */

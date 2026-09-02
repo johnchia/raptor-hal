@@ -29,7 +29,10 @@
  *   max_enc_channels   3   /proc/umap/venc reports VencMaxChnNum = 3 as a
  *                          module parameter. That is a driver-level cap, well
  *                          under RVD_MAX_STREAMS, and it is a real number
- *                          rather than a header constant.
+ *                          rather than a header constant. It is also the
+ *                          number OpenIPC's load_hisilicon passed, so hal_init
+ *                          reads the parameter back from sysfs and publishes
+ *                          what this image loaded; 3 is the fallback.
  *
  *   max_fs_channels    2   A floor, not a ceiling, and the one number here
  *                          that is expected to rise. Two VPSS channels were

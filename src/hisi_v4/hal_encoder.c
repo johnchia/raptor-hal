@@ -76,6 +76,48 @@
 
 #include <sys/select.h>
 #include <unistd.h>
+#include <dirent.h>
+
+/*
+ * hisi_venc_max_chn -- how many encoder channels the loaded driver has.
+ *
+ * VencMaxChnNum is a parameter of the venc module (hi3516ev200_venc on a
+ * vendor kernel, open_venc on OpenIPC's) and reads back from sysfs. OpenIPC's
+ * load_hisilicon passes 3, the vendor's load script passes nothing, and the
+ * header says 16: the number in caps_hisilicon.inc is what was measured on
+ * one image, not what this image loaded. Returns the parameter, or -1 when
+ * no module ending in "venc" publishes one; src names the file read.
+ */
+int hisi_venc_max_chn(char *src, size_t src_len)
+{
+    static const char *suffix = "venc";
+    DIR *dir = opendir("/sys/module");
+    struct dirent *de;
+    int ret = -1;
+
+    if (!dir)
+        return -1;
+
+    while (ret < 0 && (de = readdir(dir))) {
+        char path[192];
+        char line[32];
+        size_t n = strlen(de->d_name);
+        FILE *f;
+
+        if (n < strlen(suffix) || strcmp(de->d_name + n - strlen(suffix), suffix) != 0)
+            continue;
+        snprintf(path, sizeof(path), "/sys/module/%s/parameters/VencMaxChnNum", de->d_name);
+        if (!(f = fopen(path, "r")))
+            continue;
+        if (fgets(line, sizeof(line), f) && atoi(line) > 0) {
+            ret = atoi(line);
+            snprintf(src, src_len, "%s", path);
+        }
+        fclose(f);
+    }
+    closedir(dir);
+    return ret;
+}
 
 /* ================================================================
  * CHANNEL LOOKUP

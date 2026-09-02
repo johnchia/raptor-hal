@@ -2419,6 +2419,30 @@ static int hal_init(void *ctx, const rss_multi_sensor_config_t *cfg)
         goto err_unload;
     /* The mode load is where a name the config left out gets resolved. */
     snprintf(st->sensor_name, sizeof(st->sensor_name), "%s", st->mode.name);
+
+    /*
+     * The encoder channel count is whatever the venc module was loaded
+     * with, and rvd sizes its snapshot channels by caps, so the context's
+     * copy of caps is corrected here from the module parameter. The table's
+     * number stands when no module publishes one. Capped at this backend's
+     * own array, which is raptor's ceiling rather than the driver's.
+     */
+    {
+        char src[192];
+        int n = hisi_venc_max_chn(src, sizeof(src));
+
+        if (n > 0) {
+            if (n > HISI_VENC_CHN_NUM) {
+                HAL_LOG_INFO("venc: %d channels in %s, using this backend's %d", n, src,
+                             HISI_VENC_CHN_NUM);
+                n = HISI_VENC_CHN_NUM;
+            } else if (n != c->caps.max_enc_channels) {
+                HAL_LOG_INFO("venc: %d channels (%s; caps table said %d)", n, src,
+                             c->caps.max_enc_channels);
+            }
+            c->caps.max_enc_channels = n;
+        }
+    }
 #endif
 
 #ifdef HAL_MODULE_VIDEO
