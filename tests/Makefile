@@ -188,8 +188,24 @@ else
 	@echo "abi-check-i6c: IQ table matches the vendor headers"
 endif
 
+# The gen4 (HiMPP V4.0) layouts. Different shape of check: the v4_*.h
+# headers are self-contained transcriptions with their offsets pinned by
+# _Static_assert, so there is no SDK to compile against -- but the asserts
+# describe 32-bit ARM EABI and are defined away in HISI_CFLAGS above, which
+# means the host suite never runs them. This target compiles them live with
+# the ARM cross-compiler; it needs CROSS_COMPILE and nothing else.
+abi-check-hisi:
+ifeq ($(CROSS_COMPILE),)
+	@echo "abi-check-hisi: skipped, set CROSS_COMPILE=arm-openipc-linux-musleabi-"
+else
+	$(ABI_CC) -Wall -Wextra -std=c11 -DPLATFORM_HI3516EV300=1 \
+	    -I../src/hisi_v4 -I../src -I../include -I../../raptor-common/include \
+	    -c -o /dev/null abi_hisi.c
+	@echo "abi-check-hisi: gen4 ABI transcriptions hold ($$(grep -c _Static_assert ../src/hisi_v4/v4_*.h | awk -F: '{n+=$$2} END {print n}') asserts)"
+endif
+
 clean:
 	rm -f $(BINS)
 
-.PHONY: test clean abi-check abi-check-i6c test-isp_i6c test-enc_i6c \
+.PHONY: test clean abi-check abi-check-i6c abi-check-hisi test-isp_i6c test-enc_i6c \
 	$(addprefix test-,$(SUITES))
