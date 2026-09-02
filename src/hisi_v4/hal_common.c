@@ -2155,16 +2155,24 @@ static unsigned int hisi_vb_raw_size(unsigned int width, unsigned int height,
  * sensor-sized blocks the pipeline deadlocks: /proc/umap/vb shows Free 0
  * and MinFree 0 with all four blocks owned by VI, while /proc/umap/vpss
  * counts pictures arriving and none leaving. Nothing logs an error -- VI's
- * VbFail stays zero, because VI is not the module being refused. Six is
- * enough for VI and the group; the channel outputs need their own.
+ * VbFail stays zero, because VI is not the module being refused. The
+ * channel outputs need their own pool either way.
+ *
+ * Seven, not six, for pool 0. Six was a guess and it ran: VI and the
+ * group came up, but /proc/umap/vi showed VbFail climbing in step with
+ * LostFrame -- 5.2% of captured frames at 2592x1944, the pipe at 25-26
+ * fps against the sensor's 30, and a configured 20 fps producing 17. The
+ * vendor's streamer on the same board runs seven with VbFail flat at
+ * zero; matching it holds VI at 30 fps and 0.4%. Seven sensor blocks are
+ * 7.2 MiB each and fit only because pool 1 is sized separately.
  *
  * The counts cannot simply keep rising, and the reason is in
  * /proc/cmdline: this board runs mmz_allocator=cma, so a pool is one
- * contiguous CMA allocation. Six sensor blocks (45 MiB) succeed and seven
- * (53 MiB) fail with HI_MPI_VB_Init returning 0xa001800c, VB / NOMEM, on a
- * 96 MiB zone reporting 95 MiB free. Splitting the memory across two
- * smaller pools is therefore not only tighter, it is likelier to be
- * satisfiable at all.
+ * contiguous CMA allocation on a 96 MiB zone. An earlier single-pool
+ * layout with seven blocks of the combined size did fail HI_MPI_VB_Init
+ * with 0xa001800c (VB / NOMEM); splitting the memory across two smaller
+ * pools is what made seven satisfiable. An eighth would not fit beside
+ * pool 1 as it is sized today.
  */
 #define HISI_VB_BLK_CNT 7u
 
@@ -2312,6 +2320,10 @@ static int hal_init(void *ctx, const rss_multi_sensor_config_t *cfg)
             st->osd_src_fs[i] = -1;
         }
         st->vpss_crop_owner = -1;
+        /* The codec fd too: a video-only run of an audio-enabled build
+         * would otherwise close(0) in hal_deinit and ioctl(0, ...) from
+         * the volume and gain setters before audio_init opened it. */
+        st->acodec_fd = -1;
     }
 
     /*
