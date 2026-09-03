@@ -1231,6 +1231,82 @@ static void load_dyn(void)
     hisi_dyn_free(&st);
 }
 
+/* ---- the sensor rate: [sensor] fps over the mode INI's Isp_FrameRate ---- */
+
+static v4_isp_pub_attr g_pub;
+static int g_pub_gets, g_pub_sets, g_pub_set_fail;
+
+static int get_pub(int pipe, v4_isp_pub_attr *p)
+{
+    (void)pipe;
+    g_pub_gets++;
+    *p = g_pub;
+    return 0;
+}
+
+static int set_pub(int pipe, const v4_isp_pub_attr *p)
+{
+    (void)pipe;
+    g_pub_sets++;
+    if (g_pub_set_fail)
+        return 0xa01c0004;
+    g_pub = *p;
+    return 0;
+}
+
+static void sensor_fps(void)
+{
+    static hisi_state_t st;
+    rss_hal_ctx_t g_ctx;
+    uint32_t num = 0, den = 0;
+
+    memset(&g_ctx, 0, sizeof(g_ctx));
+    g_ctx.platform = &st;
+
+    /* Before the 3A thread runs, the set is a note in the mode: nothing to
+     * write yet, hisi_isp_bringup will build the attribute from it. */
+    reset_all(&st);
+    st.mode.frame_rate = 30;
+    assert(hal_isp_set_sensor_fps(&g_ctx, 20, 1) == RSS_OK);
+    assert(st.mode.frame_rate == 20 && g_pub_sets == 0);
+    assert(log_count("sensor: 20 fps for bring-up (the mode INI said 30)") == 1);
+    assert(hal_isp_get_sensor_fps(&g_ctx, &num, &den) == RSS_OK && num == 20 && den == 1);
+    assert(hal_isp_set_sensor_fps(&g_ctx, 0, 1) == RSS_ERR_INVAL);
+    assert(hal_isp_set_sensor_fps(&g_ctx, 1, 4) == RSS_ERR_INVAL);
+    assert(st.mode.frame_rate == 20);
+
+    /* Running: get-modify-set of the public attribute, the exact fraction
+     * in the attribute and the rounded whole in the mode. */
+    st.isp.fnGetPubAttr = get_pub;
+    st.isp.fnSetPubAttr = set_pub;
+    g_pub.frame_rate = 20.0f;
+    g_pub.bayer = 3;
+    st.isp_thread_running = 1;
+    assert(hal_isp_set_sensor_fps(&g_ctx, 25, 1) == RSS_OK);
+    assert(g_pub_gets == 1 && g_pub_sets == 1);
+    assert(g_pub.frame_rate == 25.0f && g_pub.bayer == 3 && st.mode.frame_rate == 25);
+    assert(log_count("sensor: 25/1 fps (the mode INI said 20)") == 1);
+    assert(hal_isp_get_sensor_fps(&g_ctx, &num, &den) == RSS_OK && num == 25000 && den == 1000);
+    assert(hal_isp_set_sensor_fps(&g_ctx, 25, 1) == RSS_OK && g_pub_sets == 1); /* same: no write */
+    assert(hal_isp_set_sensor_fps(&g_ctx, 59, 2) == RSS_OK);
+    assert(g_pub.frame_rate == 29.5f && st.mode.frame_rate == 30);
+
+    /* A refused write leaves the mode as it was. */
+    g_pub_set_fail = 1;
+    assert(hal_isp_set_sensor_fps(&g_ctx, 15, 1) == RSS_ERR_IO);
+    assert(g_pub.frame_rate == 29.5f && st.mode.frame_rate == 30);
+    assert(log_count("HI_MPI_ISP_SetPubAttr(15/1 fps) failed: 0xa01c0004") == 1);
+    g_pub_set_fail = 0;
+
+    /* Running without the optional GetPubAttr symbol: unsettable, and the
+     * get falls back to the mode. */
+    st.isp.fnGetPubAttr = NULL;
+    assert(hal_isp_set_sensor_fps(&g_ctx, 15, 1) == RSS_ERR_NOTSUP);
+    assert(hal_isp_get_sensor_fps(&g_ctx, &num, &den) == RSS_OK && num == 30 && den == 1);
+    st.isp_thread_running = 0;
+    st.isp.fnSetPubAttr = NULL;
+}
+
 int main(void)
 {
     load_good();
@@ -1238,6 +1314,7 @@ int main(void)
     load_vendor_failures();
     load_nrx_edges();
     load_dyn();
+    sensor_fps();
 
     printf("t_hisi_iq: OK\n");
     return 0;

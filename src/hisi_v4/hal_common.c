@@ -2793,13 +2793,16 @@ static const rss_hal_ops_t g_ops = {
     .enc_get_fd = hal_enc_get_fd,
 
     /*
-     * ISP. Phase 2 publishes the sensor-geometry accessor and nothing else:
-     * the tuning ops are Phase 3, and a knob published before its mapping
-     * is argued is a knob that quietly costs the tuning's own per-gain
-     * curve. Every one of them answers RSS_ERR_NOTSUP until then, which rvd
-     * reports as unsettable and rcd hides.
+     * ISP. Phase 2 publishes the sensor-geometry accessor and the sensor
+     * rate ([sensor] fps, through the ISP public attribute) and nothing
+     * else: the tuning ops are Phase 3, and a knob published before its
+     * mapping is argued is a knob that quietly costs the tuning's own
+     * per-gain curve. Every one of them answers RSS_ERR_NOTSUP until then,
+     * which rvd reports as unsettable and rcd hides.
      */
     .isp_get_sensor_attr = hal_isp_get_sensor_attr,
+    .isp_set_sensor_fps = hal_isp_set_sensor_fps,
+    .isp_get_sensor_fps = hal_isp_get_sensor_fps,
 
     /*
      * OSD == RGN overlays attached to a VENC channel

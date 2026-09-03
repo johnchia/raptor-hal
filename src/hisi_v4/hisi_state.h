@@ -755,6 +755,8 @@ void hisi_osd_release_all(hisi_state_t *st);
  * three live in hal_isp.c; resolve runs once from hal_init, note_frame is
  * the per-frame latch the encoder's frame loop pays one atomic test for. */
 int hal_isp_get_sensor_attr(void *ctx, uint32_t *width, uint32_t *height);
+int hal_isp_set_sensor_fps(void *ctx, uint32_t fps_num, uint32_t fps_den);
+int hal_isp_get_sensor_fps(void *ctx, uint32_t *fps_num, uint32_t *fps_den);
 void hisi_isp_resolve_iq(hisi_state_t *st);
 void hisi_isp_note_frame(hisi_state_t *st);
 

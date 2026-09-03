@@ -137,6 +137,96 @@ int hal_isp_get_sensor_attr(void *ctx, uint32_t *width, uint32_t *height)
     return RSS_OK;
 }
 
+/*
+ * hal_isp_set_sensor_fps / hal_isp_get_sensor_fps -- the sensor's rate.
+ *
+ * The mode INI's Isp_FrameRate was the only rate the pipeline knew: rvd
+ * read [sensor] fps, asked the backend, and the backend had no op, so the
+ * config key did nothing and the way to run a 30 fps mode at 20 was to
+ * patch the vendor's INI on the board. On gen4 the rate lives in the ISP's
+ * public attribute: the sensor driver's fps callback takes f32FrameRate
+ * from there and reprograms VMAX, and HI_MPI_ISP_SetPubAttr accepts a rate
+ * change on a running pipe (the geometry it refuses to change; the rate it
+ * does not). So the set is a get-modify-set of the public attribute once
+ * the 3A thread runs, and just a note in the mode before that --
+ * hisi_isp_bringup builds the attribute from the mode. The mode's copy is
+ * updated either way, because hal_framesource paces VPSS channels against
+ * it, and a channel asked for 20 fps against a sensor now at 20 should get
+ * no pacing rather than the INI's 30-to-20 drop.
+ *
+ * The mode keeps a whole number, rounded, because the INI's key is a whole
+ * number and every consumer of the mode's copy is an integer rate; the
+ * attribute itself gets the exact fraction.
+ */
+int hal_isp_set_sensor_fps(void *ctx, uint32_t fps_num, uint32_t fps_den)
+{
+    hisi_state_t *st = hisi_state(ctx);
+    int whole;
+
+    if (!st)
+        return RSS_ERR_INVAL;
+    if (!fps_num || !fps_den)
+        return RSS_ERR_INVAL;
+    whole = (int)((fps_num + fps_den / 2) / fps_den);
+    if (whole < 1)
+        return RSS_ERR_INVAL;
+
+    if (__atomic_load_n(&st->isp_thread_running, __ATOMIC_ACQUIRE)) {
+        v4_isp_pub_attr pub;
+        float fps = (float)fps_num / (float)fps_den;
+        int ret;
+
+        if (!st->isp.fnGetPubAttr || !st->isp.fnSetPubAttr)
+            return RSS_ERR_NOTSUP;
+        ret = st->isp.fnGetPubAttr(HISI_VI_PIPE, &pub);
+        if (ret) {
+            HAL_LOG_ERR("HI_MPI_ISP_GetPubAttr failed: 0x%x", ret);
+            return RSS_ERR_IO;
+        }
+        if (pub.frame_rate != fps) {
+            pub.frame_rate = fps;
+            ret = st->isp.fnSetPubAttr(HISI_VI_PIPE, &pub);
+            if (ret) {
+                HAL_LOG_ERR("HI_MPI_ISP_SetPubAttr(%u/%u fps) failed: 0x%x", fps_num, fps_den,
+                            ret);
+                return RSS_ERR_IO;
+            }
+            HAL_LOG_INFO("sensor: %u/%u fps (the mode INI said %d)", fps_num, fps_den,
+                         st->mode.frame_rate);
+        }
+    } else if (whole != st->mode.frame_rate) {
+        HAL_LOG_INFO("sensor: %d fps for bring-up (the mode INI said %d)", whole,
+                     st->mode.frame_rate);
+    }
+    st->mode.frame_rate = whole;
+    return RSS_OK;
+}
+
+int hal_isp_get_sensor_fps(void *ctx, uint32_t *fps_num, uint32_t *fps_den)
+{
+    hisi_state_t *st = hisi_state(ctx);
+
+    if (!st)
+        return RSS_ERR_INVAL;
+    if (!fps_num || !fps_den)
+        return RSS_ERR_INVAL;
+
+    if (__atomic_load_n(&st->isp_thread_running, __ATOMIC_ACQUIRE) && st->isp.fnGetPubAttr) {
+        v4_isp_pub_attr pub;
+
+        if (st->isp.fnGetPubAttr(HISI_VI_PIPE, &pub) == 0 && pub.frame_rate > 0.0f) {
+            *fps_num = (uint32_t)(pub.frame_rate * 1000.0f + 0.5f);
+            *fps_den = 1000;
+            return RSS_OK;
+        }
+    }
+    if (st->mode.frame_rate <= 0)
+        return RSS_ERR_NOTSUP;
+    *fps_num = (uint32_t)st->mode.frame_rate;
+    *fps_den = 1;
+    return RSS_OK;
+}
+
 /* ================================================================
  * IQ FILE RESOLUTION
  * ================================================================ */
