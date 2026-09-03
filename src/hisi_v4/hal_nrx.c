@@ -19,8 +19,9 @@
  *
  * THE FORMAT, AND WHY THIS IS A TOKENIZER AND NOT AN sscanf. The SDK
  * sample parses a block with one 45-line sscanf format whose literal
- * spacing is the whole grammar. Majestic's files carry two embedded tags
- * the sample's format does not know (-mode, -presfc), and an sscanf stops
+ * spacing is the whole grammar. The shipped files carry two embedded tags
+ * the sample's format does not know (-mode, -presfc -- fields the driver
+ * has and the SDK header does not name in its sscanf), and an sscanf stops
  * dead at the first mismatch, silently leaving everything after it zero.
  * So this reads the block as a token stream instead: a tag opens a row,
  * numbers fill the row's slots in order, '|' and the "(n)" annotations are
@@ -38,18 +39,31 @@
  * IEEn, MADZ, DZMode -- are the driver's own. Every block therefore starts
  * as a copy of what GetGrpNRXParam returns and has the text laid over it.
  *
- * MANUAL, WITH RAPTOR PICKING THE RUNG. The V3 parameter has an AUTO form
- * -- N blocks plus N ISO thresholds for the driver to pick from -- and the
- * EV300 driver refuses it: HI_MPI_VPSS_SetGrpNRXParam returns 0xa0078003
- * (ILLEGAL_PARAM) for the shipped nine-rung ladder, measured 2026-09-01.
- * The SDK's own scene_auto sample never tries it; it reads the ISO from AE
- * (HI_MPI_ISP_QueryExposureInfo), interpolates between the two rungs
- * either side of it, and writes MANUAL. That is what this does, from
- * hal_dyn.c's once-a-second ISO tick off the encoder's frame hook
- * (hisi_nrx_on_iso), and only when the ISO has moved a step (the sample's
- * MapISO, about six per stop -- hisi_iso_map, which lives there with the
- * query and the blend the dynamic ISP sections share). Without the query
- * symbol the ISO 100 rung goes in once and stays.
+ * AUTO IF THE DRIVER TAKES IT, MANUAL IF IT WILL NOT. The V3 parameter has
+ * an AUTO form -- N blocks plus N ISO thresholds, and the driver selects
+ * between them itself, once per frame, off the ISO it reads from the ISP.
+ * That is strictly better than doing it here: no once-a-second tick, no
+ * dependency on HI_MPI_ISP_QueryExposureInfo, and the selection happens on
+ * the frame rather than up to a second late. So AUTO is tried first.
+ *
+ * It used to fail with 0xa0078003 (ILLEGAL_PARAM), which read as "this
+ * driver does not do AUTO". It was not: stNRXAuto sits at +936 in the
+ * driver's VPSS_NRX_PARAM_V3_S and raptor was writing it at +928, so the
+ * driver read the pastNRXParam pointer as u32ParamNum and rejected the
+ * count. v4_vpss.h now carries the driver's layout, with the disassembly
+ * it came from. The fall-back stays, because a driver that really does
+ * refuse the form is a thing this backend should survive, and because the
+ * ladder can fail the driver's own AUTO-only rules (ISO in 100..3276800,
+ * strictly ascending, at most 16 rungs).
+ *
+ * The fall-back is the SDK's scene_auto sample: read the ISO from AE
+ * (HI_MPI_ISP_QueryExposureInfo), interpolate between the two rungs either
+ * side of it, and write MANUAL. It runs from hal_dyn.c's once-a-second ISO
+ * tick off the encoder's frame hook (hisi_nrx_on_iso), and only when the
+ * ISO has moved a step (the sample's MapISO, about six per stop --
+ * hisi_iso_map, which lives there with the query and the blend the dynamic
+ * ISP sections share). Without the query symbol the ISO 100 rung goes in
+ * once and stays.
  *
  * Copyright (C) 2026 Thingino Project
  * SPDX-License-Identifier: GPL-3.0-or-later
@@ -107,7 +121,7 @@ typedef struct {
 } nrx_x_mdy;
 
 typedef struct {
-    unsigned sfc, tfc, trc, tpc;
+    unsigned sfc, tfc, trc, tpc, mode, presfc;
 } nrx_x_nrc;
 
 typedef struct {
@@ -191,9 +205,9 @@ static const nrx_spec nrx_specs[] = {
     {"nXtfs", 1, false, false, 4, {TF4(tfs)}},
     {"nXtdz", 1, false, false, 4, {TF4(tdz)}},
     {"nXtdx", 1, false, false, 4, {TF4(tdx)}},
-    {"mode", 1, true, true, 1, {0}},   /* majestic-only; no V3 field */
+    {"mode", 1, true, false, 1, {O(nrc.mode)}},
     {"nXtfrs", 1, false, false, 1, {O(tfy[0].tfrs)}},
-    {"presfc", 1, true, true, 1, {0}}, /* majestic-only; no V3 field */
+    {"presfc", 1, true, false, 1, {O(nrc.presfc)}},
     /* -nXtfr0 spans two physical lines: [0..2] of each column, then -sfc
      * embedded, then [3..5] of each column, then -tfc. */
     {"nXtfr0", 1, false, false, 18,
@@ -522,6 +536,8 @@ static void nrx_pack(v4_vpss_nrx_v3 *d, const nrx_x *x)
     d->nrc.tfc = nrx_cl(x->nrc.tfc, 32);
     d->nrc.tpc = nrx_cl(x->nrc.tpc, 32);
     d->nrc.trc = nrx_cl(x->nrc.trc, 255);
+    d->nrc.mode = x->nrc.mode ? 1 : 0;
+    d->nrc.presfc = nrx_cl(x->nrc.presfc, 32);
 }
 
 /* ================================================================
@@ -661,6 +677,66 @@ static int nrx_write(hisi_state_t *st, struct hisi_nrx_set *set, unsigned iso)
 }
 
 /* ================================================================
+ * AUTO -- the whole ladder, and the driver does the selecting
+ * ================================================================ */
+
+/* VPSS_DRV_CopyNRXAutoParamFromUser's own bound on each threshold. Out of
+ * range it answers ILLEGAL_PARAM, which is the same code a dozen other
+ * things answer, so the check is worth making here where it can be named. */
+#define NRX_AUTO_ISO_MIN 100u
+#define NRX_AUTO_ISO_MAX 3276800u
+
+/*
+ * nrx_auto_try -- pack every rung and hand the driver the set.
+ *
+ * The driver copies the ISO array and the blocks into the group before it
+ * returns, so neither has to outlive the call. Returns true when it took
+ * them; *err is the driver's code when it answered one, and 0 when the
+ * ladder never went in.
+ */
+static bool nrx_auto_try(hisi_state_t *st, struct hisi_nrx_set *set, int *err)
+{
+    v4_vpss_grp_nrx_param param;
+    v4_vpss_nrx_v3 *blocks;
+    int i, ret;
+
+    *err = 0;
+    for (i = 0; i < set->n; i++)
+        if (set->iso[i] < NRX_AUTO_ISO_MIN || set->iso[i] > NRX_AUTO_ISO_MAX) {
+            HAL_LOG_INFO("isp tuning: [static_3dnr] IsoThresh entry %d is %u, outside the "
+                         "driver's AUTO range %u..%u",
+                         i, set->iso[i], NRX_AUTO_ISO_MIN, NRX_AUTO_ISO_MAX);
+            return false;
+        }
+
+    blocks = calloc((size_t)set->n, sizeof(*blocks));
+    if (!blocks)
+        return false;
+    for (i = 0; i < set->n; i++) {
+        blocks[i] = set->base;
+        nrx_pack(&blocks[i], &set->x[i]);
+    }
+
+    memset(&param, 0, sizeof(param));
+    param.nr_ver = V4_VPSS_NR_V3;
+    param.v3.opt_mode = V4_OPERATION_MODE_AUTO;
+    /* Unread in this mode, but a group's parameter is one object and
+     * leaving half of it zeroed is not a description of anything. */
+    param.v3.manual = set->base;
+    param.v3.auto_.param_num = (unsigned int)set->n;
+    param.v3.auto_.iso = set->iso;
+    param.v3.auto_.params = blocks;
+
+    ret = st->vpss.fnSetGrpNRXParam(HISI_VPSS_GRP, &param);
+    free(blocks);
+    if (ret) {
+        *err = ret;
+        return false;
+    }
+    return true;
+}
+
+/* ================================================================
  * APPLY, AND THE TICK
  * ================================================================ */
 
@@ -736,6 +812,22 @@ int hisi_nrx_apply(hisi_state_t *st, char *note, size_t note_len)
     }
     set->base = base.v3.manual;
     set->last_lvl = -1;
+
+    /* AUTO first. Nothing is armed on this path: the driver has the whole
+     * ladder and picks per frame, so there is no tick to run. */
+    if (nrx_auto_try(st, set, &ret)) {
+        HAL_LOG_INFO("isp tuning: [static_3dnr] %d rungs, ISO %u..%u; the driver has the ladder "
+                     "and selects per frame (AUTO)",
+                     n, set->iso[0], set->iso[n - 1]);
+        return 1;
+    }
+    if (ret)
+        HAL_LOG_INFO("isp tuning: [static_3dnr] HI_MPI_VPSS_SetGrpNRXParam refused the ladder "
+                     "(AUTO): 0x%x; raptor selects the rung instead",
+                     (unsigned)ret);
+    else
+        HAL_LOG_INFO("isp tuning: [static_3dnr] the ladder cannot go in as AUTO; raptor selects "
+                     "the rung instead");
 
     if (!hisi_iso_query(st, &iso, NULL))
         iso = 0;

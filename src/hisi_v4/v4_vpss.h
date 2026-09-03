@@ -154,8 +154,39 @@ _Static_assert(sizeof(v4_vpss_crop_info) == 24, "VPSS_CROP_INFO_S is 24 bytes");
  * /proc/umap/vpss reports "Intf NR_X, Version VER_3" on the EV300.
  *
  * VPSS_GRP_NRX_PARAM_S carries a union of the V1/V2/V3 parameter sets;
- * V3 is the largest (940 bytes) and the only one this backend writes, so
- * the union is transcribed as V3 alone and the total is pinned.
+ * V3 is the largest and the only one this backend writes, so the union is
+ * transcribed as V3 alone and the total is pinned.
+ *
+ * ...AND THEN CORRECTED AGAINST THE DRIVER, 2026-09-03. The header is not
+ * the ABI here. The EV300 runs openhisilicon's GPL open_vpss, and its
+ * VPSS_NRX_V3_S is 932 bytes where the header's is 924, because its NRc is
+ * 12 bytes on a 4-byte alignment where the header's is 6 on a 1-byte one.
+ * Every offset above NRc is the same in both; NRc alone moves, from +918
+ * to +920, and everything after it shifts by eight.
+ *
+ * Read off the driver rather than guessed:
+ *
+ *   VPSS_DRV_CheckGrpNRXVideoParam (vpss.o 0x20948) walks the block --
+ *   IEy stride 6 at +0, SFy stride 156 at +30, MDy at +810 and +828,
+ *   TFy stride 24 at +846, and then VPSS_DRV_CheckNRc at *+920*.
+ *   VPSS_DRV_CheckNRc (0x20898) range-checks bytes +1, +3 and *+8* of it
+ *   (TFC, TPC, PRESFC, each masked 0x3f against 32).
+ *   Hi3516EV200MapNRx (0x30378..0x304a0) reads SFC at +920, TFC at +921,
+ *   TRC at +922, TPC at +923, a whole 32-bit word at +924, and PRESFC at
+ *   +928 -- so the field between TPC and PRESFC is an HI_BOOL, which is
+ *   what pushes NRc to 4-byte alignment and 12 bytes.
+ *   VPSS_DRV_COMM_SetGrpNRXParam (0x19c68) then confirms the totals:
+ *   memcpy of *932* bytes from stNRXParam_V3+4 for MANUAL, and
+ *   stNRXParam_V3+*936* handed to VPSS_DRV_CopyNRXAutoParamFromUser for
+ *   AUTO. Both ioctls encode 952 (set 0x43b85049, get 0xc3b8504a).
+ *
+ * The eight bytes matter twice over. They put stNRXAuto out of reach --
+ * every AUTO write landed its three words eight bytes early, the driver
+ * read the pastNRXParam pointer as u32ParamNum, and the range test in
+ * VPSS_DRV_COMM_CheckGrpNRXParam returned 0xa0078003; that is the whole of
+ * why this backend used to write MANUAL only. And they put NRc two bytes
+ * early, so the file's TRC was landing in the driver's SFC and its TPC in
+ * the driver's TFC while the file's own SFC and TFC went into padding.
  *
  * Field names are the vendor's, lower-cased, because the tuning text
  * refers to them by those names (-nXsf1 is SFS1:SFT1:SBR1, and so on)
@@ -205,9 +236,15 @@ typedef struct {
     unsigned short advmath : 1, advth : 12, rb5 : 3;
 } v4_vpss_nrx_mdy;
 
+/* The header's tV200_VPSS_NRc ends after PRESFC and is 6 bytes; the
+ * driver's carries an HI_BOOL between TPC and PRESFC, which makes it 12 on
+ * a 4-byte alignment and is the only structural difference in the whole
+ * block. `mode` is the vendor's MODE, the new-chroma-denoise switch. */
 typedef struct {
     unsigned char sfc, tfc : 6, rb0 : 2;
     unsigned char trc, tpc : 6, rb1 : 2;
+    int mode;
+    unsigned char presfc : 6, rb2 : 2;
 } v4_vpss_nrx_nrc;
 
 typedef struct {
@@ -232,13 +269,16 @@ _Static_assert(offsetof(v4_vpss_nrx_tfy, tfr0) == 9, "TFR0 at +9");
 _Static_assert(offsetof(v4_vpss_nrx_tfy, tfr1) == 16, "TFR1 at +16");
 _Static_assert(sizeof(v4_vpss_nrx_mdy) == 18, "tV200_VPSS_MDy is 18 bytes");
 _Static_assert(offsetof(v4_vpss_nrx_mdy, mabr0) == 4, "MABR0 at +4");
-_Static_assert(sizeof(v4_vpss_nrx_nrc) == 4, "tV200_VPSS_NRc is 4 bytes");
+_Static_assert(sizeof(v4_vpss_nrx_nrc) == 12, "tV200_VPSS_NRc is 12 bytes");
 _Static_assert(offsetof(v4_vpss_nrx_nrc, trc) == 2, "TRC at +2");
-_Static_assert(sizeof(v4_vpss_nrx_v3) == 922, "VPSS_NRX_V3_S is 922 bytes");
+_Static_assert(offsetof(v4_vpss_nrx_nrc, mode) == 4, "MODE at +4");
+/* PRESFC is a bitfield and has no offsetof; it is the first storage unit
+ * after `mode`, so MODE at +4 and a total of 12 put it at +8. */
+_Static_assert(sizeof(v4_vpss_nrx_v3) == 932, "VPSS_NRX_V3_S is 932 bytes");
 _Static_assert(offsetof(v4_vpss_nrx_v3, sfy) == 30, "SFy at +30");
 _Static_assert(offsetof(v4_vpss_nrx_v3, mdy) == 810, "MDy at +810");
 _Static_assert(offsetof(v4_vpss_nrx_v3, tfy) == 846, "TFy at +846");
-_Static_assert(offsetof(v4_vpss_nrx_v3, nrc) == 918, "NRc at +918");
+_Static_assert(offsetof(v4_vpss_nrx_v3, nrc) == 920, "NRc at +920");
 
 /* OPERATION_MODE_E, hi_comm_video.h. */
 #define V4_OPERATION_MODE_AUTO 0
@@ -251,6 +291,15 @@ _Static_assert(offsetof(v4_vpss_nrx_v3, nrc) == 918, "NRc at +918");
  * at 16 (HI_SCENE_3DNR_MAX_COUNT) and the shipped files carry 9. */
 #define V4_VPSS_NRX_MAX_BLOCKS 16
 
+/*
+ * The AUTO form: the whole ladder, for the driver to pick between itself.
+ * VPSS_DRV_CopyNRXAutoParamFromUser (vpss.o 0x20a60) copies param_num ISO
+ * words and param_num blocks into the group and then, per frame,
+ * VPSS_DRV_PrepareNRxV3Param reads the ISO from the ISP and interpolates
+ * (V16ev200CalcNRxV2AotoParam). What it insists on, from that function:
+ * param_num in 1..16, every ISO in 100..3276800 and strictly ascending,
+ * and every block passing the same check a MANUAL block does.
+ */
 typedef struct {
     unsigned int param_num; /* u32ParamNum */
     unsigned int *iso;      /* pau32ISO, param_num entries, ascending */
@@ -271,10 +320,12 @@ typedef struct {
 _Static_assert(sizeof(v4_vpss_nrx_auto_v3) == 12, "VPSS_NRX_PARAM_AUTO_V3_S is 12 bytes");
 _Static_assert(offsetof(v4_vpss_nrx_auto_v3, iso) == 4, "pau32ISO at +4");
 _Static_assert(offsetof(v4_vpss_nrx_auto_v3, params) == 8, "pastNRXParam at +8");
-_Static_assert(sizeof(v4_vpss_nrx_param_v3) == 940, "VPSS_NRX_PARAM_V3_S is 940 bytes");
+_Static_assert(sizeof(v4_vpss_nrx_param_v3) == 948, "VPSS_NRX_PARAM_V3_S is 948 bytes");
 _Static_assert(offsetof(v4_vpss_nrx_param_v3, manual) == 4, "stNRXManual at +4");
-_Static_assert(offsetof(v4_vpss_nrx_param_v3, auto_) == 928, "stNRXAuto at +928");
-_Static_assert(sizeof(v4_vpss_grp_nrx_param) == 944, "VPSS_GRP_NRX_PARAM_S is 944 bytes");
+_Static_assert(offsetof(v4_vpss_nrx_param_v3, auto_) == 936, "stNRXAuto at +936");
+/* The 952 the two ioctls encode; a smaller object here is a kernel
+ * over-read on Set and an over-write on Get. */
+_Static_assert(sizeof(v4_vpss_grp_nrx_param) == 952, "VPSS_GRP_NRX_PARAM_S is 952 bytes");
 _Static_assert(offsetof(v4_vpss_grp_nrx_param, v3) == 4, "stNRXParam_V3 at +4");
 
 /* ================================================================
