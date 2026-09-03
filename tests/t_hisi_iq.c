@@ -1617,6 +1617,7 @@ static void knobs(void)
     g_csc.enable = 1;
     g_csc.luma = 50;
     g_csc.contr = 50;
+    g_csc.satu = 50;
     g_exp.auto_attr.compensation = 56;
     g_drc.enable = 1;
     g_drc.op_type = 1;
@@ -1631,7 +1632,10 @@ static void knobs(void)
     assert(hal_isp_set_ae_comp(&ctx, 80) == RSS_OK && g_exp.auto_attr.compensation == 56);
     assert(hal_isp_set_ae_comp(&ctx, 256) == RSS_ERR_INVAL);
     assert(hal_isp_set_drc_strength(&ctx, 300) == RSS_OK && g_drc.manual_strength == 512);
+    assert(hal_isp_set_saturation(&ctx, 62) == RSS_OK && g_csc.satu == 50);
+    assert(hal_isp_set_saturation(&ctx, 101) == RSS_ERR_INVAL);
     assert(hal_isp_get_brightness(&ctx, &v) == RSS_OK && v == 70);
+    assert(hal_isp_get_saturation(&ctx, &v) == RSS_OK && v == 62);
     assert(hal_isp_get_contrast(&ctx, &v) == RSS_ERR_BUSY);
     assert(hal_isp_get_knob_caps(&ctx, "ae_comp", &k) == RSS_OK && k.neutral == 56);
 
@@ -1640,7 +1644,7 @@ static void knobs(void)
      * 100 (420); the pin goes on over it and holds the engine. */
     st.isp_thread_running = 1;
     hisi_isp_note_frame(&st);
-    assert(g_csc.luma == 70 && g_csc.contr == 50);
+    assert(g_csc.luma == 70 && g_csc.contr == 50 && g_csc.satu == 62);
     assert(g_exp.auto_attr.compensation == 80);
     assert(st.knob.ae_base_known && st.knob.ae_base != 80);
     assert(g_drc.op_type == 1 && g_drc.manual_strength == 300);
@@ -1652,6 +1656,11 @@ static void knobs(void)
     /* Live: written at once, read back live. */
     assert(hal_isp_set_contrast(&ctx, 30) == RSS_OK && g_csc.contr == 30 && g_csc.luma == 70);
     assert(hal_isp_get_contrast(&ctx, &v) == RSS_OK && v == 30);
+    /* One attribute carries all three, so every write is a write of all
+     * three: the two nobody touched have to come back unchanged. */
+    assert(hal_isp_set_saturation(&ctx, 80) == RSS_OK);
+    assert(g_csc.satu == 80 && g_csc.luma == 70 && g_csc.contr == 30);
+    assert(hal_isp_get_saturation(&ctx, &v) == RSS_OK && v == 80);
     assert(hal_isp_set_ae_comp(&ctx, 100) == RSS_OK && g_exp.auto_attr.compensation == 100);
     assert(hal_isp_get_ae_comp(&ctx, &v) == RSS_OK && v == 100);
     assert(hal_isp_get_drc_strength(&ctx, &v) == RSS_OK && v == 300);
@@ -1666,7 +1675,12 @@ static void knobs(void)
     assert(k.max == 1023 && k.neutral == 420 && k.has_auto && k.enabled);
     assert(hal_isp_get_knob_caps(&ctx, "brightness", &k) == RSS_OK);
     assert(k.max == 100 && k.neutral == 50 && !k.has_auto && k.enabled);
-    assert(hal_isp_get_knob_caps(&ctx, "saturation", &k) == RSS_ERR_NOTSUP);
+    /* Saturation is the CSC's, on the CSC's scale -- not the 0..255 of the
+     * ISP's own per-ISO table, which this knob does not touch. No auto:
+     * there is no CSC curve to hand back to, and unity is the answer. */
+    assert(hal_isp_get_knob_caps(&ctx, "saturation", &k) == RSS_OK);
+    assert(k.min == 0 && k.max == 100 && k.neutral == 50 && !k.has_auto && k.enabled);
+    assert(hal_isp_get_knob_caps(&ctx, "hue", &k) == RSS_ERR_NOTSUP);
 
     /* auto: the tuning's value back; the DRC engine released and writing
      * its column for the ISO it last saw, at once. */
@@ -1676,6 +1690,7 @@ static void knobs(void)
     assert(st.dyn->drc.engine == 1 && g_drc.op_type == 0 && g_drc.auto_strength == 240);
     assert(log_count("drc: [dynamic_linear_drc] released; strength 240 for ISO 300") == 1);
     assert(hal_isp_set_brightness(&ctx, RSS_ISP_AUTO) == RSS_OK && g_csc.luma == 50);
+    assert(hal_isp_set_saturation(&ctx, RSS_ISP_AUTO) == RSS_OK && g_csc.satu == 50);
 
     /* A reload lifts a pin before the file and puts it back after. */
     assert(hal_isp_set_drc_strength(&ctx, 200) == RSS_OK && g_drc.op_type == 1);

@@ -407,6 +407,16 @@ typedef struct {
     bool bmp_logged;
 } hisi_osd_region_t;
 
+/*
+ * One [image] knob's wanted value. `asked` is the whole difference between
+ * a knob nobody has set -- where the tuning's own number stands, and must
+ * keep standing across a reload -- and one somebody set to the same number.
+ */
+typedef struct {
+    bool asked;
+    int val;
+} hisi_knob_slot_t;
+
 typedef struct {
     /* Loaded vendor libraries, and the tables resolved out of them.
      * Layout order follows star_state.h: vtables first, then descriptors,
@@ -616,10 +626,7 @@ typedef struct {
      * forgotten at every load.
      */
     struct {
-        struct {
-            bool asked;
-            int val;
-        } brightness, contrast, ae_comp, drc;
+        hisi_knob_slot_t brightness, contrast, saturation, ae_comp, drc;
         bool ae_base_known;
         int ae_base;
         bool drc_base_known;
@@ -870,6 +877,8 @@ int hal_isp_set_brightness(void *ctx, int val);
 int hal_isp_get_brightness(void *ctx, int *val);
 int hal_isp_set_contrast(void *ctx, int val);
 int hal_isp_get_contrast(void *ctx, int *val);
+int hal_isp_set_saturation(void *ctx, int val);
+int hal_isp_get_saturation(void *ctx, int *val);
 int hal_isp_set_ae_comp(void *ctx, int val);
 int hal_isp_get_ae_comp(void *ctx, int *val);
 int hal_isp_set_drc_strength(void *ctx, int val);

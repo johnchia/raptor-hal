@@ -1,15 +1,28 @@
 /*
  * hisi_v4/hal_knob.c -- the [image] knobs, and the exposure readback
  *
- * Four knobs, each a get-modify-set on one ISP attribute, three of which
- * the tuning loader (hal_isp.c) already reaches and one it does not:
+ * Five knobs over three ISP attributes, each a get-modify-set on one of
+ * them. The tuning loader (hal_isp.c) writes two of the three and never
+ * the CSC, which is why the neutral differs in kind between them:
  *
- *   brightness, contrast   ISP_CSC_ATTR_S u8Luma / u8Contr, 0..100 with 50
- *                          as unity. The CSC is the last stage before YUV
- *                          and the vendor's own image-adjust surface. The
- *                          tuning file has no section for it, so the
- *                          driver's 50/50 is what "as the tuning left it"
- *                          means for these two.
+ *   brightness, contrast,  ISP_CSC_ATTR_S u8Luma / u8Contr / u8Satu, each
+ *   saturation             0..100 with 50 as unity. The CSC is the last
+ *                          stage before YUV and the vendor's own
+ *                          image-adjust surface. The tuning file has no
+ *                          section for it, so the driver's 50 is what "as
+ *                          the tuning left it" means for all three.
+ *
+ *                          Saturation is the one knob here that is not the
+ *                          only writer of its quantity: the ISP's own
+ *                          saturation, ISP_SATURATION_ATTR_S in
+ *                          lib_hiawb.so, is a per-ISO table set by the
+ *                          tuning's [static_saturation] or, where the file
+ *                          has none, by the sensor library's calibrated
+ *                          per-gain ladder. That runs on the Bayer side
+ *                          and stays exactly as it was; this is a flat
+ *                          adjustment of the YUV the ISP hands out, which
+ *                          is why unity here means "the tuning's answer,
+ *                          whatever it currently is" and not a number.
  *   ae_comp                ISP_EXPOSURE_ATTR_S stAuto.u8Compensation,
  *                          0..255: the AE's target-luma multiplier. The
  *                          tuning's [static_ae] may set it, so unity is
@@ -68,7 +81,30 @@ static bool knob_live(const hisi_state_t *st)
     return __atomic_load_n(&st->isp_thread_running, __ATOMIC_ACQUIRE) != 0;
 }
 
-/* ---------------- CSC: brightness and contrast ---------------- */
+/* ---------------- CSC: brightness, contrast and saturation ---------------- */
+
+/*
+ * Three of the CSC's four adjust fields. They share one attribute, so a
+ * write of any is a get-modify-set of all, and they share these helpers
+ * rather than repeating it three times. The fourth field is u8Hue, on the
+ * same scale and one row of this enum from being a knob as well; it is not
+ * one because nothing has asked for it, not because it is hard.
+ */
+enum { CSC_LUMA, CSC_CONTR, CSC_SATU, CSC_FIELDS };
+
+static const char *const csc_names[CSC_FIELDS] = {"brightness", "contrast", "saturation"};
+
+static unsigned char *csc_field(v4_isp_csc_attr *a, int f)
+{
+    return f == CSC_LUMA ? &a->luma : f == CSC_CONTR ? &a->contr : &a->satu;
+}
+
+static hisi_knob_slot_t *csc_slot(hisi_state_t *st, int f)
+{
+    return f == CSC_LUMA    ? &st->knob.brightness
+           : f == CSC_CONTR ? &st->knob.contrast
+                            : &st->knob.saturation;
+}
 
 static int knob_csc_get(hisi_state_t *st, v4_isp_csc_attr *a)
 {
@@ -88,60 +124,55 @@ static int knob_csc_get(hisi_state_t *st, v4_isp_csc_attr *a)
 static int knob_csc_write(hisi_state_t *st)
 {
     v4_isp_csc_attr a;
-    int ret;
+    bool any = false;
+    int f, ret;
 
-    if (!st->knob.brightness.asked && !st->knob.contrast.asked)
+    for (f = 0; f < CSC_FIELDS; f++)
+        any |= csc_slot(st, f)->asked;
+    if (!any)
         return RSS_OK;
     ret = knob_csc_get(st, &a);
     if (ret)
         return ret;
-    if (st->knob.brightness.asked)
-        a.luma = (unsigned char)st->knob.brightness.val;
-    if (st->knob.contrast.asked)
-        a.contr = (unsigned char)st->knob.contrast.val;
+    for (f = 0; f < CSC_FIELDS; f++)
+        if (csc_slot(st, f)->asked)
+            *csc_field(&a, f) = (unsigned char)csc_slot(st, f)->val;
     ret = st->tune.set_csc(HISI_VI_PIPE, &a);
     if (ret) {
-        HAL_LOG_ERR("HI_MPI_ISP_SetCSCAttr(luma %u, contrast %u) failed: 0x%x", a.luma, a.contr,
-                    ret);
+        HAL_LOG_ERR("HI_MPI_ISP_SetCSCAttr(luma %u, contrast %u, saturation %u) failed: 0x%x",
+                    a.luma, a.contr, a.satu, ret);
         return RSS_ERR_IO;
     }
     return RSS_OK;
 }
 
-static int knob_csc_set(hisi_state_t *st, bool bright, int val)
+static int knob_csc_set(hisi_state_t *st, int f, int val)
 {
-    const char *name = bright ? "brightness" : "contrast";
-
     if (val == RSS_ISP_AUTO)
         val = KNOB_CSC_UNITY; /* no auto mode to hand back to: unity is the tuning's */
     if (val < 0 || val > KNOB_CSC_MAX) {
-        HAL_LOG_WARN("%s: %d is outside the CSC's 0..%d", name, val, KNOB_CSC_MAX);
+        HAL_LOG_WARN("%s: %d is outside the CSC's 0..%d", csc_names[f], val, KNOB_CSC_MAX);
         return RSS_ERR_INVAL;
     }
-    if (bright) {
-        st->knob.brightness.asked = true;
-        st->knob.brightness.val = val;
-    } else {
-        st->knob.contrast.asked = true;
-        st->knob.contrast.val = val;
-    }
+    csc_slot(st, f)->asked = true;
+    csc_slot(st, f)->val = val;
     if (!knob_live(st)) {
-        HAL_LOG_DBG("%s: %d noted for when the ISP runs", name, val);
+        HAL_LOG_DBG("%s: %d noted for when the ISP runs", csc_names[f], val);
         return RSS_OK;
     }
     return knob_csc_write(st);
 }
 
-static int knob_csc_read(hisi_state_t *st, bool bright, int *val)
+static int knob_csc_read(hisi_state_t *st, int f, int *val)
 {
     v4_isp_csc_attr a;
 
     if (knob_live(st) && knob_csc_get(st, &a) == RSS_OK) {
-        *val = bright ? a.luma : a.contr;
+        *val = *csc_field(&a, f);
         return RSS_OK;
     }
-    if (bright ? st->knob.brightness.asked : st->knob.contrast.asked) {
-        *val = bright ? st->knob.brightness.val : st->knob.contrast.val;
+    if (csc_slot(st, f)->asked) {
+        *val = csc_slot(st, f)->val;
         return RSS_OK;
     }
     return RSS_ERR_BUSY;
@@ -151,28 +182,42 @@ int hal_isp_set_brightness(void *ctx, int val)
 {
     hisi_state_t *st = hisi_state(ctx);
 
-    return st ? knob_csc_set(st, true, val) : RSS_ERR_INVAL;
+    return st ? knob_csc_set(st, CSC_LUMA, val) : RSS_ERR_INVAL;
 }
 
 int hal_isp_get_brightness(void *ctx, int *val)
 {
     hisi_state_t *st = hisi_state(ctx);
 
-    return st && val ? knob_csc_read(st, true, val) : RSS_ERR_INVAL;
+    return st && val ? knob_csc_read(st, CSC_LUMA, val) : RSS_ERR_INVAL;
 }
 
 int hal_isp_set_contrast(void *ctx, int val)
 {
     hisi_state_t *st = hisi_state(ctx);
 
-    return st ? knob_csc_set(st, false, val) : RSS_ERR_INVAL;
+    return st ? knob_csc_set(st, CSC_CONTR, val) : RSS_ERR_INVAL;
 }
 
 int hal_isp_get_contrast(void *ctx, int *val)
 {
     hisi_state_t *st = hisi_state(ctx);
 
-    return st && val ? knob_csc_read(st, false, val) : RSS_ERR_INVAL;
+    return st && val ? knob_csc_read(st, CSC_CONTR, val) : RSS_ERR_INVAL;
+}
+
+int hal_isp_set_saturation(void *ctx, int val)
+{
+    hisi_state_t *st = hisi_state(ctx);
+
+    return st ? knob_csc_set(st, CSC_SATU, val) : RSS_ERR_INVAL;
+}
+
+int hal_isp_get_saturation(void *ctx, int *val)
+{
+    hisi_state_t *st = hisi_state(ctx);
+
+    return st && val ? knob_csc_read(st, CSC_SATU, val) : RSS_ERR_INVAL;
 }
 
 /* ---------------- AE compensation ---------------- */
@@ -394,7 +439,8 @@ int hal_isp_get_knob_caps(void *ctx, const char *name, rss_isp_knob_t *caps)
     memset(caps, 0, sizeof(*caps));
     caps->enabled = true;
 
-    if (strcmp(name, "brightness") == 0 || strcmp(name, "contrast") == 0) {
+    if (strcmp(name, "brightness") == 0 || strcmp(name, "contrast") == 0 ||
+        strcmp(name, "saturation") == 0) {
         v4_isp_csc_attr a;
 
         caps->min = 0;
