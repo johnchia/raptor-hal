@@ -27,8 +27,8 @@
  * defaults, which is what makes a partial file safe to apply.
  *
  * Sections applied here: static_ae, static_aerouteex, static_aeweight,
- * static_ldci, static_drc, static_nr, static_dehaze, static_sharpen and
- * static_dpc -- the ones that are values.
+ * static_ldci, static_drc, static_nr, static_dehaze, static_sharpen,
+ * static_dpc and static_saturation -- the ones that are values.
  *
  * Sections handed to an engine, because they are tables over an axis
  * majestic walks at runtime:
@@ -62,8 +62,9 @@
  *
  * Selection: $RSS_ISP_TUNING if set (explicit wins outright -- an
  * unreadable explicit path is a warning and an untuned picture, not a
- * silent fallback), else /etc/sensors/iq/<sensor-stem>.ini, else untuned
- * with one WARN naming the path that was tried.
+ * silent fallback), else /usr/share/raptor/iq/<sensor-stem>.ini -- raptor's
+ * own, from config/iq/hisilicon -- else the image's
+ * /etc/sensors/iq/<sensor-stem>.ini, else untuned with one WARN.
  *
  * THE PARSER IS LOCAL, ON PURPOSE
  *
@@ -276,16 +277,28 @@ void hisi_isp_resolve_iq(hisi_state_t *st)
     if (!stem[0])
         return;
 
-    snprintf(st->iq_file, sizeof(st->iq_file), "/etc/sensors/iq/%s.ini", stem);
-    if ((f = fopen(st->iq_file, "r"))) {
-        fclose(f);
-        HAL_LOG_INFO("isp: tuning is %s (loads on the first frame)", st->iq_file);
-        return;
+    /* raptor's own tuning first, where the package installs one
+     * (config/iq/hisilicon in the raptor tree), then the image's. The
+     * shipped imx335.ini is majestic's daylight file with a 3DNR ladder
+     * that ends at ISO 12800; raptor's carries the night corrections
+     * docs/hisilicon.md's night comparison arrived at. */
+    {
+        static const char *const dirs[] = {"/usr/share/raptor/iq", "/etc/sensors/iq"};
+        unsigned int d;
+
+        for (d = 0; d < sizeof(dirs) / sizeof(dirs[0]); d++) {
+            snprintf(st->iq_file, sizeof(st->iq_file), "%s/%s.ini", dirs[d], stem);
+            if ((f = fopen(st->iq_file, "r"))) {
+                fclose(f);
+                HAL_LOG_INFO("isp: tuning is %s (loads on the first frame)", st->iq_file);
+                return;
+            }
+        }
     }
 
-    HAL_LOG_WARN("isp: no IQ tuning at %s -- the picture stays on the "
-                 "sensor driver's defaults (untuned)",
-                 st->iq_file);
+    HAL_LOG_WARN("isp: no IQ tuning for %s in /usr/share/raptor/iq or /etc/sensors/iq -- "
+                 "the picture stays on the sensor driver's defaults (untuned)",
+                 stem);
     st->iq_file[0] = '\0';
 }
 
@@ -553,6 +566,7 @@ enum {
     IQ_DEHAZE = 1 << 6,
     IQ_SHARPEN = 1 << 7,
     IQ_DPC = 1 << 8,
+    IQ_SAT = 1 << 9,
 };
 
 typedef struct {
@@ -565,6 +579,7 @@ typedef struct {
     v4_isp_dehaze_attr dehaze;
     v4_isp_sharpen_attr sharpen;
     v4_isp_dp_dyn_attr dpc;
+    v4_isp_sat_attr sat;
 
     unsigned int have;    /* fetched via Get */
     unsigned int unavail; /* Get failed or symbol missing; do not retry */
@@ -596,6 +611,8 @@ static const char *iq_mod_name(unsigned int bit)
         return "IspSharpenAttr";
     case IQ_DPC:
         return "DPDynamicAttr";
+    case IQ_SAT:
+        return "SaturationAttr";
     }
     return "?";
 }
@@ -621,6 +638,8 @@ static void *iq_struct_of(hisi_iq_load *ld, unsigned int bit)
         return &ld->sharpen;
     case IQ_DPC:
         return &ld->dpc;
+    case IQ_SAT:
+        return &ld->sat;
     }
     return NULL;
 }
@@ -663,6 +682,9 @@ static bool iq_fetch(hisi_state_t *st, hisi_iq_load *ld, unsigned int bit)
         break;
     case IQ_DPC:
         get = (int (*)(int, void *))st->tune.get_dpc;
+        break;
+    case IQ_SAT:
+        get = (int (*)(int, void *))st->tune.get_sat;
         break;
     }
 
@@ -907,6 +929,34 @@ static void iq_sect_dehaze(hisi_state_t *st, hisi_iq_load *ld, const char *key, 
     ld->dirty |= IQ_DEHAZE;
 }
 
+/*
+ * [static_saturation]: AutoSat, the per-ISO table, sixteen columns from
+ * ISO 100 doubling. The op type stays whatever the driver runs (auto,
+ * unless something else pinned it), so the columns are what the picture
+ * follows. A table that falls to zero past the ISO the scene goes
+ * monochrome at is how a tuning says "grey at night" -- see
+ * docs/hisilicon.md, the night comparison.
+ */
+static void iq_sect_saturation(hisi_state_t *st, hisi_iq_load *ld, const char *key,
+                               const char *val)
+{
+    v4_isp_sat_attr *sat = &ld->sat;
+    int n, i;
+
+    if (!iq_fetch(st, ld, IQ_SAT))
+        return;
+
+    if (iq_ci_eq(key, "AutoSat")) {
+        n = iq_nums(val, ld->nums, V4_ISP_ISO_NUM);
+        for (i = 0; i < n; i++)
+            sat->auto_sat[i] = (unsigned char)iq_clamp(ld->nums[i], 0, 255);
+    } else {
+        HAL_LOG_DBG("isp tuning: [static_saturation] %s: no mapping", key);
+        return;
+    }
+    ld->dirty |= IQ_SAT;
+}
+
 static void iq_sect_sharpen(hisi_state_t *st, hisi_iq_load *ld, const char *key, const char *val)
 {
     v4_isp_sharpen_auto *a = &ld->sharpen.auto_attr;
@@ -1039,6 +1089,8 @@ static void iq_dispatch(hisi_state_t *st, hisi_iq_load *ld, hisi_iq_reader *r)
         iq_sect_sharpen(st, ld, r->key, r->val);
     else if (iq_ci_eq(s, "static_dpc"))
         iq_sect_dpc(st, ld, r->key, r->val);
+    else if (iq_ci_eq(s, "static_saturation"))
+        iq_sect_saturation(st, ld, r->key, r->val);
     else if (iq_ci_eq(s, "dynamic_linear_drc") || iq_ci_eq(s, "dynamic_dehaze") ||
              iq_ci_eq(s, "dynamic_gamma")) {
         if (!hisi_dyn_key(st, s, r->key, r->val))
@@ -1113,14 +1165,18 @@ void hisi_isp_tune_resolve(hisi_state_t *st)
             "GK_API_ISP_SetGammaAttr");
     V4_TUNE(query_exp, int (*)(int, v4_isp_exp_info *), "HI_MPI_ISP_QueryExposureInfo",
             "GK_API_ISP_QueryExposureInfo");
+    V4_TUNE(get_sat, int (*)(int, v4_isp_sat_attr *), "HI_MPI_ISP_GetSaturationAttr",
+            "GK_API_ISP_GetSaturationAttr");
+    V4_TUNE(set_sat, int (*)(int, const v4_isp_sat_attr *), "HI_MPI_ISP_SetSaturationAttr",
+            "GK_API_ISP_SetSaturationAttr");
 
 #undef V4_TUNE
 }
 
 static void hisi_isp_apply_tuning(hisi_state_t *st)
 {
-    static const unsigned int apply_order[] = {IQ_EXP,     IQ_ROUTE, IQ_STAT, IQ_NR,     IQ_SHARPEN,
-                                               IQ_LDCI,    IQ_DRC,   IQ_DEHAZE, IQ_DPC};
+    static const unsigned int apply_order[] = {IQ_EXP,  IQ_ROUTE, IQ_STAT,   IQ_NR,  IQ_SHARPEN,
+                                               IQ_LDCI, IQ_DRC,   IQ_DEHAZE, IQ_DPC, IQ_SAT};
     hisi_iq_reader r;
     hisi_iq_load *ld;
     int applied = 0, failed = 0;
@@ -1191,6 +1247,9 @@ static void hisi_isp_apply_tuning(hisi_state_t *st)
             break;
         case IQ_DPC:
             set = (int (*)(int, const void *))st->tune.set_dpc;
+            break;
+        case IQ_SAT:
+            set = (int (*)(int, const void *))st->tune.set_sat;
             break;
         }
 

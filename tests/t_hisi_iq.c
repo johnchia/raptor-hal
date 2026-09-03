@@ -56,6 +56,7 @@ static v4_isp_sharpen_attr g_sharpen;
 static v4_isp_dp_dyn_attr g_dpc;
 static v4_isp_gamma_attr g_gamma;
 static v4_isp_csc_attr g_csc;
+static v4_isp_sat_attr g_sat;
 
 enum {
     M_EXP,
@@ -69,6 +70,7 @@ enum {
     M_DPC,
     M_GAMMA,
     M_CSC,
+    M_SAT,
     M_N
 };
 
@@ -110,6 +112,7 @@ STUB(sharpen, v4_isp_sharpen_attr, g_sharpen, M_SHARPEN)
 STUB(dpc, v4_isp_dp_dyn_attr, g_dpc, M_DPC)
 STUB(gamma, v4_isp_gamma_attr, g_gamma, M_GAMMA)
 STUB(csc, v4_isp_csc_attr, g_csc, M_CSC)
+STUB(sat, v4_isp_sat_attr, g_sat, M_SAT)
 
 /* hal_framesource.c is not in this suite; the orientation ops hand the
  * remembered bits to it, and this records what they handed over. */
@@ -394,6 +397,7 @@ static void reset_all(hisi_state_t *st)
     memset(&g_dpc, 0, sizeof(g_dpc));
     memset(&g_gamma, 0, sizeof(g_gamma));
     memset(&g_csc, 0, sizeof(g_csc));
+    memset(&g_sat, 0, sizeof(g_sat));
     g_again = g_dgain = g_isp_dgain = 1024;
     g_ave_lum = 0;
     memset(g_get_fail, 0, sizeof(g_get_fail));
@@ -443,6 +447,8 @@ static void reset_all(hisi_state_t *st)
     st->tune.set_dpc = set_dpc;
     st->tune.get_gamma = get_gamma;
     st->tune.set_gamma = set_gamma;
+    st->tune.get_sat = get_sat;
+    st->tune.set_sat = set_sat;
 }
 
 static FILE *open_tmp(char *path)
@@ -523,6 +529,8 @@ static void write_ini_good(char *path)
           "[static_dpc]\n"
           "DpcEnable = \"1\"\n"
           "DpcStrength = \"50, 100\"\n"
+          "[static_saturation]\n"
+          "AutoSat = \"128, 122, 120\"\n" /* a short table: the rest stay the driver's */
           "[static_3dnr]\n"
           "3DnrParam_0 = \\\n"
           "-nXsf1 18: 0:128 | 20: 0:128 \\\n"
@@ -632,6 +640,10 @@ static void load_good(void)
     assert(g_dpc.enable == 1);
     assert(g_dpc.auto_strength[1] == 100);
 
+    /* [static_saturation]: the per-ISO table, op type left as fetched */
+    assert(g_sat.auto_sat[0] == 128 && g_sat.auto_sat[1] == 122 && g_sat.auto_sat[2] == 120);
+    assert(g_sat.auto_sat[3] == 0 && g_sat.op_type == 0);
+
     /* [dynamic_gamma]: exposure 1000 is the first band, so Table_0, all
      * 1025 nodes through the continuations, straight in */
     assert(g_gamma.enable == 1);
@@ -642,11 +654,11 @@ static void load_good(void)
     assert(log_count("[dynamic_gamma] 2 tables; AE at exposure 1000, table 0 written; tracking "
                      "exposure") == 1);
 
-    /* one Set per touched module -- nine static, three dynamic -- and
-     * only touched modules; with the 3DNR ladder that is thirteen. A
+    /* one Set per touched module -- ten static, three dynamic -- and
+     * only touched modules; with the 3DNR ladder that is fourteen. A
      * well-formed file trips none of the refusals load 2 is about */
-    assert(g_sets == 12);
-    assert(log_count("13 modules applied") == 1);
+    assert(g_sets == 13);
+    assert(log_count("14 modules applied") == 1);
     assert(log_count("truncated") == 0);
     assert(log_count("not applied") == 0);
     assert(log_count("module skipped") == 0);
@@ -959,13 +971,13 @@ static void load_vendor_failures(void)
     assert(g_exp.auto_attr.speed == 0);
     assert(g_dpc.enable == 0);
 
-    /* Eight static modules were fetched and dirtied; dpc has no Set to
-     * call, so seven are attempted, of which exp fails. Then the engines:
+    /* Nine static modules were fetched and dirtied; dpc has no Set to
+     * call, so eight are attempted, of which exp fails. Then the engines:
      * DRC and dehaze write, gamma's Get fails before its Set. With the
-     * 3DNR ladder that is nine applied, and exp, dpc, gamma failed. */
-    assert(g_set_calls == 9);
-    assert(g_sets == 8);
-    assert(log_count("9 modules applied, 3 failed") == 1);
+     * 3DNR ladder that is ten applied, and exp, dpc, gamma failed. */
+    assert(g_set_calls == 10);
+    assert(g_sets == 9);
+    assert(log_count("10 modules applied, 3 failed") == 1);
     assert(log_count("skipped: all_param ir_* dynamic_gamma(Get failed)") == 1);
 
     /* The undisturbed ones still went through */

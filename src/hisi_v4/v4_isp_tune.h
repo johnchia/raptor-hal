@@ -512,6 +512,22 @@ _Static_assert(offsetof(v4_isp_csc_attr, contr) == 10, "u8Contr at +10");
 _Static_assert(offsetof(v4_isp_csc_attr, limited_range_en) == 12, "bLimitedRangeEn at +12");
 _Static_assert(offsetof(v4_isp_csc_attr, csc_idc) == 24, "stCscMagtrx at +24");
 
+/*
+ * ISP_SATURATION_ATTR_S: an op type, a manual value and a 16-column
+ * per-ISO table. The tuning's [static_saturation] carries the table
+ * (AutoSat). The calls live in lib_hiawb.so, not libisp.so, which is why
+ * the tune loader's search list includes the 3A libraries.
+ */
+typedef struct {
+    int op_type; /* ISP_OP_TYPE_E */
+    unsigned char manual_sat;
+    unsigned char auto_sat[V4_ISP_ISO_NUM];
+} v4_isp_sat_attr;
+
+_Static_assert(sizeof(v4_isp_sat_attr) == 24, "ISP_SATURATION_ATTR_S is 24 bytes");
+_Static_assert(offsetof(v4_isp_sat_attr, manual_sat) == 4, "stManual.u8Saturation at +4");
+_Static_assert(offsetof(v4_isp_sat_attr, auto_sat) == 5, "stAuto.au8Sat at +5");
+
 typedef struct {
     int (*get_exp)(int vi_pipe, v4_isp_exp_attr *a);
     int (*set_exp)(int vi_pipe, const v4_isp_exp_attr *a);
@@ -533,6 +549,9 @@ typedef struct {
     int (*set_dpc)(int vi_pipe, const v4_isp_dp_dyn_attr *a);
     int (*get_gamma)(int vi_pipe, v4_isp_gamma_attr *a);
     int (*set_gamma)(int vi_pipe, const v4_isp_gamma_attr *a);
+    /* Saturation, from lib_hiawb.so ([static_saturation]). */
+    int (*get_sat)(int vi_pipe, v4_isp_sat_attr *a);
+    int (*set_sat)(int vi_pipe, const v4_isp_sat_attr *a);
     /* The CSC: brightness and contrast (hal_knob.c). */
     int (*get_csc)(int vi_pipe, v4_isp_csc_attr *a);
     int (*set_csc)(int vi_pipe, const v4_isp_csc_attr *a);
