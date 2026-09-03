@@ -281,6 +281,43 @@ static struct hisi_dyn_set *dyn_set(hisi_state_t *st)
     return st->dyn;
 }
 
+/*
+ * hisi_dyn_drc_hold -- the drc_strength knob's grip on the DRC column.
+ *
+ * A pinned strength and a per-ISO column cannot both own stManual.u16Strength,
+ * so the knob holds the engine's DRC while it is pinned. Release puts the
+ * engine back for the ISO it last wrote for, right away rather than at the
+ * next MapISO step, so `auto` is visible at once. The other two engines are
+ * not involved. A load re-arms the engine and the knob's re-apply re-holds
+ * it, in that order, so the hold survives a tuning reload.
+ */
+static int dyn_write_drc(hisi_state_t *st, struct hisi_dyn_set *d, unsigned iso);
+
+void hisi_dyn_drc_hold(hisi_state_t *st, bool hold)
+{
+    struct hisi_dyn_set *d = st->dyn;
+
+    if (!d)
+        return;
+    if (hold) {
+        if (d->drc.engine) {
+            d->drc.engine = 0;
+            HAL_LOG_INFO("drc: [dynamic_linear_drc] held while drc_strength is pinned");
+        }
+        return;
+    }
+    if (d->drc.engine || d->drc.n < 2 || d->drc.failures >= 3)
+        return;
+    d->drc.engine = 1;
+    d->drc.last_lvl = -1;
+    __atomic_store_n(&d->engine, 1, __ATOMIC_RELEASE);
+    if (d->last_iso && dyn_write_drc(st, d, d->last_iso) == 0)
+        HAL_LOG_INFO("drc: [dynamic_linear_drc] released; strength %ld for ISO %u",
+                     d->drc.cur[DRC_STRENGTH], d->last_iso);
+    else
+        HAL_LOG_INFO("drc: [dynamic_linear_drc] released; next ISO step rewrites it");
+}
+
 void hisi_dyn_free(hisi_state_t *st)
 {
     free(st->dyn);

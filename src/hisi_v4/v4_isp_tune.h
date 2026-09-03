@@ -487,6 +487,31 @@ _Static_assert(offsetof(v4_isp_exp_info, ave_lum) == 4144, "u8AveLum at +4144");
 _Static_assert(offsetof(v4_isp_exp_info, fps) == 4156, "u32Fps at +4156");
 _Static_assert(offsetof(v4_isp_exp_info, iso) == 4160, "u32ISO at +4160");
 
+/* ISP_CSC_ATTR_S -- the colour-space conversion at the end of the ISP,
+ * and the vendor's own image-adjust surface: hue, luma, contrast and
+ * saturation are 0..100 with 50 as unity. The tuning file has no section
+ * for it; the [image] knobs (hal_knob.c) are its only writer. */
+typedef struct {
+    int enable;
+    int color_gamut; /* COLOR_GAMUT_E */
+    unsigned char hue;
+    unsigned char luma;
+    unsigned char contr;
+    unsigned char satu;
+    int limited_range_en;
+    int ext_csc_en;
+    int ct_mode_en;
+    short csc_idc[3]; /* CSC_MATRX_S, inlined */
+    short csc_odc[3];
+    short csc_coef[9];
+} v4_isp_csc_attr;
+
+_Static_assert(sizeof(v4_isp_csc_attr) == 56, "ISP_CSC_ATTR_S is 56 bytes");
+_Static_assert(offsetof(v4_isp_csc_attr, hue) == 8, "u8Hue at +8");
+_Static_assert(offsetof(v4_isp_csc_attr, contr) == 10, "u8Contr at +10");
+_Static_assert(offsetof(v4_isp_csc_attr, limited_range_en) == 12, "bLimitedRangeEn at +12");
+_Static_assert(offsetof(v4_isp_csc_attr, csc_idc) == 24, "stCscMagtrx at +24");
+
 typedef struct {
     int (*get_exp)(int vi_pipe, v4_isp_exp_attr *a);
     int (*set_exp)(int vi_pipe, const v4_isp_exp_attr *a);
@@ -508,6 +533,9 @@ typedef struct {
     int (*set_dpc)(int vi_pipe, const v4_isp_dp_dyn_attr *a);
     int (*get_gamma)(int vi_pipe, v4_isp_gamma_attr *a);
     int (*set_gamma)(int vi_pipe, const v4_isp_gamma_attr *a);
+    /* The CSC: brightness and contrast (hal_knob.c). */
+    int (*get_csc)(int vi_pipe, v4_isp_csc_attr *a);
+    int (*set_csc)(int vi_pipe, const v4_isp_csc_attr *a);
     /* HI_MPI_ISP_QueryExposureInfo, exported by lib_hiae.so rather than
      * libmpi; the 3DNR ladder's ISO source (hal_nrx.c). */
     int (*query_exp)(int vi_pipe, v4_isp_exp_info *info);

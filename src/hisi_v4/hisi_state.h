@@ -540,6 +540,26 @@ typedef struct {
     char iso_busy;         /* one tick at a time, across encoder threads */
 
     /*
+     * The [image] knobs, hal_knob.c. Each is remembered because a tuning
+     * load rewrites the attributes two of them live in and the loader
+     * re-applies them afterwards; the two baselines are what the tuning
+     * left there, learned before the knob's first write over it and
+     * forgotten at every load.
+     */
+    struct {
+        struct {
+            bool asked;
+            int val;
+        } brightness, contrast, ae_comp, drc;
+        bool ae_base_known;
+        int ae_base;
+        bool drc_base_known;
+        int drc_base;
+        int drc_base_op;
+        bool exp_warned;
+    } knob;
+
+    /*
      * Phase 4 -- audio. One AI device, one channel, one frame in flight;
      * the codec fd is /dev/acodec, held open because volume, gain and
      * mute all go through it at runtime.
@@ -759,6 +779,22 @@ int hal_isp_set_sensor_fps(void *ctx, uint32_t fps_num, uint32_t fps_den);
 int hal_isp_get_sensor_fps(void *ctx, uint32_t *fps_num, uint32_t *fps_den);
 void hisi_isp_resolve_iq(hisi_state_t *st);
 void hisi_isp_note_frame(hisi_state_t *st);
+void hisi_isp_tune_resolve(hisi_state_t *st);
+
+/* hal_knob.c -- the [image] knobs over the tuning's baseline, and the
+ * exposure readback. The loader brackets each load with the two hooks. */
+int hal_isp_get_exposure(void *ctx, rss_exposure_t *exposure);
+int hal_isp_set_brightness(void *ctx, int val);
+int hal_isp_get_brightness(void *ctx, int *val);
+int hal_isp_set_contrast(void *ctx, int val);
+int hal_isp_get_contrast(void *ctx, int *val);
+int hal_isp_set_ae_comp(void *ctx, int val);
+int hal_isp_get_ae_comp(void *ctx, int *val);
+int hal_isp_set_drc_strength(void *ctx, int val);
+int hal_isp_get_drc_strength(void *ctx, int *val);
+int hal_isp_get_knob_caps(void *ctx, const char *name, rss_isp_knob_t *caps);
+void hisi_knob_before_load(hisi_state_t *st);
+void hisi_knob_reapply(hisi_state_t *st);
 
 /* hal_nrx.c -- the [static_3dnr] section (VPSS 3DNR X-params). */
 bool hisi_nrx_key(hisi_state_t *st, const char *key, const char *val);
@@ -776,6 +812,7 @@ bool hisi_dyn_key(hisi_state_t *st, const char *sect, const char *key, const cha
 int hisi_dyn_apply(hisi_state_t *st, int *failed, char *note, size_t note_len);
 void hisi_dyn_on_exposure(hisi_state_t *st, unsigned iso, unsigned long long exposure);
 void hisi_dyn_tick(hisi_state_t *st);
+void hisi_dyn_drc_hold(hisi_state_t *st, bool hold);
 void hisi_dyn_free(hisi_state_t *st);
 
 /* The __ctype_b/mmap trampoline verification in hal_common.c. Exposed

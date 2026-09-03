@@ -2803,6 +2803,18 @@ static const rss_hal_ops_t g_ops = {
     .isp_get_sensor_attr = hal_isp_get_sensor_attr,
     .isp_set_sensor_fps = hal_isp_set_sensor_fps,
     .isp_get_sensor_fps = hal_isp_get_sensor_fps,
+    /* hal_knob.c: the knobs that adjust from the tuning's baseline, and
+     * the exposure readback the OSD, the console and ric read. */
+    .isp_get_exposure = hal_isp_get_exposure,
+    .isp_set_brightness = hal_isp_set_brightness,
+    .isp_get_brightness = hal_isp_get_brightness,
+    .isp_set_contrast = hal_isp_set_contrast,
+    .isp_get_contrast = hal_isp_get_contrast,
+    .isp_set_ae_comp = hal_isp_set_ae_comp,
+    .isp_get_ae_comp = hal_isp_get_ae_comp,
+    .isp_set_drc_strength = hal_isp_set_drc_strength,
+    .isp_get_drc_strength = hal_isp_get_drc_strength,
+    .isp_get_knob_caps = hal_isp_get_knob_caps,
 
     /*
      * OSD == RGN overlays attached to a VENC channel

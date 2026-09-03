@@ -36,6 +36,7 @@
 #include "../src/hisi_v4/hal_isp.c"
 #include "../src/hisi_v4/hal_nrx.c"
 #include "../src/hisi_v4/hal_dyn.c"
+#include "../src/hisi_v4/hal_knob.c"
 
 #include <assert.h>
 #include <limits.h>
@@ -54,8 +55,9 @@ static v4_isp_dehaze_attr g_dehaze;
 static v4_isp_sharpen_attr g_sharpen;
 static v4_isp_dp_dyn_attr g_dpc;
 static v4_isp_gamma_attr g_gamma;
+static v4_isp_csc_attr g_csc;
 
-enum { M_EXP, M_ROUTE, M_STAT, M_LDCI, M_DRC, M_NR, M_DEHAZE, M_SHARPEN, M_DPC, M_GAMMA, M_N };
+enum { M_EXP, M_ROUTE, M_STAT, M_LDCI, M_DRC, M_NR, M_DEHAZE, M_SHARPEN, M_DPC, M_GAMMA, M_CSC, M_N };
 
 /* Failure injection for load 3. HI_DEF_ERR-shaped values so the log lines
  * read like the real thing; nothing reads them back. */
@@ -94,6 +96,7 @@ STUB(dehaze, v4_isp_dehaze_attr, g_dehaze, M_DEHAZE)
 STUB(sharpen, v4_isp_sharpen_attr, g_sharpen, M_SHARPEN)
 STUB(dpc, v4_isp_dp_dyn_attr, g_dpc, M_DPC)
 STUB(gamma, v4_isp_gamma_attr, g_gamma, M_GAMMA)
+STUB(csc, v4_isp_csc_attr, g_csc, M_CSC)
 
 /* ---------------- log capture ---------------- */
 
@@ -192,12 +195,19 @@ static int set_nrx(int grp, const v4_vpss_grp_nrx_param *p)
     return 0;
 }
 
+static unsigned g_again, g_dgain, g_isp_dgain;
+static unsigned char g_ave_lum;
+
 static int query_exp(int pipe, v4_isp_exp_info *info)
 {
     (void)pipe;
     memset(info, 0, sizeof(*info));
     info->iso = g_iso;
     info->exp_time = g_exp_time;
+    info->again = g_again;
+    info->dgain = g_dgain;
+    info->isp_dgain = g_isp_dgain;
+    info->ave_lum = g_ave_lum;
     return 0;
 }
 
@@ -358,6 +368,9 @@ static void reset_all(hisi_state_t *st)
     memset(&g_sharpen, 0, sizeof(g_sharpen));
     memset(&g_dpc, 0, sizeof(g_dpc));
     memset(&g_gamma, 0, sizeof(g_gamma));
+    memset(&g_csc, 0, sizeof(g_csc));
+    g_again = g_dgain = g_isp_dgain = 1024;
+    g_ave_lum = 0;
     memset(g_get_fail, 0, sizeof(g_get_fail));
     memset(g_set_fail, 0, sizeof(g_set_fail));
     g_sets = 0;
@@ -385,6 +398,8 @@ static void reset_all(hisi_state_t *st)
     st->tune.query_exp = query_exp;
     st->tune.get_exp = get_exp;
     st->tune.set_exp = set_exp;
+    st->tune.get_csc = get_csc;
+    st->tune.set_csc = set_csc;
     st->tune.get_route_ex = get_route;
     st->tune.set_route_ex = set_route;
     st->tune.get_stat = get_stat;
@@ -1307,6 +1322,111 @@ static void sensor_fps(void)
     st.isp.fnSetPubAttr = NULL;
 }
 
+/* ---- the [image] knobs over the tuning, and the exposure readback ---- */
+
+static void knobs(void)
+{
+    static hisi_state_t st;
+    rss_hal_ctx_t ctx;
+    rss_isp_knob_t k;
+    rss_exposure_t e;
+    char path[32];
+    int v = -1;
+
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.platform = &st;
+    reset_all(&st);
+    g_csc.enable = 1;
+    g_csc.luma = 50;
+    g_csc.contr = 50;
+    g_exp.auto_attr.compensation = 56;
+    g_drc.enable = 1;
+    g_drc.op_type = 1;
+    g_drc.manual_strength = 512;
+    write_ini_dyn(path, "100, 200, 400", "420, 380, 100");
+    snprintf(st.iq_file, sizeof(st.iq_file), "%s", path);
+
+    /* Before the ISP runs: noted, nothing written, the readback busy. */
+    assert(hal_isp_get_exposure(&ctx, &e) == RSS_ERR_BUSY);
+    assert(hal_isp_set_brightness(&ctx, 70) == RSS_OK && g_csc.luma == 50);
+    assert(hal_isp_set_brightness(&ctx, 101) == RSS_ERR_INVAL);
+    assert(hal_isp_set_ae_comp(&ctx, 80) == RSS_OK && g_exp.auto_attr.compensation == 56);
+    assert(hal_isp_set_ae_comp(&ctx, 256) == RSS_ERR_INVAL);
+    assert(hal_isp_set_drc_strength(&ctx, 300) == RSS_OK && g_drc.manual_strength == 512);
+    assert(hal_isp_get_brightness(&ctx, &v) == RSS_OK && v == 70);
+    assert(hal_isp_get_contrast(&ctx, &v) == RSS_ERR_BUSY);
+    assert(hal_isp_get_knob_caps(&ctx, "ae_comp", &k) == RSS_OK && k.neutral == 56);
+
+    /* The load: the file over the baseline, then the knobs over the file.
+     * The fixture's [static_drc] is auto with the engine's column at ISO
+     * 100 (420); the pin goes on over it and holds the engine. */
+    st.isp_thread_running = 1;
+    hisi_isp_note_frame(&st);
+    assert(g_csc.luma == 70 && g_csc.contr == 50);
+    assert(g_exp.auto_attr.compensation == 80);
+    assert(st.knob.ae_base_known && st.knob.ae_base != 80);
+    assert(g_drc.op_type == 1 && g_drc.manual_strength == 300);
+    assert(st.knob.drc_base == 420 && st.knob.drc_base_op == 0);
+    assert(st.dyn && st.dyn->drc.engine == 0 && st.dyn->dehaze.engine == 1);
+    assert(log_count("drc: [dynamic_linear_drc] held while drc_strength is pinned") == 1);
+    assert(log_count("drc_strength: 300 pinned (the tuning's is 420, auto)") == 1);
+
+    /* Live: written at once, read back live. */
+    assert(hal_isp_set_contrast(&ctx, 30) == RSS_OK && g_csc.contr == 30 && g_csc.luma == 70);
+    assert(hal_isp_get_contrast(&ctx, &v) == RSS_OK && v == 30);
+    assert(hal_isp_set_ae_comp(&ctx, 100) == RSS_OK && g_exp.auto_attr.compensation == 100);
+    assert(hal_isp_get_ae_comp(&ctx, &v) == RSS_OK && v == 100);
+    assert(hal_isp_get_drc_strength(&ctx, &v) == RSS_OK && v == 300);
+    /* An ISO step moves dehaze and leaves the pinned DRC alone. */
+    hisi_dyn_on_exposure(&st, 300, 3000);
+    assert(g_drc.op_type == 1 && g_drc.manual_strength == 300 && g_dehaze.auto_strength == 78);
+
+    /* Caps: the hardware's units, the tuning's neutrals. */
+    assert(hal_isp_get_knob_caps(&ctx, "ae_comp", &k) == RSS_OK);
+    assert(k.min == 0 && k.max == 255 && k.neutral == st.knob.ae_base && k.has_auto);
+    assert(hal_isp_get_knob_caps(&ctx, "drc_strength", &k) == RSS_OK);
+    assert(k.max == 1023 && k.neutral == 420 && k.has_auto && k.enabled);
+    assert(hal_isp_get_knob_caps(&ctx, "brightness", &k) == RSS_OK);
+    assert(k.max == 100 && k.neutral == 50 && !k.has_auto && k.enabled);
+    assert(hal_isp_get_knob_caps(&ctx, "saturation", &k) == RSS_ERR_NOTSUP);
+
+    /* auto: the tuning's value back; the DRC engine released and writing
+     * its column for the ISO it last saw, at once. */
+    assert(hal_isp_set_ae_comp(&ctx, RSS_ISP_AUTO) == RSS_OK);
+    assert(g_exp.auto_attr.compensation == st.knob.ae_base);
+    assert(hal_isp_set_drc_strength(&ctx, RSS_ISP_AUTO) == RSS_OK);
+    assert(st.dyn->drc.engine == 1 && g_drc.op_type == 0 && g_drc.auto_strength == 240);
+    assert(log_count("drc: [dynamic_linear_drc] released; strength 240 for ISO 300") == 1);
+    assert(hal_isp_set_brightness(&ctx, RSS_ISP_AUTO) == RSS_OK && g_csc.luma == 50);
+
+    /* A reload lifts a pin before the file and puts it back after. */
+    assert(hal_isp_set_drc_strength(&ctx, 200) == RSS_OK && g_drc.op_type == 1);
+    st.iq_load_started = 0;
+    hisi_isp_note_frame(&st);
+    assert(g_drc.op_type == 1 && g_drc.manual_strength == 200 && st.dyn->drc.engine == 0);
+    assert(log_count("drc_strength: the tuning's 420 put back") == 2);
+    assert(log_count("drc_strength: 200 pinned (the tuning's is 420, auto)") == 2);
+
+    /* The readback: three 22.10 gains into one 1024-per-unit figure. */
+    g_again = 2048;
+    g_dgain = 1024;
+    g_isp_dgain = 1536;
+    g_ave_lum = 77;
+    g_exp_time = 8333;
+    assert(hal_isp_get_exposure(&ctx, &e) == RSS_OK);
+    assert(e.total_gain == 3072 && e.exposure_time == 8333 && e.ae_luma == 77);
+    assert(e.valid_mask == (RSS_EXPOSURE_VALID_TOTAL_GAIN | RSS_EXPOSURE_VALID_TIME |
+                            RSS_EXPOSURE_VALID_AE_LUMA));
+
+    /* A refused write is an error, and the wanted value stays for the
+     * next re-apply. */
+    g_set_fail[M_CSC] = true;
+    assert(hal_isp_set_contrast(&ctx, 40) == RSS_ERR_IO && g_csc.contr == 30);
+    g_set_fail[M_CSC] = false;
+    assert(st.knob.contrast.val == 40);
+    st.isp_thread_running = 0;
+}
+
 int main(void)
 {
     load_good();
@@ -1315,6 +1435,7 @@ int main(void)
     load_nrx_edges();
     load_dyn();
     sensor_fps();
+    knobs();
 
     printf("t_hisi_iq: OK\n");
     return 0;

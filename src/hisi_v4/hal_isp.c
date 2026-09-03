@@ -4,13 +4,16 @@
  * OP COVERAGE
  *
  * Implemented: isp_get_sensor_attr (moved here from hal_framesource.c, as
- * the Phase 2 notes promised), plus the internal tuning loader below --
- * which is Phase 3's entire scope. Every knob op that SigmaStar's table
- * mirrors (brightness, contrast, saturation, sharpness, sinter/temper
- * strength, ae_comp, defog, antiflicker, hflip/vflip, the getters) is
- * deliberately absent and stays NULL in the vtable: none of them matter
- * until there is a baseline image to adjust from, and RSS_HAL_CALL turns
- * their absence into RSS_ERR_NOTSUP, which is the truth.
+ * the Phase 2 notes promised), isp_set/get_sensor_fps, plus the internal
+ * tuning loader below -- which is Phase 3's entire scope. The knobs that
+ * adjust from the loader's baseline -- brightness, contrast, ae_comp,
+ * drc_strength, their getters, isp_get_knob_caps -- and the exposure
+ * readback live in hal_knob.c, and the loader calls its re-apply at the
+ * end of every load because the load rewrites the attributes two of them
+ * live in. The rest of SigmaStar's table (saturation, sharpness,
+ * sinter/temper strength, defog, antiflicker, hflip/vflip) stays NULL in
+ * the vtable, and RSS_HAL_CALL turns the absence into RSS_ERR_NOTSUP,
+ * which is the truth.
  *
  * WHAT THE TUNING LOADER DOES
  *
@@ -1049,7 +1052,7 @@ static void iq_dispatch(hisi_state_t *st, hisi_iq_load *ld, hisi_iq_reader *r)
 
 /* ---------------- resolve, load, apply ---------------- */
 
-static void hisi_isp_tune_resolve(hisi_state_t *st)
+void hisi_isp_tune_resolve(hisi_state_t *st)
 {
     v4_mpi_libs search;
 
@@ -1064,6 +1067,10 @@ static void hisi_isp_tune_resolve(hisi_state_t *st)
 
 #define V4_TUNE(field, type, hi, gk) st->tune.field = (type)v4_symbol_opt(&search, hi, gk)
 
+    V4_TUNE(get_csc, int (*)(int, v4_isp_csc_attr *), "HI_MPI_ISP_GetCSCAttr",
+            "GK_API_ISP_GetCSCAttr");
+    V4_TUNE(set_csc, int (*)(int, const v4_isp_csc_attr *), "HI_MPI_ISP_SetCSCAttr",
+            "GK_API_ISP_SetCSCAttr");
     V4_TUNE(get_exp, int (*)(int, v4_isp_exp_attr *), "HI_MPI_ISP_GetExposureAttr",
             "GK_API_ISP_GetExposureAttr");
     V4_TUNE(set_exp, int (*)(int, const v4_isp_exp_attr *), "HI_MPI_ISP_SetExposureAttr",
@@ -1120,11 +1127,15 @@ static void hisi_isp_apply_tuning(hisi_state_t *st)
     unsigned int i;
 
     hisi_isp_tune_resolve(st);
+    /* A pinned [image] knob is lifted first, so the file lands on the
+     * baseline and the knob is put back over it at the end. */
+    hisi_knob_before_load(st);
 
     memset(&r, 0, sizeof(r));
     r.path = st->iq_file;
     if (!(r.f = fopen(st->iq_file, "r"))) {
         HAL_LOG_WARN("isp tuning: %s vanished between resolve and load", st->iq_file);
+        hisi_knob_reapply(st);
         return;
     }
     if (!(ld = calloc(1, sizeof(*ld))) || !(r.val = malloc(HISI_IQ_VAL_MAX))) {
@@ -1235,6 +1246,9 @@ static void hisi_isp_apply_tuning(hisi_state_t *st)
 
     free(r.val);
     free(ld);
+
+    /* The [image] knobs, over the baseline the file just laid down. */
+    hisi_knob_reapply(st);
 }
 
 /*

@@ -126,13 +126,18 @@ const rss_hal_caps_t g_hal_caps = {
     .has_jpeg_qp = true,
     .jpeg_pulse = true,
 
-    /* ISP -- Phase 3. No ops, so no flags. */
+    /*
+     * ISP -- Phase 3. The two flags that are true are the two knobs
+     * hal_knob.c publishes beyond brightness and contrast: DRC strength
+     * (ISP_DRC_ATTR_S, 0..1023, pinned in manual mode) and AE compensation
+     * (stAuto.u8Compensation, 0..255). The rest have no op.
+     */
     .has_color2grey = false,
     .has_defog = false,
     .has_sinter = false,
-    .has_drc = false,
+    .has_drc = true,
     .has_temper = false,
-    .has_ae_comp = false,
+    .has_ae_comp = true,
 
     /*
      * One sensor. Gen4 has a second VI pipe, but sensor identity here is

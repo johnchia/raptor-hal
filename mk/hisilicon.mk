@@ -75,6 +75,7 @@ VIDEO_SRCS := $(BACKEND_DIR)/hisi_sensor.c \
               $(BACKEND_DIR)/hal_isp.c \
               $(BACKEND_DIR)/hal_nrx.c \
               $(BACKEND_DIR)/hal_dyn.c \
+              $(BACKEND_DIR)/hal_knob.c \
               $(BACKEND_DIR)/hal_osd.c \
               src/hal_gpio.c
 
