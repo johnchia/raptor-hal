@@ -187,6 +187,11 @@ typedef struct {
     unsigned int height;
     v4_frame_rate frame_rate;
 
+    /* Degrees the channel's output is turned, as last set through
+     * fs_set_rotation. width and height above stay the caller's; what
+     * leaves the channel is height x width for 90 and 270. */
+    int rotation;
+
     /*
      * u32Depth, the number of frames the channel queues for *userspace*.
      *
@@ -449,10 +454,23 @@ typedef struct {
      */
     v4_vi_vpss_mode_e vi_vpss_mode;
 
-    /* Orientation, as asked for by the config. Applied at the sensor
-     * through pfnMirrorFlip, as on SigmaStar and for the same reason: the
-     * driver latches it during its own init, before any caller can reach
-     * an ISP op. */
+    /*
+     * Orientation: bMirror and bFlip of every VPSS channel, the same on
+     * each. Seeded from the config before the first channel is created and
+     * rewritten by isp_set_hflip / isp_set_vflip, which VPSS takes on an
+     * enabled channel (hisi_fs_apply_orien).
+     *
+     * Two other places were tried first. The sensor's pfnMirrorFlip, the
+     * SigmaStar precedent: optional in ISP_SNS_OBJ_S and left out of the
+     * OpenIPC sensor libraries -- the IMX335's has no mirror or flip code at
+     * all -- so a configured flip silently did nothing. Then the VI
+     * channel's own bMirror / bFlip, which take the write and are the
+     * natural single point: flip streams, but mirror stalls the channel on
+     * the EV300 in the offline VI mode this backend runs -- VI CHN STATUS
+     * counts every frame as lost and the encoders see nothing until it is
+     * cleared. VPSS's bits do both, live, which is also where divinus puts
+     * them.
+     */
     int mirror;
     int flip;
 
@@ -708,6 +726,8 @@ int hal_fs_get_frame(void *ctx, int chn, void **frame_data, rss_frame_info_t *in
 int hal_fs_release_frame(void *ctx, int chn, void *frame_data);
 int hal_fs_set_frame_depth(void *ctx, int chn, int depth);
 int hal_fs_get_frame_depth(void *ctx, int chn, int *depth);
+int hal_fs_set_rotation(void *ctx, int chn, int degrees);
+int hisi_fs_apply_orien(hisi_state_t *st);
 
 /* Called from hisi_teardown so a channel's held frame and enable state do
  * not outlive the VPSS group. */
@@ -795,6 +815,10 @@ int hal_isp_get_drc_strength(void *ctx, int *val);
 int hal_isp_get_knob_caps(void *ctx, const char *name, rss_isp_knob_t *caps);
 void hisi_knob_before_load(hisi_state_t *st);
 void hisi_knob_reapply(hisi_state_t *st);
+/* Orientation, on the VPSS channels; see hisi_state_t.mirror. */
+int hal_isp_set_hflip(void *ctx, int enable);
+int hal_isp_set_vflip(void *ctx, int enable);
+int hal_isp_get_hvflip(void *ctx, int *hflip, int *vflip);
 
 /* hal_nrx.c -- the [static_3dnr] section (VPSS 3DNR X-params). */
 bool hisi_nrx_key(hisi_state_t *st, const char *key, const char *val);

@@ -666,8 +666,8 @@ static void hisi_read_chip_id(hisi_state_t *st)
     st->chip_id = id;
     /* "Hi" + the top five hex digits + the elided 'V' + the last three:
      * 0x3516E300 -> Hi3516EV300. Eleven characters, whatever the part. */
-    snprintf(st->chip_name, sizeof(st->chip_name), "%s%05XV%03X",
-             (id >> 28) == 0x7 ? "GK" : "Hi", id >> 12, id & 0xfff);
+    snprintf(st->chip_name, sizeof(st->chip_name), "%s%05XV%03X", (id >> 28) == 0x7 ? "GK" : "Hi",
+             id >> 12, id & 0xfff);
 
     HAL_LOG_INFO("chip: %s (SCSYSID0 0x%08x)", st->chip_name, id);
 }
@@ -783,8 +783,8 @@ static int hisi_mipi_configure(hisi_state_t *st)
 
     st->mipi_configured = true;
     HAL_LOG_INFO("mipi: dev %u, RAW%d, %ux%u+%d+%d, lanes %d|%d|%d|%d", devno, m->raw_bitness,
-                 m->dev_rect.width, m->dev_rect.height, m->dev_rect.x, m->dev_rect.y,
-                 m->lane_id[0], m->lane_id[1], m->lane_id[2], m->lane_id[3]);
+                 m->dev_rect.width, m->dev_rect.height, m->dev_rect.x, m->dev_rect.y, m->lane_id[0],
+                 m->lane_id[1], m->lane_id[2], m->lane_id[3]);
 
 out:
     close(fd);
@@ -897,7 +897,6 @@ static void hisi_vi_vpss_mode(hisi_state_t *st)
     st->vi_vpss_mode = mode.mode[HISI_VI_PIPE];
     HAL_LOG_INFO("vi/vpss coupling: mode %d", (int)st->vi_vpss_mode);
 }
-
 
 static int hisi_vi_bringup(hisi_state_t *st)
 {
@@ -1021,9 +1020,9 @@ static int hisi_vi_bringup(hisi_state_t *st)
     chn.dynamic_range = V4_DYNAMIC_RANGE_SDR8;
     chn.video_format = V4_VIDEO_FORMAT_LINEAR;
     chn.compress_mode = V4_COMPRESS_MODE_NONE;
-    /* Orientation lives at the sensor; see hisi_sensor_bringup. Left to the
-     * memset so a reader looking for where this backend sets mirror and
-     * flip on the VI channel finds nothing, which is the point. */
+    /* bMirror and bFlip stay zero: orientation is the VPSS channels'. The
+     * VI channel's mirror stalls it on the EV300 -- see hisi_state_t.mirror
+     * for the measurement. */
     chn.depth = 0;
     chn.frame_rate.src_frame_rate = -1;
     chn.frame_rate.dst_frame_rate = -1;
@@ -1143,31 +1142,9 @@ static int hisi_sensor_bringup(hisi_state_t *st, const rss_sensor_config_t *cfg)
     }
     st->awb_registered = true;
 
-    /*
-     * Orientation, applied at the sensor.
-     *
-     * Same decision as the SigmaStar backend and for the same reason: the
-     * driver latches mirror and flip during its own register writes, before
-     * any caller can reach an ISP op, and a camera is mounted one way round
-     * and stays there. Doing it downstream instead would put it on the VPSS
-     * channel, where it is per-stream and would have to be repeated.
-     *
-     * pfnMirrorFlip is optional in the vtable -- a few drivers omit it --
-     * so a configured orientation on a driver that cannot do it is reported
-     * rather than silently dropped.
-     */
-    st->mirror = cfg && cfg->hflip ? 1 : 0;
-    st->flip = cfg && cfg->vflip ? 1 : 0;
-    if (st->mirror || st->flip) {
-        v4_sns_mirrorflip mf = st->mirror ? (st->flip ? V4_SNS_MIRROR_FLIP : V4_SNS_MIRROR)
-                                          : V4_SNS_FLIP;
-
-        if (st->snr.obj->pfnMirrorFlip)
-            st->snr.obj->pfnMirrorFlip(HISI_VI_PIPE, mf);
-        else
-            HAL_LOG_WARN("sensor: %s has no pfnMirrorFlip; hflip=%d vflip=%d not applied",
-                         st->snr.obj_name, st->mirror, st->flip);
-    }
+    /* The driver's pfnMirrorFlip is deliberately not called here, even
+     * when the object carries one: orientation is the VPSS channels', and
+     * turning the picture at the sensor as well would turn it back. */
 
     return RSS_OK;
 }
@@ -1341,8 +1318,8 @@ static int hisi_isp_bringup(hisi_state_t *st)
     st->isp_thread_started = true;
 
     HAL_LOG_INFO("isp: pipe %d running, %ux%u+%d+%d @ %d fps, bayer %d", HISI_VI_PIPE,
-                 m->dev_rect.width, m->dev_rect.height, m->dev_rect.x, m->dev_rect.y,
-                 m->frame_rate, (int)m->bayer);
+                 m->dev_rect.width, m->dev_rect.height, m->dev_rect.x, m->dev_rect.y, m->frame_rate,
+                 (int)m->bayer);
     return RSS_OK;
 }
 
@@ -1565,8 +1542,7 @@ int hisi_bind_vpss_venc(hisi_state_t *st, int fs_chn, int enc_chn)
 
     if (ret) {
         HAL_LOG_ERR("HI_MPI_SYS_Bind VPSS(%d,%d) -> VENC(%d) failed: 0x%x", HISI_VPSS_GRP,
-                    hisi_vpss_phy(fs_chn),
-                    enc_chn, ret);
+                    hisi_vpss_phy(fs_chn), enc_chn, ret);
         return RSS_ERR_IO;
     }
 
@@ -1804,6 +1780,11 @@ static int hisi_video_bringup(hisi_state_t *st, const rss_sensor_config_t *cfg)
     ret = hisi_mipi_configure(st);
     if (ret)
         return ret;
+
+    /* Orientation from the config, for the VPSS channels rvd creates after
+     * this returns. The ops rewrite these later. */
+    st->mirror = cfg && cfg->hflip ? 1 : 0;
+    st->flip = cfg && cfg->vflip ? 1 : 0;
 
     ret = hisi_vi_bringup(st);
     if (ret)
@@ -2393,8 +2374,8 @@ static int hal_init(void *ctx, const rss_multi_sensor_config_t *cfg)
 
         memset(&ver, 0, sizeof(ver));
         if (!st->sys.fnGetVersion(&ver))
-            snprintf(st->mpp_version, sizeof(st->mpp_version), "%.*s",
-                     (int)sizeof(ver.version), ver.version);
+            snprintf(st->mpp_version, sizeof(st->mpp_version), "%.*s", (int)sizeof(ver.version),
+                     ver.version);
     }
     HAL_LOG_INFO("mpp: %s", st->mpp_version[0] ? st->mpp_version : "version unavailable");
 
@@ -2507,8 +2488,7 @@ err_free:
     /* Same rule as hal_deinit: a 3A thread that outlived its join still
      * writes into this block, so a wedged partial bring-up leaks it. */
     if (st->isp_thread_leaked)
-        HAL_LOG_ERR("isp: leaking HAL state (%zu bytes) to a still-running 3A thread",
-                    sizeof(*st));
+        HAL_LOG_ERR("isp: leaking HAL state (%zu bytes) to a still-running 3A thread", sizeof(*st));
     else {
 #ifdef HAL_MODULE_VIDEO
         /* The tuning engines' ladders: video-only state, and hal_nrx.c and
@@ -2620,8 +2600,7 @@ static int hal_deinit(void *ctx)
      * whenever HI_MPI_ISP_Run finally returns; freeing it converts a wedged
      * shutdown into silent heap corruption. Leak it and say so. */
     if (st->isp_thread_leaked)
-        HAL_LOG_ERR("isp: leaking HAL state (%zu bytes) to a still-running 3A thread",
-                    sizeof(*st));
+        HAL_LOG_ERR("isp: leaking HAL state (%zu bytes) to a still-running 3A thread", sizeof(*st));
     else {
 #ifdef HAL_MODULE_VIDEO
         /* The tuning engines' ladders: video-only state, and hal_nrx.c and
@@ -2763,6 +2742,7 @@ static const rss_hal_ops_t g_ops = {
     .fs_release_frame = hal_fs_release_frame,
     .fs_set_frame_depth = hal_fs_set_frame_depth,
     .fs_get_frame_depth = hal_fs_get_frame_depth,
+    .fs_set_rotation = hal_fs_set_rotation,
 
     /* Encoder == VENC channel (src/hisi_v4/hal_encoder.c). The group ops
      * are bookkeeping: HiMPP has no encoder group, and rvd calls them
@@ -2815,6 +2795,9 @@ static const rss_hal_ops_t g_ops = {
     .isp_set_drc_strength = hal_isp_set_drc_strength,
     .isp_get_drc_strength = hal_isp_get_drc_strength,
     .isp_get_knob_caps = hal_isp_get_knob_caps,
+    .isp_set_hflip = hal_isp_set_hflip,
+    .isp_set_vflip = hal_isp_set_vflip,
+    .isp_get_hvflip = hal_isp_get_hvflip,
 
     /*
      * OSD == RGN overlays attached to a VENC channel
@@ -3065,12 +3048,14 @@ void rss_hal_check_platform(const char *name)
          * and syslog both -- because rvd may already have detached from the
          * terminal by the time this runs, and a fatal nobody can read is
          * indistinguishable from a silent one. */
-        fprintf(stderr, "FATAL: built for %s (HiMPP V4.0) but SCSYSID0 reads 0x%08x, "
-                        "which is not a V4.0 part\n",
+        fprintf(stderr,
+                "FATAL: built for %s (HiMPP V4.0) but SCSYSID0 reads 0x%08x, "
+                "which is not a V4.0 part\n",
                 HAL_PLATFORM_NAME, id);
         openlog(name ? name : "raptor", LOG_PID, LOG_DAEMON);
-        syslog(LOG_ERR, "FATAL: built for %s (HiMPP V4.0) but SCSYSID0 reads 0x%08x, "
-                        "which is not a V4.0 part",
+        syslog(LOG_ERR,
+               "FATAL: built for %s (HiMPP V4.0) but SCSYSID0 reads 0x%08x, "
+               "which is not a V4.0 part",
                HAL_PLATFORM_NAME, id);
         closelog();
         _exit(1);

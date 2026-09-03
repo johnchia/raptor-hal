@@ -495,7 +495,9 @@ typedef struct {
      * the background it is crossing. See star_isp_apply_orien's absence.
      *
      * Ingenic backends ignore these and use the ops, where orientation is an
-     * ISP attribute settable at any time.
+     * ISP attribute settable at any time. HiSilicon gen4 takes them here for
+     * the first frame and honours the ops as well: its orientation is the
+     * VPSS channels' mirror and flip bits, which take a live write.
      */
     int hflip;
     int vflip;

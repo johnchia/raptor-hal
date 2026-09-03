@@ -449,6 +449,10 @@ typedef struct {
      */
     bool pipeline_up;
     unsigned int pipeline_refs;
+    /* Degrees the SCL channel was last turned by hal_fs_set_rotation. Every
+     * port shares it, so a request for another channel with the same angle
+     * is already satisfied. */
+    int rotation;
 
     /*
      * What the sensor said about itself. Read once at bring-up and kept, since

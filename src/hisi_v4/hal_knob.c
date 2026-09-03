@@ -27,6 +27,9 @@
  * Units are the hardware's own, as [image]'s comment in raptor.conf
  * promises, and isp_get_knob_caps says what they are.
  *
+ * The orientation pair, hflip and vflip, is at the end of the file: not an
+ * ISP attribute at all but the VPSS channels' mirror and flip bits.
+ *
  * WHEN THE WRITE HAPPENS. rvd applies [image] right after hal_init, before
  * the first frame; the tuning loads on the first frame and rewrites the
  * exposure and DRC attributes from the file, which would silently undo
@@ -496,5 +499,48 @@ int hal_isp_get_exposure(void *ctx, rss_exposure_t *exposure)
     exposure->ae_luma = info->ave_lum;
     exposure->valid_mask |= RSS_EXPOSURE_VALID_AE_LUMA;
     free(info);
+    return RSS_OK;
+}
+
+/* ---------------- orientation: the VPSS channels' bMirror / bFlip ---------------- */
+
+/*
+ * The value is remembered here and written to every framesource channel
+ * that exists by hisi_fs_apply_orien; a channel created later takes it
+ * from hisi_fs_fill_attr. Before any exists it is only remembered, which is
+ * how rvd's [image] hflip / vflip reach the picture from the first frame:
+ * rvd hands them over in the sensor config before hal_init as well as
+ * through these ops after it. See hisi_state_t.mirror for why VPSS.
+ */
+int hal_isp_set_hflip(void *ctx, int enable)
+{
+    hisi_state_t *st = hisi_state(ctx);
+
+    if (!st)
+        return RSS_ERR_INVAL;
+    st->mirror = enable ? 1 : 0;
+    return hisi_fs_apply_orien(st);
+}
+
+int hal_isp_set_vflip(void *ctx, int enable)
+{
+    hisi_state_t *st = hisi_state(ctx);
+
+    if (!st)
+        return RSS_ERR_INVAL;
+    st->flip = enable ? 1 : 0;
+    return hisi_fs_apply_orien(st);
+}
+
+/* The remembered value, not a read-back: HI_MPI_VPSS_GetChnAttr answers only
+ * while the group runs, and the answer would be the same. */
+int hal_isp_get_hvflip(void *ctx, int *hflip, int *vflip)
+{
+    hisi_state_t *st = hisi_state(ctx);
+
+    if (!st || !hflip || !vflip)
+        return RSS_ERR_INVAL;
+    *hflip = st->mirror;
+    *vflip = st->flip;
     return RSS_OK;
 }

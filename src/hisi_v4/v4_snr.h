@@ -60,9 +60,10 @@ typedef union {
 
 _Static_assert(sizeof(v4_sns_commbus) == 1, "ISP_SNS_COMMBUS_U is one byte");
 
-/* ISP_SNS_MIRRORFLIP_TYPE_E. Orientation belongs to the sensor on this
- * family, as it does on SigmaStar: it is latched by the driver's own
- * register writes rather than applied downstream. */
+/* ISP_SNS_MIRRORFLIP_TYPE_E, the argument of pfnMirrorFlip. Transcribed for
+ * the vtable's sake and not used: the entry is optional and the OpenIPC
+ * sensor libraries omit it, so orientation is the VI channel's instead. See
+ * hisi_state_t.mirror. */
 typedef enum {
     V4_SNS_NORMAL = 0,
     V4_SNS_MIRROR = 1,
@@ -242,7 +243,7 @@ _Static_assert(V4_MIPI_ENABLE_SENSOR_CLOCK == 0x40046d10u, "ENABLE_SENSOR_CLOCK 
  * A bare dlopen("libsns_imx335.so") fails on a board where the driver is
  * plainly present, which is a confusing way to be told the path is wrong.
  */
-#define V4_SNR_DIRS                                                                                    {                                                                                                      "", "/usr/lib/sensors/", "/usr/lib/", "/lib/"                                                  }
+#define V4_SNR_DIRS {"", "/usr/lib/sensors/", "/usr/lib/", "/lib/"}
 
 typedef struct {
     void *handle;
@@ -345,8 +346,7 @@ static inline int v4_snr_load(v4_snr_impl *lib, const char *name, const char *ob
      * driver missing either is not usable, and finding out here beats
      * finding out through a NULL call three steps later. */
     if (!lib->obj->pfnRegisterCallback || !lib->obj->pfnSetBusInfo) {
-        HAL_LOG_ERR("%s: %s: %s has no register/bus entry points", mod, lib->path,
-                    lib->obj_name);
+        HAL_LOG_ERR("%s: %s: %s has no register/bus entry points", mod, lib->path, lib->obj_name);
         dlclose(lib->handle);
         lib->handle = NULL;
         lib->obj = NULL;

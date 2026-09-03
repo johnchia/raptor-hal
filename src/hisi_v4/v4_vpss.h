@@ -49,6 +49,17 @@ typedef enum {
     V4_VPSS_CHN_MODE_AUTO = 1,
 } v4_vpss_chn_mode;
 
+/* ROTATION_E (hi_comm_video.h). A fixed-angle turn of one channel's output,
+ * set with HI_MPI_VPSS_SetChnRotation after the channel attribute. The
+ * attribute keeps the caller's width and height; the picture that comes out
+ * has them swapped for 90 and 270. */
+typedef enum {
+    V4_ROTATION_0 = 0,
+    V4_ROTATION_90 = 1,
+    V4_ROTATION_180 = 2,
+    V4_ROTATION_270 = 3,
+} v4_rotation;
+
 /* VPSS_NR_TYPE_E */
 typedef enum {
     V4_VPSS_NR_TYPE_VIDEO = 0,
@@ -233,14 +244,14 @@ _Static_assert(offsetof(v4_vpss_nrx_v3, nrc) == 918, "NRc at +918");
 #define V4_VPSS_NRX_MAX_BLOCKS 16
 
 typedef struct {
-    unsigned int param_num;   /* u32ParamNum */
-    unsigned int *iso;        /* pau32ISO, param_num entries, ascending */
-    v4_vpss_nrx_v3 *params;   /* pastNRXParam, param_num entries */
+    unsigned int param_num; /* u32ParamNum */
+    unsigned int *iso;      /* pau32ISO, param_num entries, ascending */
+    v4_vpss_nrx_v3 *params; /* pastNRXParam, param_num entries */
 } v4_vpss_nrx_auto_v3;
 
 typedef struct {
-    int opt_mode; /* enOptMode: V4_OPERATION_MODE_* */
-    v4_vpss_nrx_v3 manual;    /* stNRXManual.stNRXParam */
+    int opt_mode;              /* enOptMode: V4_OPERATION_MODE_* */
+    v4_vpss_nrx_v3 manual;     /* stNRXManual.stNRXParam */
     v4_vpss_nrx_auto_v3 auto_; /* stNRXAuto */
 } v4_vpss_nrx_param_v3;
 
@@ -276,6 +287,11 @@ typedef struct {
     int (*fnEnableChn)(int grp, int chn);
     int (*fnDisableChn)(int grp, int chn);
     int (*fnSetChnCrop)(int grp, int chn, const v4_vpss_crop_info *crop);
+    /* Fixed-angle rotation of one physical channel's output; optional, and
+     * hal_fs_set_rotation answers NOTSUP without it. The EV200/EV300 libmpi
+     * carries both. */
+    int (*fnSetChnRotation)(int grp, int chn, int rotation);
+    int (*fnGetChnRotation)(int grp, int chn, int *rotation);
 
     /* Userspace frame access on a channel. Needs the channel's u32Depth to
      * be non-zero, which is why hal_fs_set_frame_depth is a real op here
@@ -320,6 +336,10 @@ static inline int v4_vpss_load(v4_vpss_impl *lib, const v4_mpi_libs *libs)
         libs, "HI_MPI_VPSS_GetChnAttr", "GK_API_VPSS_GetChnAttr");
     lib->fnSetChnCrop = (int (*)(int, int, const v4_vpss_crop_info *))v4_symbol_opt(
         libs, "HI_MPI_VPSS_SetChnCrop", "GK_API_VPSS_SetChnCrop");
+    lib->fnSetChnRotation = (int (*)(int, int, int))v4_symbol_opt(
+        libs, "HI_MPI_VPSS_SetChnRotation", "GK_API_VPSS_SetChnRotation");
+    lib->fnGetChnRotation = (int (*)(int, int, int *))v4_symbol_opt(
+        libs, "HI_MPI_VPSS_GetChnRotation", "GK_API_VPSS_GetChnRotation");
     lib->fnGetChnFrame = (int (*)(int, int, v4_video_frame_info *, int))v4_symbol_opt(
         libs, "HI_MPI_VPSS_GetChnFrame", "GK_API_VPSS_GetChnFrame");
     lib->fnSetGrpNRXParam = (int (*)(int, const v4_vpss_grp_nrx_param *))v4_symbol_opt(

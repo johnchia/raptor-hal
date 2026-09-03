@@ -57,7 +57,20 @@ static v4_isp_dp_dyn_attr g_dpc;
 static v4_isp_gamma_attr g_gamma;
 static v4_isp_csc_attr g_csc;
 
-enum { M_EXP, M_ROUTE, M_STAT, M_LDCI, M_DRC, M_NR, M_DEHAZE, M_SHARPEN, M_DPC, M_GAMMA, M_CSC, M_N };
+enum {
+    M_EXP,
+    M_ROUTE,
+    M_STAT,
+    M_LDCI,
+    M_DRC,
+    M_NR,
+    M_DEHAZE,
+    M_SHARPEN,
+    M_DPC,
+    M_GAMMA,
+    M_CSC,
+    M_N
+};
 
 /* Failure injection for load 3. HI_DEF_ERR-shaped values so the log lines
  * read like the real thing; nothing reads them back. */
@@ -97,6 +110,18 @@ STUB(sharpen, v4_isp_sharpen_attr, g_sharpen, M_SHARPEN)
 STUB(dpc, v4_isp_dp_dyn_attr, g_dpc, M_DPC)
 STUB(gamma, v4_isp_gamma_attr, g_gamma, M_GAMMA)
 STUB(csc, v4_isp_csc_attr, g_csc, M_CSC)
+
+/* hal_framesource.c is not in this suite; the orientation ops hand the
+ * remembered bits to it, and this records what they handed over. */
+static int g_orien_calls, g_orien_mirror, g_orien_flip;
+
+int hisi_fs_apply_orien(hisi_state_t *st)
+{
+    g_orien_calls++;
+    g_orien_mirror = st->mirror;
+    g_orien_flip = st->flip;
+    return RSS_OK;
+}
 
 /* ---------------- log capture ---------------- */
 
@@ -638,42 +663,42 @@ static void load_good(void)
         /* the sample's mapping, row by row, on the ISO 100 block */
         assert(b->sfy[0].sfs1 == 18 && b->sfy[0].sft1 == 0 && b->sfy[0].sbr1 == 128);
         assert(b->sfy[1].sfs2 == 30 && b->sfy[3].sfs4 == 30);
-        assert(b->sfy[0].srt0 == 16 && b->sfy[0].srt1 == 16);       /* -SelRt */
-        assert(b->sfy[2].kmode == 1 && b->sfy[3].kmode == 1);      /* -kmode, embedded */
-        assert(b->sfy[0].derate == 0 && b->sfy[0].deidx == 4);      /* -DeRt */
-        assert(b->sfy[4].sfs1 == 60 && b->sfy[4].sfs2 == 60 && b->sfy[4].sfs4 == 60); /* -sfs5 */
+        assert(b->sfy[0].srt0 == 16 && b->sfy[0].srt1 == 16);  /* -SelRt */
+        assert(b->sfy[2].kmode == 1 && b->sfy[3].kmode == 1);  /* -kmode, embedded */
+        assert(b->sfy[0].derate == 0 && b->sfy[0].deidx == 4); /* -DeRt */
+        assert(b->sfy[4].sfs1 == 60 && b->sfy[4].sfs2 == 60 && b->sfy[4].sfs4 == 60);  /* -sfs5 */
         assert(b->iey[3].ies0 == 110 && b->iey[3].ies1 == 90 && b->iey[4].ies0 == 96); /* -nXsf5 */
-        assert(b->iey[2].iedz == 0);                                 /* -dzsf5 */
+        assert(b->iey[2].iedz == 0);                                                   /* -dzsf5 */
         assert(b->sfy[1].spn6 == 4 && b->sfy[1].sbn6 == 2 && b->sfy[1].pbr6 == 0 &&
-               b->sfy[1].jmode == 4);                                /* -nXsf6 */
-        assert(b->sfy[1].sfr6[2] == 8 && b->sfy[3].sfr6[0] == 10);   /* -nXsfr6 */
-        assert(b->sfy[0].sbr6[0] == 15 && b->sfy[3].sbr6[1] == 15);  /* -nXsbr6 */
+               b->sfy[1].jmode == 4);                                              /* -nXsf6 */
+        assert(b->sfy[1].sfr6[2] == 8 && b->sfy[3].sfr6[0] == 10);                 /* -nXsfr6 */
+        assert(b->sfy[0].sbr6[0] == 15 && b->sfy[3].sbr6[1] == 15);                /* -nXsbr6 */
         assert(b->sfy[0].sfn0 == 1 && b->sfy[0].sfn1 == 2 && b->sfy[0].sfn2 == 4); /* -nXsfn */
         assert(b->sfy[0].sth1 == 20 && b->sfy[0].sth2 == 40 && b->sfy[4].sthd2 == 30);
-        assert(b->sfy[0].sfr == 31 && b->sfy[4].sfr == 31);          /* -sfr (0) */
-        assert(b->tfy[0].bref == 0 && b->tfy[1].bref == 1);          /* -ref */
-        assert(b->tfy[1].ted == 0 && b->tfy[2].ted == 0);            /* -tedge */
-        assert(b->mdy[1].math1 == 90);                               /* -mXmath, embedded */
-        assert(b->mdy[1].mathd1 == 60);                              /* -mXmathd, embedded */
+        assert(b->sfy[0].sfr == 31 && b->sfy[4].sfr == 31); /* -sfr (0) */
+        assert(b->tfy[0].bref == 0 && b->tfy[1].bref == 1); /* -ref */
+        assert(b->tfy[1].ted == 0 && b->tfy[2].ted == 0);   /* -tedge */
+        assert(b->mdy[1].math1 == 90);                      /* -mXmath, embedded */
+        assert(b->mdy[1].mathd1 == 60);                     /* -mXmathd, embedded */
         assert(b->tfy[0].str0 == 31 && b->tfy[1].str0 == 31 && b->tfy[1].str1 == 31 &&
-               b->tfy[2].str0 == 31);                                /* -nXstr (1) */
-        assert(b->mdy[1].mate1 == 2);                                /* -mXmate, embedded */
-        assert(b->mdy[1].mabw1 == 5);                                /* -mXmabw, embedded */
-        assert(b->tfy[0].tsi0 == 1 && b->tfy[1].tsi1 == 1);          /* -nXtsi */
+               b->tfy[2].str0 == 31);                       /* -nXstr (1) */
+        assert(b->mdy[1].mate1 == 2);                       /* -mXmate, embedded */
+        assert(b->mdy[1].mabw1 == 5);                       /* -mXmabw, embedded */
+        assert(b->tfy[0].tsi0 == 1 && b->tfy[1].tsi1 == 1); /* -nXtsi */
         assert(b->tfy[0].tfs0 == 0 && b->tfy[1].tfs0 == 7 && b->tfy[1].tfs1 == 11 &&
-               b->tfy[2].tfs0 == 10);                                /* -nXtfs */
-        assert(b->tfy[0].tdx0 == 2 && b->tfy[1].tdx1 == 2);          /* -nXtdx; -mode ignored */
-        assert(b->tfy[0].tfrs == 15);                                /* -nXtfrs; -presfc ignored */
+               b->tfy[2].tfs0 == 10);                       /* -nXtfs */
+        assert(b->tfy[0].tdx0 == 2 && b->tfy[1].tdx1 == 2); /* -nXtdx; -mode ignored */
+        assert(b->tfy[0].tfrs == 15);                       /* -nXtfrs; -presfc ignored */
         assert(b->tfy[0].tfr0[0] == 16 && b->tfy[0].tfr0[1] == 8 && b->tfy[0].tfr0[2] == 16 &&
                b->tfy[0].tfr0[3] == 8 && b->tfy[0].tfr0[4] == 0 && b->tfy[0].tfr0[5] == 0);
         assert(b->tfy[1].tfr0[0] == 8 && b->tfy[1].tfr0[1] == 4 && b->tfy[1].tfr0[3] == 0);
-        assert(b->tfy[2].tfr0[0] == 16 && b->tfy[2].tfr0[3] == 8);   /* -nXtfr0, two lines */
-        assert(b->nrc.sfc == 60 && b->nrc.tfc == 10);                /* embedded in tfr0 */
+        assert(b->tfy[2].tfr0[0] == 16 && b->tfy[2].tfr0[3] == 8); /* -nXtfr0, two lines */
+        assert(b->nrc.sfc == 60 && b->nrc.tfc == 10);              /* embedded in tfr0 */
         assert(b->tfy[1].tfr1[0] == 16 && b->tfy[1].tfr1[1] == 8 && b->tfy[1].tfr1[2] == 16 &&
-               b->tfy[1].tfr1[3] == 8 && b->tfy[1].tfr1[4] == 0);    /* -nXtfr1 */
-        assert(b->nrc.tpc == 10 && b->nrc.trc == 12);                /* embedded in tfr1 */
+               b->tfy[1].tfr1[3] == 8 && b->tfy[1].tfr1[4] == 0); /* -nXtfr1 */
+        assert(b->nrc.tpc == 10 && b->nrc.trc == 12);             /* embedded in tfr1 */
         assert(b->mdy[0].mai00 == 1 && b->mdy[0].mai01 == 1 && b->mdy[0].mai02 == 2 &&
-               b->mdy[1].mai00 == 1 && b->mdy[1].mai02 == 2);        /* -mXid0 */
+               b->mdy[1].mai00 == 1 && b->mdy[1].mai02 == 2);                         /* -mXid0 */
         assert(b->mdy[0].mai10 == 2 && b->mdy[0].mai11 == 2 && b->mdy[0].mai12 == 2); /* -mXid1 */
         assert(b->mdy[0].mabr0 == 0 && b->mdy[0].mabr1 == 0 && b->mdy[1].mabr0 == 0);
         assert(b->mdy[0].advmath == 1 && b->mdy[0].advth == 0);
@@ -1068,13 +1093,16 @@ static void write_ini_dyn(char *path, const char *iso_level, const char *strengt
             iso_level, strength);
     fputs("Table_0 = \\\n", f);
     for (i = 0; i < V4_ISP_GAMMA_NODES; i++)
-        fprintf(f, "%d%s", i % 4096, i == V4_ISP_GAMMA_NODES - 1 ? "\n" : (i % 30 == 29 ? ",\\\n" : ","));
+        fprintf(f, "%d%s", i % 4096,
+                i == V4_ISP_GAMMA_NODES - 1 ? "\n" : (i % 30 == 29 ? ",\\\n" : ","));
     fputs("Table_1 = \\\n", f);
     for (i = 0; i < V4_ISP_GAMMA_NODES; i++)
-        fprintf(f, "%d%s", i / 2, i == V4_ISP_GAMMA_NODES - 1 ? "\n" : (i % 30 == 29 ? ",\\\n" : ","));
+        fprintf(f, "%d%s", i / 2,
+                i == V4_ISP_GAMMA_NODES - 1 ? "\n" : (i % 30 == 29 ? ",\\\n" : ","));
     fputs("Table_2 = \\\n", f);
     for (i = 0; i < V4_ISP_GAMMA_NODES; i++)
-        fprintf(f, "%d%s", i / 4, i == V4_ISP_GAMMA_NODES - 1 ? "\n" : (i % 30 == 29 ? ",\\\n" : ","));
+        fprintf(f, "%d%s", i / 4,
+                i == V4_ISP_GAMMA_NODES - 1 ? "\n" : (i % 30 == 29 ? ",\\\n" : ","));
     fclose(f);
 }
 
@@ -1415,8 +1443,8 @@ static void knobs(void)
     g_exp_time = 8333;
     assert(hal_isp_get_exposure(&ctx, &e) == RSS_OK);
     assert(e.total_gain == 3072 && e.exposure_time == 8333 && e.ae_luma == 77);
-    assert(e.valid_mask == (RSS_EXPOSURE_VALID_TOTAL_GAIN | RSS_EXPOSURE_VALID_TIME |
-                            RSS_EXPOSURE_VALID_AE_LUMA));
+    assert(e.valid_mask ==
+           (RSS_EXPOSURE_VALID_TOTAL_GAIN | RSS_EXPOSURE_VALID_TIME | RSS_EXPOSURE_VALID_AE_LUMA));
 
     /* A refused write is an error, and the wanted value stays for the
      * next re-apply. */
@@ -1425,6 +1453,38 @@ static void knobs(void)
     g_set_fail[M_CSC] = false;
     assert(st.knob.contrast.val == 40);
     st.isp_thread_running = 0;
+}
+
+/* Orientation: the ops remember the bits and hand them to the framesource
+ * layer every time, and the getter answers from memory. */
+static void orien(void)
+{
+    static hisi_state_t st;
+    rss_hal_ctx_t g_ctx;
+    int hf = -1, vf = -1;
+
+    memset(&g_ctx, 0, sizeof(g_ctx));
+    g_ctx.platform = &st;
+    reset_all(&st);
+    g_orien_calls = 0;
+
+    assert(hal_isp_get_hvflip(&g_ctx, &hf, &vf) == RSS_OK);
+    assert(hf == 0 && vf == 0);
+
+    assert(hal_isp_set_hflip(&g_ctx, 1) == RSS_OK);
+    assert(g_orien_calls == 1 && g_orien_mirror == 1 && g_orien_flip == 0);
+    /* Any non-zero is on. */
+    assert(hal_isp_set_vflip(&g_ctx, 5) == RSS_OK);
+    assert(g_orien_calls == 2 && g_orien_mirror == 1 && g_orien_flip == 1);
+    assert(hal_isp_get_hvflip(&g_ctx, &hf, &vf) == RSS_OK);
+    assert(hf == 1 && vf == 1);
+
+    assert(hal_isp_set_hflip(&g_ctx, 0) == RSS_OK);
+    assert(g_orien_calls == 3 && g_orien_mirror == 0 && g_orien_flip == 1);
+
+    assert(hal_isp_get_hvflip(&g_ctx, NULL, &vf) == RSS_ERR_INVAL);
+    assert(hal_isp_set_hflip(NULL, 1) == RSS_ERR_INVAL);
+    assert(g_orien_calls == 3);
 }
 
 int main(void)
@@ -1436,6 +1496,7 @@ int main(void)
     load_dyn();
     sensor_fps();
     knobs();
+    orien();
 
     printf("t_hisi_iq: OK\n");
     return 0;

@@ -14,14 +14,9 @@
  * OP COVERAGE
  *
  * Published: create/set/destroy channel, enable/disable, get/release frame,
- * get/set frame depth.
+ * get/set frame depth, set rotation.
  *
  * Absent, and why:
- *
- *  - fs_set_rotation. VPSS has no rotate on gen4; mirror and flip are
- *    channel attributes but a 90-degree rotation is not available at all.
- *    Publishing a rotation op that only accepted 0 would be worse than
- *    publishing none.
  *
  *  - fs_set_fifo / fs_get_fifo. Ingenic's FIFO is a per-channel queue depth
  *    with its own semantics; gen4's nearest thing is u32Depth, which
@@ -68,8 +63,8 @@
     do {                                                                                           \
         if (!st_var)                                                                               \
             return RSS_ERR_INVAL;                                                                  \
-        if ((chn) < 0 || (chn) >= HISI_FS_CHN_NUM) {                                             \
-            HAL_LOG_ERR("vpss: channel %d out of range [0,%d)", (chn), HISI_FS_CHN_NUM);         \
+        if ((chn) < 0 || (chn) >= HISI_FS_CHN_NUM) {                                               \
+            HAL_LOG_ERR("vpss: channel %d out of range [0,%d)", (chn), HISI_FS_CHN_NUM);           \
             return RSS_ERR_INVAL;                                                                  \
         }                                                                                          \
         fs_var = &st_var->fs[chn];                                                                 \
@@ -100,15 +95,16 @@
  *   output may be read through fs_get_frame, and a compressed frame handed
  *   to a caller expecting NV12 is unreadable.
  *
- *   bMirror / bFlip stay zero. Orientation lives at the sensor on this
- *   family -- see hisi_sensor_bringup -- and setting it here as well would
- *   apply it twice.
+ *   bMirror / bFlip are the backend's orientation, the same for every
+ *   channel -- see hisi_state_t.mirror for why they are here and not on
+ *   the VI channel or at the sensor.
  *
  *   u32Depth comes from the channel's tracked value, which is 0 for a
  *   streaming channel. See hisi_vpss_chn_t.depth for why zero is right and
  *   why it is not a bug that GetChnFrame then blocks.
  */
-static void hisi_fs_fill_attr(const hisi_vpss_chn_t *fs, v4_vpss_chn_attr *attr)
+static void hisi_fs_fill_attr(const hisi_state_t *st, const hisi_vpss_chn_t *fs,
+                              v4_vpss_chn_attr *attr)
 {
     memset(attr, 0, sizeof(*attr));
 
@@ -120,7 +116,47 @@ static void hisi_fs_fill_attr(const hisi_vpss_chn_t *fs, v4_vpss_chn_attr *attr)
     attr->dynamic_range = V4_DYNAMIC_RANGE_SDR8;
     attr->compress_mode = V4_COMPRESS_MODE_NONE;
     attr->frame_rate = fs->frame_rate;
+    attr->mirror = st->mirror;
+    attr->flip = st->flip;
     attr->depth = fs->depth;
+}
+
+/*
+ * hisi_fs_apply_orien -- write the current mirror and flip to every channel
+ * that exists. The attribute is rebuilt from tracked state rather than read
+ * back, as everywhere in this file, and VPSS takes it on an enabled channel
+ * without a gap in the bound encoder's frames. Called by the hflip / vflip
+ * ops; a channel created later gets the same bits from hisi_fs_fill_attr.
+ */
+int hisi_fs_apply_orien(hisi_state_t *st)
+{
+    int applied = 0;
+
+    if (!st->vpss.fnSetChnAttr)
+        return RSS_ERR_NOTSUP;
+    for (int chn = 0; chn < HISI_FS_CHN_NUM; chn++) {
+        hisi_vpss_chn_t *fs = &st->fs[chn];
+        v4_vpss_chn_attr attr;
+        int ret;
+
+        if (!fs->configured)
+            continue;
+        hisi_fs_fill_attr(st, fs, &attr);
+        ret = st->vpss.fnSetChnAttr(HISI_VPSS_GRP, hisi_vpss_phy(chn), &attr);
+        if (ret) {
+            HAL_LOG_WARN("HI_MPI_VPSS_SetChnAttr(%d, %d) mirror %d flip %d failed: 0x%x",
+                         HISI_VPSS_GRP, chn, st->mirror, st->flip, ret);
+            return RSS_ERR_IO;
+        }
+        applied++;
+    }
+    if (applied)
+        HAL_LOG_INFO("orientation: mirror %d, flip %d on %d vpss channel%s", st->mirror, st->flip,
+                     applied, applied == 1 ? "" : "s");
+    else
+        HAL_LOG_DBG("orientation: mirror %d, flip %d noted for the channels to come", st->mirror,
+                    st->flip);
+    return RSS_OK;
 }
 
 /*
@@ -304,8 +340,8 @@ static int hisi_fs_apply_crop(hisi_state_t *st, int chn, const rss_fs_config_t *
     ret = st->vpss.fnSetGrpCrop(HISI_VPSS_GRP, &crop);
     if (ret) {
         HAL_LOG_ERR("HI_MPI_VPSS_SetGrpCrop(%d) %ux%u+%d+%d failed: 0x%x", HISI_VPSS_GRP,
-                    crop.crop_rect.width, crop.crop_rect.height, crop.crop_rect.x,
-                    crop.crop_rect.y, ret);
+                    crop.crop_rect.width, crop.crop_rect.height, crop.crop_rect.x, crop.crop_rect.y,
+                    ret);
         return RSS_ERR_IO;
     }
 
@@ -351,14 +387,13 @@ int hal_fs_create_channel(void *ctx, int chn, const rss_fs_config_t *cfg)
      * asking for anything else (rvd's raw-grab recreates the channel with a
      * RAW request) must hear that the bytes it dumps will be NV12. */
     if (cfg->pixfmt != RSS_PIXFMT_NV12)
-        HAL_LOG_WARN("vpss chn %d: pixfmt %d not supported; output is NV12", chn,
-                     (int)cfg->pixfmt);
+        HAL_LOG_WARN("vpss chn %d: pixfmt %d not supported; output is NV12", chn, (int)cfg->pixfmt);
 
     fs->width = cfg->width;
     fs->height = cfg->height;
     hisi_fs_frame_rate(st, cfg->fps_num, cfg->fps_den, &fs->frame_rate);
 
-    hisi_fs_fill_attr(fs, &attr);
+    hisi_fs_fill_attr(st, fs, &attr);
     ret = st->vpss.fnSetChnAttr(HISI_VPSS_GRP, hisi_vpss_phy(chn), &attr);
     if (ret) {
         HAL_LOG_ERR("HI_MPI_VPSS_SetChnAttr(%d, %d) %ux%u failed: 0x%x", HISI_VPSS_GRP, chn,
@@ -405,6 +440,69 @@ int hal_fs_create_channel(void *ctx, int chn, const rss_fs_config_t *cfg)
 }
 
 /*
+ * hal_fs_set_rotation -- turn one channel's output by a fixed angle.
+ *
+ * HI_MPI_VPSS_SetChnRotation, which the reference allows after the channel
+ * attribute is set and on a physical channel in USER mode with uncompressed
+ * semi-planar 4:2:0 -- every channel this file creates. The attribute keeps
+ * the caller's width and height and the picture leaves as height x width for
+ * 90 and 270, so the encoder bound to the channel has to be created with the
+ * swapped geometry; rvd does that from the same config key that reaches here.
+ *
+ * Per channel, unlike the SigmaStar backends, so a rotated main stream and
+ * an upright sub stream is a legal request. The VI channel has a rotation of
+ * its own that would turn every stream at once; not used, because it would
+ * also turn the sensor geometry rvd sizes everything from.
+ */
+int hal_fs_set_rotation(void *ctx, int chn, int degrees)
+{
+    int rot;
+    int ret;
+
+    HISI_FS_ENTER(ctx, chn, st, fs);
+
+    switch (degrees) {
+    case 0:
+        rot = V4_ROTATION_0;
+        break;
+    case 90:
+        rot = V4_ROTATION_90;
+        break;
+    case 180:
+        rot = V4_ROTATION_180;
+        break;
+    case 270:
+        rot = V4_ROTATION_270;
+        break;
+    default:
+        HAL_LOG_ERR("vpss chn %d: rotation %d is not 0, 90, 180 or 270", chn, degrees);
+        return RSS_ERR_INVAL;
+    }
+    if (!st->vpss.fnSetChnRotation) {
+        HAL_LOG_WARN("vpss chn %d: this libmpi has no HI_MPI_VPSS_SetChnRotation", chn);
+        return RSS_ERR_NOTSUP;
+    }
+    if (!fs->configured) {
+        HAL_LOG_ERR("vpss chn %d: rotation asked for before the channel exists", chn);
+        return RSS_ERR_INVAL;
+    }
+
+    ret = st->vpss.fnSetChnRotation(HISI_VPSS_GRP, hisi_vpss_phy(chn), rot);
+    if (ret) {
+        HAL_LOG_ERR("HI_MPI_VPSS_SetChnRotation(%d, %d, %d deg) failed: 0x%x", HISI_VPSS_GRP, chn,
+                    degrees, ret);
+        return RSS_ERR_IO;
+    }
+    fs->rotation = degrees;
+    if (degrees == 90 || degrees == 270)
+        HAL_LOG_INFO("vpss chn %d: turned %d degrees; %ux%u in, %ux%u out", chn, degrees, fs->width,
+                     fs->height, fs->height, fs->width);
+    else
+        HAL_LOG_INFO("vpss chn %d: turned %d degrees", chn, degrees);
+    return RSS_OK;
+}
+
+/*
  * hal_fs_set_channel_attr -- change geometry or rate on a live channel.
  *
  * VPSS accepts SetChnAttr on an enabled channel, so this does not cycle it.
@@ -439,7 +537,7 @@ int hal_fs_set_channel_attr(void *ctx, int chn, const rss_fs_config_t *cfg)
         }
         hisi_fs_frame_rate(st, cfg->fps_num, cfg->fps_den, &fs->frame_rate);
 
-        hisi_fs_fill_attr(fs, &attr);
+        hisi_fs_fill_attr(st, fs, &attr);
         ret = st->vpss.fnSetChnAttr(HISI_VPSS_GRP, hisi_vpss_phy(chn), &attr);
         if (ret) {
             HAL_LOG_ERR("HI_MPI_VPSS_SetChnAttr(%d, %d) %ux%u failed: 0x%x", HISI_VPSS_GRP, chn,
@@ -570,7 +668,7 @@ int hal_fs_set_frame_depth(void *ctx, int chn, int depth)
     if (!fs->configured)
         return RSS_OK;
 
-    hisi_fs_fill_attr(fs, &attr);
+    hisi_fs_fill_attr(st, fs, &attr);
     ret = st->vpss.fnSetChnAttr(HISI_VPSS_GRP, hisi_vpss_phy(chn), &attr);
     if (ret) {
         HAL_LOG_ERR("HI_MPI_VPSS_SetChnAttr(%d, %d) depth %d failed: 0x%x", HISI_VPSS_GRP, chn,

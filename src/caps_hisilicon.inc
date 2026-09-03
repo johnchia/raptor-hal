@@ -86,11 +86,14 @@ const rss_hal_caps_t g_hal_caps = {
      * true as of Phase 2 because enc_set_bitrate exists and works the only
      * way HiMPP allows: a read-modify-write of the whole channel attribute.
      *
+     * has_rotation is true and per channel: HI_MPI_VPSS_SetChnRotation
+     * turns one VPSS channel's output by 90, 180 or 270, so each stream can
+     * be turned on its own (the SigmaStar backends turn all at once). The
+     * channel attribute keeps the configured size and the picture leaves
+     * with width and height swapped, which rvd sizes the encoder for.
+     *
      * The three that stay false are decisions, not gaps:
      *
-     *   has_rotation   VPSS has no rotate on gen4. Mirror and flip are
-     *                  channel attributes; a 90-degree rotation is not
-     *                  available at any stage of this pipeline.
      *   has_gop_attr   The op would be enc_set_chn_gop_attr, which takes an
      *                  opaque vendor struct. gen4's is VENC_GOP_ATTR_S with a
      *                  per-mode union, and publishing it means committing to
@@ -104,7 +107,7 @@ const rss_hal_caps_t g_hal_caps = {
      *                  supplied.
      */
     .has_h265 = true,
-    .has_rotation = false,
+    .has_rotation = true,
     .has_set_bitrate = true,
     .has_gop_attr = false,
     .has_capped_rc = false,

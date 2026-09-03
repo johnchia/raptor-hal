@@ -1229,7 +1229,10 @@ int hal_fs_destroy_channel(void *ctx, int chn)
  * Rotation lives on the SCL *channel*, not the port, so it cannot be set per
  * stream: the ports all hang off one channel. Accepted for channel 0 and
  * refused elsewhere rather than silently applied to everything, since a caller
- * asking to rotate one stream would otherwise get all of them.
+ * asking to rotate one stream would otherwise get all of them. The one
+ * exception is a request for another channel at the angle channel 0 already
+ * has: rvd turns every framesource by the same [image] rotate, and that port
+ * is already turned, so it is answered yes rather than refused.
  */
 int hal_fs_set_rotation(void *ctx, int chn, int degrees)
 {
@@ -1239,6 +1242,11 @@ int hal_fs_set_rotation(void *ctx, int chn, int degrees)
     I6C_ENTER(ctx, chn, st);
 
     if (chn != 0) {
+        if (st->pipeline_up && degrees == st->rotation) {
+            HAL_LOG_DBG("infinity6c: chn %d already turned %d degrees with the SCL channel", chn,
+                        degrees);
+            return RSS_OK;
+        }
         HAL_LOG_WARN("infinity6c: rotation is per SCL channel, so it cannot apply to chn %d alone",
                      chn);
         return RSS_ERR_NOTSUP;
@@ -1269,6 +1277,7 @@ int hal_fs_set_rotation(void *ctx, int chn, int degrees)
         HAL_LOG_ERR("MI_SCL_SetChnParam(rotate %d) failed: %d", degrees, ret);
         return RSS_ERR_IO;
     }
+    st->rotation = degrees;
 
     return RSS_OK;
 }
