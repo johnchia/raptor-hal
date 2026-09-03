@@ -1705,6 +1705,86 @@ static void knobs(void)
     st.isp_thread_running = 0;
 }
 
+/*
+ * drc_strength offers `auto` only where the tuning has a curve behind it.
+ *
+ * The control that draws the offer promises the tuning's own curve, varying
+ * with the light. A file whose [dynamic_linear_drc] is absent -- or is one
+ * column, which the engine cannot blend -- has no such curve, and the offer
+ * would be for something that does not exist. Its one static strength is
+ * still in `neutral`, where it can be read and typed.
+ */
+static void knob_auto_needs_a_curve(void)
+{
+    static hisi_state_t st;
+    rss_hal_ctx_t ctx;
+    rss_isp_knob_t k;
+    char path[32];
+    FILE *f;
+
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.platform = &st;
+
+    /* A static strength and nothing else. */
+    reset_all(&st);
+    g_drc.enable = 1;
+    f = open_tmp(path);
+    fputs("[static_drc]\n"
+          "Enable = \"1\"\n"
+          "DRCOpType = \"0\"\n"
+          "DRCAutoStr = \"512\"\n",
+          f);
+    fclose(f);
+    snprintf(st.iq_file, sizeof(st.iq_file), "%s", path);
+
+    /* Before the file is read nothing is known, and the optimistic answer
+     * is the right one: a control drawn and then withdrawn is worse than
+     * one that refuses at the edge. */
+    assert(hal_isp_get_knob_caps(&ctx, "drc_strength", &k) == RSS_OK && k.has_auto);
+
+    st.isp_thread_running = 1;
+    hisi_isp_note_frame(&st);
+    assert(g_drc.auto_strength == 512);
+    assert(hal_isp_get_knob_caps(&ctx, "drc_strength", &k) == RSS_OK);
+    assert(!k.has_auto && k.max == 1023 && k.neutral == 512 && k.enabled);
+    unlink(path);
+
+    /* One column is not a curve: the engine wants two to blend between. */
+    reset_all(&st);
+    g_drc.enable = 1;
+    f = open_tmp(path);
+    fputs("[static_drc]\n"
+          "Enable = \"1\"\n"
+          "[dynamic_linear_drc]\n"
+          "Enable = \"1\"\n"
+          "IsoLevel = \"100\"\n"
+          "Strength = \"420\"\n",
+          f);
+    fclose(f);
+    snprintf(st.iq_file, sizeof(st.iq_file), "%s", path);
+    st.isp_thread_running = 1;
+    hisi_isp_note_frame(&st);
+    assert(hal_isp_get_knob_caps(&ctx, "drc_strength", &k) == RSS_OK && !k.has_auto);
+    unlink(path);
+
+    /* And a real ladder does get the offer -- including while the knob is
+     * pinned, which is exactly when the way back is being looked for. */
+    reset_all(&st);
+    g_drc.enable = 1;
+    write_ini_dyn(path, "100, 200, 400", "420, 380, 100");
+    snprintf(st.iq_file, sizeof(st.iq_file), "%s", path);
+    st.isp_thread_running = 1;
+    hisi_isp_note_frame(&st);
+    assert(hal_isp_set_drc_strength(&ctx, 200) == RSS_OK);
+    assert(st.dyn && st.dyn->drc.engine == 0); /* held by the pin */
+    assert(hal_isp_get_knob_caps(&ctx, "drc_strength", &k) == RSS_OK && k.has_auto);
+    st.isp_thread_running = 0;
+    unlink(path);
+
+    hisi_nrx_free(&st);
+    hisi_dyn_free(&st);
+}
+
 /* Orientation: the ops remember the bits and hand them to the framesource
  * layer every time, and the getter answers from memory. */
 static void orien(void)
@@ -1748,6 +1828,7 @@ int main(void)
     load_module_state();
     sensor_fps();
     knobs();
+    knob_auto_needs_a_curve();
     orien();
 
     printf("t_hisi_iq: OK\n");

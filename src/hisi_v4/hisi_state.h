@@ -899,6 +899,7 @@ int hisi_dyn_apply(hisi_state_t *st, int *failed, char *note, size_t note_len);
 void hisi_dyn_on_exposure(hisi_state_t *st, unsigned iso, unsigned long long exposure);
 void hisi_dyn_tick(hisi_state_t *st);
 void hisi_dyn_drc_hold(hisi_state_t *st, bool hold);
+bool hisi_dyn_drc_curve(hisi_state_t *st);
 void hisi_dyn_free(hisi_state_t *st);
 
 /* The __ctype_b/mmap trampoline verification in hal_common.c. Exposed

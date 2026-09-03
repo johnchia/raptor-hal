@@ -22,7 +22,9 @@
  *                          manual mode. The [dynamic_linear_drc] engine
  *                          (hal_dyn.c) writes the same field by ISO, so a pin
  *                          holds the engine's DRC column for as long as it
- *                          stands and `auto` hands it back.
+ *                          stands and `auto` hands it back -- and the caps
+ *                          offer `auto` only where that engine has a curve
+ *                          to hand it back to.
  *
  * Units are the hardware's own, as [image]'s comment in raptor.conf
  * promises, and isp_get_knob_caps says what they are.
@@ -422,7 +424,19 @@ int hal_isp_get_knob_caps(void *ctx, const char *name, rss_isp_knob_t *caps)
 
         caps->min = 0;
         caps->max = KNOB_DRC_MAX;
-        caps->has_auto = true;
+        /*
+         * Auto is the [dynamic_linear_drc] column for the light the AE is
+         * reporting, so it is offered when the tuning has that curve and
+         * not otherwise -- a file with one static strength has nothing for
+         * auto to hand back to that `neutral` below does not already say,
+         * and a control promising a curve there would be promising one
+         * that does not exist. Until the file has been read there is
+         * nothing to know, and the optimistic answer is the right one: a
+         * control drawn and then withdrawn is worse than one that refuses
+         * at the edge.
+         */
+        caps->has_auto =
+            !__atomic_load_n(&st->iq_load_started, __ATOMIC_ACQUIRE) || hisi_dyn_drc_curve(st);
         if (knob_live(st) && knob_drc_get(st, &a) == RSS_OK)
             caps->enabled = a.enable != 0;
         caps->neutral = st->knob.drc_base_known ? st->knob.drc_base : 0;

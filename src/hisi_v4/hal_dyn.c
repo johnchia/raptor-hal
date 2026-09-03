@@ -328,6 +328,25 @@ void hisi_dyn_free(hisi_state_t *st)
  * THE KEYS
  * ================================================================ */
 
+/*
+ * hisi_dyn_drc_curve -- does the tuning vary DRC with the light?
+ *
+ * The drc_strength knob's `auto` is this engine's column for whatever ISO
+ * the AE is reporting, and the control that offers it says exactly that:
+ * follow the tuning's own curve, which varies with the light. A file whose
+ * [dynamic_linear_drc] is absent, off or one column wide has no curve, so
+ * there is nothing for auto to mean and hal_knob.c publishes none.
+ *
+ * `n` is the validated column count, and the knob's hold clears `engine`
+ * rather than the table, so this answers the same whether or not the knob
+ * is currently pinned -- which it has to, since the pinned state is exactly
+ * when the operator is looking for the way back.
+ */
+bool hisi_dyn_drc_curve(hisi_state_t *st)
+{
+    return st && st->dyn && st->dyn->drc.n >= 2;
+}
+
 static bool dyn_key_drc(struct hisi_dyn_set *d, const char *key, const char *val)
 {
     long tmp[DYN_COLS];
