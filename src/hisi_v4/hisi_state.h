@@ -169,6 +169,40 @@ typedef struct {
 int hisi_sensor_mode_load(hisi_sensor_mode_t *m, const char *sensor_name);
 
 /* ================================================================
+ * VB GEOMETRY
+ * ================================================================ */
+
+/*
+ * COMMON_GetPicBufferSize, transcribed for the one case this backend needs:
+ * NV12, 8-bit, uncompressed.
+ *
+ * From the SDK's own inline helper (mpp/include/hi_buffer.h:179 and the
+ * COMMON_GetPicBufferConfig above it), reduced to the branch that applies:
+ *
+ *   align  = DEFAULT_ALIGN (8), which is what every vendor sample passes
+ *   stride = ALIGN_UP(width * 8 / 8, align)
+ *   height = ALIGN_UP(height, 2)
+ *   size   = stride * height * 3 / 2
+ *
+ * Transcribed rather than approximated because an undersized VB block is
+ * one of the two classic gen4 bring-up failures -- SYS_Init succeeds, the
+ * pipeline builds, and VI silently delivers nothing.
+ *
+ * Here rather than in hal_common.c because both users of the formula need
+ * it: hal_common sizes the common pools from the sensor, and
+ * hal_framesource sizes a channel's own pool from the stream.
+ */
+#define HISI_VB_ALIGN 8u
+
+static inline unsigned int hisi_vb_nv12_size(unsigned int width, unsigned int height)
+{
+    unsigned int stride = ((width + HISI_VB_ALIGN - 1u) / HISI_VB_ALIGN) * HISI_VB_ALIGN;
+    unsigned int rows = (height + 1u) & ~1u;
+
+    return stride * rows * 3u / 2u;
+}
+
+/* ================================================================
  * PER-CHANNEL BOOKKEEPING
  * ================================================================ */
 
@@ -209,6 +243,23 @@ typedef struct {
      * caller gets a pointer into it. */
     bool frame_held;
     v4_video_frame_info frame;
+
+    /*
+     * This channel's own VB pool, when it has one.
+     *
+     * hal_init cannot size a common pool for streams it is never told about
+     * -- rss_multi_sensor_config_t carries sensors, not streams -- so a
+     * channel whose frames would waste a sensor-sized block gets a pool cut
+     * to its own geometry at create time, when the geometry is finally
+     * known. See hisi_fs_pool_acquire.
+     *
+     * Two fields rather than V4_VB_INVALID_POOL in one, because the state is
+     * zeroed at allocation and pool 0 is a real pool: "no pool" has to be
+     * the all-zero state or a fresh channel claims someone else's.
+     */
+    bool vb_pool_owned;
+    unsigned int vb_pool;
+    unsigned long long vb_pool_blk_size;
 } hisi_vpss_chn_t;
 
 /*
@@ -621,6 +672,17 @@ typedef struct {
     bool vb_configured;
     bool vb_inited;
     bool sys_inited;
+
+    /*
+     * Common pool 0's block size, and whether this libmpi can cut private
+     * pools at all. Both are settled in hisi_vb_bringup and read by
+     * hal_framesource: the first is the threshold above which a channel is
+     * better off in the common pool it would fill anyway, the second is what
+     * decides whether a common stream pool is configured in the first place.
+     * Zero and false on an audio-only build, which configures no pools.
+     */
+    unsigned long long vb_blk_size;
+    bool vb_private_pools;
 
     bool mipi_configured;
     bool sensor_registered;

@@ -360,6 +360,192 @@ static int hisi_fs_apply_crop(hisi_state_t *st, int chn, const rss_fs_config_t *
     return RSS_OK;
 }
 
+/* ================================================================
+ * PER-CHANNEL VB POOLS
+ * ================================================================ */
+
+/*
+ * Blocks in a channel's own pool.
+ *
+ * Four, which is what the common stream pool this replaces was configured
+ * with and what /proc/umap/vb measured it actually using: one sub-stream
+ * channel on a four-block pool held MinFree at 1. rvd's nr_vbs raises it
+ * where a caller has asked for more, and never lowers it -- rvd's own
+ * default is 2, which is its Ingenic-era figure and not a statement about
+ * this pipeline.
+ */
+#define HISI_FS_POOL_BLK_CNT 4u
+
+/*
+ * The block size this channel's own pool should have, or 0 to leave it in
+ * the common pool.
+ *
+ * The threshold is pool 0's block. A channel whose frames fill one anyway
+ * gains nothing from a pool of its own and would cost a second set of them:
+ * on a 5 MP board the full-resolution main stream is exactly that case, and
+ * it stays where it has always been. What this catches is the sub-stream,
+ * whose 640x480 frame is a sixteenth of a sensor block.
+ */
+static unsigned long long hisi_fs_pool_want(const hisi_state_t *st, const hisi_vpss_chn_t *fs)
+{
+    unsigned long long size;
+
+    if (!st->vb_private_pools || !st->vb_blk_size)
+        return 0;
+    if (!fs->width || !fs->height)
+        return 0;
+
+    size = hisi_vb_nv12_size(fs->width, fs->height);
+    if (size >= st->vb_blk_size)
+        return 0;
+    return size;
+}
+
+/*
+ * hisi_fs_pool_acquire -- cut a pool to this channel's frame and attach it.
+ *
+ * Nothing here fails the bring-up, deliberately: a channel with no pool of
+ * its own draws from the common pool, which is what every channel does on
+ * this board today and is correct everywhere. That keeps the optimisation's
+ * failure mode the same shape as the one the pool it replaced had -- a
+ * stream too big for it quietly fell back to pool 0 -- rather than
+ * introducing a new way for a pipeline to refuse to start.
+ *
+ * On the EV300 this never gets past the attach; see the NOT_SUPPORT branch.
+ */
+static void hisi_fs_pool_acquire(hisi_state_t *st, int chn, hisi_vpss_chn_t *fs, int nr_vbs)
+{
+    v4_vb_pool_conf conf;
+    unsigned long long size = hisi_fs_pool_want(st, fs);
+    unsigned int pool;
+    int ret;
+
+    if (!size)
+        return;
+
+    memset(&conf, 0, sizeof(conf));
+    conf.blk_size = size;
+    conf.blk_cnt = nr_vbs > (int)HISI_FS_POOL_BLK_CNT ? (unsigned int)nr_vbs : HISI_FS_POOL_BLK_CNT;
+    conf.remap_mode = V4_VB_REMAP_NOCACHE;
+    /* acMmzName left empty: the anonymous zone, which is where the common
+     * pools live and the only one this board declares in /proc/media-mem. */
+
+    pool = st->sys.fnVbCreatePool(&conf);
+    if (pool == V4_VB_INVALID_POOL) {
+        HAL_LOG_WARN("vpss chn %d: HI_MPI_VB_CreatePool(%llu x %u) failed; "
+                     "the channel will use the common pool",
+                     chn, conf.blk_size, conf.blk_cnt);
+        return;
+    }
+
+    ret = st->vpss.fnAttachVbPool(HISI_VPSS_GRP, hisi_vpss_phy(chn), pool);
+    if (ret) {
+        st->sys.fnVbDestroyPool(pool);
+        /*
+         * NOT_SUPPORT is the driver saying it has no such operation, not
+         * this call being wrong, so stop asking: every later channel would
+         * get the same answer and log the same line. Measured on an EV300
+         * running the openhisilicon modules, which is what this is for --
+         * HI_MPI_VPSS_AttachVbPool is in libmpi's symbol table and returns
+         * 0xa0078008 whether it is called before EnableChn or after.
+         */
+        if (ret == V4_ERR_VPSS_NOT_SUPPORT) {
+            st->vb_private_pools = false;
+            HAL_LOG_INFO("vpss: this driver has no AttachVbPool (0x%x); channels take their "
+                         "output blocks from the common pool",
+                         ret);
+        } else {
+            HAL_LOG_WARN("HI_MPI_VPSS_AttachVbPool(%d, %d, %u) failed: 0x%x; "
+                         "the channel will use the common pool",
+                         HISI_VPSS_GRP, hisi_vpss_phy(chn), pool, ret);
+        }
+        return;
+    }
+
+    fs->vb_pool_owned = true;
+    fs->vb_pool = pool;
+    fs->vb_pool_blk_size = conf.blk_size;
+    HAL_LOG_INFO("vpss chn %d: vb pool %u, %llu x %u = %llu KiB", chn, pool, conf.blk_size,
+                 conf.blk_cnt, conf.blk_size * conf.blk_cnt / 1024ull);
+}
+
+/*
+ * hisi_fs_pool_release -- detach and free, in that order.
+ *
+ * The destroy runs even when the detach reported a failure. A pool the
+ * driver still considers attached refuses to be destroyed and says so, which
+ * is a message; a pool nothing points at and nobody freed is CMA gone until
+ * the modules are reloaded, which is not. The caller disables the channel
+ * first -- see hal_fs_destroy_channel and hisi_fs_release_all.
+ */
+static void hisi_fs_pool_release(hisi_state_t *st, int chn, hisi_vpss_chn_t *fs)
+{
+    int ret;
+
+    if (!fs->vb_pool_owned)
+        return;
+
+    ret = st->vpss.fnDetachVbPool(HISI_VPSS_GRP, hisi_vpss_phy(chn));
+    if (ret)
+        HAL_LOG_WARN("HI_MPI_VPSS_DetachVbPool(%d, %d) failed: 0x%x", HISI_VPSS_GRP,
+                     hisi_vpss_phy(chn), ret);
+
+    ret = st->sys.fnVbDestroyPool(fs->vb_pool);
+    if (ret)
+        HAL_LOG_WARN("HI_MPI_VB_DestroyPool(%u) failed: 0x%x", fs->vb_pool, ret);
+
+    fs->vb_pool_owned = false;
+    fs->vb_pool = 0;
+    fs->vb_pool_blk_size = 0;
+}
+
+/*
+ * hisi_fs_pool_refresh -- keep the pool matched to a geometry that changed.
+ *
+ * A channel that grew past its own pool's blocks would otherwise stay
+ * attached to a pool that can never satisfy it, and stop producing without
+ * logging anything: the silent no-frames failure hisi_vb_nv12_size's comment
+ * warns about, arrived at from the other direction. Only an actual change in
+ * what the channel needs cycles it, so the fps-only reconfigures rvd issues
+ * while streaming still do not touch the channel.
+ */
+static void hisi_fs_pool_refresh(hisi_state_t *st, int chn, hisi_vpss_chn_t *fs, int nr_vbs)
+{
+    unsigned long long want;
+    bool was_enabled;
+    int ret;
+
+    if (!st->vb_private_pools)
+        return;
+
+    want = hisi_fs_pool_want(st, fs);
+    if (want == (fs->vb_pool_owned ? fs->vb_pool_blk_size : 0ull))
+        return;
+
+    was_enabled = fs->enabled;
+    if (was_enabled) {
+        ret = st->vpss.fnDisableChn(HISI_VPSS_GRP, hisi_vpss_phy(chn));
+        if (ret) {
+            HAL_LOG_WARN("vpss chn %d: DisableChn failed 0x%x; keeping the old vb pool", chn, ret);
+            return;
+        }
+        fs->enabled = false;
+    }
+
+    hisi_fs_pool_release(st, chn, fs);
+    hisi_fs_pool_acquire(st, chn, fs, nr_vbs);
+
+    if (was_enabled) {
+        ret = st->vpss.fnEnableChn(HISI_VPSS_GRP, hisi_vpss_phy(chn));
+        if (ret) {
+            HAL_LOG_ERR("HI_MPI_VPSS_EnableChn(%d, %d) after a vb pool change failed: 0x%x",
+                        HISI_VPSS_GRP, hisi_vpss_phy(chn), ret);
+            return;
+        }
+        fs->enabled = true;
+    }
+}
+
 int hal_fs_create_channel(void *ctx, int chn, const rss_fs_config_t *cfg)
 {
     v4_vpss_chn_attr attr;
@@ -426,9 +612,14 @@ int hal_fs_create_channel(void *ctx, int chn, const rss_fs_config_t *cfg)
      * disable op still works and still stops frames; re-enabling resumes
      * them without touching the bind.
      */
+    /* Before EnableChn, which is what instantiates the channel: the attach
+     * has to be in place by the time it starts asking for blocks. */
+    hisi_fs_pool_acquire(st, chn, fs, cfg->nr_vbs);
+
     ret = st->vpss.fnEnableChn(HISI_VPSS_GRP, hisi_vpss_phy(chn));
     if (ret) {
         HAL_LOG_ERR("HI_MPI_VPSS_EnableChn(%d, %d) failed: 0x%x", HISI_VPSS_GRP, chn, ret);
+        hisi_fs_pool_release(st, chn, fs);
         fs->configured = false;
         return RSS_ERR_IO;
     }
@@ -552,7 +743,15 @@ int hal_fs_set_channel_attr(void *ctx, int chn, const rss_fs_config_t *cfg)
     /* The crop belongs to the geometry, so a live geometry change carries
      * it. Without this a channel reconfigured from cropped to uncropped
      * would keep scaling out of the old window. */
-    return hisi_fs_apply_crop(st, chn, cfg);
+    ret = hisi_fs_apply_crop(st, chn, cfg);
+    if (ret != RSS_OK)
+        return ret;
+
+    /* And so does the pool. rvd stops the stream around set-resolution, its
+     * only caller that changes geometry, so the cycle this may do is inside
+     * a gap that already exists. */
+    hisi_fs_pool_refresh(st, chn, fs, cfg->nr_vbs);
+    return RSS_OK;
 }
 
 int hal_fs_enable_channel(void *ctx, int chn)
@@ -622,6 +821,10 @@ int hal_fs_destroy_channel(void *ctx, int chn)
     HISI_FS_ENTER(ctx, chn, st, fs);
 
     ret = hal_fs_disable_channel(ctx, chn);
+
+    /* After the disable: a pool is detached from a channel that has stopped
+     * asking it for blocks. */
+    hisi_fs_pool_release(st, chn, fs);
 
     fs->configured = false;
     fs->width = 0;
@@ -811,6 +1014,9 @@ void hisi_fs_release_all(hisi_state_t *st)
                 HAL_LOG_WARN("HI_MPI_VPSS_DisableChn(%d, %d) failed: 0x%x", HISI_VPSS_GRP, i, ret);
         }
         fs->enabled = false;
+        /* Before VB_Exit, which is the point: a pool still alive when the
+         * module goes down is the CMA-stuck-until-reload failure. */
+        hisi_fs_pool_release(st, i, fs);
         fs->configured = false;
     }
 }

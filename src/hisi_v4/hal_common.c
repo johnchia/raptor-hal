@@ -2084,33 +2084,11 @@ static void hisi_video_teardown(hisi_state_t *st)
  * SYSTEM LIFECYCLE
  * ================================================================ */
 
-/*
- * COMMON_GetPicBufferSize, transcribed for the one case this backend needs:
- * NV12, 8-bit, uncompressed.
- *
- * From the SDK's own inline helper (mpp/include/hi_buffer.h:179 and the
- * COMMON_GetPicBufferConfig above it), reduced to the branch that applies:
- *
- *   align  = DEFAULT_ALIGN (8), which is what every vendor sample passes
- *   stride = ALIGN_UP(width * 8 / 8, align)
- *   height = ALIGN_UP(height, 2)
- *   size   = stride * height * 3 / 2
- *
- * Transcribed rather than approximated because an undersized VB block is
- * one of the two classic gen4 bring-up failures -- SYS_Init succeeds, the
- * pipeline builds, and VI silently delivers nothing.
- */
-#define HISI_VB_ALIGN 8u
+/* hisi_vb_nv12_size and HISI_VB_ALIGN moved to hisi_state.h when the
+ * framesource started sizing its own pools; the formula and the reason it is
+ * transcribed rather than approximated are documented there. */
 
 #ifdef HAL_MODULE_VIDEO
-static unsigned int hisi_vb_nv12_size(unsigned int width, unsigned int height)
-{
-    unsigned int stride = ((width + HISI_VB_ALIGN - 1u) / HISI_VB_ALIGN) * HISI_VB_ALIGN;
-    unsigned int rows = (height + 1u) & ~1u;
-
-    return stride * rows * 3u / 2u;
-}
-
 /*
  * VI_GetRawBufferSize, transcribed for the uncompressed case (hi_buffer.h,
  * the RAW branch): bits per row rounded to whole bytes, the byte stride
@@ -2179,18 +2157,33 @@ static unsigned int hisi_vb_raw_size(unsigned int width, unsigned int height,
 #define HISI_VB_BLK_CNT 7u
 
 /*
- * Pool 1's geometry: the sensor's, capped at 1920x1080.
+ * Pool 1 -- the guessed stream pool -- is gone, and this is the record of
+ * why, because its absence is easier to misread than its presence was.
  *
- * hal_init is not told the stream configuration -- rss_multi_sensor_config_t
- * carries sensors, not streams -- so the size cannot be derived from what
- * rvd is about to ask for. The cap is a statement about the common case
- * rather than a limit: a stream above it falls back to pool 0 and still
- * works, and a sensor below it makes the two pools the same size, which
- * costs nothing.
+ * hal_init is not told the stream configuration: rss_multi_sensor_config_t
+ * carries sensors, not streams. So a second common pool for channel outputs
+ * could only ever be a guess, and the guess was the sensor's geometry capped
+ * at 1920x1080. On a 5 MP 4:3 board it was wrong in both directions at once.
+ * Too small for the main stream, which runs at the sensor's own resolution,
+ * falls back to pool 0 and competes there with VI for the seven blocks the
+ * count above was measured to reserve. And far too large for the sub-stream
+ * that was then its only user: /proc/umap/vb showed a single VENC-held block
+ * of 3,110,400 bytes carrying a 640x480 frame -- 11.9 MiB of CMA reserved to
+ * serve 1.8 MiB of pictures -- while pool 0 sat at MinFree 0.
+ *
+ * With one pool the channels share those seven blocks. Measured over three
+ * minutes with both streams pulled over RTSP: VI at 20 fps with LostFrame
+ * and VbFail both 0 across 10,888 frames, pool 0 steady at 2 free of 7, and
+ * 11.8 MiB handed back to the kernel -- MemFree 1.4 MiB to 13.2 MiB on the
+ * board whose OOM killer has form (docs/hisilicon.md).
+ *
+ * hisi_fs_pool_acquire is the other half of the idea, and the half that does
+ * *not* run here: hal_fs_create_channel does know the stream geometry, so
+ * where the driver implements HI_MPI_VPSS_AttachVbPool a small channel gets
+ * a pool cut to its own frame rather than borrowing a sensor-sized one. The
+ * EV300's answers NOT_SUPPORT, so on this board the paragraph above is the
+ * whole story.
  */
-#define HISI_VB_STREAM_MAX_W 1920u
-#define HISI_VB_STREAM_MAX_H 1080u
-#define HISI_VB_STREAM_BLK_CNT 4u
 
 static int hisi_vb_bringup(hisi_state_t *st)
 {
@@ -2203,13 +2196,19 @@ static int hisi_vb_bringup(hisi_state_t *st)
     if (st->mode.dev_rect.width && st->mode.dev_rect.height) {
         unsigned int sw = st->mode.dev_rect.width;
         unsigned int sh = st->mode.dev_rect.height;
-        unsigned int cw = sw < HISI_VB_STREAM_MAX_W ? sw : HISI_VB_STREAM_MAX_W;
-        unsigned int ch = sh < HISI_VB_STREAM_MAX_H ? sh : HISI_VB_STREAM_MAX_H;
 
         unsigned int nv12 = hisi_vb_nv12_size(sw, sh);
         unsigned int raw = hisi_vb_raw_size(sw, sh, (unsigned int)st->mode.raw_bitness);
 
-        conf.max_pool_cnt = 2;
+        /* All four, because the pair at each end is useless alone: a pool
+         * with nothing to attach it to leaks, and an attach with no pool to
+         * name has nothing to say. Whether the driver behind them implements
+         * the attach is a separate question, and only hisi_fs_pool_acquire
+         * is in a position to ask it. */
+        st->vb_private_pools = st->sys.fnVbCreatePool && st->sys.fnVbDestroyPool &&
+                               st->vpss.fnAttachVbPool && st->vpss.fnDetachVbPool;
+
+        conf.max_pool_cnt = 1;
 
         conf.pool[0].blk_size = raw > nv12 ? raw : nv12;
         conf.pool[0].blk_cnt = HISI_VB_BLK_CNT;
@@ -2218,9 +2217,8 @@ static int hisi_vb_bringup(hisi_state_t *st)
          * every hand-off between VI, VPSS and VENC. */
         conf.pool[0].remap_mode = V4_VB_REMAP_NOCACHE;
 
-        conf.pool[1].blk_size = hisi_vb_nv12_size(cw, ch);
-        conf.pool[1].blk_cnt = HISI_VB_STREAM_BLK_CNT;
-        conf.pool[1].remap_mode = V4_VB_REMAP_NOCACHE;
+        /* What hal_framesource compares a channel's own frame against. */
+        st->vb_blk_size = conf.pool[0].blk_size;
     }
 #endif
 
@@ -2229,12 +2227,8 @@ static int hisi_vb_bringup(hisi_state_t *st)
      * pools -- and that is the one case where an empty table is right.
      */
     if (conf.max_pool_cnt)
-        HAL_LOG_INFO("vb: %u pools, %llu x %u + %llu x %u = %llu KiB", conf.max_pool_cnt,
-                     conf.pool[0].blk_size, conf.pool[0].blk_cnt, conf.pool[1].blk_size,
-                     conf.pool[1].blk_cnt,
-                     (conf.pool[0].blk_size * conf.pool[0].blk_cnt +
-                      conf.pool[1].blk_size * conf.pool[1].blk_cnt) /
-                         1024ull);
+        HAL_LOG_INFO("vb: 1 pool, %llu x %u = %llu KiB", conf.pool[0].blk_size,
+                     conf.pool[0].blk_cnt, conf.pool[0].blk_size * conf.pool[0].blk_cnt / 1024ull);
     else
         HAL_LOG_INFO("vb: no common pools (no sensor geometry -- audio-only build)");
 

@@ -65,6 +65,12 @@ typedef struct {
 _Static_assert(sizeof(v4_vb_conf) == 520, "VB_CONFIG_S is 520 bytes");
 _Static_assert(offsetof(v4_vb_conf, pool) == 8, "VB_CONFIG_S.astCommPool at +8, not +4");
 
+/*
+ * VB_INVALID_POOLID. A pool id is an unsigned handle and 0 is a real pool,
+ * so "this channel has none" needs a value of its own; this is the SDK's.
+ */
+#define V4_VB_INVALID_POOL 0xFFFFFFFFu
+
 /* ================================================================
  * SYS -- VI/VPSS coupling
  * ================================================================ */
@@ -110,6 +116,21 @@ typedef struct {
     int (*fnVbExit)(void);
     int (*fnVbSetConfig)(const v4_vb_conf *conf);
     int (*fnVbGetConfig)(v4_vb_conf *conf);
+
+    /*
+     * Pools created *after* VB_Init, rather than configured before it.
+     *
+     * The common pools have to be sized in hal_init, which is not told the
+     * stream configuration; these are how a stage that does know its own
+     * geometry gets a pool cut to it. Optional -- without them every stage
+     * draws from the common pools, which is what the pipeline did before
+     * hisi_fs_pool_acquire existed.
+     *
+     * CreatePool returns the pool id, or V4_VB_INVALID_POOL on failure; it
+     * does not follow the 0-is-success convention of its neighbours.
+     */
+    unsigned int (*fnVbCreatePool)(const v4_vb_pool_conf *conf);
+    int (*fnVbDestroyPool)(unsigned int pool);
 
     /* Identification. */
     int (*fnGetVersion)(v4_sys_ver *version);
@@ -175,6 +196,11 @@ static inline int v4_sys_load(v4_sys_impl *lib, const v4_mpi_libs *libs)
 
     lib->fnVbGetConfig =
         (int (*)(v4_vb_conf *))v4_symbol_opt(libs, "HI_MPI_VB_GetConfig", "GK_API_VB_GetConfig");
+
+    lib->fnVbCreatePool = (unsigned int (*)(const v4_vb_pool_conf *))v4_symbol_opt(
+        libs, "HI_MPI_VB_CreatePool", "GK_API_VB_CreatePool");
+    lib->fnVbDestroyPool = (int (*)(unsigned int))v4_symbol_opt(libs, "HI_MPI_VB_DestroyPool",
+                                                                "GK_API_VB_DestroyPool");
 
     lib->fnGetVersion =
         (int (*)(v4_sys_ver *))v4_symbol_opt(libs, "HI_MPI_SYS_GetVersion", "GK_API_SYS_GetVersion");

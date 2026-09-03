@@ -41,6 +41,14 @@
 #define V4_VPSS_MAX_PHY_CHN_NUM 3
 #define V4_VPSS_MAX_CHN_NUM 7
 
+/*
+ * HI_DEF_ERR(HI_ID_VPSS, EN_ERR_LEVEL_ERROR, EN_ERR_NOT_SUPPORT) -- "this
+ * driver does not implement that call", as distinct from the call being
+ * wrong. Spelled out because it is the one VPSS error this backend acts on
+ * rather than reports: see hisi_fs_pool_acquire.
+ */
+#define V4_ERR_VPSS_NOT_SUPPORT ((int)0xa0078008)
+
 /* VPSS_CHN_MODE_E. USER means the channel's width and height are what the
  * caller asked for; AUTO makes it follow the group. Every channel raptor
  * creates is a specific stream resolution, so every one is USER. */
@@ -302,6 +310,18 @@ typedef struct {
     /* 3DNR X-params; optional, hal_nrx.c degrades to "untuned" without them. */
     int (*fnSetGrpNRXParam)(int grp, const v4_vpss_grp_nrx_param *param);
     int (*fnGetGrpNRXParam)(int grp, v4_vpss_grp_nrx_param *param);
+
+    /*
+     * Point one channel at a VB pool of its own instead of the common pools.
+     *
+     * Optional, and the pair is all-or-nothing: without both, a channel's
+     * output blocks come from the common pools, which is where they came
+     * from before. Attach wants the channel not enabled -- EnableChn is what
+     * instantiates a gen4 channel, so the window is between SetChnAttr and
+     * EnableChn. See hisi_fs_pool_acquire.
+     */
+    int (*fnAttachVbPool)(int grp, int chn, unsigned int pool);
+    int (*fnDetachVbPool)(int grp, int chn);
 } v4_vpss_impl;
 
 static inline int v4_vpss_load(v4_vpss_impl *lib, const v4_mpi_libs *libs)
@@ -348,6 +368,11 @@ static inline int v4_vpss_load(v4_vpss_impl *lib, const v4_mpi_libs *libs)
         libs, "HI_MPI_VPSS_GetGrpNRXParam", "GK_API_VPSS_GetGrpNRXParam");
     lib->fnReleaseChnFrame = (int (*)(int, int, const v4_video_frame_info *))v4_symbol_opt(
         libs, "HI_MPI_VPSS_ReleaseChnFrame", "GK_API_VPSS_ReleaseChnFrame");
+
+    lib->fnAttachVbPool = (int (*)(int, int, unsigned int))v4_symbol_opt(
+        libs, "HI_MPI_VPSS_AttachVbPool", "GK_API_VPSS_AttachVbPool");
+    lib->fnDetachVbPool = (int (*)(int, int))v4_symbol_opt(libs, "HI_MPI_VPSS_DetachVbPool",
+                                                           "GK_API_VPSS_DetachVbPool");
 
     return RSS_OK;
 }
