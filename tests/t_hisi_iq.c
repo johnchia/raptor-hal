@@ -19,7 +19,10 @@
  *      whole-tables, and a value left hanging on a backslash at EOF --
  *      where the question is what the loader refuses to apply;
  *   3. one with the vendor calls failing: a Get that errors, a Set that
- *      errors, and a symbol that never resolved.
+ *      errors, and a symbol that never resolved;
+ *   4. files carrying [module_state], the vendor's own enable mask, where
+ *      the question is which sections the loader declines to apply and
+ *      whether it still reads the mask when the file puts it last.
  *
  * Loads 2 and 3 assert on the log as well as on the structs, because
  * "skipped" is most of what they are supposed to do, and a skip is
@@ -1332,6 +1335,195 @@ static void load_dyn(void)
     hisi_dyn_free(&st);
 }
 
+/* ---------------- [module_state], the file's own enable mask ---------------- */
+
+/*
+ * The same body every time; only the mask and where it sits change. Each
+ * section carries one field that is unmistakable once written, so an
+ * assertion on the struct says whether the section ran at all -- which is
+ * the whole question here.
+ */
+static void write_ini_state(char *path, const char *mask, bool at_end)
+{
+    FILE *f = open_tmp(path);
+    int i;
+
+    if (!at_end)
+        fputs(mask, f);
+    fputs("[static_ae]\n"
+          "AutoSpeed = \"64\"\n"
+          "[static_aerouteex]\n"
+          "TotalNum = \"3\"\n"
+          "RouteEXIntTime = \"32, 20000, 40000\"\n"
+          "[static_aeweight]\n"
+          "ExpWeight_0 = \"1, 2, 3\"\n"
+          "[static_ldci]\n"
+          "Enable = \"1\"\n"
+          "[static_drc]\n"
+          "Enable = \"1\"\n"
+          "DRCAutoStr = \"512\"\n"
+          "[static_nr]\n"
+          "Enable = \"1\"\n"
+          "FineStr = \"64, 72\"\n"
+          "[static_dehaze]\n"
+          "Enable = \"1\"\n"
+          "[static_sharpen]\n"
+          "Enable = \"1\"\n"
+          "[static_dpc]\n"
+          "DpcEnable = \"1\"\n"
+          "[static_saturation]\n"
+          "AutoSat = \"128, 122, 120\"\n"
+          "[dynamic_gamma]\n"
+          "TotalNum = \"2\"\n"
+          "Interval = \"4\"\n"
+          "gammaExpThreshHtoL = \"400000, 800000\"\n"
+          "Table_0 = \\\n",
+          f);
+    for (i = 0; i < V4_ISP_GAMMA_NODES; i++)
+        fprintf(f, "%d%s", i % 4096,
+                i == V4_ISP_GAMMA_NODES - 1 ? "\n" : (i % 30 == 29 ? ",\\\n" : ","));
+    fputs("Table_1 = \\\n", f);
+    for (i = 0; i < V4_ISP_GAMMA_NODES; i++)
+        fprintf(f, "%d%s", i / 2,
+                i == V4_ISP_GAMMA_NODES - 1 ? "\n" : (i % 30 == 29 ? ",\\\n" : ","));
+    fputs("[static_3dnr]\n"
+          "3DNRCount = \"1\"\n"
+          "IsoThresh = \"100\"\n"
+          "3DnrParam_0 = \\\n",
+          f);
+    fputs(NRX_ROWS_A, f);
+    fputs("\n", f);
+    if (at_end)
+        fputs(mask, f);
+    fclose(f);
+}
+
+/* AE, its weight table, LDCI, NR, saturation, gamma and the 3DNR ladder
+ * on; DRC, dehaze, sharpen and DPC off, with their sections present and
+ * full. */
+static const char MASK_MIXED[] = "[module_state]\n"
+                                 "bStaticAE          = \"1\"\n"
+                                 "bAeWeightTab       = \"1\"\n"
+                                 "bStaticLdci        = \"1\"\n"
+                                 "bStaticDRC         = \"0\"\n"
+                                 "bStaticNr          = \"1\"\n"
+                                 "bStaticDehaze      = \"0\"\n"
+                                 "bStaticSharpen     = \"0\"\n"
+                                 "bStaticDPC         = \"0\"\n"
+                                 "bStaticSaturation  = \"1\"\n"
+                                 "bDynamicGamma      = \"1\"\n"
+                                 "bDyanamic3DNR      = \"1\"\n";
+
+static void check_mixed(void)
+{
+    /* On. */
+    assert(g_exp.auto_attr.speed == 64);
+    assert(g_route.total_num == 3 && g_route.node[2].int_time == 40000);
+    assert(g_exp.route_ex_valid == 1);
+    assert(g_stat.weight[0][0] == 1 && g_stat.weight[0][2] == 3);
+    assert(g_ldci.enable == 1);
+    assert(g_nr.enable == 1 && g_nr.auto_fine_str[0] == 64);
+    assert(g_sat.auto_sat[0] == 128 && g_sat.auto_sat[2] == 120);
+    assert(g_gamma.table[1024] == 1024);
+    assert(g_nrx_set_calls == 1 && g_nrx_mode == V4_OPERATION_MODE_AUTO);
+
+    /* Off, and every one of them had a section in the file. */
+    assert(g_drc.enable == 0 && g_drc.auto_strength == 0);
+    assert(g_dehaze.enable == 0);
+    assert(g_sharpen.enable == 0);
+    assert(g_dpc.enable == 0);
+
+    assert(log_count("[module_state] off: static_drc static_dehaze static_sharpen static_dpc") ==
+           1);
+    assert(log_count("8 modules applied") == 1);
+}
+
+static void load_module_state(void)
+{
+    static hisi_state_t st;
+    char path[32];
+
+    /* The mask where the vendor writes it. */
+    reset_all(&st);
+    write_ini_state(path, MASK_MIXED, false);
+    snprintf(st.iq_file, sizeof(st.iq_file), "%s", path);
+    hisi_isp_note_frame(&st);
+    check_mixed();
+    unlink(path);
+    hisi_nrx_free(&st);
+    hisi_dyn_free(&st);
+
+    /* And the same mask after everything it governs, which only holds
+     * because the mask is read in a pass of its own. */
+    reset_all(&st);
+    write_ini_state(path, MASK_MIXED, true);
+    snprintf(st.iq_file, sizeof(st.iq_file), "%s", path);
+    hisi_isp_note_frame(&st);
+    check_mixed();
+    unlink(path);
+    hisi_nrx_free(&st);
+    hisi_dyn_free(&st);
+
+    /* A section that names one flag has named its whole set: everything
+     * it does not list is off, the vendor's zeroed-struct rule. */
+    reset_all(&st);
+    write_ini_state(path, "[module_state]\nbStaticNr = \"1\"\n", false);
+    snprintf(st.iq_file, sizeof(st.iq_file), "%s", path);
+    hisi_isp_note_frame(&st);
+    assert(g_nr.enable == 1);
+    assert(g_exp.auto_attr.speed == 0 && g_route.total_num == 0);
+    assert(g_stat.weight[0][0] == 0 && g_ldci.enable == 0 && g_sat.auto_sat[0] == 0);
+    assert(g_gamma.table[1024] == 0);
+    assert(g_nrx_set_calls == 0);
+    assert(log_count("1 modules applied") == 1);
+    assert(log_count("[module_state] off: static_ae static_aerouteex static_aeweight "
+                     "static_ldci static_drc static_dehaze static_sharpen static_dpc "
+                     "static_saturation dynamic_gamma static_3dnr") == 1);
+    unlink(path);
+    hisi_nrx_free(&st);
+    hisi_dyn_free(&st);
+
+    /* bStaticAE alone carries the route with it -- the vendor writes both
+     * in one function -- but not the weight table, which is nested behind
+     * its own flag inside that same function. */
+    reset_all(&st);
+    write_ini_state(path, "[module_state]\nbStaticAE = \"1\"\n", false);
+    snprintf(st.iq_file, sizeof(st.iq_file), "%s", path);
+    hisi_isp_note_frame(&st);
+    assert(g_exp.auto_attr.speed == 64 && g_route.total_num == 3);
+    assert(g_stat.weight[0][0] == 0);
+    assert(log_count("2 modules applied") == 1);
+    unlink(path);
+    hisi_nrx_free(&st);
+    hisi_dyn_free(&st);
+
+    /* And the nesting the other way: the table's own flag is not enough. */
+    reset_all(&st);
+    write_ini_state(path, "[module_state]\nbAeWeightTab = \"1\"\n", false);
+    snprintf(st.iq_file, sizeof(st.iq_file), "%s", path);
+    hisi_isp_note_frame(&st);
+    assert(g_exp.auto_attr.speed == 0 && g_route.total_num == 0);
+    assert(g_stat.weight[0][0] == 0);
+    assert(log_count("0 modules applied") == 1);
+    unlink(path);
+    hisi_nrx_free(&st);
+    hisi_dyn_free(&st);
+
+    /* The ladder answers to the dynamic flag, spelled either way: the
+     * vendor's bDyanamic3DNR above, and the correction below. bStatic3DNR
+     * governs nothing, which is why a file may carry it as "0" and still
+     * have a ladder. */
+    reset_all(&st);
+    write_ini_state(path, "[module_state]\nbStatic3DNR = \"0\"\nbDynamic3DNR = \"1\"\n", false);
+    snprintf(st.iq_file, sizeof(st.iq_file), "%s", path);
+    hisi_isp_note_frame(&st);
+    assert(g_nrx_set_calls == 1 && g_nrx_mode == V4_OPERATION_MODE_AUTO);
+    assert(log_count("1 modules applied") == 1);
+    unlink(path);
+    hisi_nrx_free(&st);
+    hisi_dyn_free(&st);
+}
+
 /* ---- the sensor rate: [sensor] fps over the mode INI's Isp_FrameRate ---- */
 
 static v4_isp_pub_attr g_pub;
@@ -1553,6 +1745,7 @@ int main(void)
     load_vendor_failures();
     load_nrx_edges();
     load_dyn();
+    load_module_state();
     sensor_fps();
     knobs();
     orien();

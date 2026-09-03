@@ -51,6 +51,16 @@
  *                  majestic's runtime engines (ISO thresholds, fps
  *                  ladders). No static application exists.
  *
+ * THE ENABLE MASK
+ *
+ * A file may open with [module_state], the vendor's own list of which of
+ * its sections it meant to be applied. Every section above is gated on
+ * the matching flag; a file that carries no such section means all of
+ * them, which is what this loader did before the mask existed and what
+ * every OpenIPC IQ file but imx307.ini gets. The map from flag to section
+ * is the vendor scene_auto reference's, surprises included -- see the
+ * block above iq_state_bits.
+ *
  * WHEN IT RUNS
  *
  * The file is resolved at bring-up (hisi_isp_resolve_iq) and applied on
@@ -587,9 +597,11 @@ typedef struct {
     unsigned int unavail; /* Get failed or symbol missing; do not retry */
     unsigned int dirty;   /* INI touched it; Set on completion */
     bool route_seen;      /* static_aerouteex present -> bAERouteExValid */
+    unsigned int state;   /* [module_state]; MS_ALL when the file carries none */
 
     long nums[V4_ISP_DEHAZE_LUT]; /* the largest table parsed here */
-    char skipped[192]; /* section names for the summary line */
+    char skipped[192];  /* section names for the summary line */
+    char disabled[192]; /* sections [module_state] turned off */
 } hisi_iq_load;
 
 static const char *iq_mod_name(unsigned int bit)
@@ -1044,22 +1056,169 @@ static void iq_sect_dpc(hisi_state_t *st, hisi_iq_load *ld, const char *key, con
     ld->dirty |= IQ_DPC;
 }
 
-/* Sections with no static application, remembered once for the summary. */
-static void iq_note_skip(hisi_iq_load *ld, const char *sect)
+/* Section names collected for the summary line, each noted once. */
+static void iq_note_into(char *buf, size_t cap, const char *sect)
 {
-    size_t have = strlen(ld->skipped);
+    size_t have = strlen(buf);
 
     /* Already noted? A substring match is enough at this scale. */
-    if (strstr(ld->skipped, sect))
+    if (strstr(buf, sect))
         return;
-    if (have + strlen(sect) + 2 >= sizeof(ld->skipped))
+    if (have + strlen(sect) + 2 >= cap)
         return;
-    snprintf(ld->skipped + have, sizeof(ld->skipped) - have, "%s%s", have ? " " : "", sect);
+    snprintf(buf + have, cap - have, "%s%s", have ? " " : "", sect);
+}
+
+/* Sections with no static application. */
+static void iq_note_skip(hisi_iq_load *ld, const char *sect)
+{
+    iq_note_into(ld->skipped, sizeof(ld->skipped), sect);
+}
+
+/* ---------------- [module_state] ---------------- */
+
+/*
+ * The one part of this dialect that is not a value. [module_state] is the
+ * author's list of which of the file's own sections are meant to be
+ * applied, and the vendor's reference loader (the SDK's scene_auto
+ * sample, src/core/hi_scene_setparam.c) opens every HI_SCENE_SetXxx with
+ * the matching flag and returns without touching the ISP when it is
+ * clear. So a section sitting under a "0" is documentation, not tuning,
+ * and reading it as tuning is how a file written to leave a module alone
+ * ends up rewriting it. The shipped imx307.ini is exactly that file: it
+ * carries a full [static_sharpen], [static_ldci], [static_drc],
+ * [static_nr], [static_dehaze], [static_dpc] and [static_saturation] and
+ * turns every one of them off.
+ *
+ * Three details in the map below are the vendor's, not ours:
+ *
+ *   - [static_aerouteex] has no flag of its own. HI_SCENE_SetStaticAE
+ *     writes the route and the exposure attributes together, under
+ *     bStaticAE.
+ *   - the AE weight table is nested inside that same function, which
+ *     calls SetAeWeightTab only if bAeWeightTab, so [static_aeweight]
+ *     needs both flags and not just its own.
+ *   - the 3DNR ladder answers to bDyanamic3DNR -- the vendor's spelling,
+ *     typo and all. HI_SCENE_SetStatic3DNR is #if 0'd out of the SDK (it
+ *     is the old VI-pipe NRX V1 path), so bStatic3DNR gates nothing; the
+ *     live consumer of [static_3dnr] is HI_SCENE_SetDynamic3DNR, which
+ *     interpolates the ladder by ISO the way hal_nrx.c does. That is why
+ *     imx307.ini can carry bStatic3DNR = "0" and still have a 3DNR
+ *     ladder.
+ *
+ * Inside a [module_state] that is present, a flag that is not listed is
+ * off: the vendor's parser writes only the flags it finds into a struct
+ * that started zeroed, so absent reads as disabled there. A file that
+ * names the section has named its set.
+ */
+enum {
+    MS_STATIC_AE = 1u << 0,
+    MS_AE_WEIGHT = 1u << 1,
+    MS_STATIC_LDCI = 1u << 2,
+    MS_STATIC_DRC = 1u << 3,
+    MS_STATIC_NR = 1u << 4,
+    MS_STATIC_DEHAZE = 1u << 5,
+    MS_STATIC_SHARPEN = 1u << 6,
+    MS_STATIC_DPC = 1u << 7,
+    MS_STATIC_SAT = 1u << 8,
+    MS_DYN_LINEAR_DRC = 1u << 9,
+    MS_DYN_DEHAZE = 1u << 10,
+    MS_DYN_GAMMA = 1u << 11,
+    MS_DYN_3DNR = 1u << 12,
+    MS_ALL = (1u << 13) - 1,
+};
+
+static const struct {
+    const char *key;
+    unsigned int bit;
+} iq_state_keys[] = {
+    {"bStaticAE", MS_STATIC_AE},
+    {"bAeWeightTab", MS_AE_WEIGHT},
+    {"bStaticLdci", MS_STATIC_LDCI},
+    {"bStaticDRC", MS_STATIC_DRC},
+    {"bStaticNr", MS_STATIC_NR},
+    {"bStaticDehaze", MS_STATIC_DEHAZE},
+    {"bStaticSharpen", MS_STATIC_SHARPEN},
+    {"bStaticDPC", MS_STATIC_DPC},
+    {"bStaticSaturation", MS_STATIC_SAT},
+    {"bDynamicLinearDrc", MS_DYN_LINEAR_DRC},
+    {"bDynamicDehaze", MS_DYN_DEHAZE},
+    {"bDynamicGamma", MS_DYN_GAMMA},
+    {"bDyanamic3DNR", MS_DYN_3DNR}, /* the vendor's own key, typo and all */
+    {"bDynamic3DNR", MS_DYN_3DNR},  /* and the spelling a corrected file would use */
+};
+
+/* Which flags a section needs; 0 for one the mask does not cover. */
+static unsigned int iq_state_bits(const char *s)
+{
+    if (iq_ci_eq(s, "static_ae") || iq_ci_eq(s, "static_aerouteex"))
+        return MS_STATIC_AE;
+    if (iq_ci_eq(s, "static_aeweight"))
+        return MS_STATIC_AE | MS_AE_WEIGHT;
+    if (iq_ci_eq(s, "static_ldci"))
+        return MS_STATIC_LDCI;
+    if (iq_ci_eq(s, "static_drc"))
+        return MS_STATIC_DRC;
+    if (iq_ci_eq(s, "static_nr"))
+        return MS_STATIC_NR;
+    if (iq_ci_eq(s, "static_dehaze"))
+        return MS_STATIC_DEHAZE;
+    if (iq_ci_eq(s, "static_sharpen"))
+        return MS_STATIC_SHARPEN;
+    if (iq_ci_eq(s, "static_dpc"))
+        return MS_STATIC_DPC;
+    if (iq_ci_eq(s, "static_saturation"))
+        return MS_STATIC_SAT;
+    if (iq_ci_eq(s, "dynamic_linear_drc"))
+        return MS_DYN_LINEAR_DRC;
+    if (iq_ci_eq(s, "dynamic_dehaze"))
+        return MS_DYN_DEHAZE;
+    if (iq_ci_eq(s, "dynamic_gamma"))
+        return MS_DYN_GAMMA;
+    if (iq_ci_eq(s, "static_3dnr"))
+        return MS_DYN_3DNR;
+    return 0;
+}
+
+/*
+ * A pass of its own, before the one that applies. Every file the vendor
+ * writes puts [module_state] first, so reading it as it goes by would
+ * work today -- but a mask that only held when the section came first
+ * would be a trap for the file that puts it last, and the whole file is
+ * one short read. Returns MS_ALL for a file with no such section, which
+ * is what keeps every other IQ file behaving exactly as it did.
+ */
+static unsigned int iq_scan_state(hisi_iq_reader *r)
+{
+    unsigned int mask = 0;
+    bool seen = false;
+    size_t i;
+
+    while (iq_next(r)) {
+        if (!iq_ci_eq(r->sect, "module_state"))
+            continue;
+        seen = true;
+        for (i = 0; i < sizeof(iq_state_keys) / sizeof(iq_state_keys[0]); i++) {
+            if (!iq_ci_eq(r->key, iq_state_keys[i].key))
+                continue;
+            if (iq_num(r->val, 0))
+                mask |= iq_state_keys[i].bit;
+            break;
+        }
+    }
+
+    rewind(r->f);
+    r->sect[0] = '\0';
+    r->key[0] = '\0';
+    /* The *_warned flags stay set: the second pass reads the same file and
+     * a warning it already earned should not be printed twice. */
+    return seen ? mask : MS_ALL;
 }
 
 static void iq_dispatch(hisi_state_t *st, hisi_iq_load *ld, hisi_iq_reader *r)
 {
     const char *s = r->sect;
+    unsigned int bits;
 
     /* No section: either keys before the first header or the fallout of a
      * malformed one. Either way they belong to no module. */
@@ -1070,6 +1229,18 @@ static void iq_dispatch(hisi_state_t *st, hisi_iq_load *ld, hisi_iq_reader *r)
     if (tolower((unsigned char)s[0]) == 'i' && tolower((unsigned char)s[1]) == 'r' &&
         s[2] == '_') {
         iq_note_skip(ld, "ir_*");
+        return;
+    }
+
+    /* Read in full by iq_scan_state, before this pass began. */
+    if (iq_ci_eq(s, "module_state"))
+        return;
+
+    /* What the file says it meant. A section the mask does not cover
+     * needs no flag and keeps going. */
+    bits = iq_state_bits(s);
+    if (bits && (ld->state & bits) != bits) {
+        iq_note_into(ld->disabled, sizeof(ld->disabled), s);
         return;
     }
 
@@ -1203,6 +1374,8 @@ static void hisi_isp_apply_tuning(hisi_state_t *st)
         return;
     }
 
+    ld->state = iq_scan_state(&r);
+
     while (iq_next(&r))
         iq_dispatch(st, ld, &r);
     fclose(r.f);
@@ -1299,11 +1472,13 @@ static void hisi_isp_apply_tuning(hisi_state_t *st)
     }
 
     if (failed)
-        HAL_LOG_WARN("isp tuning: %s: %d modules applied, %d failed%s%s", st->iq_file, applied,
-                     failed, ld->skipped[0] ? "; skipped: " : "", ld->skipped);
+        HAL_LOG_WARN("isp tuning: %s: %d modules applied, %d failed%s%s%s%s", st->iq_file, applied,
+                     failed, ld->skipped[0] ? "; skipped: " : "", ld->skipped,
+                     ld->disabled[0] ? "; [module_state] off: " : "", ld->disabled);
     else
-        HAL_LOG_INFO("isp tuning: %s: %d modules applied%s%s", st->iq_file, applied,
-                     ld->skipped[0] ? "; skipped: " : "", ld->skipped);
+        HAL_LOG_INFO("isp tuning: %s: %d modules applied%s%s%s%s", st->iq_file, applied,
+                     ld->skipped[0] ? "; skipped: " : "", ld->skipped,
+                     ld->disabled[0] ? "; [module_state] off: " : "", ld->disabled);
 
     free(r.val);
     free(ld);
