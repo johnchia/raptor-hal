@@ -157,12 +157,19 @@ _Static_assert(sizeof(v4_vpss_crop_info) == 24, "VPSS_CROP_INFO_S is 24 bytes");
  * V3 is the largest and the only one this backend writes, so the union is
  * transcribed as V3 alone and the total is pinned.
  *
- * ...AND THEN CORRECTED AGAINST THE DRIVER, 2026-09-03. The header is not
- * the ABI here. The EV300 runs openhisilicon's GPL open_vpss, and its
- * VPSS_NRX_V3_S is 932 bytes where the header's is 924, because its NRc is
- * 12 bytes on a 4-byte alignment where the header's is 6 on a 1-byte one.
- * Every offset above NRc is the same in both; NRc alone moves, from +918
- * to +920, and everything after it shifts by eight.
+ * ...AND THEN CORRECTED AGAINST THE DRIVER, 2026-09-03. The headers are
+ * accurate; they are the wrong version. The board runs MPP V1.0.1.2 B030
+ * (libmpi's HI_VERSION string, and /proc/umap/vpss), and the SDK we have
+ * is V1.0.1.0. NRc grew between the two: the V1.0.1.0 header has SFC, TFC,
+ * TRC and TPC and nothing else, four bytes on a one-byte alignment; the
+ * running driver's carries an HI_BOOL and a PRESFC after them, twelve
+ * bytes on a four-byte alignment. (openhisilicon's own tree has no
+ * hi3516ev200 include directory -- its V4 VPSS is a prebuilt vpss.o, and
+ * the tV200_* block in its hi3516cv500 header is a third version again,
+ * six bytes, with MODE and PRESFC as HI_U8.)
+ *
+ * Every offset below NRc is the same in all three. NRc alone moves, from
+ * +918 to +920, and everything after it shifts by eight.
  *
  * Read off the driver rather than guessed:
  *
@@ -187,6 +194,23 @@ _Static_assert(sizeof(v4_vpss_crop_info) == 24, "VPSS_CROP_INFO_S is 24 bytes");
  * why this backend used to write MANUAL only. And they put NRc two bytes
  * early, so the file's TRC was landing in the driver's SFC and its TPC in
  * the driver's TFC while the file's own SFC and TFC went into padding.
+ *
+ * NOTHING ELSE ON THIS SURFACE MOVED, which is worth writing down because
+ * the obvious next worry is that it did. Two sweeps of V1.0.1.0 against
+ * V1.0.1.2, both from the binaries rather than from headers:
+ *
+ *   Every libmpi wrapper bulk-copies its caller's struct into an ioctl
+ *   whose _IOC_SIZE is therefore that struct's size. Of the 351 MPI
+ *   functions in both versions, exactly one changed size -- this one,
+ *   944 -> 952. (libisp's ISP_MOD_PARAM_S went 8 -> 12, and hal_common.c
+ *   forwards that one as a void *, so it never sees the shape.)
+ *
+ *   The ISP, AE and AWB attributes do not cross an ioctl one for one --
+ *   the libraries walk the caller's struct field by field into a shared
+ *   context -- so for those the check is the set of offsets each function
+ *   reaches through its argument pointer. All 27 that this backend calls
+ *   are identical between the two versions; SetStatisticsConfig alone
+ *   differs, and only by no longer reading two fields it used to.
  *
  * Field names are the vendor's, lower-cased, because the tuning text
  * refers to them by those names (-nXsf1 is SFS1:SFT1:SBR1, and so on)
