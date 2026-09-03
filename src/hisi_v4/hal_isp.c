@@ -62,9 +62,10 @@
  *
  * Selection: $RSS_ISP_TUNING if set (explicit wins outright -- an
  * unreadable explicit path is a warning and an untuned picture, not a
- * silent fallback), else /usr/share/raptor/iq/<sensor-stem>.ini -- raptor's
- * own, from config/iq/hisilicon -- else the image's
- * /etc/sensors/iq/<sensor-stem>.ini, else untuned with one WARN.
+ * silent fallback), else /usr/share/raptor/iq/<sensor-stem>.ini -- an
+ * override the image can carry, which raptor itself ships nothing into --
+ * else the image's /etc/sensors/iq/<sensor-stem>.ini, else untuned with one
+ * WARN.
  *
  * THE PARSER IS LOCAL, ON PURPOSE
  *
@@ -277,11 +278,12 @@ void hisi_isp_resolve_iq(hisi_state_t *st)
     if (!stem[0])
         return;
 
-    /* raptor's own tuning first, where the package installs one
-     * (config/iq/hisilicon in the raptor tree), then the image's. The
-     * shipped imx335.ini is majestic's daylight file with a 3DNR ladder
-     * that ends at ISO 12800; raptor's carries the night corrections
-     * docs/hisilicon.md's night comparison arrived at. */
+    /* An override first, then the image's own. raptor ships no IQ files:
+     * a tuning belongs to the sensor package that knows the part, and the
+     * night corrections docs/hisilicon.md arrived at went into OpenIPC's
+     * hisilicon-osdrv-hi3516ev200 instead. /usr/share/raptor/iq is left as
+     * the place to put one file without editing a vendor package -- empty
+     * on a stock image, and skipped in a directory read either way. */
     {
         static const char *const dirs[] = {"/usr/share/raptor/iq", "/etc/sensors/iq"};
         unsigned int d;
