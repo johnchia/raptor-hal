@@ -169,6 +169,7 @@ static int log_count(const char *needle)
 
 static int g_nrx_get_calls, g_nrx_set_calls;
 static bool g_nrx_get_fail, g_nrx_set_fail;
+static bool g_nrx_auto_refuse; /* the driver takes MANUAL but not the ladder */
 static unsigned g_iso;      /* what the stubbed AE query reports */
 static unsigned g_exp_time; /* ...and its integration time, us */
 static int g_nrx_mode;
@@ -208,6 +209,11 @@ static int set_nrx(int grp, const v4_vpss_grp_nrx_param *p)
     assert(p->nr_ver == V4_VPSS_NR_V3);
     if (g_nrx_set_fail)
         return 0xA0078006;
+    /* What this driver answered to an AUTO write before the NRc offsets
+     * were corrected, and what any driver too old for the ladder answers:
+     * VPSS/ILLEGAL_PARAM. */
+    if (g_nrx_auto_refuse && p->v3.opt_mode == V4_OPERATION_MODE_AUTO)
+        return 0xA0078003;
     g_nrx_mode = p->v3.opt_mode;
     if (p->v3.opt_mode == V4_OPERATION_MODE_AUTO) {
         g_nrx_num = p->v3.auto_.param_num;
@@ -411,6 +417,7 @@ static void reset_all(hisi_state_t *st)
     g_nrx_set_calls = 0;
     g_nrx_get_fail = false;
     g_nrx_set_fail = false;
+    g_nrx_auto_refuse = false;
     g_iso = 100;
     g_exp_time = 1000; /* ISO 100 at 1 ms: exposure 1000, the first gamma band */
     g_nrx_mode = -1;
@@ -663,14 +670,17 @@ static void load_good(void)
     assert(log_count("not applied") == 0);
     assert(log_count("module skipped") == 0);
 
-    /* [static_3dnr]: two rungs; AE says ISO 100, so the first goes in MANUAL */
+    /* [static_3dnr]: two rungs, and the driver takes the whole ladder, so
+     * the write is AUTO and block 0 is still the ISO 100 rung */
     {
         const v4_vpss_nrx_v3 *b = &g_nrx_blk[0];
 
         assert(g_nrx_get_calls == 1);
         assert(g_nrx_set_calls == 1);
-        assert(g_nrx_mode == V4_OPERATION_MODE_MANUAL);
-        assert(log_count("2 rungs, ISO 100..400; AE at ISO 100, rung written") == 1);
+        assert(g_nrx_mode == V4_OPERATION_MODE_AUTO);
+        assert(g_nrx_num == 2 && g_nrx_iso[0] == 100 && g_nrx_iso[1] == 400);
+        assert(log_count("2 rungs, ISO 100..400; the driver has the ladder "
+                         "and selects per frame (AUTO)") == 1);
 
         /* the sample's mapping, row by row, on the ISO 100 block */
         assert(b->sfy[0].sfs1 == 18 && b->sfy[0].sft1 == 0 && b->sfy[0].sbr1 == 128);
@@ -727,63 +737,6 @@ static void load_good(void)
         /* column 4's SFT/SBR are not in the text either */
         assert(b->sfy[4].sft1 == 0 && b->sfy[4].sbr1 == 0);
 
-        /* the tick: ISO 200 sits halfway between the rungs in stops, so the
-         * blend is the sample's rounding midpoint of 60/61 and 7/9, 11/13 */
-        g_iso = 200;
-        hisi_nrx_on_iso(&st, g_iso);
-        assert(g_nrx_set_calls == 2);
-        assert(b->nrc.sfc == 61);
-        assert(b->tfy[1].tfs0 == 8 && b->tfy[1].tfs1 == 12);
-        assert(b->sfy[0].sfs1 == 18 && b->sfy[0].sbsk[0] == 1234); /* unchanged, and kept */
-
-        /* the second rung, where the fixture changed it and only there */
-        g_iso = 400;
-        hisi_nrx_on_iso(&st, g_iso);
-        assert(g_nrx_set_calls == 3);
-        assert(b->nrc.sfc == 61);
-        assert(b->tfy[1].tfs0 == 9 && b->tfy[1].tfs1 == 13);
-        assert(b->sfy[0].sfs1 == 18 && b->mdy[0].math1 == 150);
-
-        /* past the top rung is the top rung; the same step is no write */
-        g_iso = 50000;
-        hisi_nrx_on_iso(&st, g_iso);
-        assert(g_nrx_set_calls == 4 && b->nrc.sfc == 61 && b->tfy[1].tfs0 == 9);
-        hisi_nrx_on_iso(&st, g_iso);
-        assert(g_nrx_set_calls == 4);
-        g_iso = 50500; /* same MapISO step */
-        hisi_nrx_on_iso(&st, g_iso);
-        assert(g_nrx_set_calls == 4);
-
-        /* and back down to the first */
-        g_iso = 100;
-        hisi_nrx_on_iso(&st, g_iso);
-        assert(g_nrx_set_calls == 5 && b->nrc.sfc == 60 && b->tfy[1].tfs0 == 7);
-
-        /* the clocked entry point is armed and rate-limited: two calls in
-         * the same second are one query at most, and a stopped engine is
-         * silent. The same tick feeds the ISP engines: ISO 400 is their
-         * top column too. */
-        g_iso = 400;
-        hisi_dyn_tick(&st);
-        hisi_dyn_tick(&st);
-        assert(g_nrx_set_calls == 6);
-        assert(g_drc.manual_strength == 100 && g_drc.detail_adjust_factor == -4);
-        assert(g_dehaze.auto_strength == 90);
-        assert(log_count("drc: ISO 100 -> 400, now on column 2 (ISO 400); strength 100") == 1);
-        assert(log_count("dehaze: ISO 100 -> 400, now on column 2 (ISO 400); strength 90") == 1);
-        g_nrx_set_fail = true;
-        g_iso = 100;
-        hisi_nrx_on_iso(&st, g_iso);
-        hisi_nrx_on_iso(&st, g_iso);
-        hisi_nrx_on_iso(&st, g_iso);
-        assert(log_count("failed three times running") == 1);
-        assert(st.nrx->engine == 0);
-        g_nrx_set_fail = false;
-        st.iso_tick_ns = 0;
-        hisi_dyn_tick(&st);
-        assert(g_nrx_set_calls == 9); /* the three failed writes, none after */
-        /* ...while the ISP engines, untroubled, followed AE back down */
-        assert(g_drc.manual_strength == 420 && g_dehaze.auto_strength == 58);
     }
 
     /* the latch is one-shot: a second frame reloads nothing, and the tick
@@ -794,6 +747,96 @@ static void load_good(void)
         hisi_isp_note_frame(&st);
         assert(g_sets == sets);
     }
+
+    unlink(path);
+}
+
+/*
+ * The MANUAL fall-back, on a driver that will not take the ladder. That
+ * was every board until the NRc offsets were corrected -- an AUTO write
+ * came back 0xa0078003 -- and it stays the path for any driver too old
+ * for the whole ladder, so the per-ISO engine behind it is live code and
+ * is tested here. Load 1's file, verbatim; only the vendor's answer to
+ * the AUTO write differs.
+ */
+static void load_nrx_manual(void)
+{
+    static hisi_state_t st;
+    const v4_vpss_nrx_v3 *b = &g_nrx_blk[0];
+    char path[32];
+
+    reset_all(&st);
+    g_nrx_auto_refuse = true;
+    write_ini_good(path);
+    snprintf(st.iq_file, sizeof(st.iq_file), "%s", path);
+
+    hisi_isp_note_frame(&st);
+
+    /* the refused ladder, then the rung AE asks for */
+    assert(g_nrx_set_calls == 2);
+    assert(g_nrx_mode == V4_OPERATION_MODE_MANUAL);
+    assert(log_count("refused the ladder (AUTO): 0xa0078003; raptor selects the rung "
+                     "instead") == 1);
+    assert(log_count("2 rungs, ISO 100..400; AE at ISO 100, rung written") == 1);
+    assert(b->nrc.sfc == 60);
+
+    /* the tick: ISO 200 sits halfway between the rungs in stops, so the
+     * blend is the sample's rounding midpoint of 60/61 and 7/9, 11/13 */
+    g_iso = 200;
+    hisi_nrx_on_iso(&st, g_iso);
+    assert(g_nrx_set_calls == 3);
+    assert(b->nrc.sfc == 61);
+    assert(b->tfy[1].tfs0 == 8 && b->tfy[1].tfs1 == 12);
+    assert(b->sfy[0].sfs1 == 18 && b->sfy[0].sbsk[0] == 1234); /* unchanged, and kept */
+
+    /* the second rung, where the fixture changed it and only there */
+    g_iso = 400;
+    hisi_nrx_on_iso(&st, g_iso);
+    assert(g_nrx_set_calls == 4);
+    assert(b->nrc.sfc == 61);
+    assert(b->tfy[1].tfs0 == 9 && b->tfy[1].tfs1 == 13);
+    assert(b->sfy[0].sfs1 == 18 && b->mdy[0].math1 == 150);
+
+    /* past the top rung is the top rung; the same step is no write */
+    g_iso = 50000;
+    hisi_nrx_on_iso(&st, g_iso);
+    assert(g_nrx_set_calls == 5 && b->nrc.sfc == 61 && b->tfy[1].tfs0 == 9);
+    hisi_nrx_on_iso(&st, g_iso);
+    assert(g_nrx_set_calls == 5);
+    g_iso = 50500; /* same MapISO step */
+    hisi_nrx_on_iso(&st, g_iso);
+    assert(g_nrx_set_calls == 5);
+
+    /* and back down to the first */
+    g_iso = 100;
+    hisi_nrx_on_iso(&st, g_iso);
+    assert(g_nrx_set_calls == 6 && b->nrc.sfc == 60 && b->tfy[1].tfs0 == 7);
+
+    /* the clocked entry point is armed and rate-limited: two calls in
+     * the same second are one query at most, and a stopped engine is
+     * silent. The same tick feeds the ISP engines: ISO 400 is their
+     * top column too. */
+    g_iso = 400;
+    hisi_dyn_tick(&st);
+    hisi_dyn_tick(&st);
+    assert(g_nrx_set_calls == 7);
+    assert(g_drc.manual_strength == 100 && g_drc.detail_adjust_factor == -4);
+    assert(g_dehaze.auto_strength == 90);
+    assert(log_count("drc: ISO 100 -> 400, now on column 2 (ISO 400); strength 100") == 1);
+    assert(log_count("dehaze: ISO 100 -> 400, now on column 2 (ISO 400); strength 90") == 1);
+    g_nrx_set_fail = true;
+    g_iso = 100;
+    hisi_nrx_on_iso(&st, g_iso);
+    hisi_nrx_on_iso(&st, g_iso);
+    hisi_nrx_on_iso(&st, g_iso);
+    assert(log_count("failed three times running") == 1);
+    assert(st.nrx->engine == 0);
+    g_nrx_set_fail = false;
+    st.iso_tick_ns = 0;
+    hisi_dyn_tick(&st);
+    assert(g_nrx_set_calls == 10); /* the three failed writes, none after */
+    /* ...while the ISP engines, untroubled, followed AE back down */
+    assert(g_drc.manual_strength == 420 && g_dehaze.auto_strength == 58);
 
     unlink(path);
 }
@@ -1012,8 +1055,8 @@ static void load_nrx_edges(void)
     static hisi_state_t st;
     char path[32];
 
-    /* A second rung one row short: skipped by name, the ladder shortens to
-     * one rung, and AE's ISO 400 lands on that rung. */
+    /* A second rung one row short: skipped by name, and the ladder the
+     * driver is handed shortens to the one rung that parsed. */
     reset_all(&st);
     g_iso = 400;
     write_ini_nrx(path, true, "100, 400", false);
@@ -1021,27 +1064,30 @@ static void load_nrx_edges(void)
     hisi_isp_note_frame(&st);
     assert(log_count("3DnrParam_1: 1 rows short, first missing -mXmatw; block skipped") == 1);
     assert(log_count("3DNRCount is 2 but 3DnrParam_1 is missing or malformed; using the 1") == 1);
-    assert(g_nrx_mode == V4_OPERATION_MODE_MANUAL && g_nrx_set_calls == 1);
+    assert(g_nrx_mode == V4_OPERATION_MODE_AUTO && g_nrx_set_calls == 1);
+    assert(g_nrx_num == 1 && g_nrx_iso[0] == 100);
     assert(g_nrx_blk[0].nrc.sfc == 60);
-    assert(log_count("1 rungs, ISO 100..100; AE at ISO 400") == 1);
+    assert(log_count("1 rungs, ISO 100..100; the driver has the ladder") == 1);
     unlink(path);
 
-    /* A ladder that is not ascending is cut at the fault, and with no way
-     * to ask AE the first rung goes in once and the engine stays off. */
+    /* A ladder that is not ascending is cut at the fault. On the MANUAL
+     * fall-back, with no way to ask AE, the first rung goes in once and
+     * the engine stays off. */
     reset_all(&st);
+    g_nrx_auto_refuse = true;
     st.tune.query_exp = NULL;
     write_ini_nrx(path, false, "400, 100", false);
     snprintf(st.iq_file, sizeof(st.iq_file), "%s", path);
     hisi_isp_note_frame(&st);
     assert(log_count("IsoThresh not ascending at entry 1 (100 after 400); truncating to 1") == 1);
-    assert(g_nrx_set_calls == 1);
+    assert(g_nrx_set_calls == 2); /* the refused ladder, then the rung */
     assert(g_nrx_mode == V4_OPERATION_MODE_MANUAL);
     assert(g_nrx_blk[0].nrc.sfc == 60 && g_nrx_blk[0].sfy[0].sbsk[0] == 1234);
     assert(log_count("no ISO query") == 1);
     assert(st.nrx->engine == 0);
     st.iso_tick_ns = 0;
     hisi_dyn_tick(&st);
-    assert(g_nrx_set_calls == 1);
+    assert(g_nrx_set_calls == 2);
     unlink(path);
 
     /* The write itself failing counts as a failed module. */
@@ -1502,6 +1548,7 @@ static void orien(void)
 int main(void)
 {
     load_good();
+    load_nrx_manual();
     load_bad();
     load_vendor_failures();
     load_nrx_edges();
