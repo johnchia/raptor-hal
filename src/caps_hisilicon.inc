@@ -88,7 +88,8 @@ const rss_hal_caps_t g_hal_caps = {
      *
      * has_rotation is true and per channel: HI_MPI_VPSS_SetChnRotation
      * turns one VPSS channel's output by 90, 180 or 270, so each stream can
-     * be turned on its own (the SigmaStar backends turn all at once). The
+     * be turned on its own (no SigmaStar backend turns one at all: the 6C's
+     * scaler answers MI_ERR_SCL_NOT_SUPPORT and star publishes no such op). The
      * channel attribute keeps the configured size and the picture leaves
      * with width and height swapped, which rvd sizes the encoder for.
      *
