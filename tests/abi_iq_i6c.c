@@ -103,6 +103,7 @@
                    #row ": the entry array does not end where stManual begins");
 
 I6C_ISP_IQ_AUTOMAN_ROWS(IQ_MANUAL_AT)
+I6C_ISP_IQ_MANUALONLY_ROWS(IQ_MANUAL_AT)
 I6C_ISP_IQ_FLAT_ROWS(IQ_FITS)
 I6C_ISP_IQ_VECTOR_ROWS(IQ_VECTOR_AT)
 I6C_ISP_IQ_GAINRUN_ROWS(IQ_GAINRUN_AT)
@@ -151,6 +152,42 @@ _Static_assert(sizeof(MI_ISP_IQ_SaturationParam_t) == 24,
  * a 112-byte parameter block against a 104-byte one. That is why has_temper is
  * true on this SoC and false on 6E -- see src/caps_sigmastar.inc.
  */
+
+/*
+ * Colortrans, field by field, because it is the one module this port composes a
+ * payload for rather than writing a single level into: three offsets and nine
+ * matrix entries all have to be where the table says, and a payload size checks
+ * none of it. The offsets are addressed individually rather than as an array,
+ * so each is asserted rather than only the first.
+ */
+#define CT_PARAM MI_ISP_IQ_ColorTransParam_t
+#define CT_AT(ours, theirs)                                                                        \
+    _Static_assert(I6C_ISP_IQ_COLORTRANS_##ours ==                                                 \
+                       I6C_ISP_IQ_COLORTRANS_MANUAL + offsetof(CT_PARAM, theirs),                  \
+                   "COLORTRANS: " #ours " is not at stManual + offsetof("                          \
+                   "MI_ISP_IQ_ColorTransParam_t, " #theirs ")");
+
+CT_AT(YOFST, u16Y_OFST)
+CT_AT(UOFST, u16U_OFST)
+CT_AT(VOFST, u16V_OFST)
+CT_AT(MATRIX, u16Matrix)
+_Static_assert(I6C_ISP_IQ_COLORTRANS_MAT_NUM == COLORTRANS_MATRIX_NUM,
+               "COLORTRANS: the matrix is not the vendor's number of entries");
+_Static_assert(sizeof(((CT_PARAM *)0)->u16Matrix[0]) == 2 &&
+                   sizeof(((CT_PARAM *)0)->u16Y_OFST) == 2,
+               "COLORTRANS: the composer reads and writes both fields two bytes wide");
+
+/*
+ * R2Y is recorded and not driven, so only the two numbers a later use would
+ * start from are checked: where its matrix begins and where the Y-pedestal flag
+ * sits behind it.
+ */
+_Static_assert(I6C_ISP_IQ_R2Y_MATRIX ==
+                   I6C_ISP_IQ_R2Y_MANUAL + offsetof(MI_ISP_IQ_R2YParam_t, u16Matrix),
+               "R2Y: the matrix is not at offsetof(MI_ISP_IQ_R2YParam_t, u16Matrix)");
+_Static_assert(I6C_ISP_IQ_R2Y_ADDY16 ==
+                   I6C_ISP_IQ_R2Y_MANUAL + offsetof(MI_ISP_IQ_R2YParam_t, u8AddY16),
+               "R2Y: the pedestal flag is not at offsetof(MI_ISP_IQ_R2YParam_t, u8AddY16)");
 
 /*
  * The ISP channel parameters, which are where Infinity6C's flip, rotation and

@@ -286,6 +286,122 @@ static uint32_t neighbour_at(const uint8_t *store, unsigned int i)
     return i6c_iq_read(store, I6C_ISP_IQ_NR3D_AUTO + i * I6C_ISP_IQ_NR3D_ENTRY + NR3D_MDGAIN, 2);
 }
 
+/*
+ * The colour transform, which is the one module here that three knobs share.
+ *
+ * Stubbed as a byte store like the rest, and for a sharper version of the same
+ * reason: the composer writes nine coefficients and one offset out of a payload
+ * of twenty-eight bytes, so what has to be caught is a write landing outside
+ * the fields it names as much as a wrong value inside them.
+ */
+static uint8_t g_ctrans[I6C_ISP_IQ_COLORTRANS_PAYLOAD];
+static uint8_t g_ctex[I6C_ISP_IQ_COLORTRANSEX_PAYLOAD];
+static int g_ctrans_sets;
+
+static int fake_get_ctrans(unsigned int device, unsigned int channel, void *payload)
+{
+    (void)device;
+    (void)channel;
+    memcpy(payload, g_ctrans, sizeof(g_ctrans));
+    return 0;
+}
+
+static int fake_set_ctrans(unsigned int device, unsigned int channel, void *payload)
+{
+    (void)device;
+    (void)channel;
+    g_ctrans_sets++;
+    memcpy(g_ctrans, payload, sizeof(g_ctrans));
+    return 0;
+}
+
+static int fake_get_ctex(unsigned int device, unsigned int channel, void *payload)
+{
+    (void)device;
+    (void)channel;
+    memcpy(payload, g_ctex, sizeof(g_ctex));
+    return 0;
+}
+
+static int fake_set_ctex(unsigned int device, unsigned int channel, void *payload)
+{
+    (void)device;
+    (void)channel;
+    memcpy(g_ctex, payload, sizeof(g_ctex));
+    return 0;
+}
+
+/*
+ * The conversion an IMX335 tuning ships: BT.601 at full swing over 256, with
+ * the negative coefficients in the field's 10-bit two's complement and all
+ * three offsets at zero.
+ */
+static const int16_t ct_full[I6C_ISP_IQ_COLORTRANS_MAT_NUM] = {77,  150, 29,   -43, -85,
+                                                               128, 128, -107, -21};
+
+/*
+ * The same conversion at limited swing, which is what the ISP puts out with the
+ * module disabled and therefore what the composer works in once a full-range
+ * tuning has been narrowed -- see i6c_ct_capture. The luma row comes to 219 of
+ * 256 and the chroma rows to 224, with a 16-count pedestal that is 64 in the
+ * offset field's quarter-count domain.
+ *
+ * The seed for every test that is not about the narrowing itself, so that
+ * "unchanged" means unchanged rather than "unchanged after a conversion the
+ * test would have to repeat".
+ */
+static const int16_t ct_lim[I6C_ISP_IQ_COLORTRANS_MAT_NUM] = {66,  129, 25,  -38, -75,
+                                                              112, 112, -94, -18};
+#define CT_LIM_OFST 64
+
+static void seed_ctrans(const int16_t *m, int32_t yofst)
+{
+    int i;
+
+    memset(g_ctrans, 0, sizeof(g_ctrans));
+    for (i = 0; i < I6C_ISP_IQ_COLORTRANS_MAT_NUM; i++)
+        i6c_iq_write(g_ctrans, I6C_ISP_IQ_COLORTRANS_MATRIX + 2 * i, 2,
+                     i6c_ct_unsigned(m[i], I6C_ISP_IQ_COLORTRANS_MAT_WRAP));
+    i6c_iq_write(g_ctrans, I6C_ISP_IQ_COLORTRANS_YOFST, 2,
+                 i6c_ct_unsigned(yofst, I6C_ISP_IQ_COLORTRANS_OFST_WRAP));
+}
+
+static int32_t ct_coef(int i)
+{
+    return i6c_ct_signed(i6c_iq_read(g_ctrans, I6C_ISP_IQ_COLORTRANS_MATRIX + 2 * i, 2),
+                         I6C_ISP_IQ_COLORTRANS_MAT_WRAP);
+}
+
+static int32_t ct_ofst(int i)
+{
+    return i6c_ct_signed(i6c_iq_read(g_ctrans, I6C_ISP_IQ_COLORTRANS_YOFST + 2 * i, 2),
+                         I6C_ISP_IQ_COLORTRANS_OFST_WRAP);
+}
+
+/* What the composed transform makes of a neutral grey: R = G = B = 128 puts
+ * 128 * sum/256 through the row, and the offset adds a quarter of its own
+ * count. */
+static int32_t ct_mid_grey(void)
+{
+    return (128 * (ct_coef(0) + ct_coef(1) + ct_coef(2))) / 256 + ct_ofst(0) / 4;
+}
+
+/* The state the composer keeps is file-static and outlives a test, as g_iq is. */
+static void reset_ct_rows(void)
+{
+    int i;
+
+    reset_row(IQ_COLORTRANS, fake_get_ctrans, fake_set_ctrans);
+    reset_row(IQ_COLORTRANS_EX, fake_get_ctex, fake_set_ctex);
+    seed_ctrans(ct_lim, CT_LIM_OFST);
+    memset(g_ctex, 0, sizeof(g_ctex));
+    g_ctrans_sets = 0;
+
+    memset(&g_ct, 0, sizeof(g_ct));
+    for (i = 0; i < CT_KNOB_COUNT; i++)
+        g_ct.val[i] = RSS_ISP_AUTO;
+}
+
 static void reset(infinity6c_state_t *st)
 {
     memset(st, 0, sizeof(*st));
@@ -308,6 +424,13 @@ static void reset(infinity6c_state_t *st)
     reset_row(IQ_DEFOG, fake_get_defog, fake_set_defog);
     reset_row(IQ_DEFOG_EN, fake_get_defog, fake_set_defog);
     memset(g_defog, 0, sizeof(g_defog));
+
+    /*
+     * The colour transform, wired for every test rather than only the ones
+     * about it: the flush composes it unconditionally, so a test of anything
+     * else that reaches the flush would otherwise resolve a NULL getter.
+     */
+    reset_ct_rows();
 
     /* The tuning binary's own envelope on this board: a 100 ms ceiling, which
      * at 8.08 us a line is VMAX 12376 and about 8 fps. */
@@ -1444,6 +1567,563 @@ static void test_temper_says_so_when_the_tuning_is_in_manual(void)
 }
 
 /*
+ * Neutral is the tuning's own rendering, exactly.
+ *
+ * The load-bearing test of the whole mechanism. Every knob below is expressed
+ * as a departure from this, so if neutral is not a byte-for-byte reproduction
+ * of what the tuner left then none of the others means what it says -- and the
+ * failure would be invisible, because a picture that is slightly wrong
+ * everywhere looks like a picture.
+ *
+ * Both spellings of neutral, because they are different requests: auto says the
+ * tuning owns the knob and 50 says the operator has chosen the middle. They
+ * write the same bytes on purpose, and only the getter tells them apart.
+ */
+static void test_neutral_reproduces_the_tunings_own_transform(void)
+{
+    rss_hal_ctx_t ctx;
+    infinity6c_state_t st;
+    uint8_t before[I6C_ISP_IQ_COLORTRANS_PAYLOAD];
+    void *c = &ctx;
+    int v;
+
+    reset(&st);
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.platform = &st;
+    st.isp_knobs_live = true;
+    seed_ctrans(ct_lim, CT_LIM_OFST);
+    memcpy(before, g_ctrans, sizeof(before));
+
+    CHECK(hal_isp_set_brightness(c, 50) == RSS_OK, "the middle is a legal value");
+    CHECK(hal_isp_set_contrast(c, 50) == RSS_OK, "so is the middle of contrast");
+    CHECK(hal_isp_set_saturation(c, 50) == RSS_OK, "and of saturation");
+
+    CHECK(memcmp(g_ctrans + I6C_ISP_IQ_COLORTRANS_YOFST, before + I6C_ISP_IQ_COLORTRANS_YOFST,
+                 sizeof(before) - I6C_ISP_IQ_COLORTRANS_YOFST) == 0,
+          "the middle of all three knobs must reproduce the tuning byte for byte");
+    CHECK(i6c_iq_read(g_ctrans, I6C_ISP_ENABLE_OFF, 4) == 1,
+          "and must switch the module on, since nothing else will");
+
+    CHECK(hal_isp_set_brightness(c, RSS_ISP_AUTO) == RSS_OK, "auto is a legal value");
+    CHECK(hal_isp_set_contrast(c, RSS_ISP_AUTO) == RSS_OK, "for all three");
+    CHECK(hal_isp_set_saturation(c, RSS_ISP_AUTO) == RSS_OK, "of them");
+    CHECK(memcmp(g_ctrans + I6C_ISP_IQ_COLORTRANS_YOFST, before + I6C_ISP_IQ_COLORTRANS_YOFST,
+                 sizeof(before) - I6C_ISP_IQ_COLORTRANS_YOFST) == 0,
+          "auto writes the same bytes as the middle does");
+
+    CHECK(hal_isp_get_brightness(c, &v) == RSS_OK && v == RSS_ISP_AUTO,
+          "and is the one thing that reads back differently, got %d", v);
+}
+
+/*
+ * Contrast pivots on mid-grey, not on black.
+ *
+ * Scaling the luma row alone multiplies every luma including the ones near
+ * zero, so raising contrast would raise the whole picture's brightness with it
+ * and lowering it would sink it. The offset term is what turns that into a
+ * pivot, and the identity it has to satisfy is the one asserted here: mid-grey
+ * in gives mid-grey out at any contrast.
+ */
+static void test_contrast_pivots_on_mid_grey(void)
+{
+    rss_hal_ctx_t ctx;
+    infinity6c_state_t st;
+    void *c = &ctx;
+    int32_t y_of_mid;
+    int i;
+
+    reset(&st);
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.platform = &st;
+    st.isp_knobs_live = true;
+
+    /* Where the baseline puts mid-grey, before any knob has moved. */
+    CHECK(hal_isp_set_contrast(c, I6C_CT_KNOB_UNITY) == RSS_OK, "the middle is legal");
+    y_of_mid = ct_mid_grey();
+
+    /*
+     * What must not move is where the baseline put mid-grey, which is not
+     * mid-grey itself: this conversion carries a pedestal, so 128 in comes out
+     * at 126. Measured from the baseline rather than assumed, because a test
+     * that assumed 128 would pass only for a full-range tuning and would have
+     * agreed with a composer that tilts every limited-range one.
+     */
+    CHECK(y_of_mid == 126, "the baseline maps mid-grey to 126, got %d", y_of_mid);
+
+    CHECK(hal_isp_set_contrast(c, I6C_CT_KNOB_MAX) == RSS_OK, "full contrast is legal");
+    for (i = 0; i < I6C_CT_ROW_LEN; i++)
+        CHECK(ct_coef(i) == 2 * ct_lim[i], "the luma row doubles at full contrast, %d gave %d", i,
+              ct_coef(i));
+    CHECK(ct_mid_grey() == y_of_mid, "and mid-grey must not move, got %d", ct_mid_grey());
+
+    CHECK(hal_isp_set_contrast(c, 0) == RSS_OK, "so is none");
+    CHECK(ct_mid_grey() == y_of_mid, "nor at none of it, got %d", ct_mid_grey());
+
+    CHECK(hal_isp_set_contrast(c, 70) == RSS_OK, "nor anywhere between");
+    CHECK(ct_mid_grey() == y_of_mid, "got %d", ct_mid_grey());
+
+    /* Chroma is not contrast's business, and neither are the chroma offsets. */
+    for (i = I6C_CT_ROW_U; i < I6C_ISP_IQ_COLORTRANS_MAT_NUM; i++)
+        CHECK(ct_coef(i) == ct_lim[i], "contrast must not touch chroma, %d gave %d", i, ct_coef(i));
+    CHECK(ct_ofst(1) == 0 && ct_ofst(2) == 0, "nor the chroma offsets");
+}
+
+/*
+ * Saturation scales the chroma rows and nothing else.
+ *
+ * It needs no pivot term of its own, and that is a property of the hardware
+ * rather than an omission: the 128 pedestal is added after the matrix, so a
+ * scaled chroma row already pivots on neutral grey. The test that it works is
+ * that the offsets stay where the tuning left them while the rows move.
+ */
+static void test_saturation_scales_only_the_chroma_rows(void)
+{
+    rss_hal_ctx_t ctx;
+    infinity6c_state_t st;
+    void *c = &ctx;
+    int i;
+
+    reset(&st);
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.platform = &st;
+    st.isp_knobs_live = true;
+    seed_ctrans(ct_lim, CT_LIM_OFST);
+
+    CHECK(hal_isp_set_saturation(c, I6C_CT_KNOB_UNITY / 2) == RSS_OK, "half saturation is legal");
+
+    for (i = 0; i < I6C_CT_ROW_LEN; i++)
+        CHECK(ct_coef(i) == ct_lim[i], "saturation must not touch luma, %d gave %d", i, ct_coef(i));
+    for (i = I6C_CT_ROW_U; i < I6C_ISP_IQ_COLORTRANS_MAT_NUM; i++) {
+        int32_t want = i6c_ct_scale(ct_lim[i], I6C_CT_KNOB_UNITY / 2);
+
+        CHECK(ct_coef(i) == want, "chroma %d should be %d, got %d", i, want, ct_coef(i));
+    }
+    CHECK(ct_ofst(0) == CT_LIM_OFST, "the tuning's own luma offset survives, got %d", ct_ofst(0));
+    CHECK(ct_ofst(1) == 0 && ct_ofst(2) == 0, "and the chroma offsets are not the pedestal");
+}
+
+/*
+ * Brightness is four counts of the offset per count of eight-bit luma.
+ *
+ * The one knob with no gain in it, so the only thing that can be wrong is the
+ * domain -- and getting that wrong is a factor of four, which looks like a knob
+ * that either does nothing or saturates immediately.
+ *
+ * Asserted against literal counts rather than against the constants the
+ * composer uses. Written the other way the test passes for any domain at all,
+ * because both sides of it move together -- which is exactly the mistake it
+ * exists to catch.
+ */
+static void test_brightness_moves_the_offset_and_nothing_else(void)
+{
+    rss_hal_ctx_t ctx;
+    infinity6c_state_t st;
+    void *c = &ctx;
+    int i;
+
+    reset(&st);
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.platform = &st;
+    st.isp_knobs_live = true;
+    seed_ctrans(ct_lim, CT_LIM_OFST);
+
+    /* 64 counts of luma at four counts of the field each, above the tuning's
+     * own offset of 64: 64 + 256. */
+    CHECK(hal_isp_set_brightness(c, I6C_CT_KNOB_MAX) == RSS_OK, "full brightness is legal");
+    CHECK(ct_ofst(0) == 320, "the top of the knob is +64 luma over the tuning's 64, got %d",
+          ct_ofst(0));
+
+    CHECK(hal_isp_set_brightness(c, 0) == RSS_OK, "and so is none");
+    CHECK(ct_ofst(0) == -192, "the bottom is the same distance the other way, got %d", ct_ofst(0));
+
+    /* And the middle is the tuning's own offset, untouched. */
+    CHECK(hal_isp_set_brightness(c, I6C_CT_KNOB_UNITY) == RSS_OK, "as is the middle");
+    CHECK(ct_ofst(0) == 64, "which must leave the offset exactly as found, got %d", ct_ofst(0));
+
+    for (i = 0; i < I6C_ISP_IQ_COLORTRANS_MAT_NUM; i++)
+        CHECK(ct_coef(i) == ct_lim[i], "brightness must not touch the matrix, %d gave %d", i,
+              ct_coef(i));
+}
+
+/*
+ * A knob out of range clamps the gain, never a coefficient.
+ *
+ * The distinction is the whole reason i6c_ct_gain_cap exists. A row is a
+ * direction: clamping its entries one at a time keeps every number inside the
+ * field while tilting the row, which on a chroma row is a hue shift and on the
+ * luma row a colour cast -- so the picture would go wrong in a way that looks
+ * like a miscalibration rather than like a knob at its limit.
+ *
+ * Seeded with a chroma row a real tuning would not carry, because a tuning that
+ * fits comfortably cannot exercise this at all. Limited swing on the luma side,
+ * so the narrowing in i6c_ct_capture stays out of it and the only thing moving
+ * here is the clamp.
+ */
+static void test_a_gain_is_clamped_before_a_coefficient_is(void)
+{
+    const int16_t wide[I6C_ISP_IQ_COLORTRANS_MAT_NUM] = {66,  129, 25,  -400, -200,
+                                                         100, 112, -94, -18};
+    rss_hal_ctx_t ctx;
+    infinity6c_state_t st;
+    rss_isp_knob_t caps;
+    void *c = &ctx;
+    int i;
+
+    reset(&st);
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.platform = &st;
+    st.isp_knobs_live = true;
+    seed_ctrans(wide, CT_LIM_OFST);
+    log_reset();
+
+    CHECK(hal_isp_set_saturation(c, I6C_CT_KNOB_MAX) == RSS_OK, "the value is still accepted");
+    CHECK(strstr(g_log, "limit saturation") != NULL,
+          "and the tuning's own ceiling is said once, when it is learned");
+
+    for (i = I6C_CT_ROW_U; i < I6C_ISP_IQ_COLORTRANS_MAT_NUM; i++)
+        CHECK(ct_coef(i) >= I6C_CT_MAT_MIN && ct_coef(i) <= I6C_CT_MAT_MAX,
+              "every coefficient stays in the field, %d gave %d", i, ct_coef(i));
+
+    /*
+     * Proportional, which is the claim: the ratio the tuner chose between the
+     * row's entries survives the clamp. Checked against the largest entry so
+     * that rounding is the only source of error.
+     */
+    for (i = I6C_CT_ROW_U; i < I6C_CT_ROW_U + I6C_CT_ROW_LEN; i++) {
+        int32_t want = (int32_t)wide[i] * ct_coef(I6C_CT_ROW_U) / wide[I6C_CT_ROW_U];
+        int32_t got = ct_coef(i);
+
+        CHECK(got >= want - 1 && got <= want + 1,
+              "the row keeps its shape through the clamp, %d wanted about %d and gave %d", i, want,
+              got);
+    }
+
+    /* The published range does not shrink with the tuning -- a client draws the
+     * same control everywhere -- so the ceiling is a log line and not a cap. */
+    CHECK(hal_isp_get_knob_caps(c, "saturation", &caps) == RSS_OK, "saturation publishes caps");
+    CHECK(caps.max == I6C_CT_KNOB_MAX, "and the whole range, got %d", caps.max);
+}
+
+/*
+ * A full-range tuning is composed over the range the ISP was actually putting
+ * out, not over the matrix the block holds.
+ *
+ * The two are not the same on this family, and the difference is not cosmetic:
+ * switching the module on with the tuning's own full-range matrix moves the
+ * stream from limited to full range with nothing telling a decoder the range
+ * changed. Measured on an SSC377QE + IMX335 across three interleaved pairs of
+ * the same build with and without the enable -- 13% more chroma, 4% less luma,
+ * and the limited-range prediction from the enabled picture landing within 0.07
+ * of a luma count of the disabled one.
+ *
+ * So neutral has to reproduce the disabled rendering, which means narrowing the
+ * baseline rather than taking the block at its word.
+ */
+static void test_a_full_range_tuning_is_narrowed_to_what_the_isp_was_doing(void)
+{
+    rss_hal_ctx_t ctx;
+    infinity6c_state_t st;
+    void *c = &ctx;
+    int i;
+
+    reset(&st);
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.platform = &st;
+    st.isp_knobs_live = true;
+    seed_ctrans(ct_full, 0);
+    log_reset();
+
+    CHECK(hal_isp_set_saturation(c, I6C_CT_KNOB_UNITY) == RSS_OK, "the middle is legal");
+    CHECK(strstr(g_log, "full range") != NULL, "and the narrowing is said once, when it happens");
+
+    for (i = 0; i < I6C_ISP_IQ_COLORTRANS_MAT_NUM; i++)
+        CHECK(ct_coef(i) == ct_lim[i], "coefficient %d should narrow to %d, got %d", i, ct_lim[i],
+              ct_coef(i));
+    CHECK(ct_ofst(0) == CT_LIM_OFST, "and gain the 16-count pedestal, got %d", ct_ofst(0));
+
+    /*
+     * A tuning that already stores limited range is left exactly as it is --
+     * narrowing twice would be the same defect in the other direction.
+     */
+    reset(&st);
+    st.isp_knobs_live = true;
+    seed_ctrans(ct_lim, CT_LIM_OFST);
+    log_reset();
+
+    CHECK(hal_isp_set_saturation(c, I6C_CT_KNOB_UNITY) == RSS_OK, "the middle is still legal");
+    CHECK(strstr(g_log, "full range") == NULL, "and this one is not narrowed");
+    for (i = 0; i < I6C_ISP_IQ_COLORTRANS_MAT_NUM; i++)
+        CHECK(ct_coef(i) == ct_lim[i], "coefficient %d must be untouched, got %d", i, ct_coef(i));
+    CHECK(ct_ofst(0) == CT_LIM_OFST, "and so must the offset, got %d", ct_ofst(0));
+}
+
+/*
+ * The vendor's own block: narrowed rows with no pedestal beside them.
+ *
+ * This is what SigmaStar's IMX335 tuning and OpenIPC's both ship, and it is why
+ * the range and the pedestal are corrected separately rather than as one step.
+ * A rule that only fired on a full-range matrix would leave this one 16 counts
+ * of luma below the picture the module was not in -- and a rule that only
+ * looked at the offset would narrow it a second time.
+ */
+static void test_the_vendor_block_gains_the_pedestal_and_nothing_else(void)
+{
+    rss_hal_ctx_t ctx;
+    infinity6c_state_t st;
+    void *c = &ctx;
+    int i;
+
+    reset(&st);
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.platform = &st;
+    st.isp_knobs_live = true;
+    seed_ctrans(ct_lim, 0);
+    log_reset();
+
+    CHECK(hal_isp_set_saturation(c, I6C_CT_KNOB_UNITY) == RSS_OK, "the middle is legal");
+    CHECK(strstr(g_log, "full range") == NULL, "rows already limited, so no narrowing");
+    CHECK(strstr(g_log, "no luma pedestal") != NULL, "but the missing pedestal is said");
+
+    for (i = 0; i < I6C_ISP_IQ_COLORTRANS_MAT_NUM; i++)
+        CHECK(ct_coef(i) == ct_lim[i], "coefficient %d must be untouched, got %d", i, ct_coef(i));
+    CHECK(ct_ofst(0) == CT_LIM_OFST, "and the pedestal supplied, got %d", ct_ofst(0));
+
+    /*
+     * The full-range block and the vendor's must land in the same place, since
+     * they are two spellings of one conversion. That is the whole claim.
+     */
+    reset(&st);
+    st.isp_knobs_live = true;
+    seed_ctrans(ct_full, 0);
+    CHECK(hal_isp_set_saturation(c, I6C_CT_KNOB_UNITY) == RSS_OK, "and from the other end");
+    for (i = 0; i < I6C_ISP_IQ_COLORTRANS_MAT_NUM; i++)
+        CHECK(ct_coef(i) == ct_lim[i], "coefficient %d should agree, got %d", i, ct_coef(i));
+    CHECK(ct_ofst(0) == CT_LIM_OFST, "and so should the offset, got %d", ct_ofst(0));
+
+    /*
+     * The fourth corner, and the one that says the two corrections really are
+     * independent: full-range rows with a pedestal already beside them. The
+     * rows still have to narrow and the pedestal must not be added twice, which
+     * a single coupled condition cannot express -- it would decline to narrow
+     * on account of an offset that has nothing to do with the swing.
+     */
+    reset(&st);
+    st.isp_knobs_live = true;
+    seed_ctrans(ct_full, CT_LIM_OFST);
+    CHECK(hal_isp_set_saturation(c, I6C_CT_KNOB_UNITY) == RSS_OK, "full range with a pedestal");
+    for (i = 0; i < I6C_ISP_IQ_COLORTRANS_MAT_NUM; i++)
+        CHECK(ct_coef(i) == ct_lim[i], "coefficient %d must still narrow, got %d", i, ct_coef(i));
+    CHECK(ct_ofst(0) == CT_LIM_OFST, "and the pedestal must not double, got %d", ct_ofst(0));
+}
+
+/*
+ * Setting a knob twice is the same as setting it once.
+ *
+ * The composer scales from the captured baseline and never from what is in the
+ * field, which is what makes this true. Scaling from the field would compound,
+ * so a slider dragged across its range would end up somewhere a slider dropped
+ * on the same value could not reach, with no way back short of a tuning reload
+ * -- the same trap i6c_iq_param_t::base[] exists to avoid for a vector row.
+ */
+static void test_the_transform_does_not_compound(void)
+{
+    rss_hal_ctx_t ctx;
+    infinity6c_state_t st;
+    uint8_t once[I6C_ISP_IQ_COLORTRANS_PAYLOAD];
+    void *c = &ctx;
+
+    reset(&st);
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.platform = &st;
+    st.isp_knobs_live = true;
+
+    CHECK(hal_isp_set_saturation(c, 80) == RSS_OK, "set it once");
+    memcpy(once, g_ctrans, sizeof(once));
+
+    CHECK(hal_isp_set_saturation(c, 80) == RSS_OK, "and again");
+    CHECK(hal_isp_set_saturation(c, 80) == RSS_OK, "and again");
+    CHECK(memcmp(once, g_ctrans, sizeof(once)) == 0, "the same value must give the same matrix");
+
+    /* And the other two knobs are re-derived from the baseline each time rather
+     * than carried forward from whatever the last write left. */
+    CHECK(hal_isp_set_contrast(c, 70) == RSS_OK, "a second knob moves");
+    CHECK(hal_isp_set_contrast(c, I6C_CT_KNOB_UNITY) == RSS_OK, "and comes back");
+    CHECK(memcmp(once, g_ctrans, sizeof(once)) == 0,
+          "and leaves the first knob exactly where it was");
+}
+
+/*
+ * A tuning load re-reads the transform, and the knobs are composed over the new
+ * one.
+ *
+ * The tuning binary writes over the API store on the first frame, so everything
+ * the knobs are expressed against has just been replaced. A baseline kept from
+ * before that would scale the old tuner's matrix into the new tuner's module.
+ */
+static void test_a_tuning_load_relearns_the_transform(void)
+{
+    const int16_t other[I6C_ISP_IQ_COLORTRANS_MAT_NUM] = {69,  120, 31,  -35, -77,
+                                                          112, 112, -88, -24};
+    rss_hal_ctx_t ctx;
+    infinity6c_state_t st;
+    void *c = &ctx;
+    int i;
+
+    reset(&st);
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.platform = &st;
+    st.isp_knobs_live = true;
+
+    CHECK(hal_isp_set_saturation(c, I6C_CT_KNOB_UNITY / 2) == RSS_OK, "a knob is set");
+
+    /* What a reload looks like from here: the module holds the tuner's values
+     * again, and the flush is what notices. */
+    seed_ctrans(other, CT_LIM_OFST);
+    i6c_isp_flush_knobs(&st);
+
+    for (i = I6C_CT_ROW_U; i < I6C_ISP_IQ_COLORTRANS_MAT_NUM; i++) {
+        int32_t want = i6c_ct_scale(other[i], I6C_CT_KNOB_UNITY / 2);
+
+        CHECK(ct_coef(i) == want, "chroma %d should scale the new tuning to %d, got %d", i, want,
+              ct_coef(i));
+    }
+    for (i = 0; i < I6C_CT_ROW_LEN; i++)
+        CHECK(ct_coef(i) == other[i], "and the new luma row is left alone, %d gave %d", i,
+              ct_coef(i));
+}
+
+/*
+ * A knob asked for before the tuning has loaded is composed by the flush.
+ *
+ * rvd applies its whole [image] block during pipeline construction, which is
+ * well before any frame, so without this every one of those values would be
+ * written into a store the tuning binary is about to overwrite.
+ */
+static void test_a_composed_knob_queued_before_the_load_is_flushed(void)
+{
+    rss_hal_ctx_t ctx;
+    infinity6c_state_t st;
+    void *c = &ctx;
+    int i;
+
+    reset(&st);
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.platform = &st;
+    st.isp_knobs_live = true;
+    st.isp_knobs_live = false;
+
+    CHECK(hal_isp_set_saturation(c, I6C_CT_KNOB_MAX) == RSS_OK, "the value is taken");
+    CHECK(g_ctrans_sets == 0, "but nothing is written yet");
+    CHECK(i6c_iq_read(g_ctrans, I6C_ISP_ENABLE_OFF, 4) == 0, "not even the enable");
+
+    i6c_isp_flush_knobs(&st);
+
+    CHECK(g_ctrans_sets == 1, "the flush writes it once, got %d", g_ctrans_sets);
+    CHECK(i6c_iq_read(g_ctrans, I6C_ISP_ENABLE_OFF, 4) == 1, "and switches the module on");
+    for (i = I6C_CT_ROW_U; i < I6C_ISP_IQ_COLORTRANS_MAT_NUM; i++) {
+        int32_t want = i6c_ct_scale(ct_lim[i], I6C_CT_KNOB_MAX);
+
+        CHECK(ct_coef(i) == want, "with the queued value, %d should be %d and gave %d", i, want,
+              ct_coef(i));
+    }
+}
+
+/*
+ * A module the tuning never populated is refused rather than enabled.
+ *
+ * An empty transform reads back as zeros, and switching it on then would put
+ * out a black picture -- the one failure here bad enough to be worth declining
+ * outright rather than clamping into something. The caps say so too, so a
+ * client can grey the control instead of offering three knobs that do nothing.
+ */
+static void test_an_empty_transform_is_refused(void)
+{
+    const int16_t empty[I6C_ISP_IQ_COLORTRANS_MAT_NUM] = {0, 0, 0, 0, 0, 0, 0, 0, 0};
+    rss_hal_ctx_t ctx;
+    infinity6c_state_t st;
+    rss_isp_knob_t caps;
+    void *c = &ctx;
+
+    reset(&st);
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.platform = &st;
+    st.isp_knobs_live = true;
+    seed_ctrans(empty, 0);
+    log_reset();
+
+    CHECK(hal_isp_set_saturation(c, 80) == RSS_ERR_NOTSUP, "the write is declined");
+    CHECK(i6c_iq_read(g_ctrans, I6C_ISP_ENABLE_OFF, 4) == 0,
+          "and the module is not switched on over an empty matrix");
+    CHECK(strstr(g_log, "no conversion") != NULL, "and it says why");
+
+    CHECK(hal_isp_get_knob_caps(c, "saturation", &caps) == RSS_OK, "the caps still answer");
+    CHECK(!caps.enabled, "but report the knob unavailable");
+}
+
+/*
+ * The preset selector taking the matrix out of the path is reported.
+ *
+ * ColorTransEX chooses a fixed conversion, so with it enabled every write below
+ * is correct, reads back as asked for, and changes nothing on screen. There is
+ * nothing in the picture to tell that apart from a knob that works, which is
+ * what makes it worth a line in the log rather than silence.
+ */
+static void test_the_preset_override_is_reported(void)
+{
+    rss_hal_ctx_t ctx;
+    infinity6c_state_t st;
+    void *c = &ctx;
+
+    reset(&st);
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.platform = &st;
+    st.isp_knobs_live = true;
+    i6c_iq_write(g_ctex, I6C_ISP_ENABLE_OFF, 4, 1);
+    i6c_iq_write(g_ctex, I6C_ISP_IQ_COLORTRANSEX_TYPE, 1, 2);
+    log_reset();
+
+    CHECK(hal_isp_set_saturation(c, 80) == RSS_OK, "the write still goes in");
+    CHECK(strstr(g_log, "overrides the custom matrix") != NULL,
+          "but the override has to be said, since the picture will not say it");
+    CHECK(i6c_iq_read(g_ctex, I6C_ISP_ENABLE_OFF, 4) == 1,
+          "and it is reported, not corrected -- the conversion is the tuning's choice");
+}
+
+/*
+ * Saturation is published on this family now, on the same scale as the two it
+ * shares a module with.
+ *
+ * It was absent while MI's own Saturation module was the only way to reach it,
+ * because every shipped tuning varies it across gain and manual mode would have
+ * traded that curve for a constant. Composed into the transform it costs that
+ * curve nothing, so what changed is the mechanism and not the judgement.
+ */
+static void test_saturation_is_published_with_the_other_two(void)
+{
+    rss_hal_ctx_t ctx;
+    infinity6c_state_t st;
+    rss_isp_knob_t caps;
+    void *c = &ctx;
+
+    reset(&st);
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.platform = &st;
+    st.isp_knobs_live = true;
+
+    CHECK(hal_isp_get_knob_caps(c, "saturation", &caps) == RSS_OK, "saturation has caps");
+    CHECK(caps.min == 0 && caps.max == I6C_CT_KNOB_MAX && caps.neutral == I6C_CT_KNOB_UNITY,
+          "on the same scale as brightness and contrast, got %d..%d neutral %d", caps.min, caps.max,
+          caps.neutral);
+    CHECK(caps.has_auto, "and auto means the tuning's own rendering");
+
+    CHECK(hal_isp_set_saturation(c, I6C_CT_KNOB_MAX + 1) == RSS_ERR_INVAL,
+          "a value past the published maximum is refused");
+    CHECK(hal_isp_set_saturation(c, -1) == RSS_ERR_INVAL, "and so is one below the floor");
+    CHECK(hal_isp_set_saturation(NULL, 50) == RSS_ERR_INVAL, "NULL ctx rejected");
+    CHECK(hal_isp_get_saturation(NULL, NULL) == RSS_ERR_INVAL, "and on the way back");
+}
+
+/*
  * The neutral a client centres its control on, which is not the same question
  * as the range.
  *
@@ -1526,6 +2206,20 @@ int main(void)
     test_temper_caps_come_from_the_tuning();
     test_temper_says_so_when_the_tuning_is_in_manual();
     test_a_one_sided_strength_is_neutral_at_its_floor();
+
+    test_neutral_reproduces_the_tunings_own_transform();
+    test_contrast_pivots_on_mid_grey();
+    test_saturation_scales_only_the_chroma_rows();
+    test_brightness_moves_the_offset_and_nothing_else();
+    test_a_gain_is_clamped_before_a_coefficient_is();
+    test_a_full_range_tuning_is_narrowed_to_what_the_isp_was_doing();
+    test_the_vendor_block_gains_the_pedestal_and_nothing_else();
+    test_the_transform_does_not_compound();
+    test_a_tuning_load_relearns_the_transform();
+    test_a_composed_knob_queued_before_the_load_is_flushed();
+    test_an_empty_transform_is_refused();
+    test_the_preset_override_is_reported();
+    test_saturation_is_published_with_the_other_two();
 
     if (failures) {
         printf("t_isp_i6c: %d failure(s)\n", failures);

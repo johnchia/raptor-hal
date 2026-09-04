@@ -372,15 +372,14 @@ typedef struct {
 } i6c_iq_param_t;
 
 enum {
-    IQ_BRIGHTNESS,
-    IQ_CONTRAST,
-    IQ_SATURATION,
     IQ_SHARPNESS,
     IQ_DEFOG,
     IQ_DEFOG_EN,
     IQ_DRC,
     IQ_GRAY,
     IQ_NR3D,
+    IQ_COLORTRANS,
+    IQ_COLORTRANS_EX,
     AE_EVCOMP,
     AE_FLICKER,
     IQ_PARAM_COUNT
@@ -393,13 +392,9 @@ enum {
  * as the tuner left it -- and it is what hal_isp_get_knob_caps publishes as
  * caps->neutral, which is where a client centres a control:
  *
- *   brightness/contrast  u32Lev 0..100, midpoint 50
- *   saturation           u8SatAllStr 0..127 where 32 is unity gain (1X), *not*
- *                        the midpoint -- a linear 0..255 -> 0..127 map would
- *                        silently double saturation at raptor's neutral
- *   defog/drc            one-sided effect strengths: 0 is no contribution, so
- *                        0 is the neutral and the midpoint means half on
- *   EV compensation      signed, +/-I6C_AE_EV_SPAN about the tuning's own value
+ *   defog/drc        one-sided effect strengths: 0 is no contribution, so 0 is
+ *                    the neutral and the midpoint means half on
+ *   EV compensation  signed, +/-I6C_AE_EV_SPAN about the tuning's own value
  *
  * The midpoint is only a neutral for a knob with two sides to be between. For a
  * strength whose floor is "off" it is nothing of the sort, and the distinction
@@ -413,25 +408,24 @@ enum {
  * MI_ISP_IQ_{Set,Get}Defog on an SSC377QE, so nothing narrower is enforced --
  * but it is inference, not documentation.
  *
- * The two vector rows have no constant to put here at all, which is why both
- * learn their neutral from the tuning; see i6c_iq_apply_vector. What is in
- * mi_unity for them is the fallback for a board with no tuning file, and it is
- * the midpoint of the field because nothing better is knowable without one.
+ * The vector row has no constant to put here at all, which is why it learns its
+ * neutral from the tuning; see i6c_iq_apply_vector. What is in mi_unity for it
+ * is the fallback for a board with no tuning file, and it is the midpoint of
+ * the field because nothing better is knowable without one.
+ *
+ * NO BRIGHTNESS, CONTRAST OR SATURATION ROWS HERE
+ *
+ * All three are published knobs and none of them is an MI_ISP_IQ module any
+ * more. They are composed into the colour transform instead -- see THE COLOUR
+ * TRANSFORM below for why, and for what the rows used to cost. The MI modules
+ * are still running; what is gone is anything of raptor's writing to them, so
+ * their per-gain curves are the tuning's business from end to end.
  *
  * Single-instance, like the Infinity6E table: the resolved symbols and the
  * pending queue belong to one HAL context, which is what rvd creates. Cleared by
  * i6c_isp_forget_knobs at teardown.
  */
 static i6c_iq_param_t g_iq[IQ_PARAM_COUNT] = {
-    [IQ_BRIGHTNESS] = {"brightness", "MI_ISP_IQ_GetBrightness", "MI_ISP_IQ_SetBrightness",
-                       I6C_ISP_IQ_BRIGHTNESS_PAYLOAD, I6C_ISP_IQ_BRIGHTNESS_MANUAL, 4, 1, 4,
-                       IQ_AUTOMAN, 100, 50, 0, false, NULL, NULL, 0, false, false, false},
-    [IQ_CONTRAST] = {"contrast", "MI_ISP_IQ_GetContrast", "MI_ISP_IQ_SetContrast",
-                     I6C_ISP_IQ_CONTRAST_PAYLOAD, I6C_ISP_IQ_CONTRAST_MANUAL, 4, 1, 4,
-                     IQ_AUTOMAN, 100, 50, 0, false, NULL, NULL, 0, false, false, false},
-    [IQ_SATURATION] = {"saturation", "MI_ISP_IQ_GetSaturation", "MI_ISP_IQ_SetSaturation",
-                       I6C_ISP_IQ_SATURATION_PAYLOAD, I6C_ISP_IQ_SATURATION_MANUAL, 1, 1, 1,
-                       IQ_AUTOMAN, 127, 32, 0, false, NULL, NULL, 0, false, false, false},
     /*
      * Sharpness, and the reason this file grew a vector shape.
      *
@@ -475,8 +469,24 @@ static i6c_iq_param_t g_iq[IQ_PARAM_COUNT] = {
                   I6C_ISP_IQ_DEFOG_MANUAL, 1, 1, 1, IQ_AUTOMAN, 255, 0, 0, false, NULL, NULL, 0,
                   false, false, false},
     [IQ_DEFOG_EN] = {"defog enable", "MI_ISP_IQ_GetDefog", "MI_ISP_IQ_SetDefog",
-                     I6C_ISP_IQ_DEFOG_PAYLOAD, I6C_ISP_ENABLE_OFF, 4, 1, 4, IQ_BOOL, 1, 0, 0,
-                     false, NULL, NULL, 0, false, false, false},
+                     I6C_ISP_IQ_DEFOG_PAYLOAD, I6C_ISP_ENABLE_OFF, 4, 1, 4, IQ_BOOL, 1, 0, 0, false,
+                     NULL, NULL, 0, false, false, false},
+    /*
+     * The colour transform, and the preset selector that can take it out of the
+     * path. Neither is a knob and neither goes through i6c_iq_apply: the rows
+     * exist for their symbols, their payload length and the bounds check in
+     * i6c_iq_resolve, so that the composer below can reach the module through
+     * the same fetch and store as everything else. Declared IQ_BOOL because
+     * bEnable is the only field of either that a row shape can describe; what
+     * the composer writes it addresses by offset. See THE COLOUR TRANSFORM.
+     */
+    [IQ_COLORTRANS] = {"colortrans", "MI_ISP_IQ_GetColorTrans", "MI_ISP_IQ_SetColorTrans",
+                       I6C_ISP_IQ_COLORTRANS_PAYLOAD, I6C_ISP_ENABLE_OFF, 4, 1, 4, IQ_BOOL, 1, 0, 0,
+                       false, NULL, NULL, 0, false, false, false},
+    [IQ_COLORTRANS_EX] = {"colortrans ex", "MI_ISP_IQ_GetColorTrans_EX",
+                          "MI_ISP_IQ_SetColorTrans_EX", I6C_ISP_IQ_COLORTRANSEX_PAYLOAD,
+                          I6C_ISP_ENABLE_OFF, 4, 1, 4, IQ_BOOL, 1, 0, 0, false, NULL, NULL, 0,
+                          false, false, false},
     /*
      * DRC -- MI's WDR module, and the level is one byte of it.
      *
@@ -502,8 +512,8 @@ static i6c_iq_param_t g_iq[IQ_PARAM_COUNT] = {
                 I6C_ISP_IQ_WDR_MANUAL + I6C_ISP_IQ_WDR_STRENGTH, 1, 1, 1, IQ_AUTOMAN, 255, 0, 0,
                 false, NULL, NULL, 0, false, false, false},
     [IQ_GRAY] = {"gray", "MI_ISP_IQ_GetColorToGray", "MI_ISP_IQ_SetColorToGray",
-                 I6C_ISP_IQ_GRAY_PAYLOAD, 0, 4, 1, 4, IQ_BOOL, 1, 0, 0, false, NULL, NULL, 0,
-                 false, false, false},
+                 I6C_ISP_IQ_GRAY_PAYLOAD, 0, 4, 1, 4, IQ_BOOL, 1, 0, 0, false, NULL, NULL, 0, false,
+                 false, false},
     /*
      * NR3D -- raptor's temper knob, and the only row that writes into stAuto.
      *
@@ -552,8 +562,8 @@ static i6c_iq_param_t g_iq[IQ_PARAM_COUNT] = {
                    I6C_ISP_AE_EVCOMP_PAYLOAD, 0, 4, 1, 4, IQ_FLAT, I6C_AE_EV_SPAN, 0,
                    -I6C_AE_EV_SPAN, true, NULL, NULL, 0, false, false, false},
     [AE_FLICKER] = {"antiflicker", "MI_ISP_AE_GetFlicker", "MI_ISP_AE_SetFlicker",
-                    I6C_ISP_AE_FLICKER_PAYLOAD, 0, 4, 1, 4, IQ_FLAT, 3, 0, 0, false, NULL, NULL,
-                    0, false, false, false},
+                    I6C_ISP_AE_FLICKER_PAYLOAD, 0, 4, 1, 4, IQ_FLAT, 3, 0, 0, false, NULL, NULL, 0,
+                    false, false, false},
 };
 
 /* memcpy rather than a cast: the payload is a byte buffer and these offsets
@@ -979,8 +989,8 @@ static int i6c_iq_apply_scalar(infinity6c_state_t *st, int idx, int val)
          * Leaving auto costs the tuning file's per-gain curve for this
          * module: MI interpolates stAuto[16] across gain, and stManual is
          * one value for all of it. Real rather than hypothetical -- every
-         * one of the six shipped Infinity6C tunings varies saturation and
-         * sharpness across gain. Said once per departure rather than per
+         * one of the six shipped Infinity6C tunings varies sharpness and WDR
+         * strength across gain. Said once per departure rather than per
          * write, so re-applying the same value does not repeat it.
          */
         if (i6c_iq_read(buf, I6C_ISP_OPTYPE_OFF, 4) == I6C_ISP_OP_AUTO)
@@ -1350,6 +1360,538 @@ static int i6c_iq_get_raw(void *ctx, int idx, uint32_t *raw)
     return RSS_OK;
 }
 
+/* ================================================================
+ * THE COLOUR TRANSFORM
+ * ================================================================ */
+
+/*
+ * Brightness, contrast and saturation, composed into one 3x3 matrix.
+ *
+ * WHY NOT MI'S OWN THREE MODULES
+ *
+ * Because reaching any of them costs the tuning file's per-gain curve for it.
+ * MI_ISP_IQ_{Brightness,Contrast,Saturation}Type_t are auto/manual modules and
+ * enOpType has exactly two states, so any value but the tuner's own replaces
+ * sixteen gain-indexed entries with one constant for the whole gain range. That
+ * is not an adjustment, it is a discard, and here it discards something real:
+ * saturation's AllStr varies across the entries in all six shipped tunings --
+ * 28..40 on gc4653, 28..36 on imx335, 30..45 on imx415 -- which is the tuner
+ * pulling colour back as gain climbs so that amplified chroma noise does not
+ * come with it. Contrast and brightness carry curves of their own on this
+ * sensor. Pinning one value spends exactly that, which is why saturation was
+ * withdrawn here rather than published, and why the other two were published
+ * on a claim about flat curves that does not hold on IMX335.
+ *
+ * The colour transform has no such curve to spend. MI_ISP_IQ_ColorTransType_t
+ * is bEnable and one manual block, with no enOpType and no stAuto at all: it
+ * holds one conversion for every gain because that is what an RGB-to-YUV matrix
+ * is. So scaling its rows is a control the tuning does not pay for, and the
+ * three MI modules keep running on the tuner's terms underneath -- the knob
+ * multiplies what their curves produce instead of replacing it.
+ *
+ * WHY ONE WRITER AND NOT THREE ROWS
+ *
+ * Because the three knobs share a block and two of them share a field. Contrast
+ * scales the luma row, which darkens as well as flattens unless the offset
+ * compensates; brightness is that same offset. Three independent writers would
+ * each fetch, change their own part and store, and the last one would carry a
+ * stale version of the others.
+ *
+ * THE ARITHMETIC
+ *
+ * With b, c and s the three knobs normalised so that the neutral 50 is 1.0:
+ *
+ *     Y row  = baseline * c            U row, V row = baseline * s
+ *     Y_OFST = baseline + 512 * (1 - c) + 4 * b8
+ *
+ * The 512 term is the contrast pivot. Scaling the luma row alone pivots on
+ * black, so raising contrast would darken the whole picture; contrast has to
+ * pivot on mid-grey, and Y' = c*(Y - 128) + 128 = c*Y + 128*(1 - c) in eight
+ * bits. The offset field is a quarter-count domain -- Y_OFST 64 raises luma by
+ * 16 -- so 128 there is 512 here, and the 4 on the brightness term is the same
+ * factor.
+ *
+ * Chroma needs no pivot term, and that is a property of the hardware rather
+ * than a simplification: the 128 pedestal is added after the matrix and not
+ * through U_OFST/V_OFST, which a shipped tuning confirms by leaving both at
+ * zero while colour renders correctly. So scaling the two chroma rows pivots on
+ * neutral grey by itself, and the offsets are left exactly as found.
+ *
+ * The baseline the three are scaled from is not always the matrix the block
+ * holds -- switching the module on can change the output's range. See
+ * i6c_ct_capture, which is where that is measured and undone.
+ *
+ * WHAT IT COSTS
+ *
+ * Rounding, and only rounding. Each coefficient is an integer, so the finest
+ * gain change that moves anything is one count on the row's largest entry: 1 in
+ * 150 for luma and 1 in 128 for chroma, both finer than one count of a 0..100
+ * knob. Hue is not at risk from it -- the whole row is scaled by one gain, and
+ * where a gain would drive any entry out of the field the *gain* is clamped
+ * rather than the entry, since clamping entries one at a time is precisely what
+ * would tilt a row.
+ */
+
+typedef enum { CT_BRIGHTNESS, CT_CONTRAST, CT_SATURATION, CT_KNOB_COUNT } i6c_ct_knob_t;
+
+/*
+ * raptor's published units for all three, and the neutral it centres them on.
+ * Unchanged from what the MI rows published for brightness and contrast, so
+ * this is a change of mechanism and not of interface; saturation joins them on
+ * the same scale rather than on MI's 0..127 about 32, since the field it used
+ * to name is not the field being written any more.
+ */
+#define I6C_CT_KNOB_MAX 100
+#define I6C_CT_KNOB_UNITY 50
+
+/* Eight-bit luma each way at the ends of the brightness knob. */
+#define I6C_CT_BRIGHT_SPAN 64
+
+/* The offset field's domain: four counts to one count of eight-bit luma. */
+#define I6C_CT_OFST_PER_LUMA 4
+
+/* Mid-grey, which is what contrast pivots on. */
+#define I6C_CT_LUMA_MID 128
+
+/*
+ * Limited-range BT.601, which is the conversion the ISP runs while the module
+ * is disabled -- see i6c_ct_capture. Luma spans 16..235 of 255 and chroma
+ * 16..240, so both rows are narrowed and the luma gets a 16-count pedestal.
+ */
+#define I6C_CT_LIMITED_Y 219
+#define I6C_CT_LIMITED_C 224
+#define I6C_CT_SWING_DEN 255
+#define I6C_CT_PEDESTAL 16
+
+/*
+ * The matrix field's unity, which is also what a full-range luma row sums to:
+ * full-range BT.601's coefficients sum to one, and the field is over 256.
+ *
+ * The swing is told apart at the midpoint between the two rather than at 256
+ * exactly, so a tuning a count or two off either textbook value still lands on
+ * the right one.
+ */
+#define I6C_CT_MAT_UNITY 256
+#define I6C_CT_SWING_SPLIT ((I6C_CT_MAT_UNITY + I6C_CT_LIMITED_Y) / 2)
+
+/* Eight luma counts of pedestal, which no full-range matrix would carry. */
+#define I6C_CT_PEDESTAL_SPLIT (8 * I6C_CT_OFST_PER_LUMA)
+
+/* The matrix field's bounds, from its 10-bit two's complement. */
+#define I6C_CT_MAT_MAX (I6C_ISP_IQ_COLORTRANS_MAT_WRAP / 2 - 1)
+#define I6C_CT_MAT_MIN (-(I6C_ISP_IQ_COLORTRANS_MAT_WRAP / 2))
+
+/* The offset field's, from its 11-bit one. */
+#define I6C_CT_OFST_MAX (I6C_ISP_IQ_COLORTRANS_OFST_WRAP / 2 - 1)
+#define I6C_CT_OFST_MIN (-(I6C_ISP_IQ_COLORTRANS_OFST_WRAP / 2))
+
+/* Where each row of the matrix begins. */
+#define I6C_CT_ROW_Y 0
+#define I6C_CT_ROW_U 3
+#define I6C_CT_ROW_V 6
+#define I6C_CT_ROW_LEN 3
+
+static struct {
+    /*
+     * The transform as the tuning binary left it, which is what every knob is
+     * expressed against. Read once per tuning load and never from a value of
+     * ours: scaling from whatever is in the field now would compound, so a knob
+     * nudged four times would end up somewhere a knob set once could not reach.
+     * This is the same reasoning as a vector row's base[], and the same flag
+     * discipline -- see i6c_isp_flush_knobs.
+     */
+    int16_t matrix[I6C_ISP_IQ_COLORTRANS_MAT_NUM];
+    int16_t ofst[3];
+    bool base_valid;
+
+    /*
+     * Whether that baseline is a colour transform at all. A module the tuning
+     * never populated reads back as zeros, and enabling it then would put out a
+     * black picture -- so the composer declines instead, and the caps say so.
+     */
+    bool usable;
+
+    /*
+     * The largest value each knob can take on this tuning, which is the
+     * published maximum unless a row's own coefficients run out of field first.
+     * Derived with the baseline rather than at each write, because it is a
+     * property of the tuning and not of what was asked for.
+     */
+    int32_t cap[CT_KNOB_COUNT];
+
+    /* What the operator asked for. RSS_ISP_AUTO until they have asked. */
+    int val[CT_KNOB_COUNT];
+} g_ct = {
+    .val = {RSS_ISP_AUTO, RSS_ISP_AUTO, RSS_ISP_AUTO},
+};
+
+static const char *const i6c_ct_name[CT_KNOB_COUNT] = {"brightness", "contrast", "saturation"};
+
+/*
+ * The two fields are unsigned in the vendor's struct and signed in what they
+ * mean, so every read out of one and write into one goes through these.
+ */
+static int32_t i6c_ct_signed(uint32_t raw, int32_t wrap)
+{
+    return (int32_t)raw >= wrap / 2 ? (int32_t)raw - wrap : (int32_t)raw;
+}
+
+static uint32_t i6c_ct_unsigned(int32_t v, int32_t wrap)
+{
+    return (uint32_t)(v < 0 ? v + wrap : v);
+}
+
+static int32_t i6c_ct_clamp(int32_t v, int32_t lo, int32_t hi)
+{
+    if (v < lo)
+        return lo;
+    if (v > hi)
+        return hi;
+
+    return v;
+}
+
+/* base * gain, with the knob's neutral as unity and rounding away from zero so
+ * that the two halves of the range are symmetric. */
+static int32_t i6c_ct_scale(int32_t base, int32_t gain)
+{
+    int32_t n = base * gain;
+    int32_t half = I6C_CT_KNOB_UNITY / 2;
+
+    return (n >= 0 ? n + half : n - half) / I6C_CT_KNOB_UNITY;
+}
+
+/*
+ * The largest gain a row can take before any of its entries leaves the field,
+ * in knob units.
+ *
+ * Asked of the row rather than of each entry because a matrix row is a
+ * direction and not three independent numbers: clamping the entries one at a
+ * time keeps the picture in range by tilting the row, which on a chroma row is
+ * a hue shift and on the luma row a colour cast. Clamping the gain instead
+ * costs only the amount of the knob's range that this tuning cannot carry.
+ *
+ * A row of zeros has no bound to state -- nothing scaled by anything leaves the
+ * field -- so it reports the whole range rather than a division by zero.
+ */
+static int32_t i6c_ct_gain_cap(const int16_t *m, int row)
+{
+    int32_t mx = 0;
+    int i;
+
+    for (i = row; i < row + I6C_CT_ROW_LEN; i++) {
+        int32_t a = m[i] < 0 ? -(int32_t)m[i] : (int32_t)m[i];
+
+        if (a > mx)
+            mx = a;
+    }
+    if (!mx)
+        return I6C_CT_KNOB_MAX;
+
+    return (I6C_CT_MAT_MAX * I6C_CT_KNOB_UNITY) / mx;
+}
+
+/*
+ * Read the tuning's own transform back out, before anything of ours has been
+ * written over it.
+ *
+ * Both halves of what the module holds are needed and they are not the same
+ * kind of thing: the matrix is what the knobs scale, and the offsets are what
+ * the brightness and contrast terms are added to. Neither is knowable without a
+ * tuning, which is why this runs from the flush and not from bring-up.
+ */
+static void i6c_ct_capture(const uint8_t *buf)
+{
+    int32_t ysum;
+    int i;
+
+    for (i = 0; i < I6C_ISP_IQ_COLORTRANS_MAT_NUM; i++)
+        g_ct.matrix[i] =
+            (int16_t)i6c_ct_signed(i6c_iq_read(buf, I6C_ISP_IQ_COLORTRANS_MATRIX + 2 * i, 2),
+                                   I6C_ISP_IQ_COLORTRANS_MAT_WRAP);
+    for (i = 0; i < 3; i++)
+        g_ct.ofst[i] =
+            (int16_t)i6c_ct_signed(i6c_iq_read(buf, I6C_ISP_IQ_COLORTRANS_YOFST + 2 * i, 2),
+                                   I6C_ISP_IQ_COLORTRANS_OFST_WRAP);
+
+    /*
+     * A luma row that does not sum to something positive is not a conversion:
+     * either the module was never populated, or the header no longer describes
+     * it. Either way the knobs have nothing to scale, and switching the module
+     * on with it would be the one failure worth refusing outright.
+     */
+    ysum =
+        g_ct.matrix[I6C_CT_ROW_Y] + g_ct.matrix[I6C_CT_ROW_Y + 1] + g_ct.matrix[I6C_CT_ROW_Y + 2];
+    g_ct.usable = ysum > 0;
+    if (!g_ct.usable) {
+        g_ct.base_valid = true;
+        HAL_LOG_ERR("isp: the colour transform holds no conversion (luma row %d %d %d), so "
+                    "brightness, contrast and saturation have nothing to scale and are inert",
+                    g_ct.matrix[0], g_ct.matrix[1], g_ct.matrix[2]);
+        return;
+    }
+
+    /*
+     * THE BLOCK DOES NOT ALWAYS HOLD THE CONVERSION IN EFFECT
+     *
+     * Every knob here is a departure from what the tuning was already
+     * producing, so the baseline has to be that rendering and not merely what
+     * the module's fields contain -- and on this family the two differ.
+     *
+     * Measured on an SSC377QE + IMX335 by running the same build with and
+     * without the enable, three interleaved pairs: the ISP puts out
+     * limited-range BT.601 with the module disabled, and the limited-range
+     * prediction from the enabled picture matched the disabled one to 0.07 of a
+     * luma count. So a stored transform that is not already limited range is
+     * not the no-op it looks like -- enabling it moves the stream's range with
+     * nothing telling a decoder the range changed.
+     *
+     * The stored block can be short of that rendering in two independent ways,
+     * so they are corrected separately.
+     *
+     * What the corrected baseline has to come to is not inferred. SStar's ISP
+     * reference (MARUKO v1.2, 3.1.43) gives a worked example for 16-235 output:
+     * 66 129 25 / -38 -74 112 / 112 -94 -18 with Y_OFST 64, which is BT.601
+     * narrowed to 219 and 224 of 255 with the pedestal beside it. Narrowing
+     * full-range BT.601 here reproduces it to the count on eight of the nine
+     * coefficients, and one off on the ninth where the vendor truncated and
+     * this rounds.
+     *
+     * The stored block can fall short of that in two independent ways, so they
+     * are corrected separately rather than as one step.
+     *
+     * The rows, first. SigmaStar's own IMX335 tuning and OpenIPC's both carry
+     * the narrowed ones; a tuning carrying full-range BT.601 instead has what
+     * the documentation gives as its *other* example, so that is a defaulted
+     * block rather than a tuned one.
+     *
+     * The pedestal, second, and neither vendor bin has it -- both store Y_OFST
+     * 0 beside rows the same document pairs with 64, which is a block that
+     * ships disabled and has therefore never had to be complete. Supplied here
+     * when the stored offset does not already carry it, so a vendor block and a
+     * defaulted one both land on the documented conversion, which is also the
+     * one the ISP was measurably already running.
+     */
+    if (ysum >= I6C_CT_SWING_SPLIT) {
+        for (i = 0; i < I6C_ISP_IQ_COLORTRANS_MAT_NUM; i++) {
+            int32_t num = i < I6C_CT_ROW_U ? I6C_CT_LIMITED_Y : I6C_CT_LIMITED_C;
+            int32_t v = (int32_t)g_ct.matrix[i] * num;
+
+            g_ct.matrix[i] =
+                (int16_t)((v >= 0 ? v + I6C_CT_SWING_DEN / 2 : v - I6C_CT_SWING_DEN / 2) /
+                          I6C_CT_SWING_DEN);
+        }
+        HAL_LOG_INFO("isp: the tuning's colour transform is full range (luma row sums to %d), "
+                     "so the knobs are composed over the limited-range form of it -- which is "
+                     "what the ISP puts out with the module disabled, and what SigmaStar's own "
+                     "tuning for this sensor stores",
+                     ysum);
+    }
+
+    if (g_ct.ofst[0] < I6C_CT_PEDESTAL_SPLIT) {
+        g_ct.ofst[0] = (int16_t)(g_ct.ofst[0] + I6C_CT_PEDESTAL * I6C_CT_OFST_PER_LUMA);
+        HAL_LOG_INFO("isp: the tuning's colour transform carries no luma pedestal; the knobs "
+                     "are composed over one, since the picture the module was not in has it");
+    }
+
+    /*
+     * Brightness is an offset and not a gain, so it has the whole range; the
+     * other two are bounded by the row they scale, and saturation by the
+     * tighter of its two.
+     */
+    g_ct.cap[CT_BRIGHTNESS] = I6C_CT_KNOB_MAX;
+    g_ct.cap[CT_CONTRAST] = i6c_ct_gain_cap(g_ct.matrix, I6C_CT_ROW_Y);
+    g_ct.cap[CT_SATURATION] = i6c_ct_gain_cap(g_ct.matrix, I6C_CT_ROW_U);
+    if (i6c_ct_gain_cap(g_ct.matrix, I6C_CT_ROW_V) < g_ct.cap[CT_SATURATION])
+        g_ct.cap[CT_SATURATION] = i6c_ct_gain_cap(g_ct.matrix, I6C_CT_ROW_V);
+    g_ct.base_valid = true;
+
+    HAL_LOG_DBG("isp: colour transform baseline %d %d %d / %d %d %d / %d %d %d, "
+                "offsets %d %d %d",
+                g_ct.matrix[0], g_ct.matrix[1], g_ct.matrix[2], g_ct.matrix[3], g_ct.matrix[4],
+                g_ct.matrix[5], g_ct.matrix[6], g_ct.matrix[7], g_ct.matrix[8], g_ct.ofst[0],
+                g_ct.ofst[1], g_ct.ofst[2]);
+
+    /*
+     * Said once per tuning load rather than per write, because it is the tuning
+     * that decides it: a knob whose ceiling this brings below the published
+     * maximum simply stops moving before the end of its range, which is worth
+     * knowing before it looks like the knob has broken.
+     */
+    for (i = 0; i < CT_KNOB_COUNT; i++)
+        if (g_ct.cap[i] < I6C_CT_KNOB_MAX)
+            HAL_LOG_INFO("isp: this tuning's coefficients limit %s to %d of %d", i6c_ct_name[i],
+                         g_ct.cap[i], I6C_CT_KNOB_MAX);
+}
+
+/*
+ * Say so when the preset selector has taken the matrix out of the path.
+ *
+ * ColorTransEX chooses a fixed conversion, and a tuning that enables it makes
+ * every write below correct and invisible -- the read-back agrees with what was
+ * asked for and the picture does not move. That is the failure mode this file
+ * calls the worse of the two answers, and there is nothing in the picture to
+ * distinguish it from a knob that is working, so it is worth a line in the log.
+ *
+ * Reported rather than corrected. Which conversion the ISP runs is the tuning
+ * binary's decision, and switching a module off behind the tuner's back to make
+ * raptor's knobs work is a bigger change than the knobs are worth.
+ */
+static void i6c_ct_check_ex(infinity6c_state_t *st)
+{
+    uint8_t buf[I6C_IQ_PAYLOAD_MAX];
+
+    if (i6c_iq_fetch(st, IQ_COLORTRANS_EX, buf) != RSS_OK)
+        return;
+
+    if (!i6c_iq_read(buf, I6C_ISP_ENABLE_OFF, 4))
+        return;
+
+    HAL_LOG_WARN("isp: this tuning enables the colour transform preset (type %u), which "
+                 "overrides the custom matrix -- brightness, contrast and saturation will read "
+                 "back as set and change nothing until the tuning binary disables it",
+                 i6c_iq_read(buf, I6C_ISP_IQ_COLORTRANSEX_TYPE, 1));
+}
+
+/*
+ * Compose the three knobs into the module and write it.
+ *
+ * Always the whole block, and always from the captured baseline rather than
+ * from what is in the field, so any one knob moving re-derives the other two
+ * and the result does not depend on the order they were set in.
+ *
+ * The module is switched on whether or not a knob has left neutral. Enabling it
+ * lazily, at the first non-neutral value, would fold the cost of the enable
+ * into whatever the operator happened to nudge first -- so a brightness moved
+ * by one count would carry whatever the enable itself does, which is the one
+ * thing a knob must not do. Enabled from the first frame, every knob is a pure
+ * delta from a rendering that does not move again.
+ */
+static int i6c_ct_apply(infinity6c_state_t *st)
+{
+    uint8_t buf[I6C_IQ_PAYLOAD_MAX];
+    int32_t gain[CT_KNOB_COUNT];
+    int32_t pivot;
+    int32_t yofst;
+    int i;
+    int ret;
+
+    ret = i6c_iq_fetch(st, IQ_COLORTRANS, buf);
+    if (ret != RSS_OK)
+        return ret;
+
+    if (!g_ct.base_valid) {
+        i6c_ct_capture(buf);
+        i6c_ct_check_ex(st);
+    }
+    if (!g_ct.usable)
+        return RSS_ERR_NOTSUP;
+
+    /* Auto is the tuning's own rendering, which is the baseline exactly -- so
+     * it is unity here, and differs from a knob set to 50 only in what the
+     * getter reports. Capped where this tuning cannot carry the whole published
+     * range; i6c_ct_capture says so when that happens. */
+    for (i = 0; i < CT_KNOB_COUNT; i++) {
+        gain[i] = g_ct.val[i] == RSS_ISP_AUTO ? I6C_CT_KNOB_UNITY : g_ct.val[i];
+        if (gain[i] > g_ct.cap[i])
+            gain[i] = g_ct.cap[i];
+    }
+
+    for (i = 0; i < I6C_ISP_IQ_COLORTRANS_MAT_NUM; i++) {
+        int32_t v = i6c_ct_scale(g_ct.matrix[i],
+                                 i < I6C_CT_ROW_U ? gain[CT_CONTRAST] : gain[CT_SATURATION]);
+
+        i6c_iq_write(buf, I6C_ISP_IQ_COLORTRANS_MATRIX + 2 * i, 2,
+                     i6c_ct_unsigned(i6c_ct_clamp(v, I6C_CT_MAT_MIN, I6C_CT_MAT_MAX),
+                                     I6C_ISP_IQ_COLORTRANS_MAT_WRAP));
+    }
+
+    /*
+     * The pivot term and the brightness term, both in the offset's quarter-count
+     * domain. Clamped as a sum rather than a term at a time: neither is a
+     * direction the way a matrix row is, so a clamp here costs range at the far
+     * corner of two knobs and distorts nothing.
+     *
+     * The pivot is the luma row's own contribution at mid-grey, not a constant.
+     * What contrast has to leave alone is wherever the baseline puts mid-grey,
+     * and that is only mid-grey itself for a conversion with no pedestal: a
+     * limited-range one maps 128 to 126, and pivoting on 128 there would tilt
+     * the whole picture as the knob moved. Derived this way it comes to 512 for
+     * a full-range matrix, which is the constant it replaces.
+     */
+    pivot = (I6C_CT_LUMA_MID * I6C_CT_OFST_PER_LUMA *
+             (g_ct.matrix[I6C_CT_ROW_Y] + g_ct.matrix[I6C_CT_ROW_Y + 1] +
+              g_ct.matrix[I6C_CT_ROW_Y + 2])) /
+            I6C_CT_MAT_UNITY;
+
+    yofst = g_ct.ofst[0];
+    yofst += pivot * (I6C_CT_KNOB_UNITY - gain[CT_CONTRAST]) / I6C_CT_KNOB_UNITY;
+    yofst += (I6C_CT_BRIGHT_SPAN * I6C_CT_OFST_PER_LUMA) *
+             (gain[CT_BRIGHTNESS] - I6C_CT_KNOB_UNITY) / I6C_CT_KNOB_UNITY;
+    i6c_iq_write(buf, I6C_ISP_IQ_COLORTRANS_YOFST, 2,
+                 i6c_ct_unsigned(i6c_ct_clamp(yofst, I6C_CT_OFST_MIN, I6C_CT_OFST_MAX),
+                                 I6C_ISP_IQ_COLORTRANS_OFST_WRAP));
+
+    i6c_iq_write(buf, I6C_ISP_ENABLE_OFF, 4, 1);
+
+    ret = i6c_iq_store(st, IQ_COLORTRANS, buf);
+    if (ret == RSS_OK)
+        HAL_LOG_DBG("isp: colour transform at brightness %d contrast %d saturation %d, "
+                    "Y offset %d",
+                    gain[CT_BRIGHTNESS], gain[CT_CONTRAST], gain[CT_SATURATION], yofst);
+
+    return ret;
+}
+
+/*
+ * Queue-or-apply, as i6c_iq_set is for a row.
+ *
+ * The value is recorded whether or not it could be applied: a tuning reload
+ * puts the tuner's matrix back, and the last value asked for is what the flush
+ * has to compose over it again.
+ */
+static int i6c_ct_set(void *ctx, int which, int val)
+{
+    infinity6c_state_t *st = i6c_state(ctx);
+
+    if (!st)
+        return RSS_ERR_INVAL;
+    if (val != RSS_ISP_AUTO && (val < 0 || val > I6C_CT_KNOB_MAX))
+        return RSS_ERR_INVAL;
+
+    g_ct.val[which] = val;
+
+    if (!st->isp_knobs_live) {
+        HAL_LOG_DBG("isp: %s = %d held until the tuning has loaded", i6c_ct_name[which], val);
+        return RSS_OK;
+    }
+
+    return i6c_ct_apply(st);
+}
+
+/*
+ * Read a knob back, from the record rather than from the hardware -- which is
+ * the one place this differs from a row, and deliberately.
+ *
+ * A row can answer from the module because the field it wrote is the value it
+ * was given. Here three knobs share nine coefficients and an offset, and while
+ * the arithmetic does invert, inverting it would be a second implementation of
+ * the composition that could disagree with the first. There is also nothing in
+ * the module to distinguish auto from a knob set to the neutral, because the
+ * two write the same bytes on purpose; only the record knows which was asked
+ * for.
+ */
+static int i6c_ct_get(void *ctx, int which, int *val)
+{
+    infinity6c_state_t *st = i6c_state(ctx);
+
+    if (!st || !val)
+        return RSS_ERR_INVAL;
+
+    *val = g_ct.val[which];
+    return RSS_OK;
+}
+
 /*
  * The rate the camera is configured to hold, as distinct from the rate it is
  * managing right now.
@@ -1420,6 +1962,7 @@ void i6c_isp_flush_knobs(infinity6c_state_t *st)
      */
     for (i = 0; i < IQ_PARAM_COUNT; i++)
         g_iq[i].tuning_stale = true;
+    g_ct.base_valid = false;
 
     for (i = 0; i < IQ_PARAM_COUNT; i++) {
         i6c_iq_param_t *p = &g_iq[i];
@@ -1429,6 +1972,15 @@ void i6c_isp_flush_knobs(infinity6c_state_t *st)
 
         i6c_iq_apply(st, (int)i, p->pending, p->pending_is_raw);
     }
+
+    /*
+     * The colour transform last, unconditionally rather than only when a knob
+     * has been set: it re-reads the tuner's matrix through the flag cleared
+     * above, and it switches the module on, which happens at neutral too. See
+     * i6c_ct_apply for why the enable is not deferred to the first non-neutral
+     * value.
+     */
+    i6c_ct_apply(st);
 }
 
 void i6c_isp_forget_knobs(void)
@@ -1446,70 +1998,55 @@ void i6c_isp_forget_knobs(void)
         g_iq[i].tuning_stale = false;
         g_iq[i].overridden = false;
     }
+    g_ct.base_valid = false;
 }
 
 /* ================================================================
  * IMAGE KNOBS
  * ================================================================ */
 
+/*
+ * Brightness, contrast and saturation, all three composed into the colour
+ * transform rather than written to the MI module of the same name. The reasons
+ * are above i6c_ct_apply; what matters here is that the published range and
+ * neutral are the ones brightness and contrast always had, so this is a change
+ * of mechanism and not of interface.
+ *
+ * Saturation is published for the first time on this family. It was withdrawn
+ * while the only way to reach it was MI's own module, whose per-gain curve is
+ * the tuner pulling colour back as gain climbs and which manual mode replaces
+ * with one constant. Composed here it costs that curve nothing -- the module
+ * keeps running in auto and this scales what it produces -- so the reason for
+ * the withdrawal is gone rather than overruled.
+ */
 int hal_isp_set_brightness(void *ctx, int val)
 {
-    return i6c_iq_set_scalar(ctx, IQ_BRIGHTNESS, val);
+    return i6c_ct_set(ctx, CT_BRIGHTNESS, val);
 }
 
 int hal_isp_set_contrast(void *ctx, int val)
 {
-    return i6c_iq_set_scalar(ctx, IQ_CONTRAST, val);
+    return i6c_ct_set(ctx, CT_CONTRAST, val);
 }
 
-/*
- * NO SATURATION HERE, DELIBERATELY
- *
- * Saturation is an auto/manual module and MI's enOpType has exactly two
- * states, so any value but the neutral 128 replaces the tuner's per-gain curve
- * with one constant for the whole gain range. That is not an adjustment, it is
- * a discard, and here it discards something real: ALLSTR varies across the
- * sixteen gain entries in all six shipped tunings -- 28..40 on gc4653, 28..36
- * on imx335, 30..45 on imx415 -- which is the tuner pulling colour back as
- * gain climbs so that amplified chroma noise does not come with it. Pinning
- * one value spends exactly that.
- *
- * Sharpness stays, and the difference is the mechanism rather than the
- * principle: its op scales a run of band gains about the tuning's own values,
- * so the shape the tuner chose survives inside the manual block. Brightness
- * and defog stay because their curves are flat in every shipped bin, so
- * leaving auto costs nothing measurable. Saturation is the one row on this
- * family where the knob and the tuning cannot both have it.
- *
- * The function and its table row stay defined -- they drive the same
- * read-modify-write path the remaining knobs use, and tests/t_isp_i6c.c
- * exercises the scaling through saturation's own numbers. What is withdrawn is
- * the vtable entry, which is the whole mechanism: rvd reports the key
- * unsettable, rcd marks it unavailable, and a stale non-neutral saturation in
- * an existing config simply stops being applied and the curve comes back.
- *
- * Infinity6E withdrew this one along with brightness, contrast and sharpness,
- * for the same reason applied to a family where all four curves carry
- * something. This is the saturation half of that, not the whole of it.
- */
 int hal_isp_set_saturation(void *ctx, int val)
 {
-    return i6c_iq_set_scalar(ctx, IQ_SATURATION, val);
+    return i6c_ct_set(ctx, CT_SATURATION, val);
 }
 
 int hal_isp_get_brightness(void *ctx, int *val)
 {
-    return i6c_iq_get_scalar(ctx, IQ_BRIGHTNESS, val);
+    return i6c_ct_get(ctx, CT_BRIGHTNESS, val);
 }
 
 int hal_isp_get_contrast(void *ctx, int *val)
 {
-    return i6c_iq_get_scalar(ctx, IQ_CONTRAST, val);
+    return i6c_ct_get(ctx, CT_CONTRAST, val);
 }
 
 int hal_isp_get_saturation(void *ctx, int *val)
 {
-    return i6c_iq_get_scalar(ctx, IQ_SATURATION, val);
+    return i6c_ct_get(ctx, CT_SATURATION, val);
 }
 
 /*
@@ -1966,17 +2503,24 @@ int hal_isp_get_hvflip(void *ctx, int *hflip, int *vflip)
  * vocabulary and pretending otherwise would be a quiet lie: the table calls
  * the WDR module "drc" and the Defog module "defog", where the config and the
  * control protocol call them "drc_strength" and "defog_strength". Only the
- * rows named here answer, which keeps the caps reply and hal_common.c's ops
- * table describing the same set -- a row this platform declines to publish,
- * like saturation, is absent from both.
+ * keys named here answer, which keeps the caps reply and hal_common.c's ops
+ * table describing the same set -- something this platform declines to publish,
+ * like sharpness, is absent from both.
+ *
+ * Two kinds of knob answer through it, which is why there are two columns. A
+ * row's caps are the MI field's own bounds; the three composed into the colour
+ * transform have no single field to take them from and carry raptor's units
+ * directly.
  */
 static const struct {
     const char *key;
-    int idx;
+    int idx; /* a g_iq row, or -1 for a knob composed into the colour transform */
+    int ct;  /* an i6c_ct_knob_t, or -1 for a row */
 } i6c_knob_keys[] = {
-    {"brightness", IQ_BRIGHTNESS}, {"contrast", IQ_CONTRAST},
-    {"defog_strength", IQ_DEFOG},  {"drc_strength", IQ_DRC},  {"ae_comp", AE_EVCOMP},
-    {"temper", IQ_NR3D},
+    {"brightness", -1, CT_BRIGHTNESS}, {"contrast", -1, CT_CONTRAST},
+    {"saturation", -1, CT_SATURATION}, {"defog_strength", IQ_DEFOG, -1},
+    {"drc_strength", IQ_DRC, -1},      {"ae_comp", AE_EVCOMP, -1},
+    {"temper", IQ_NR3D, -1},
 };
 
 int hal_isp_get_knob_caps(void *ctx, const char *name, rss_isp_knob_t *caps)
@@ -1994,6 +2538,22 @@ int hal_isp_get_knob_caps(void *ctx, const char *name, rss_isp_knob_t *caps)
             break;
     if (i == sizeof(i6c_knob_keys) / sizeof(i6c_knob_keys[0]))
         return RSS_ERR_NOTSUP;
+
+    /*
+     * The composed knobs answer from constants rather than from a row, and two
+     * of the five fields differ from a row's in what they can mean. has_auto is
+     * true because auto is the tuning's own rendering and the composer writes
+     * exactly that; enabled is whether the tuning left a transform there to
+     * scale, which is the one way these three can be unavailable.
+     */
+    if (i6c_knob_keys[i].idx < 0) {
+        caps->min = 0;
+        caps->max = I6C_CT_KNOB_MAX;
+        caps->neutral = I6C_CT_KNOB_UNITY;
+        caps->has_auto = true;
+        caps->enabled = !g_ct.base_valid || g_ct.usable;
+        return RSS_OK;
+    }
 
     p = &g_iq[i6c_knob_keys[i].idx];
     caps->min = p->mi_floor;

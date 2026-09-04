@@ -718,38 +718,40 @@ static const rss_hal_ops_t g_ops = {
      * yet. RSS_HAL_CALL answers all of them RSS_ERR_NOTSUP, which rvd treats as
      * "this SoC does not have it" rather than as a fault.
      *
-     * Saturation is absent for a different reason: it has a counterpart and
-     * the counterpart costs too much. Every shipped tuning here varies it
-     * across gain, and enOpType has no state between auto and manual, so the
-     * knob could only trade that curve for a constant. See the note above
-     * hal_isp_set_saturation. Brightness, contrast and defog stay -- their
-     * curves are flat in every bin -- so this is still a row at a time rather
-     * than the family-wide withdrawal 6E took. Sharpness has since joined it,
-     * for a different reason; see below.
+     * Brightness, contrast and saturation are all three here, and none of them
+     * is MI's module of that name. They are composed into the colour transform
+     * -- one matrix with no per-gain curve to spend -- so the modules keep
+     * running in auto and the knob scales what they produce. Saturation was
+     * withdrawn while MI's own module was the only way to reach it, because
+     * every shipped tuning varies it across gain and manual mode would trade
+     * that curve for a constant; it is published now because that cost is gone,
+     * not because the objection was overruled. See THE COLOUR TRANSFORM in
+     * hal_isp.c.
      */
     .isp_set_brightness = hal_isp_set_brightness,
     .isp_get_brightness = hal_isp_get_brightness,
     .isp_get_knob_caps = hal_isp_get_knob_caps,
     .isp_set_contrast = hal_isp_set_contrast,
     .isp_get_contrast = hal_isp_get_contrast,
+    .isp_set_saturation = hal_isp_set_saturation,
+    .isp_get_saturation = hal_isp_get_saturation,
     /*
-     * Sharpness is absent, and unlike saturation it is not the per-gain curve
-     * that costs too much -- it is the rest of the module. Measured on an
+     * Sharpness is absent, and what costs too much is not the per-gain curve
+     * that DRC below pays -- it is the rest of the module. Measured on an
      * SSC377QE + IMX335: gradient energy 4790 with the knob left alone, 1224 at
      * sharpness 0, 1794 at sharpness 127. Every point of the published range is
      * a third of what the tuning was already doing, and the maximum is softer
      * than not touching it. See the note above hal_isp_set_sharpness.
      */
     /*
-     * DRC is MI's WDR module. It is published where saturation is not, and the
-     * difference is which way the trade falls: WDR's level is one byte the knob
-     * can carry the majestic scale onto exactly, and the module is enabled and
-     * in auto in all six shipped tunings here, so the knob has somewhere to go.
-     * It does spend the per-gain curve when it leaves auto -- WDR's Strength
-     * varies across gain in every bin -- which is the same cost saturation was
-     * withdrawn for, taken deliberately this time because there is no other way
-     * to offer the control at all and majestic has offered it this way for
-     * years. Asking for auto by name hands the curve back.
+     * DRC is MI's WDR module, and it is the one knob here that still pays the
+     * per-gain curve: WDR's Strength varies across gain in every bin and there
+     * is no second module to compose it into the way the colour transform takes
+     * the other three. Taken deliberately -- the level is one byte the knob
+     * carries the majestic scale onto exactly, the module is enabled and in auto
+     * in all six shipped tunings so the knob has somewhere to go, and majestic
+     * has offered it this way for years. Asking for auto by name hands the curve
+     * back.
      */
     .isp_set_drc_strength = hal_isp_set_drc_strength,
     .isp_get_drc_strength = hal_isp_get_drc_strength,
