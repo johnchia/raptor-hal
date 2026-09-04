@@ -484,9 +484,20 @@ static int i6c_isp_bringup(infinity6c_state_t *st)
      * Orientation and the 3DNR level as raptor asked for them, which is why they
      * are read out of the state rather than written as constants: rvd applies its
      * whole [image] block during pipeline setup, before this channel exists, so
-     * hal_isp.c holds the request and this is where it lands. Rotation stays zero
-     * -- that is the scaler's, in hal_fs_set_rotation, where it can change output
-     * geometry.
+     * hal_isp.c holds the request and this is where it lands.
+     *
+     * Rotation stays zero, and not because the scaler does it instead: the SCL
+     * on this family refuses every non-zero angle with MI_ERR_SCL_NOT_SUPPORT,
+     * which is why has_rotation is false in caps_sigmastar.inc and why there is
+     * no fs_set_rotation here. This field is the one that could turn a picture
+     * on this part -- the SDK marks ISP rotation supported on Maruko,
+     * MI_ISP_CHECK_ChnParamValid bounds offset 12 at 3 for SupportRot, and the
+     * RotFlipRelyOn3Dnr precondition is already met because isp_nr3d_req starts
+     * at 1. It stays zero because the cost is unmeasured: the SDK warns that a
+     * turned SCL port loses crop, scaling, pixel-format conversion and
+     * mirror/flip and can carry no MI_RGN overlay, and whether the same binds
+     * the ISP's rotation is unknown. This backend needs all four -- the ports
+     * are how a sub-stream gets its own size, and MI_RGN is how OSD is drawn.
      */
     param.level3DNR = st->isp_nr3d_req;
     param.mirror = (char)(st->isp_mirror_req ? 1 : 0);
@@ -1219,65 +1230,6 @@ int hal_fs_destroy_channel(void *ctx, int chn)
 
     /* Drops the shared chain once the last channel using it is gone. */
     i6c_pipeline_destroy(st);
-
-    return RSS_OK;
-}
-
-/*
- * hal_fs_set_rotation -- rotate every stream at once.
- *
- * Rotation lives on the SCL *channel*, not the port, so it cannot be set per
- * stream: the ports all hang off one channel. Accepted for channel 0 and
- * refused elsewhere rather than silently applied to everything, since a caller
- * asking to rotate one stream would otherwise get all of them. The one
- * exception is a request for another channel at the angle channel 0 already
- * has: rvd turns every framesource by the same [image] rotate, and that port
- * is already turned, so it is answered yes rather than refused.
- */
-int hal_fs_set_rotation(void *ctx, int chn, int degrees)
-{
-    i6c_scl_chn channel;
-    int ret;
-
-    I6C_ENTER(ctx, chn, st);
-
-    if (chn != 0) {
-        if (st->pipeline_up && degrees == st->rotation) {
-            HAL_LOG_DBG("infinity6c: chn %d already turned %d degrees with the SCL channel", chn,
-                        degrees);
-            return RSS_OK;
-        }
-        HAL_LOG_WARN("infinity6c: rotation is per SCL channel, so it cannot apply to chn %d alone",
-                     chn);
-        return RSS_ERR_NOTSUP;
-    }
-    if (!st->pipeline_up)
-        return RSS_ERR_INVAL;
-
-    memset(&channel, 0, sizeof(channel));
-    switch (degrees) {
-    case 0:
-        channel.rotate = I6C_SCL_ROTATE_NONE;
-        break;
-    case 90:
-        channel.rotate = I6C_SCL_ROTATE_90;
-        break;
-    case 180:
-        channel.rotate = I6C_SCL_ROTATE_180;
-        break;
-    case 270:
-        channel.rotate = I6C_SCL_ROTATE_270;
-        break;
-    default:
-        return RSS_ERR_INVAL;
-    }
-
-    ret = st->scl.set_chn_param(I6C_DEV_ID(I6C_SCL_DEV), I6C_SCL_CHN, &channel);
-    if (ret) {
-        HAL_LOG_ERR("MI_SCL_SetChnParam(rotate %d) failed: %d", degrees, ret);
-        return RSS_ERR_IO;
-    }
-    st->rotation = degrees;
 
     return RSS_OK;
 }

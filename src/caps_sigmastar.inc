@@ -359,10 +359,29 @@ const rss_hal_caps_t g_hal_caps = {
  * it was misread that way once already, and MI 3.0's explicit device layer
  * makes it look more like a total than it is.
  *
- * has_rotation is true but coarser than the flag suggests: rotation lives
- * on the SCL channel, so it turns every stream at once. hal_fs_set_rotation
- * accepts it for channel 0 and refuses it elsewhere rather than quietly
- * rotating streams the caller did not name.
+ * has_rotation is false, and not for want of an op: this part cannot turn a
+ * picture on the scaler at all. MI_SCL_SetChnParam refuses every non-zero
+ * angle on an SSC377QE with 0xA0222007, MI_ERR_SCL_NOT_SUPPORT -- the same
+ * code for 90, 180 and 270 and the same at 2592x1944 as at 640x480, so it is
+ * neither a geometry mismatch nor a pixel-rate limit. NOT_SUPPORT rather
+ * than NOT_PERM, which is what writing a running channel would answer.
+ *
+ * The SDK says it twice over. Infinity6C is Maruko: the SCL capability table
+ * gives Rotation as N there where Tiramisu and Muffin get Y, and the
+ * MI_SCL_ChnParam_t page lists the chips that can rotate without mentioning
+ * Maruko at all. The reason is structural -- the families that rotate do it
+ * on a DRAM-read device, MI_SCL_DEV_DIPR0 or DIPR1, and Maruko's three SCL
+ * devices are ISP_REALTIME0, RDMA0 and VIF_REALTIME0. There is no DIPR block
+ * on the part, and this backend runs on device 0, a realtime one.
+ *
+ * The product brief does say "Flip, Mirror, and Rotation with 90 or 270
+ * degree", which is where the belief that the scaler could came from. Read
+ * the bullets around it: that list is the ISP's, not the scaler's. Rotation
+ * on this part is real and lives one stage upstream -- see the note at
+ * param.rotate in hal_framesource.c, which is where it would be implemented.
+ * The flag stays false until something actually turns a picture, because rvd
+ * gates on it before swapping a stream's encoder geometry and rcd offers
+ * [image] rotate to every client on the strength of it.
  *
  * has_color2grey stays false even though monochrome works, which looks wrong
  * until you check what the flag gates: rvd maps it to enc_set_color2grey, an
@@ -398,7 +417,7 @@ const rss_hal_caps_t g_hal_caps = {
 
     /* Encoder */
     .has_h265 = true,
-    .has_rotation = true,
+    .has_rotation = false,
     .has_set_bitrate = true,
     /*
      * has_gop_attr stays false: enc_set_gop_attr and enc_get_gop_attr are

@@ -95,7 +95,6 @@ int hal_fs_set_channel_attr(void *ctx, int chn, const rss_fs_config_t *cfg);
 int hal_fs_destroy_channel(void *ctx, int chn);
 int hal_fs_enable_channel(void *ctx, int chn);
 int hal_fs_disable_channel(void *ctx, int chn);
-int hal_fs_set_rotation(void *ctx, int chn, int degrees);
 
 /* ── Encoder: VENC (infinity6c/hal_encoder.c) ── */
 
@@ -672,7 +671,6 @@ static const rss_hal_ops_t g_ops = {
     .fs_destroy_channel = hal_fs_destroy_channel,
     .fs_enable_channel = hal_fs_enable_channel,
     .fs_disable_channel = hal_fs_disable_channel,
-    .fs_set_rotation = hal_fs_set_rotation,
 
     /*
      * VENC. fs_get_frame and its release are deliberately absent: raw frame

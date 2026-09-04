@@ -1769,9 +1769,10 @@ int hal_isp_get_running_mode(void *ctx, rss_isp_mode_t *mode)
  * vendor driver answers from its static mode table rather than the live value.
  * i6c_snr_bringup leaves the sensor unflipped for that reason.
  *
- * The block also carries `rotate`, and it is not used from here: rotation is
- * hal_fs_set_rotation's, on the scaler, where it can change output geometry. Two
- * stages both rotating would compose.
+ * The block also carries `rotate`, and it is not used from here -- nothing in
+ * this backend turns a picture. The scaler cannot on this family, so there is no
+ * fs_set_rotation to defer to any more; this field is where rotation would be
+ * implemented if it ever is. See the note at param.rotate in hal_framesource.c.
  */
 static int i6c_isp_chn_param(infinity6c_state_t *st, i6c_isp_para *para)
 {
