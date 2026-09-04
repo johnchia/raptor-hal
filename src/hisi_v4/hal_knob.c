@@ -42,15 +42,15 @@
  *                          promise, and re-learned at each load for the same
  *                          reason.
  *
- *                          So `auto` restores that constant and stops the
- *                          reapply below re-asserting the knob; it does not
- *                          hand the field to a curve, there being none. What
- *                          it buys over writing the same number is that rcd
- *                          stores the word rather than 56, so a camera whose
- *                          AE library defaults elsewhere follows it instead
- *                          of this one's. caps.has_auto is true on that
- *                          weaker reading -- see the note in
- *                          hal_isp_get_knob_caps.
+ *                          So the caps offer no auto here: there is nothing
+ *                          to hand the field back to, which is what has_auto
+ *                          means everywhere else in the HAL. The sentinel is
+ *                          still accepted -- a config written before this
+ *                          says `ae_comp = auto` and has to keep loading --
+ *                          and reset-isp now reaches the same value by the
+ *                          shorter route, writing caps.neutral and dropping
+ *                          the key from the file, which is a truer "follow
+ *                          the AE's own" than storing a word ever was.
  *   drc_strength           ISP_DRC_ATTR_S strength, 0..1023, pinned in
  *                          manual mode. The [dynamic_linear_drc] engine
  *                          (hal_dyn.c) writes the same field by ISO, so a pin
@@ -480,17 +480,20 @@ int hal_isp_get_knob_caps(void *ctx, const char *name, rss_isp_knob_t *caps)
         caps->min = 0;
         caps->max = KNOB_AE_MAX;
         /*
-         * True on the weaker of the two readings this flag carries. There
-         * is no curve behind it: nothing varies u8Compensation, so `auto`
-         * writes the same constant `neutral` names and differs only in
-         * that rcd then stores the word instead of the number -- which
-         * still matters, the number being lib_hiae.so's rather than this
-         * port's. Left true so an operator can say "follow the AE's own"
-         * and have the config keep meaning that; the alternative reading,
-         * where auto promises a knob that moves with the light, is
-         * drc_strength's below and this is not it.
+         * No auto, for the reason every other backend gives for this same
+         * knob: nothing varies u8Compensation, so there is no curve to hand
+         * it back to. IMP says so for all thirteen of its rows, and both
+         * SigmaStar ports test the module's shape -- EV compensation being
+         * flat on each, and named as the counter-example in i6c's own
+         * comment. A knob whose only hand-back is a constant is what
+         * `neutral` is for, and reset-isp takes that branch.
+         *
+         * The sentinel stays legal in the setter regardless. This flag is
+         * advice to a client about which control to draw; it is not what
+         * decides whether RSS_ISP_AUTO is accepted, and a config carrying
+         * the word from before this must keep loading.
          */
-        caps->has_auto = true;
+        caps->has_auto = false;
         /* The neutral is the AE library's, learned by the first look; before
          * the ISP runs there is nothing to look at and its published default
          * stands in. */

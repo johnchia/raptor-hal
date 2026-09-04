@@ -1668,9 +1668,17 @@ static void knobs(void)
     hisi_dyn_on_exposure(&st, 300, 3000);
     assert(g_drc.op_type == 1 && g_drc.manual_strength == 300 && g_dehaze.auto_strength == 78);
 
-    /* Caps: the hardware's units, the tuning's neutrals. */
+    /* Caps: the hardware's units, the tuning's neutrals.
+     *
+     * has_auto is one question everywhere -- is there a curve to hand the
+     * field back to -- and ae_comp's answer is no: nothing varies
+     * u8Compensation, so its hand-back is the constant `neutral` names. It
+     * read true here once, the only key in any backend that claimed an auto
+     * with no curve behind it, so the assertion is the invariant and not
+     * just this row's value. drc_strength below is the true case, and the
+     * two sitting next to each other is the point. */
     assert(hal_isp_get_knob_caps(&ctx, "ae_comp", &k) == RSS_OK);
-    assert(k.min == 0 && k.max == 255 && k.neutral == st.knob.ae_base && k.has_auto);
+    assert(k.min == 0 && k.max == 255 && k.neutral == st.knob.ae_base && !k.has_auto);
     assert(hal_isp_get_knob_caps(&ctx, "drc_strength", &k) == RSS_OK);
     assert(k.max == 1023 && k.neutral == 420 && k.has_auto && k.enabled);
     assert(hal_isp_get_knob_caps(&ctx, "brightness", &k) == RSS_OK);
@@ -1683,7 +1691,12 @@ static void knobs(void)
     assert(hal_isp_get_knob_caps(&ctx, "hue", &k) == RSS_ERR_NOTSUP);
 
     /* auto: the tuning's value back; the DRC engine released and writing
-     * its column for the ISO it last saw, at once. */
+     * its column for the ISO it last saw, at once.
+     *
+     * ae_comp is here despite publishing has_auto false, and that is the
+     * compatibility guarantee: the flag says which control to draw, not what
+     * the setter accepts, and a raptor.conf written when the button existed
+     * still carries `ae_comp = auto` and still has to load. */
     assert(hal_isp_set_ae_comp(&ctx, RSS_ISP_AUTO) == RSS_OK);
     assert(g_exp.auto_attr.compensation == st.knob.ae_base);
     assert(hal_isp_set_drc_strength(&ctx, RSS_ISP_AUTO) == RSS_OK);
