@@ -24,13 +24,33 @@
  *                          is why unity here means "the tuning's answer,
  *                          whatever it currently is" and not a number.
  *   ae_comp                ISP_EXPOSURE_ATTR_S stAuto.u8Compensation,
- *                          0..255: the AE's target-luma multiplier. The
- *                          tuning's [static_ae] may set it, so unity is
- *                          whatever the loader left -- learned before the
- *                          knob's first write over it and forgotten at every
- *                          load, which is the SigmaStar backend's lesson
- *                          (docs/sigmastar.md, "the neutral is the
- *                          tuning's, not the midpoint").
+ *                          0..255: the setpoint the AE converges its target
+ *                          luma on, read afresh by the loop every frame and
+ *                          moved by nothing else. It is a constant, not a
+ *                          curve -- no engine here varies it with ISO, and
+ *                          the driver does not vary it either.
+ *
+ *                          The baseline is learned rather than named, but it
+ *                          is not the tuning file's: iq_sect_static_ae maps
+ *                          ten [static_ae] keys and Compensation is not among
+ *                          them, so nothing in a load writes this field and
+ *                          the value at the first read after ISP init is the
+ *                          AE library's own -- 56 on every sensor shipped
+ *                          here, which is also the caps' fallback for before
+ *                          the ISP runs. Learned anyway, because 56 is
+ *                          lib_hiae.so's number and not this port's to
+ *                          promise, and re-learned at each load for the same
+ *                          reason.
+ *
+ *                          So `auto` restores that constant and stops the
+ *                          reapply below re-asserting the knob; it does not
+ *                          hand the field to a curve, there being none. What
+ *                          it buys over writing the same number is that rcd
+ *                          stores the word rather than 56, so a camera whose
+ *                          AE library defaults elsewhere follows it instead
+ *                          of this one's. caps.has_auto is true on that
+ *                          weaker reading -- see the note in
+ *                          hal_isp_get_knob_caps.
  *   drc_strength           ISP_DRC_ATTR_S strength, 0..1023, pinned in
  *                          manual mode. The [dynamic_linear_drc] engine
  *                          (hal_dyn.c) writes the same field by ISO, so a pin
@@ -235,7 +255,10 @@ static int knob_ae_get(hisi_state_t *st, v4_isp_exp_attr *a)
         return RSS_ERR_IO;
     }
     /* The first look at the attribute since the last load is the
-     * tuning's own value, whatever writes come after. */
+     * baseline, whatever writes come after. Not the tuning file's --
+     * [static_ae] has no Compensation key and no load writes this field --
+     * but the AE library's own, which is 56 on every sensor here and still
+     * read rather than assumed. */
     if (!st->knob.ae_base_known) {
         st->knob.ae_base = a->auto_attr.compensation;
         st->knob.ae_base_known = true;
@@ -259,7 +282,7 @@ static int knob_ae_write(hisi_state_t *st, int val, const char *why)
         HAL_LOG_ERR("HI_MPI_ISP_SetExposureAttr(compensation %d) failed: 0x%x", val, ret);
         return RSS_ERR_IO;
     }
-    HAL_LOG_INFO("ae_comp: %d%s (the tuning's is %d)", val, why, st->knob.ae_base);
+    HAL_LOG_INFO("ae_comp: %d%s (the AE's own is %d)", val, why, st->knob.ae_base);
     return RSS_OK;
 }
 
@@ -274,7 +297,7 @@ int hal_isp_set_ae_comp(void *ctx, int val)
 
         st->knob.ae_comp.asked = false;
         if (knob_live(st) && st->knob.ae_base_known)
-            ret = knob_ae_write(st, st->knob.ae_base, ", the tuning's own, put back");
+            ret = knob_ae_write(st, st->knob.ae_base, ", the AE's own, put back");
         return ret;
     }
     if (val < 0 || val > KNOB_AE_MAX) {
@@ -456,10 +479,21 @@ int hal_isp_get_knob_caps(void *ctx, const char *name, rss_isp_knob_t *caps)
 
         caps->min = 0;
         caps->max = KNOB_AE_MAX;
+        /*
+         * True on the weaker of the two readings this flag carries. There
+         * is no curve behind it: nothing varies u8Compensation, so `auto`
+         * writes the same constant `neutral` names and differs only in
+         * that rcd then stores the word instead of the number -- which
+         * still matters, the number being lib_hiae.so's rather than this
+         * port's. Left true so an operator can say "follow the AE's own"
+         * and have the config keep meaning that; the alternative reading,
+         * where auto promises a knob that moves with the light, is
+         * drc_strength's below and this is not it.
+         */
         caps->has_auto = true;
-        /* The neutral is the tuning's, learned by the first look; before
-         * the ISP runs there is nothing to look at and the driver's own
-         * default stands in. */
+        /* The neutral is the AE library's, learned by the first look; before
+         * the ISP runs there is nothing to look at and its published default
+         * stands in. */
         if (!st->knob.ae_base_known && knob_live(st))
             knob_ae_get(st, &a);
         caps->neutral = st->knob.ae_base_known ? st->knob.ae_base : 56;
@@ -496,7 +530,7 @@ int hal_isp_get_knob_caps(void *ctx, const char *name, rss_isp_knob_t *caps)
 void hisi_knob_before_load(hisi_state_t *st)
 {
     if (st->knob.ae_comp.asked && st->knob.ae_base_known)
-        knob_ae_write(st, st->knob.ae_base, ", the tuning's own, back for the load");
+        knob_ae_write(st, st->knob.ae_base, ", the AE's own, back for the load");
     if (st->knob.drc.asked && st->knob.drc_base_known)
         knob_drc_release(st);
     st->knob.ae_base_known = false;
