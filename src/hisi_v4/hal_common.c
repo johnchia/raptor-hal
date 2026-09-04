@@ -34,6 +34,7 @@
 
 #include <fcntl.h>
 #include <stdarg.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <sys/mman.h>
 #include <sys/syscall.h>
@@ -2185,6 +2186,129 @@ static unsigned int hisi_vb_raw_size(unsigned int width, unsigned int height,
  * whole story.
  */
 
+/* HI_ERR_VB_BUSY -- VB is already configured, and a live one cannot be
+ * reconfigured. See hisi_vb_report_holders. */
+#define V4_ERR_VB_BUSY 0xa0018012u
+
+/* The BLK header names one column per MPP module; 23 on this MPP, with room. */
+#define V4_VB_MODS 32
+
+/* Parameterised so the parser can be run against a captured dump. */
+#define V4_VB_PROC "/proc/umap/vb"
+
+/*
+ * Say what is holding VB, because the code on its own is a dead end.
+ *
+ * hisi_reclaim_pipeline exists for the video half of this: a daemon killed
+ * mid-pipeline leaves VI enabled, the VPSS group started and VENC channels
+ * created, and the reclaim tears those down so HI_MPI_VB_Exit can succeed.
+ * It does not cover a *private* pool, which is what the audio path leaves --
+ * rad holds an AI frame buffer, hal_audio.c never calls HI_MPI_SYS_Exit on
+ * purpose, and a rad that dies while rvd tears MI down (the case rcd's
+ * quiesce_rad brackets, and that anything bypassing rcd reproduces) leaves
+ * the pool behind with a block still charged to a USER handle whose process
+ * is gone. Every later bring-up then fails here, and the only reading that
+ * says so is /proc/umap/vb:
+ *
+ *   PoolId  PhysAddr    IsComm  Owner  BlkSz  BlkCnt  Free
+ *   7       0x45d40000  0       -2     2048   62      61
+ *   BLK ... USER ...
+ *   0   ...  1   ...
+ *
+ * An operator who has that in front of them knows to reboot. One who has
+ * only "HI_MPI_VB_SetConfig failed: 0xa0018012" has an afternoon.
+ *
+ * NOT FROM THE OWNER COLUMN, though it reads like the field for it. A
+ * healthy EV300 mid-stream lists Owner -2 on all seven of its private pools
+ * -- the encoder's, the AI pool, every one -- so a negative owner says
+ * nothing about whether anyone is alive to free it. The conclusion below is
+ * drawn from the call site instead, which is sound whatever the columns say:
+ * hal_init reclaims the pipeline and calls SYS_Exit and VB_Exit before this
+ * point, so anything still standing here has already survived the only
+ * teardown this process can perform.
+ *
+ * REPORTING ONLY, DELIBERATELY. Reclaiming an orphaned private pool --
+ * HI_MPI_VB_DestroyPool over every pool whose owner is negative -- is the
+ * obvious next step and is not taken here: a pool with a block still charged
+ * to it may refuse to be destroyed, and a destroy that half-succeeds is a
+ * worse state than the one it was called from. Worth doing if this recurs
+ * often enough to be worth proving on the bench; until then the reboot is
+ * one line of advice and this is the line.
+ */
+static void hisi_vb_report_holders(const char *path)
+{
+    char mods[V4_VB_MODS][12];
+    char line[512];
+    FILE *f = fopen(path, "r");
+    int nmods = 0, pools = 0;
+    bool in_pools = false;
+
+    if (!f) {
+        HAL_LOG_ERR("vb: %s will not open; nothing further to say about the pool", path);
+        return;
+    }
+
+    while (fgets(line, sizeof(line), f)) {
+        /* The per-pool table, as opposed to the common-pool config above it,
+         * which repeats the word PoolId without an address column. */
+        if (!strncmp(line, "PoolId", 6) && strstr(line, "PhysAddr")) {
+            in_pools = true;
+            continue;
+        }
+        /* The block table's own header ends the pool rows: its rows start
+         * with a block index and would otherwise read as another pool. */
+        if (!strncmp(line, "BLK", 3)) {
+            char *tok = strtok(line + 3, " \t\n");
+
+            in_pools = false;
+            nmods = 0;
+            while (tok && nmods < V4_VB_MODS) {
+                snprintf(mods[nmods++], sizeof(mods[0]), "%s", tok);
+                tok = strtok(NULL, " \t\n");
+            }
+            continue;
+        }
+        if (!strncmp(line, "Sum", 3) && nmods > 0) {
+            char *tok = strtok(line + 3, " \t\n");
+            char held[192] = "";
+            size_t hl = 0;
+            int i = 0;
+
+            while (tok && i < nmods) {
+                if (strtol(tok, NULL, 10) > 0 && hl < sizeof(held) - 1)
+                    hl += (size_t)snprintf(held + hl, sizeof(held) - hl, "%s%s", hl ? ", " : "",
+                                           mods[i]);
+                tok = strtok(NULL, " \t\n");
+                i++;
+            }
+            if (held[0])
+                HAL_LOG_ERR("vb:   blocks still held by: %s", held);
+            continue;
+        }
+        if (in_pools && line[0] >= '0' && line[0] <= '9') {
+            unsigned long long phys = 0, blksz = 0;
+            unsigned int id = 0, iscomm = 0, cnt = 0, freeblk = 0;
+            long owner = 0;
+
+            if (sscanf(line, "%u %llx %*x %u %ld %llu %u %u", &id, &phys, &iscomm, &owner, &blksz,
+                       &cnt, &freeblk) != 7)
+                continue;
+            pools++;
+            HAL_LOG_ERR("vb: pool %u at 0x%llx: %s, owner %ld, %u blocks of %llu, %u free", id,
+                        phys, iscomm ? "common" : "private", owner, cnt, blksz, freeblk);
+        }
+    }
+    fclose(f);
+
+    if (!pools)
+        HAL_LOG_ERR("vb: no pool is listed, so the configuration alone is what refuses");
+    else
+        HAL_LOG_ERR("vb: the teardown-first pass above already reclaimed the video pipeline and "
+                    "called SYS_Exit and VB_Exit, so whatever is listed here outlived it -- a "
+                    "private pool still holding a block cannot be taken back from userspace, and "
+                    "the camera has to be rebooted before the pipeline will start");
+}
+
 static int hisi_vb_bringup(hisi_state_t *st)
 {
     v4_vb_conf conf;
@@ -2234,7 +2358,11 @@ static int hisi_vb_bringup(hisi_state_t *st)
 
     ret = st->sys.fnVbSetConfig(&conf);
     if (ret) {
-        HAL_LOG_ERR("HI_MPI_VB_SetConfig failed: 0x%x", ret);
+        HAL_LOG_ERR("HI_MPI_VB_SetConfig failed: 0x%x%s", ret,
+                    (unsigned)ret == V4_ERR_VB_BUSY ? " (VB busy -- one is already configured)"
+                                                    : "");
+        if ((unsigned)ret == V4_ERR_VB_BUSY)
+            hisi_vb_report_holders(V4_VB_PROC);
         return RSS_ERR_IO;
     }
     st->vb_configured = true;
