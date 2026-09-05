@@ -2205,6 +2205,47 @@ static unsigned int hisi_vb_raw_size(unsigned int width, unsigned int height,
 #define HISI_VB_BLK_CNT_MIN 5u
 #define HISI_VB_MMZ_PERCENT 60u
 
+/*
+ * POOL 1 -- THE SMALL-CHANNEL POOL, and why this one is not the guess that
+ * was deleted before.
+ *
+ * The pool 1 removed earlier was sized as a PREDICTION of the stream: the
+ * sensor's geometry capped at 1920x1080, which on a 5 MP 4:3 board was
+ * wrong in both directions at once. hal_init still cannot see the stream
+ * configuration -- rss_multi_sensor_config_t carries sensors -- and nothing
+ * here changes that.
+ *
+ * This is a BOUND instead, which needs no such knowledge: blocks big enough
+ * for any channel scaled down by two in each dimension. A channel at or
+ * under that gets a cheap block; a bigger one falls back to pool 0 and
+ * behaves exactly as it does today. VB hands out a block from the smallest
+ * pool whose blocks fit, which is measured rather than assumed -- adding a
+ * second pool to a running 1080p board moved exactly one allocation out of
+ * pool 0 (MinFree 1 -> 2) into pool 1, with both streams unchanged.
+ *
+ * WHAT IT BUYS. A sensor-sized block is the wrong currency for a sub-stream:
+ * on a 5 MP board the 640x480 channel takes a 7,558,400-byte block to hold a
+ * 460,800-byte picture, sixteen times what it needs. The vendor's own
+ * streamer on the same board does not do this -- its common pools are
+ * 7558272 x 5, 7558272 x 1 and 460800 x 1, the last sized to its sub-stream
+ * exactly -- and it runs the same two streams in 63,624 KiB of MMZ where
+ * this backend takes 81,628.
+ *
+ * WHY IT MATTERS BEYOND THE SAVING. Rotation costs one extra block per
+ * turned channel, and in one pool that block is sensor-sized. On a 32 MiB
+ * zone that is unaffordable next to a 1080p JPEG channel, which is why a
+ * turned sub-stream died there with SendOk 0 and pool 0 at MinFree 0 --
+ * accepted by SetChnRotation, then silently empty. Out of this pool the same
+ * block costs a ninth as much, and the turned channel runs.
+ *
+ * THREE, because two is the working set of a single turned channel (one in
+ * flight, one being filled) and the third is the headroom that made the
+ * difference on the board: two left pool 0 doing the overflow, three did
+ * not.
+ */
+#define HISI_VB_SUB_DIV 2u
+#define HISI_VB_SUB_BLK_CNT 3u
+
 /* Video-only: hal_common.c is compiled into the audio archive too, and rad
  * configures no pools at all (see hisi_vb_bringup), so an unguarded helper
  * here is an unused-function error on that build rather than dead weight. */
@@ -2237,8 +2278,16 @@ static unsigned long hisi_mmz_total_kib(const char *path)
     return kib;
 }
 
-/* How many sensor-sized blocks to ask for, given what one costs. */
-static unsigned int hisi_vb_blk_cnt(unsigned long long blk_size)
+/*
+ * How many sensor-sized blocks to ask for, given what one costs and what
+ * pool 1 has already taken.
+ *
+ * The budget is the whole VB configuration's, not pool 0's, so the small
+ * pool comes off the top: the zone has to hold both, and charging only the
+ * big pool against the bound would put the total over it by exactly the
+ * amount pool 1 costs.
+ */
+static unsigned int hisi_vb_blk_cnt(unsigned long long blk_size, unsigned long long reserved_kib)
 {
     unsigned long total_kib = hisi_mmz_total_kib(V4_MMZ_PROC);
     unsigned long long budget_kib;
@@ -2252,7 +2301,32 @@ static unsigned int hisi_vb_blk_cnt(unsigned long long blk_size)
 
     blk_kib = (blk_size + 1023ull) / 1024ull;
     budget_kib = (unsigned long long)total_kib * HISI_VB_MMZ_PERCENT / 100ull;
+    budget_kib = budget_kib > reserved_kib ? budget_kib - reserved_kib : 0ull;
     cnt = (unsigned int)(budget_kib / blk_kib);
+
+    if (cnt > HISI_VB_BLK_CNT)
+        cnt = HISI_VB_BLK_CNT;
+
+    /*
+     * One fewer when there is a pool 1, because exactly one allocation left:
+     * the sub-stream channel that used to take a sensor-sized block from
+     * here now takes a small one from there. Seven was measured with that
+     * channel inside this pool, so six without it is the same service, and
+     * the board agrees -- with pool 1 present and pool 0 still at seven, an
+     * EV300 ran a 5 MP main and a 640x480 sub at MinFree 2, two blocks it
+     * never touched.
+     *
+     * THE CASE THIS COSTS. A sub-stream too big for pool 1 falls back to
+     * here, and then this pool is serving what seven was measured for with
+     * six. That is the configuration whose VbFail cost 5% of frames, so it
+     * is not free -- which is why hisi_fs_pool_note logs the fallback at
+     * channel creation rather than leaving it to be discovered as frame
+     * loss. Pool 1's bound is half the sensor in each dimension, so falling
+     * outside it means a sub-stream above a quarter of the sensor's area,
+     * which is a stream sized like a main rather than a sub.
+     */
+    if (reserved_kib && cnt > HISI_VB_BLK_CNT_MIN)
+        cnt--;
 
     if (cnt >= HISI_VB_BLK_CNT)
         return HISI_VB_BLK_CNT;
@@ -2447,16 +2521,50 @@ static int hisi_vb_bringup(hisi_state_t *st)
         st->vb_private_pools = st->sys.fnVbCreatePool && st->sys.fnVbDestroyPool &&
                                st->vpss.fnAttachVbPool && st->vpss.fnDetachVbPool;
 
+        /*
+         * Pool 1 is sized first because pool 0's count is what gives way:
+         * the bound in hisi_vb_blk_cnt covers the whole configuration, and
+         * the small pool is the part of it whose size is fixed.
+         *
+         * Guarded on the sensor being big enough to halve usefully. Below
+         * that the two pools converge, a "small" block stops being cheap,
+         * and one pool is the right answer -- which is also what happens
+         * naturally if this is skipped.
+         */
+        unsigned int sub = 0;
+        unsigned long long sub_kib = 0;
+
+        if (sw >= 2u * HISI_VB_SUB_DIV && sh >= 2u * HISI_VB_SUB_DIV) {
+            sub = hisi_vb_nv12_size(sw / HISI_VB_SUB_DIV, sh / HISI_VB_SUB_DIV);
+            sub_kib = ((unsigned long long)sub * HISI_VB_SUB_BLK_CNT + 1023ull) / 1024ull;
+        }
+
         conf.max_pool_cnt = 1;
 
         conf.pool[0].blk_size = raw > nv12 ? raw : nv12;
-        conf.pool[0].blk_cnt = hisi_vb_blk_cnt(conf.pool[0].blk_size);
+        conf.pool[0].blk_cnt = hisi_vb_blk_cnt(conf.pool[0].blk_size, sub_kib);
         /* NOCACHE: nothing in userspace reads these blocks on the streaming
          * path, and a cached mapping would need explicit maintenance at
          * every hand-off between VI, VPSS and VENC. */
         conf.pool[0].remap_mode = V4_VB_REMAP_NOCACHE;
 
-        /* What hal_framesource compares a channel's own frame against. */
+        if (sub) {
+            conf.pool[1].blk_size = sub;
+            conf.pool[1].blk_cnt = HISI_VB_SUB_BLK_CNT;
+            conf.pool[1].remap_mode = V4_VB_REMAP_NOCACHE;
+            conf.max_pool_cnt = 2;
+        }
+        /* What hisi_fs_pool_note compares a channel against. Zero when there
+         * is no pool 1, which is also "nothing to fall back from". */
+        st->vb_sub_blk_size = sub;
+
+        /*
+         * What hal_framesource compares a channel's own frame against, and
+         * pool 0's block stays the answer: it is the largest block VB can
+         * hand out, so it is the one that decides whether a frame fits at
+         * all. Pool 1 only changes which pool a frame that already fits is
+         * served from.
+         */
         st->vb_blk_size = conf.pool[0].blk_size;
     }
 #endif
@@ -2465,7 +2573,13 @@ static int hisi_vb_bringup(hisi_state_t *st)
      * The audio archive has no sensor and no pipeline, so it configures no
      * pools -- and that is the one case where an empty table is right.
      */
-    if (conf.max_pool_cnt)
+    if (conf.max_pool_cnt > 1)
+        HAL_LOG_INFO("vb: 2 pools, %llu x %u + %llu x %u = %llu KiB", conf.pool[0].blk_size,
+                     conf.pool[0].blk_cnt, conf.pool[1].blk_size, conf.pool[1].blk_cnt,
+                     (conf.pool[0].blk_size * conf.pool[0].blk_cnt +
+                      conf.pool[1].blk_size * conf.pool[1].blk_cnt) /
+                         1024ull);
+    else if (conf.max_pool_cnt)
         HAL_LOG_INFO("vb: 1 pool, %llu x %u = %llu KiB", conf.pool[0].blk_size,
                      conf.pool[0].blk_cnt, conf.pool[0].blk_size * conf.pool[0].blk_cnt / 1024ull);
     else

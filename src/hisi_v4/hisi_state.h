@@ -689,6 +689,10 @@ typedef struct {
      * Zero and false on an audio-only build, which configures no pools.
      */
     unsigned long long vb_blk_size;
+    /* Pool 1's block size, or 0 when the configuration has only one pool.
+     * Read by hisi_fs_pool_note to say when a channel is too big for the
+     * small pool and will draw a sensor-sized block instead. */
+    unsigned int vb_sub_blk_size;
     bool vb_private_pools;
 
     bool mipi_configured;

@@ -402,6 +402,44 @@ static unsigned long long hisi_fs_pool_want(const hisi_state_t *st, const hisi_v
 }
 
 /*
+ * Say when a channel is too big for the small common pool.
+ *
+ * Pool 0's count is one lower when a pool 1 exists, on the reasoning that
+ * the sub-stream has moved out of it (see hisi_vb_blk_cnt). A channel that
+ * does not fit pool 1 moves back, and pool 0 is then one block short of
+ * what it was measured with -- which shows up as VI's VbFail climbing, a
+ * symptom whose cause is three files away from where it is observed.
+ *
+ * A note rather than a refusal: the configuration is legal, it is what
+ * every channel did before pool 1 existed, and on a zone with room it costs
+ * nothing. What it must not do is happen silently.
+ */
+static void hisi_fs_pool_note(const hisi_state_t *st, int chn, const hisi_vpss_chn_t *fs)
+{
+    unsigned int size;
+
+    if (!st->vb_sub_blk_size || !fs->width || !fs->height)
+        return;
+    /*
+     * Channel 0 only ever draws from pool 0 and is not what the count was
+     * reduced against -- it is the main stream, at or near the sensor's own
+     * geometry, and pool 1 was never sized to hold it. Noting it would fire
+     * on every boot and say nothing.
+     */
+    if (chn <= 0)
+        return;
+
+    size = hisi_vb_nv12_size(fs->width, fs->height);
+    if (size <= st->vb_sub_blk_size)
+        return;
+
+    HAL_LOG_INFO("vpss chn %d: %ux%u needs %u bytes, over pool 1's %u, so it draws a "
+                 "sensor-sized block from pool 0 -- correct, but pool 0 is sized one block "
+                 "smaller on the assumption this channel would not; watch VI VbFail",
+                 chn, fs->width, fs->height, size, st->vb_sub_blk_size);
+}
+
+/*
  * hisi_fs_pool_acquire -- cut a pool to this channel's frame and attach it.
  *
  * Nothing here fails the bring-up, deliberately: a channel with no pool of
@@ -627,6 +665,7 @@ int hal_fs_create_channel(void *ctx, int chn, const rss_fs_config_t *cfg)
 
     HAL_LOG_INFO("vpss chn %d: %ux%u @ %d/%d fps, enabled", chn, fs->width, fs->height,
                  fs->frame_rate.dst_frame_rate, fs->frame_rate.src_frame_rate);
+    hisi_fs_pool_note(st, chn, fs);
     return RSS_OK;
 }
 
