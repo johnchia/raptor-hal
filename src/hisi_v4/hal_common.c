@@ -2157,6 +2157,121 @@ static unsigned int hisi_vb_raw_size(unsigned int width, unsigned int height,
  */
 #define HISI_VB_BLK_CNT 7u
 
+/* Where the MMZ publishes its size. Parameterised like V4_VB_PROC so the
+ * parser can be run against a captured dump. */
+#define V4_MMZ_PROC "/proc/media-mem"
+
+/*
+ * Seven blocks, BUT ONLY IF THE MMZ CAN AFFORD THEM.
+ *
+ * Everything above is a measurement from one board: an EV300 carrying a 5 MP
+ * sensor and a 96 MiB zone, where seven blocks of 7.2 MiB are 50.5 MiB, just
+ * over half the MMZ, and the rest of the pipeline fits in what is left. That
+ * count is still right for that board and this does not move it.
+ *
+ * It is not a proportion that survives a smaller zone, and the count is in
+ * blocks while the constraint is in bytes -- so a part with a smaller sensor
+ * gets smaller blocks and the same seven of them, and the fraction of the MMZ
+ * they occupy goes UP, not down, because the zone shrinks faster than the
+ * frame does. A Hi3516EV200 at 192.168.1.156 is the case in point: 1080p
+ * sensor, 3.0 MiB blocks, and a 32 MiB zone because the board has 64 MiB of
+ * DDR in total. Seven blocks are 20.8 MiB there -- 63.5% of the whole MMZ --
+ * and the pipeline peaks at 31.9 of 32 MiB before it has a JPEG channel.
+ * Asking for one more is what fails:
+ *
+ *   HI_MPI_VENC_CreateChn(2) 1920x1080 codec 2 failed: 0xa008800c
+ *
+ * which is VENC / NOMEM (EN_ERR_NOMEM is 12; hi_errno.h). Nothing about the
+ * message says MMZ, no kernel allocation warning is logged, and the
+ * 640x360 JPEG channel beside it creates -- so the failure reads as a
+ * property of the JPEG encoder and is in fact the zone being full.
+ *
+ * The bound is fixed by the two measurements between which it must sit:
+ *
+ *   EV300  96 MiB zone, 7 x 7.2 MiB = 52.6%   measured good, must not move
+ *   EV200  32 MiB zone, 7 x 3.0 MiB = 63.5%   fails as above
+ *                       6 x 3.0 MiB = 54.3%   measured good, 1.6 MiB spare
+ *
+ * 60% admits the two good rows and rejects the bad one. It is a bound chosen
+ * to fit those three points, not a measurement of its own, and the honest
+ * reading is "seven unless that would take most of the zone".
+ *
+ * The floor is five, not four: four sensor-sized blocks is the configuration
+ * documented above as deadlocking VI with nothing logged, and a deadlock is
+ * a worse answer than a refusal. If five still will not fit, five is what
+ * gets asked for and VB_SetConfig says so in a way hisi_vb_report_holders
+ * can explain -- a loud failure at bring-up beats a silent stall later.
+ */
+#define HISI_VB_BLK_CNT_MIN 5u
+#define HISI_VB_MMZ_PERCENT 60u
+
+/* Video-only: hal_common.c is compiled into the audio archive too, and rad
+ * configures no pools at all (see hisi_vb_bringup), so an unguarded helper
+ * here is an unused-function error on that build rather than dead weight. */
+#ifdef HAL_MODULE_VIDEO
+
+/* The MMZ's total size in KiB, or 0 when it cannot be read -- an unreadable
+ * /proc/media-mem is not a reason to fail, only a reason to keep the
+ * measured count. */
+static unsigned long hisi_mmz_total_kib(const char *path)
+{
+    char line[256];
+    unsigned long kib = 0;
+    FILE *f = fopen(path, "r");
+
+    if (!f)
+        return 0;
+
+    /* "total size=32768KB(32MB),used=32KB(...)" -- the first field of the
+     * MMZ_USE_INFO summary. sscanf rather than a hand-rolled scan because
+     * the number is delimited on both sides by fixed text. */
+    while (fgets(line, sizeof(line), f)) {
+        const char *p = strstr(line, "total size=");
+
+        if (p && sscanf(p, "total size=%luKB", &kib) == 1)
+            break;
+        kib = 0;
+    }
+
+    fclose(f);
+    return kib;
+}
+
+/* How many sensor-sized blocks to ask for, given what one costs. */
+static unsigned int hisi_vb_blk_cnt(unsigned long long blk_size)
+{
+    unsigned long total_kib = hisi_mmz_total_kib(V4_MMZ_PROC);
+    unsigned long long budget_kib;
+    unsigned long long blk_kib;
+    unsigned int cnt;
+
+    if (!total_kib || !blk_size) {
+        HAL_LOG_INFO("vb: MMZ size unknown, asking for the measured %u blocks", HISI_VB_BLK_CNT);
+        return HISI_VB_BLK_CNT;
+    }
+
+    blk_kib = (blk_size + 1023ull) / 1024ull;
+    budget_kib = (unsigned long long)total_kib * HISI_VB_MMZ_PERCENT / 100ull;
+    cnt = (unsigned int)(budget_kib / blk_kib);
+
+    if (cnt >= HISI_VB_BLK_CNT)
+        return HISI_VB_BLK_CNT;
+
+    if (cnt < HISI_VB_BLK_CNT_MIN)
+        cnt = HISI_VB_BLK_CNT_MIN;
+
+    /* Worth a line at INFO rather than DBG: it changes how many frames VI
+     * has in flight, so it is the first thing to look at if VbFail climbs. */
+    HAL_LOG_INFO("vb: MMZ is %lu KiB, so %u blocks of %llu KiB rather than %u -- "
+                 "seven would be %llu%% of the zone and leave too little for "
+                 "the encoders",
+                 total_kib, cnt, blk_kib, HISI_VB_BLK_CNT,
+                 blk_kib * HISI_VB_BLK_CNT * 100ull / total_kib);
+    return cnt;
+}
+
+#endif /* HAL_MODULE_VIDEO */
+
 /*
  * Pool 1 -- the guessed stream pool -- is gone, and this is the record of
  * why, because its absence is easier to misread than its presence was.
@@ -2335,7 +2450,7 @@ static int hisi_vb_bringup(hisi_state_t *st)
         conf.max_pool_cnt = 1;
 
         conf.pool[0].blk_size = raw > nv12 ? raw : nv12;
-        conf.pool[0].blk_cnt = HISI_VB_BLK_CNT;
+        conf.pool[0].blk_cnt = hisi_vb_blk_cnt(conf.pool[0].blk_size);
         /* NOCACHE: nothing in userspace reads these blocks on the streaming
          * path, and a cached mapping would need explicit maintenance at
          * every hand-off between VI, VPSS and VENC. */
