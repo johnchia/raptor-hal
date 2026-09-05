@@ -741,13 +741,16 @@ static inline hisi_state_t *hisi_state(void *ctx)
  * thing /proc/iomem does say: the UART at 0x12040000, which is what divinus
  * keys its own gen3/gen4 base selection on (src/hal/support.c:233-245).
  *
- * 0x3516E300 is measured on a live EV300. The rest follow the family's
- * encoding rather than being copied from anywhere, so they are labelled as
- * such: a mismatch logs the raw word, which is the useful half either way.
+ * 0x3516E300 is measured on a live EV300 and 0x3516E200 on a live EV200,
+ * which is also the first confirmation that the family's encoding predicts
+ * these correctly -- the EV200 value was inferred from it before the board
+ * existed and read back exactly. The remaining two still follow the encoding
+ * rather than being copied from anywhere, so they stay labelled as such: a
+ * mismatch logs the raw word, which is the useful half either way.
  */
 #define HISI_SCSYSID0_ADDR 0x12020EE0u
 
-#define HISI_CHIP_HI3516EV200 0x3516E200u /* inferred from the encoding */
+#define HISI_CHIP_HI3516EV200 0x3516E200u /* measured, 192.168.1.156 */
 #define HISI_CHIP_HI3516EV300 0x3516E300u /* measured, 192.168.1.196 */
 #define HISI_CHIP_HI3516DV200 0x3516D200u /* inferred from the encoding */
 #define HISI_CHIP_HI3518EV300 0x3518E300u /* inferred from the encoding */
