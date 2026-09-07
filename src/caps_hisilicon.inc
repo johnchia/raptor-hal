@@ -182,7 +182,93 @@ const rss_hal_caps_t g_hal_caps = {
     .uses_impvi = false,
 };
 
+#elif defined(PLATFORM_HI3516CV610)
+/*
+ * ═══════════════════════════════════════════════════════════════════════
+ * NOTHING MEASURED YET -- HiMPP V5, hi3516cv6xx family
+ *
+ * Phase 0 wires the platform through the build and stops there: no op in
+ * src/hisi_v5/ exists, so every flag is false and every number is 0, which
+ * rvd reads as "this platform cannot" and "do not test against". Each one
+ * rises in the commit that publishes its op, never ahead of it -- the same
+ * rule the gen4 block above was built under.
+ *
+ * ONE PLATFORM, TWO DIES. soc_name is the ABI's name (see
+ * hal_internal_hisilicon.h); the die reaches raptor as soc_model, which the
+ * build passes through from OpenIPC's BR2_OPENIPC_SOC_MODEL -- hi3516cv608 on
+ * the bench board, hi3516cv610 elsewhere. When the parts turn out to differ,
+ * this arm splits on soc_model the way the SigmaStar families do, not into two
+ * PLATFORMs. One difference is already known: OpenIPC's load_hisilicon
+ * modprobes the AI-ISP modules (open_aiisp, open_svac3e) only for certain
+ * socmodel values, so AI-BNR is not a family-wide capability (plan, risk R11).
+ *
+ * PREDICTIONS TO TEST, NOT NUMBERS TO TRUST. From the 1.0.2.0 headers
+ * (openhisilicon/kernel/include/hi3516cv6xx/ot_defines.h) -- a header constant
+ * is not a measurement, which is exactly why none of them is published below:
+ *
+ *   OT_VPSS_MAX_PHYS_CHN_NUM  3 (+2 extension)   OT_VI_MAX_DEV_NUM      2
+ *   OT_VENC_MAX_CHN_NUM      16, but OpenIPC's load_hisilicon passes
+ *                            g_venc_max_chn_num=8, and gen4 taught us the
+ *                            module parameter is the real cap -- hal_init
+ *                            reads it back from sysfs there and should here
+ *                            OT_VI_MAX_PHYS_PIPE_NUM  2   OT_RGN_HANDLE_MAX  128
+ *                            OT_AI_MAX_CHN_NUM        4
+ *
+ * max_fs_channels is deliberately 0 rather than a guess at 3: gen4's mapping
+ * of framesource n to physical VPSS channel n+1 is under challenge (Majestic
+ * streams from channel 0 there), and the V5 answer depends on the VI/VPSS
+ * coupling mode the backend selects. Plan, bench item 5.
+ * ═══════════════════════════════════════════════════════════════════════
+ */
+const rss_hal_caps_t g_hal_caps = {
+    .soc_name = HAL_PLATFORM_NAME,
+    /* A family name, not a release; hal_sys_get_version answers with the
+     * running MPP's own string once Phase 1 can ask it. */
+    .sdk_version = "HiMPP",
+
+    /* Encoder. H.265 and rotation are both expected to be true -- the headers
+     * carry OT_PT_H265 and ot_vpss_chn_attr has a rotation field -- and both
+     * stay false until an op services them in Phase 2. */
+    .has_h265 = false,
+    .has_rotation = false,
+    .has_set_bitrate = false,
+    .has_gop_attr = false,
+    .has_capped_rc = false,
+    .has_smart_rc = false,
+
+    /* JPEG. Phase 2. */
+    .has_jpeg = false,
+    .has_jpeg_qp = false,
+    .jpeg_pulse = false,
+
+    /* ISP. Phase 3, and this is where V5 diverges most from gen4: the tuning
+     * is a 46-section .ini dialect and several of these knobs have no direct
+     * equivalent. */
+    .has_color2grey = false,
+    .has_defog = false,
+    .has_sinter = false,
+    .has_drc = false,
+    .has_temper = false,
+    .has_ae_comp = false,
+
+    /* 0, not 1: no sensor op exists, so there is no sensor this backend can
+     * bring up. Phase 2's hisi_sensor.c makes it 1. */
+    .max_sensors = 0,
+
+    .max_enc_channels = 0,
+    .max_fs_channels = 0,
+    .max_enc_pixel_rate = 0,
+
+    /* OSD -- Phase 5, over ss_mpi_rgn. */
+    .max_osd_regions = 0,
+    .max_osd_groups = 0,
+
+    .uses_xburst2 = false,
+    .uses_new_sdk = false,
+    .uses_impvi = false,
+};
+
 #else
 #error                                                                                             \
-    "No PLATFORM_* defined. Set one of: PLATFORM_T10 T20 T21 T23 T30 T31 T32 T33 T40 T41 A1 INFINITY6E INFINITY6B0 INFINITY6C HI3516EV200 HI3516EV300"
+    "No PLATFORM_* defined. Set one of: PLATFORM_T10 T20 T21 T23 T30 T31 T32 T33 T40 T41 A1 INFINITY6E INFINITY6B0 INFINITY6C HI3516EV200 HI3516EV300 HI3516CV610"
 #endif

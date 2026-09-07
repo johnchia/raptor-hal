@@ -213,8 +213,35 @@ else
 	@echo "abi-check-hisi: gen4 ABI transcriptions hold ($$(grep -c _Static_assert ../src/hisi_v4/v4_*.h | awk -F: '{n+=$$2} END {print n}') asserts)"
 endif
 
-clean:
-	rm -f $(BINS)
+# The V5 (HiMPP V5.0, hi3516cv6xx) size oracle. Not the same kind of target as
+# the three above: there are no v5_*.h transcriptions to check yet, so this
+# compiles the *vendor* headers -- openhisilicon's GPL copy of the 1.0.2.0 set,
+# the version OpenIPC's hi3516cv6xx libraries were built from -- and prints
+# sizeof() for every struct those transcriptions will have to match. Phase 1
+# adds abi-check-hisi5 beside it, which is the check.
+#
+# Needs CROSS_COMPILE for the target's ABI (the numbers are the whole point, so
+# a host compile would be worthless) and OPENHISILICON for the header tree:
+#
+#   make abi-probe-hisi5 CROSS_COMPILE=arm-openipc-linux-musleabi- \
+#        OPENHISILICON=$HOME/openhisilicon/openhisilicon
+#
+# A number that disagrees with the table in PLAN-hi3516cv610.md means the
+# headers moved; the plan is stale, not the probe.
+abi-probe-hisi5:
+ifeq ($(and $(CROSS_COMPILE),$(OPENHISILICON)),)
+	@echo "abi-probe-hisi5: skipped, set CROSS_COMPILE=arm-openipc-linux-musleabi- OPENHISILICON=/path/to/openhisilicon"
+else
+	$(ABI_CC) -std=c11 -Wall -I$(OPENHISILICON)/kernel/include/hi3516cv6xx \
+	    -c -o abi_probe_hisi5.o abi_probe_hisi5.c
+	$(CROSS_COMPILE)objcopy -O binary --only-section=.rodata.sizes \
+	    abi_probe_hisi5.o abi_probe_hisi5.bin
+	@python3 abi_probe_hisi5.py abi_probe_hisi5.bin
+endif
 
-.PHONY: test clean abi-check abi-check-i6c abi-check-hisi test-isp_i6c test-enc_i6c \
+clean:
+	rm -f $(BINS) abi_probe_hisi5.o abi_probe_hisi5.bin
+
+.PHONY: test clean abi-check abi-check-i6c abi-check-hisi abi-probe-hisi5 \
+	test-isp_i6c test-enc_i6c \
 	test-hisi_iq test-hisi_osd $(addprefix test-,$(SUITES))

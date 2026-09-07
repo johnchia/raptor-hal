@@ -7,8 +7,9 @@
 #
 # Usage:
 #   make PLATFORM=HI3516EV300 CROSS_COMPILE=arm-openipc-linux-musleabi-
+#   make PLATFORM=HI3516CV610 CROSS_COMPILE=arm-openipc-linux-musleabi-
 #
-# NOTE THE TUPLE: musleabi, not musleabihf.
+# NOTE THE TUPLE: musleabi, not musleabihf. One tuple for both generations.
 #
 # Gen4 userland is soft-float. Tag_ABI_VFP_args is absent from every vendor
 # library on a stock OpenIPC board -- libmpi, libisp, libsecurec, all six
@@ -19,10 +20,19 @@
 # carries a #error on __ARM_PCS_VFP so the mistake cannot survive a compile.
 # Measured 2026-08-31; see PROBE-hi3516ev300-phase-minus-1.md in the parent
 # tree.
+#
+# V5 is the same answer from a different library set, so the tuple is shared
+# rather than assumed: OpenIPC's hi3516cv6xx libraries (MPP V1.0.2.0 B051)
+# carry no Tag_ABI_VFP_args either, with Tag_FP_arch VFPv4. Recorded in
+# board-dumps/hi3516cv610-presurvey/versions-and-float-abi.txt of the parent
+# tree.
 
-# Split by MPP generation rather than by part. V5 (hi3516cv610) is a different
-# ABI from V4 and will want its own backend directory when it lands; the union
-# is what VENDOR keys on.
+# Split by MPP generation rather than by part. V5 is a different ABI from V4 --
+# one libss_mpi.so where gen4 had libmpi, ss_mpi_/ot_ names throughout, MMZ
+# moved back out of OSAL -- so it gets its own backend directory rather than
+# #ifdefs; the union is what VENDOR keys on. Measured, not assumed: see
+# PLAN-hi3516cv610.md, "Why a second directory", and the export and symbol maps
+# in board-dumps/hi3516cv610-presurvey/.
 #
 # EV200 and EV300 share one entry not by assumption but by measurement: an
 # EV300 board reports "Hi3516EV200_MPP_V1.0.1.2 B030" on every /proc/umap node.
@@ -30,8 +40,15 @@
 # on HAL_HISI_GEN4 and never on a part macro, and why a third gen4 part costs
 # a caps block and nothing else.
 HISI_GEN4_PLATFORMS := HI3516EV200 HI3516EV300
-# HI3516CV610 joins the gen5 list when it lands.
-HISI_GEN5_PLATFORMS :=
+# One entry for the whole hi3516cv6xx family, and the name is the ABI's rather
+# than a die's. OpenIPC builds one MPP for both dies and it answers
+# "HI3516CV610_MPP_V1.0.2.0 B051 Release" on a CV608 board as readily as on a
+# CV610 -- so PLATFORM selects the ABI here the way HISI_GEN4_PLATFORMS does,
+# and the die reaches raptor separately as SOC_MODEL (hi3516cv608 /
+# hi3516cv610), which is what the caps table keys the per-part differences on.
+# The dies do differ: load_hisilicon loads the AI-ISP modules for some socmodel
+# values and not others (plan, risk R11).
+HISI_GEN5_PLATFORMS := HI3516CV610
 HISILICON_PLATFORMS := $(strip $(HISI_GEN4_PLATFORMS) $(HISI_GEN5_PLATFORMS))
 
 ifneq ($(filter $(PLATFORM),$(HISILICON_PLATFORMS)),)
@@ -66,6 +83,24 @@ HAL_COMMON_SRC := $(BACKEND_DIR)/hal_common.c
 # RSS_ERR_NOTSUP. So a Phase 1 build links, runs, and declines the pipeline,
 # which is exactly what its acceptance test asks for.
 #
+# That rule is per generation, not per tree, which is why the lists are split:
+# src/hisi_v5/ is empty today, so naming gen4's files for it would fail the
+# build on eight missing rules at once and hide the one that matters.
+ifneq ($(filter $(PLATFORM),$(HISI_GEN5_PLATFORMS)),)
+
+# V5, Phase 0: nothing of the backend exists yet. HAL_COMMON_SRC below is the
+# one file every build needs, so a Phase 0 build fails naming
+# src/hisi_v5/hal_common.c and nothing else -- which is the phase's acceptance
+# test. hal_gpio.c is vendor-neutral and already builds.
+#
+# Phase 1 adds no entry here (hal_common.c is HAL_COMMON_SRC); Phase 2 adds
+# hisi_sensor.c hal_framesource.c hal_encoder.c; Phase 3 hal_isp.c hal_dyn.c
+# hal_nrx.c hal_knob.c; Phase 4 hal_audio.c to AUDIO_SRCS; Phase 5 hal_osd.c.
+VIDEO_SRCS := src/hal_gpio.c
+AUDIO_SRCS :=
+
+else
+
 # Phase 2 added hal_framesource.c and hal_encoder.c; Phase 3 hal_isp.c (the
 # IQ tuning load); Phase 4 adds hal_audio.c; Phase 5 hal_osd.c. hal_gpio is
 # vendor-neutral and reused here as the SigmaStar backends reuse it.
@@ -82,5 +117,7 @@ VIDEO_SRCS := $(BACKEND_DIR)/hisi_sensor.c \
 # Phase 4: AI capture plus the inner codec. hal_common.c is compiled into
 # both archives; hal_audio.c only into this one.
 AUDIO_SRCS := $(BACKEND_DIR)/hal_audio.c
+
+endif
 
 endif # hisilicon platform

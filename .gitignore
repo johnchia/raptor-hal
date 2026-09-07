@@ -15,3 +15,6 @@ tests/t_enc_imp
 .build-config
 tests/t_hisi_iq
 tests/t_hisi_osd
+
+# abi-probe-hisi5 intermediates (tests/Makefile); *.o above covers the object
+tests/abi_probe_hisi5.bin
