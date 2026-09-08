@@ -273,6 +273,25 @@ typedef struct {
      * caller gets a pointer into it. */
     bool frame_held;
     v5_video_frame_info frame;
+
+    /*
+     * What this channel's output is compressed with, decided by
+     * hisi_fs_compress and cached because the pool's block size has to
+     * agree with it. Changing one without the other is how a channel ends
+     * up attached to blocks it can never fill.
+     */
+    v5_compress_mode compress_mode;
+
+    /*
+     * The channel's own VB pool -- created with ss_mpi_vb_create_pool and
+     * attached with ss_mpi_vpss_attach_chn_vb_pool, so the channel draws
+     * blocks cut to its own frame instead of sensor-sized ones out of the
+     * common pool. See hisi_fs_pool_acquire; owned is false on a channel
+     * that fell back to common, which is legal and merely wasteful.
+     */
+    bool vb_pool_owned;
+    unsigned int vb_pool;
+    unsigned long long vb_pool_blk_size;
 } hisi_vpss_chn_t;
 
 /*
@@ -358,36 +377,118 @@ typedef struct {
 /* ================================================================
  * VB GEOMETRY
  *
- * The block size for one NV12 frame, which is what every pool in this
- * backend holds.
+ * The block size for one frame, in each of the three shapes this
+ * pipeline puts in a VB block: uncompressed 4:2:0 semi-planar, the same
+ * thing SEG_COMPACT compressed, and raw Bayer.
  *
  * Transcribed rather than approximated because an undersized VB block is
  * the classic bring-up failure on this family: ss_mpi_sys_init succeeds,
- * the pipeline builds, and VI silently delivers nothing.
+ * the pipeline builds, and VI silently delivers nothing. An *oversized*
+ * one is the failure this board actually had -- a 32 MB MMZ with four
+ * sensor-sized blocks in it, VI dropping 42% of frames on vb_fail -- so
+ * the sizes have to be right in both directions, not merely safe.
  *
- * ot_common_get_uncompressed_yuv_buf_cfg (ot_buffer_detail.h:216-267),
- * reduced to the one case this backend needs -- 8-bit NV12, uncompressed,
- * automatic alignment:
+ * These reproduce /proc/umap/vb exactly at 2304x1296: raw10 3,732,480,
+ * NV21 4,478,976, and 1920x1080 3,110,400 uncompressed against about
+ * 2.13 MB compressed.
  *
- *   align        = OT_DEFAULT_ALIGN (8; ot_defines.h:45), which is what
- *                  ot_common_get_valid_align returns for align == 0
- *   stride       = ALIGN_UP((width * 8 + 7) >> 3, align) = ALIGN_UP(width, 8)
- *   align_height = ALIGN_UP(height, 2)
- *   size         = stride * align_height * 3 / 2
- *
- * Same arithmetic as gen4's, including the alignment: V5 did not change
- * OT_DEFAULT_ALIGN. It is transcribed again rather than shared because the
- * two generations are free to diverge and a shared helper would hide it.
+ * align is OT_DEFAULT_ALIGN (8; ot_defines.h:45), which is what
+ * ot_common_get_valid_align returns for align == 0. V5 did not change it
+ * from gen4's. The formulas are transcribed again rather than shared with
+ * hisi_v4 because the two generations are free to diverge and a shared
+ * helper would hide it.
  * ================================================================ */
 
 #define HISI_VB_ALIGN 8u
 
+static inline unsigned long long hisi_vb_align_up(unsigned long long v)
+{
+    return ((v + HISI_VB_ALIGN - 1u) / HISI_VB_ALIGN) * HISI_VB_ALIGN;
+}
+
+/*
+ * ot_common_get_uncompressed_yuv_buf_cfg (ot_buffer_detail.h:216-267),
+ * the 4:2:0 semi-planar arm:
+ *
+ *   stride       = ALIGN_UP((width * 8 + 7) >> 3, align) = ALIGN_UP(width, 8)
+ *   align_height = ALIGN_UP(height, 2)
+ *   size         = stride * align_height * 3 / 2
+ */
 static inline unsigned long long hisi_vb_nv12_size(unsigned int width, unsigned int height)
 {
     unsigned int stride = ((width + HISI_VB_ALIGN - 1u) / HISI_VB_ALIGN) * HISI_VB_ALIGN;
     unsigned int rows = (height + 1u) & ~1u;
 
     return (unsigned long long)stride * rows * 3u / 2u;
+}
+
+/*
+ * ot_common_get_raw_buf_cfg_with_compress_ratio (ot_buffer_detail.h:98-146),
+ * the OT_COMPRESS_MODE_NONE arm:
+ *
+ *   stride = ALIGN_UP(ALIGN_UP(width * bit_width, 8) / 8, align)
+ *   size   = stride * height
+ *
+ * Note the height is *not* rounded to an even number here, where the YUV
+ * one rounds it: raw blocks are a line-stride times a line count.
+ *
+ * Only the VI pipe allocates one, and only while it is offline. An online
+ * pipe hands the ISP its pixels on chip and never puts a raw frame in
+ * DDR, which is the single largest saving available on this part.
+ */
+static inline unsigned long long hisi_vb_raw_size(unsigned int width, unsigned int height,
+                                                  unsigned int bit_width)
+{
+    unsigned int bytes = ((width * bit_width) + 7u) / 8u;
+    unsigned int stride = ((bytes + HISI_VB_ALIGN - 1u) / HISI_VB_ALIGN) * HISI_VB_ALIGN;
+
+    return (unsigned long long)stride * height;
+}
+
+/*
+ * ot_common_get_compact_seg_compress_yuv_buf_cfg (ot_buffer_detail.h:291-331),
+ * the 4:2:0 semi-planar arm.
+ *
+ * head_stride is 32 for every width (ot_common_get_yuv_head_stride returns
+ * a constant on this part), the head is counted twice and then given two
+ * aligned 64-byte tails, and the two planes are divided by the vendor's
+ * own ratios -- OT_SEG_RATIO_8BIT_LUMA 1430 and OT_SEG_RATIO_8BIT_CHROMA
+ * 1800, ot_buffer_detail.h:23-24. About 31% off an uncompressed frame.
+ *
+ * The multiply runs in 64 bits before the divide, as the vendor's does:
+ * width * align_height * 1000 passes 2^31 at 1080p.
+ */
+#define HISI_VB_SEG_HEAD_STRIDE 32u
+#define HISI_VB_SEG_RATIO_LUMA 1430u
+#define HISI_VB_SEG_RATIO_CHROMA 1800u
+
+static inline unsigned long long hisi_vb_seg_compact_size(unsigned int width, unsigned int height)
+{
+    unsigned int rows = (height + 1u) & ~1u;
+    unsigned int crows = rows / 2u;
+    unsigned long long head, y, c;
+
+    head = hisi_vb_align_up((unsigned long long)HISI_VB_SEG_HEAD_STRIDE * (rows + crows)) * 2u;
+    head += hisi_vb_align_up(64u) * 2u;
+
+    y = hisi_vb_align_up((unsigned long long)width * rows * 1000ull / HISI_VB_SEG_RATIO_LUMA);
+    c = hisi_vb_align_up((unsigned long long)width * crows * 1000ull / HISI_VB_SEG_RATIO_CHROMA);
+
+    return head + y + c;
+}
+
+/*
+ * The one a caller wants: a channel's frame, in whatever it is compressed
+ * with. A pool whose blocks disagree with the channel's compress_mode is
+ * either wasteful or too small, and too small shows up as a channel that
+ * never delivers.
+ */
+static inline unsigned long long hisi_vb_yuv_size(unsigned int width, unsigned int height,
+                                                  v5_compress_mode compress)
+{
+    if (compress == V5_COMPRESS_MODE_SEG_COMPACT)
+        return hisi_vb_seg_compact_size(width, height);
+    return hisi_vb_nv12_size(width, height);
 }
 
 /* ================================================================
@@ -576,6 +677,14 @@ typedef struct {
     bool vpss_grp_created;
     bool vpss_grp_started;
     bool vi_vpss_bound;
+
+    /*
+     * Whether a VPSS channel can be given a pool of its own. Set in
+     * hal_init from the symbols, and cleared for the run the first time
+     * the driver answers NOT_SUPPORT -- every later channel would get the
+     * same answer and log the same line.
+     */
+    bool vb_private_pools;
 } hisi_state_t;
 
 static inline hisi_state_t *hisi_state(void *ctx)

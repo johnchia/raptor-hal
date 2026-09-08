@@ -87,20 +87,49 @@ typedef enum {
 /*
  * ot_compress_mode.
  *
- * NONE everywhere in Phase 2, and that is a decision rather than a default:
- * compression trades DDR bandwidth for a format the encoder and the OSD
- * have to agree about, and this board's bandwidth budget is not measured
- * yet. SEG and FRAME are named because Phase 7 measures them -- FRAME is
- * what the 3DNR reference frame wants -- and LINE because it is what the
- * FMU wrap path uses.
+ * SEG_COMPACT is the one this backend selects, and only on VPSS physical
+ * channel 0: it is what the vendor's own samples set there
+ * (sample_venc.c's get_default_vpss_chn_attr and
+ * sample_comm_vpss_get_default_vpss_cfg both do), and the tuning guide
+ * says CV610 supports YUV output compression on CHN0 alone. It costs
+ * about 31% of the block -- see hisi_vb_seg_compact_size -- for a format
+ * VENC reads directly.
+ *
+ * NONE stays the default everywhere else. FRAME is what a 3DNR reference
+ * frame wants and LINE is what the FMU wrap path uses; neither is driven
+ * here, and both are named so a reader diffing against ot_common_video.h
+ * sees no gap.
  */
 typedef enum {
     V5_COMPRESS_MODE_NONE = 0,
     V5_COMPRESS_MODE_SEG = 1,
+    V5_COMPRESS_MODE_SEG_COMPACT = 2,
     V5_COMPRESS_MODE_TILE = 3,
     V5_COMPRESS_MODE_LINE = 4,
     V5_COMPRESS_MODE_FRAME = 5,
 } v5_compress_mode;
+
+/*
+ * ot_vb_src (ot_common_video.h:48-53).
+ *
+ * Where a stage takes its output blocks from. COMMON is the default and
+ * means the pools ss_mpi_vb_set_cfg configured; USER means a pool the
+ * caller made with ss_mpi_vb_create_pool and attached to this channel,
+ * which is how a VPSS channel gets a block cut to its own frame instead
+ * of a sensor-sized one out of the common pool.
+ *
+ * Selecting USER is not enough on its own: ss_mpi_vpss_set_chn_vb_src
+ * chooses the source and ss_mpi_vpss_attach_chn_vb_pool supplies the
+ * pool, and a channel set to USER with nothing attached has no blocks at
+ * all. MOD and PRIVATE are named for completeness; nothing here selects
+ * them.
+ */
+typedef enum {
+    V5_VB_SRC_COMMON = 0,
+    V5_VB_SRC_MOD = 1,
+    V5_VB_SRC_PRIVATE = 2,
+    V5_VB_SRC_USER = 3,
+} v5_vb_src;
 
 /* ot_dynamic_range. SDR8 is the linear-mode pipeline; the WDR modes this
  * backend does not drive would want SDR10 or HDR10. */

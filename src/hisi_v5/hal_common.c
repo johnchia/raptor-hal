@@ -998,12 +998,29 @@ static void hisi_isp_teardown(hisi_state_t *st)
  * this is called from hal_init rather than from the VI bring-up, and it is
  * how the vendor sequences it too.
  *
- * VI_OFFLINE_VPSS_OFFLINE: the VI pipe writes raw to DDR, the VI channel
- * writes YUV to a VB block, and VPSS reads them over an explicit bind. The
- * offline/offline pair is chosen for gen4's reasons -- an online VPSS is
- * fed in hardware, which makes the software bind wrong and the channel
- * enable a no-op -- and asking for it explicitly matters because the board
- * does not necessarily boot in it.
+ * VI_ONLINE_VPSS_OFFLINE, which is the vendor's own default
+ * (sample_comm_sys.c's sample_comm_sys_get_default_cfg sets exactly this).
+ *
+ * The two halves are independent and are chosen for different reasons.
+ *
+ * VI ONLINE is a memory decision. An offline pipe writes the raw Bayer
+ * frame to DDR and reads it back into the ISP; an online one hands the
+ * ISP its pixels on chip. That is one whole sensor-sized VB block per
+ * frame in flight -- measured at 3,732,480 bytes of a 32 MB MMZ on the
+ * CV608 -- bought for nothing but the loss of raw dump and raw send,
+ * neither of which this backend offers. The tuning guide's own table
+ * ("性能╱带宽╱延时╱内存调优指南", 各模块内存相关可优化配置 / VI) puts the
+ * saving at 1-2 VB for the online couplings against full offline.
+ *
+ * VPSS stays OFFLINE for gen4's reason: an online VPSS is fed in
+ * hardware, which makes the software bind wrong and the channel enable a
+ * no-op. Going online there as well would take a second block, and is
+ * the next thing to measure -- but it also restricts the group to one
+ * pipe and forbids VI channel post-processing, so it is a Phase 7
+ * decision with a bench behind it rather than a default.
+ *
+ * Asking explicitly matters either way: the board does not necessarily
+ * boot in any particular coupling.
  *
  * Read-modify-write rather than build-and-set, following the vendor: the
  * array has an entry per pipe and writing a fresh one would reset the mode
@@ -1033,27 +1050,33 @@ static void hisi_vi_vpss_mode(hisi_state_t *st)
     HAL_LOG_DBG("vi: coupling on entry %d|%d|%d|%d", (int)mode.mode[0], (int)mode.mode[1],
                 (int)mode.mode[2], (int)mode.mode[3]);
 
-    if (mode.mode[HISI_VI_PIPE] == V5_VI_OFFLINE_VPSS_OFFLINE) {
+    if (mode.mode[HISI_VI_PIPE] == V5_VI_ONLINE_VPSS_OFFLINE) {
         st->vi_vpss_mode = mode;
         return;
     }
 
-    mode.mode[HISI_VI_PIPE] = V5_VI_OFFLINE_VPSS_OFFLINE;
+    mode.mode[HISI_VI_PIPE] = V5_VI_ONLINE_VPSS_OFFLINE;
 
     if ((ret = st->sys.fnSetViVpssMode(&mode)) != 0) {
-        HAL_LOG_WARN("ss_mpi_sys_set_vi_vpss_mode(pipe %d = offline/offline) failed: 0x%x -- "
+        HAL_LOG_WARN("ss_mpi_sys_set_vi_vpss_mode(pipe %d = online/offline) failed: 0x%x -- "
                      "continuing on the board's default coupling",
                      HISI_VI_PIPE, ret);
         return;
     }
 
-    /* Read back rather than assume: the driver may clamp, and the value in
-     * force is what decides whether VI -> VPSS is a software bind at all. */
+    /*
+     * Read back rather than assume, and log it at INFO rather than DBG.
+     * The driver may clamp, and the value in force decides both whether
+     * VI -> VPSS is a software bind at all and whether the VI pipe puts a
+     * raw frame in a VB block -- which is to say it decides whether the
+     * pool arithmetic in hisi_vb_fill_cfg was right. It is the first
+     * thing to read when VI starts failing on vb_fail again.
+     */
     if (st->sys.fnGetViVpssMode(&mode) == 0)
         st->vi_vpss_mode = mode;
 
-    HAL_LOG_DBG("vi: pipe %d coupling %d (0 = offline/offline)", HISI_VI_PIPE,
-                (int)st->vi_vpss_mode.mode[HISI_VI_PIPE]);
+    HAL_LOG_INFO("vi: pipe %d coupling %d (0 = offline/offline, 2 = online/offline)", HISI_VI_PIPE,
+                 (int)st->vi_vpss_mode.mode[HISI_VI_PIPE]);
 }
 
 /*
@@ -1606,57 +1629,84 @@ static void hisi_video_teardown(hisi_state_t *st)
 /*
  * hisi_vb_fill_cfg -- the common pool configuration.
  *
- * Two pools, and the split is the usual one: everything in this pipeline
- * carries an NV12 frame, and VB hands a request the smallest pool whose
- * blocks are big enough, so a pool per size class is what stops a 640x360
- * sub-stream frame from consuming a full-sensor block.
+ * ONE POOL PER CONSUMER, cut to that consumer's own frame. This is the
+ * vendor's shape rather than an invention: sample_venc.c's get_vb_attr
+ * walks the pipeline and calls update_vb_attr once per stage with that
+ * stage's geometry, pixel format and compress mode, then sets
+ * max_pool_cnt to however many stages there were. VB hands a request the
+ * smallest pool whose blocks are big enough, so exact sizes are the
+ * mechanism that stops one stage's frame from occupying another's block.
  *
- *   pool 0   one full sensor frame. Feeds the VI channel and, through the
- *            bind, the VPSS group's input -- and any VPSS channel asking
- *            for close to the sensor's size, which the main stream is.
- *   pool 1   a quarter of that in each dimension, so a sixteenth of the
- *            area. Everything smaller lands here.
+ * The size-class scheme this replaces -- a full-sensor pool and a
+ * quarter-scale one -- was measured on the CV608 and did not work. The
+ * quarter pool's blocks came out at 576x324 = 279,936 bytes and the
+ * smallest real stream was 640x360 = 345,600, so every sub-stream frame
+ * took a 4.27 MiB full-size block and the whole second pool sat unused
+ * from boot to teardown. Four blocks then had to serve four simultaneous
+ * consumers, VI never saw a spare, and 42% of frames were dropped on
+ * vb_fail. A size class only works if something is actually that size.
  *
- * THE BLOCK COUNTS ARE PROVISIONAL AND SAY SO. They are sized to fit the
- * CV608 bench board's 32 MB MMZ with room for the encoder's own stream
- * buffers, which do not come out of VB -- 4 full frames and 8 quarter ones
- * is 22 MB of a 32 MB zone at 2304x1296. That is an arithmetic guess, not
- * a measurement: Phase 7 reads /proc/umap/media-mem against a running
- * pipeline and replaces it. Undersized here does not fail at init -- it
- * fails as a VPSS channel that never delivers a frame, which is why the
- * numbers are logged.
+ * WHAT hal_init KNOWS is the sensor, so what it configures is the VI
+ * side:
+ *
+ *   pool 0   the VI channel's NV21 output at the sensor's size, which is
+ *            also what the VPSS group reads over the bind.
+ *
+ * The VPSS channels are deliberately not here. Their geometry is rvd's
+ * and arrives later, and each gets a pool cut to its own stream in
+ * hisi_fs_pool_acquire. A channel whose pool could not be created falls
+ * back to these common pools, which is the other reason pool 0 is sized
+ * for the largest frame in the pipeline rather than the VI channel alone.
+ *
+ * WHY THERE IS NO RAW POOL. The VI pipe puts a raw Bayer frame in a VB
+ * block only while it is offline, and hisi_vi_vpss_mode asks for VI
+ * online. If that request is ever refused, the pipe falls back to
+ * allocating raw from pool 0 -- and a sensor-sized NV21 block is larger
+ * than a raw one at every bit depth this backend drives (4,478,976
+ * against 3,732,480 at 2304x1296 RAW10), so the fallback costs a block
+ * rather than failing to start. The coupling actually in force is logged
+ * by hisi_vi_vpss_mode for exactly this reason.
+ *
+ * THE BLOCK COUNT is three, where the vendor's VI_VB_YUV_CNT is four.
+ * The tuning guide's rule (DDR内存调优 / 主要模块工作占用MMZ情况 / VI) is
+ * that VI holds at most three frame VBs -- one being filled, one ready for
+ * the next frame, one in rotation downstream -- and that a VPSS group
+ * holds its input frame plus a backup, which CV610 cannot disable.
+ *
+ * Four does not fit. This part has 32 MB of MMZ and four sensor-sized
+ * blocks are 17.9 MB of it; with the two stream pools on top,
+ * ss_mpi_venc_create_chn then fails 0xa0088014 -- OT_ERR_NO_MEM -- because
+ * VENC's reference and reconstruction frames do not come out of VB and
+ * there is nothing left for them. Three is 13.4 MB and leaves the encoder
+ * its room.
+ *
+ * If this turns out to be one too few it says so precisely, and the fix
+ * is a number: /proc/umap/vb reports min_free per pool, and the tuning
+ * guide's own advice is to read it -- a min_free that never leaves 0 while
+ * VI's vb_fail_cnt climbs is a pool one block short.
  *
  * The audio archive compiles this file too and has no sensor mode, so the
  * whole thing is video-only and hal_init falls back to no pools.
  */
 #ifdef HAL_MODULE_VIDEO
 
-#define HISI_VB_FULL_BLK_CNT 4u
-#define HISI_VB_SMALL_BLK_CNT 8u
-#define HISI_VB_SMALL_DIVISOR 4u
+#define HISI_VB_VI_BLK_CNT 3u
 
 static void hisi_vb_fill_cfg(const hisi_state_t *st, v5_vb_cfg *cfg)
 {
     const hisi_sensor_mode_t *m = &st->mode;
-    unsigned int sw = m->dev_rect.width / HISI_VB_SMALL_DIVISOR;
-    unsigned int sh = m->dev_rect.height / HISI_VB_SMALL_DIVISOR;
     unsigned long long full = hisi_vb_nv12_size(m->dev_rect.width, m->dev_rect.height);
-    unsigned long long small = hisi_vb_nv12_size(sw ? sw : 1u, sh ? sh : 1u);
 
     memset(cfg, 0, sizeof(*cfg));
-    cfg->max_pool_cnt = 2;
+    cfg->max_pool_cnt = 1;
 
     cfg->common_pool[0].blk_size = full;
-    cfg->common_pool[0].blk_cnt = HISI_VB_FULL_BLK_CNT;
+    cfg->common_pool[0].blk_cnt = HISI_VB_VI_BLK_CNT;
     cfg->common_pool[0].remap_mode = V5_VB_REMAP_NONE;
 
-    cfg->common_pool[1].blk_size = small;
-    cfg->common_pool[1].blk_cnt = HISI_VB_SMALL_BLK_CNT;
-    cfg->common_pool[1].remap_mode = V5_VB_REMAP_NONE;
-
     /*
-     * REMAP_NONE on both: nothing in the streaming path reads a VB block
-     * from userspace -- VPSS feeds VENC over a bind and VENC's output is a
+     * REMAP_NONE: nothing in the streaming path reads a VB block from
+     * userspace -- VPSS feeds VENC over a bind and VENC's output is a
      * stream buffer, not a VB block. A mapping nobody uses costs address
      * space and cache-maintenance bookkeeping. The snapshot path is what
      * would want CACHED, and it gets a pool of its own when it exists.
@@ -1665,10 +1715,8 @@ static void hisi_vb_fill_cfg(const hisi_state_t *st, v5_vb_cfg *cfg)
      * this board has (/proc/umap/media-mem shows one ZONE named
      * "anonymous").
      */
-    HAL_LOG_INFO("vb: pool 0 %ux%u x%u = %llu KiB, pool 1 %ux%u x%u = %llu KiB (provisional)",
-                 m->dev_rect.width, m->dev_rect.height, HISI_VB_FULL_BLK_CNT,
-                 (full * HISI_VB_FULL_BLK_CNT) >> 10, sw, sh, HISI_VB_SMALL_BLK_CNT,
-                 (small * HISI_VB_SMALL_BLK_CNT) >> 10);
+    HAL_LOG_INFO("vb: pool 0 = VI chn %ux%u NV21, %llu B x%u = %llu KiB", m->dev_rect.width,
+                 m->dev_rect.height, full, HISI_VB_VI_BLK_CNT, (full * HISI_VB_VI_BLK_CNT) >> 10);
 }
 
 #endif /* HAL_MODULE_VIDEO */
@@ -1815,6 +1863,18 @@ static int hal_init(void *ctx, const rss_multi_sensor_config_t *cfg)
         goto err_unload;
 
     /*
+     * Can a VPSS channel be given a pool of its own? All three calls are
+     * needed together -- select USER, attach the pool, and be able to
+     * detach it again at teardown -- and a board missing any of them
+     * simply has every channel draw from the common pools, which is
+     * correct and merely wasteful. See hisi_fs_pool_acquire.
+     */
+    st->vb_private_pools = st->vb.fnCreatePool && st->vb.fnDestroyPool && st->vpss.fnSetChnVbSrc &&
+                           st->vpss.fnAttachChnVbPool && st->vpss.fnDetachChnVbPool;
+    if (!st->vb_private_pools)
+        HAL_LOG_INFO("vb: no per-channel pools on this image; VPSS channels draw common blocks");
+
+    /*
      * The ISP tier last of the libraries, because opening it is what closes
      * the dlopen cycle -- see hisi_isp_open and the FORWARDERS block.
      */
@@ -1920,12 +1980,6 @@ static int hal_init(void *ctx, const rss_multi_sensor_config_t *cfg)
     }
     st->vb_inited = true;
 
-#ifdef HAL_MODULE_VIDEO
-    /* Before sys_init, and only there: the coupling is fixed when the
-     * system starts and setting it afterwards is accepted and ignored. */
-    hisi_vi_vpss_mode(st);
-#endif
-
     ret = st->sys.fnInit();
     if (ret) {
         HAL_LOG_ERR("sys: ss_mpi_sys_init failed 0x%x (err %u)", (unsigned)ret, V5_ERR_ID(ret));
@@ -1935,6 +1989,19 @@ static int hal_init(void *ctx, const rss_multi_sensor_config_t *cfg)
     st->sys_inited = true;
 
 #ifdef HAL_MODULE_VIDEO
+    /*
+     * AFTER sys_init and before the VI bring-up, which is where the vendor
+     * puts it: sample_vio_sys_init calls sample_comm_sys_init (vb_set_cfg,
+     * vb_init, sys_init) and only then sample_comm_vi_set_vi_vpss_mode.
+     *
+     * This was between vb_init and sys_init and looked correct there --
+     * the coupling does have to be settled before VI is created. It is
+     * not: ss_mpi_sys_set_vi_vpss_mode returns 0xa002800d, NOT_PERM, on an
+     * uninitialised SYS. Nothing said so, because the value asked for used
+     * to be the value already in force and the call was never reached.
+     */
+    hisi_vi_vpss_mode(st);
+
     ret = hisi_video_bringup(st, &cfg->sensors[0]);
     if (ret)
         goto err_teardown;

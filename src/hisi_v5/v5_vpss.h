@@ -227,8 +227,14 @@ typedef struct {
 
     /*
      * A pool cut to one channel rather than drawn from the common pools.
-     * Phase 7's, and optional: without it every channel draws common.
+     * Optional: without the three of them every channel draws common.
+     *
+     * All three are needed together. set_chn_vb_src selects USER,
+     * attach supplies the pool, and a channel switched to USER with no
+     * pool attached produces nothing -- so hisi_fs_pool_acquire requires
+     * every one of them before it tries.
      */
+    int (*fnSetChnVbSrc)(int grp, int chn, v5_vb_src src);
     int (*fnAttachChnVbPool)(int grp, int chn, unsigned int pool);
     int (*fnDetachChnVbPool)(int grp, int chn);
 
@@ -303,6 +309,8 @@ static inline int v5_vpss_load(v5_vpss_impl *lib, const v5_mpi_libs *libs)
     lib->fnReleaseChnFrame = (int (*)(int, int, const v5_video_frame_info *))v5_symbol_opt(
         libs, "ss_mpi_vpss_release_chn_frame");
 
+    lib->fnSetChnVbSrc =
+        (int (*)(int, int, v5_vb_src))v5_symbol_opt(libs, "ss_mpi_vpss_set_chn_vb_src");
     lib->fnAttachChnVbPool =
         (int (*)(int, int, unsigned int))v5_symbol_opt(libs, "ss_mpi_vpss_attach_chn_vb_pool");
     lib->fnDetachChnVbPool =
