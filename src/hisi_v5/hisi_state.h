@@ -36,6 +36,7 @@
 #include "v5_venc.h"
 #include "v5_isp.h"
 #include "v5_isp_tune.h"
+#include "v5_nr.h"
 #include "v5_snr.h"
 
 #include <pthread.h>
@@ -717,6 +718,14 @@ typedef struct {
     char iso_busy;         /* one tick at a time, across encoder threads */
 
     /*
+     * The 3DNR ladder, which is a VI pipe parameter rather than an ISP
+     * module and so has entry points of its own. Bound beside `tune`,
+     * both of them optional. See hal_nrx.c.
+     */
+    v5_nr_impl nr;
+    struct hisi_nrx_set *nrx;
+
+    /*
      * The [image] knobs. rvd sets them before the ISP runs and the tuning
      * load rewrites the same attributes on the first frame, so each is
      * remembered and re-applied around a load. The two baselines are
@@ -824,6 +833,15 @@ void hisi_dyn_tick(hisi_state_t *st);
 void hisi_dyn_drc_hold(hisi_state_t *st, bool hold);
 bool hisi_dyn_drc_curve(hisi_state_t *st);
 void hisi_dyn_free(hisi_state_t *st);
+
+/* hal_nrx.c -- the [static_3dnr] ladder on the VI pipe, walked off the
+ * same AE tick. Every entry point is safe on a state that never saw the
+ * section. */
+bool hisi_nrx_key(hisi_state_t *st, const char *key, const char *val);
+int hisi_nrx_apply(hisi_state_t *st, int *failed, char *note, size_t note_len);
+bool hisi_nrx_armed(hisi_state_t *st);
+void hisi_nrx_on_iso(hisi_state_t *st, unsigned iso);
+void hisi_nrx_free(hisi_state_t *st);
 
 /* hal_knob.c -- the [image] knobs, the exposure readback and orientation. */
 int hal_isp_set_brightness(void *ctx, int val);

@@ -2037,6 +2037,7 @@ err_free:
     /* The dynamic sections' ladders: video-only state, and hal_dyn.c is in
      * the video archive only. */
     hisi_dyn_free(st);
+    hisi_nrx_free(st);
 #endif
     free(st);
     c->platform = NULL;
@@ -2085,6 +2086,7 @@ static int hal_deinit(void *ctx)
 
 #ifdef HAL_MODULE_VIDEO
     hisi_dyn_free(st);
+    hisi_nrx_free(st);
 #endif
     free(st);
     c->platform = NULL;

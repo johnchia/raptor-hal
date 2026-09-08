@@ -41,15 +41,19 @@
  *   static_blc, static_csc, static_shading
  *
  * Sections deliberately not applied, and why:
- *   dynamic_*      tables over an axis (ISO, exposure, WDR ratio) that a
- *                  runtime engine walks. hal_dyn.c and hal_nrx.c are the
- *                  next two files in this phase; until they land these are
- *                  named in the summary line as skipped rather than
- *                  silently dropped, so a file that carries them is not
- *                  mistaken for one that applied them.
- *   static_3dnr    the 3DNR ladder. Not an ISP module on V5: the vendor's
- *                  reference writes it through ss_mpi_vi_set_pipe_3dnr_param
- *                  on the VI pipe, not the VPSS group gen4 uses. hal_nrx.c.
+ * Sections applied by the two engine files, which keep their tables and
+ * walk them off the AE tick rather than writing once:
+ *   dynamic_linear_drc, dynamic_dehaze, dynamic_gamma   hal_dyn.c
+ *   static_3dnr                                         hal_nrx.c, which
+ *                  writes it through ss_mpi_vi_set_pipe_3dnr_param on the
+ *                  VI pipe rather than to an ISP module -- on V5 3DNR is
+ *                  not one.
+ *
+ * Sections deliberately not applied, and why:
+ *   dynamic_*      every other table over an axis (WDR ratio, the per-ISO
+ *                  NR and CA ladders). Named in the summary line as
+ *                  skipped rather than silently dropped, so a file that
+ *                  carries them is not mistaken for one that applied them.
  *   static_awb,    sensor calibration -- white-balance curves, per-pipe
  *   static_awbex,  gain differences, lens shading meshes. These belong to
  *   static_isp_diff the module vendor's calibration of *that* lens and
@@ -1784,8 +1788,16 @@ static void iq_dispatch(hisi_state_t *st, hisi_iq_load *ld, hisi_iq_reader *r)
         iq_sect_csc(st, ld, r->key, r->val);
     else if (iq_ci_eq(s, "static_shading"))
         iq_sect_shading(st, ld, r->key, r->val);
-    else if (iq_ci_eq(s, "dynamic_linear_drc") || iq_ci_eq(s, "dynamic_dehaze") ||
-             iq_ci_eq(s, "dynamic_gamma")) {
+    else if (iq_ci_eq(s, "static_3dnr")) {
+        /* Same rule as the three below, and for the same reason: the two
+         * [module_state] flags that name this section, bStatic3DNR and
+         * bDyanamic3DNR, are 0 and 1 in every vendor file there is, and
+         * the vendor's own loader reads the section without consulting
+         * either. See the head of hal_nrx.c. */
+        if (!hisi_nrx_key(st, r->key, r->val))
+            HAL_LOG_DBG("isp tuning: [%s] %s: no mapping", s, r->key);
+    } else if (iq_ci_eq(s, "dynamic_linear_drc") || iq_ci_eq(s, "dynamic_dehaze") ||
+               iq_ci_eq(s, "dynamic_gamma")) {
         /* Tables over an axis rather than values; hal_dyn.c keeps them and
          * walks them off the AE tick. No [module_state] flag gates these
          * three -- the vendor's own bDynamic* bits are the sample's thread
@@ -1804,6 +1816,7 @@ void hisi_isp_tune_resolve(hisi_state_t *st)
         return;
     st->tune_resolved = true;
     v5_isp_tune_load(&st->tune, &st->libs);
+    v5_nr_load(&st->nr, &st->libs);
 }
 
 /*
@@ -1887,6 +1900,13 @@ static void hisi_isp_apply_tuning(hisi_state_t *st)
         int dyn_failed = 0;
 
         applied += hisi_dyn_apply(st, &dyn_failed, note, sizeof(note));
+        if (dyn_failed) {
+            failed += dyn_failed;
+            iq_note_skip(ld, note);
+        }
+
+        dyn_failed = 0;
+        applied += hisi_nrx_apply(st, &dyn_failed, note, sizeof(note));
         if (dyn_failed) {
             failed += dyn_failed;
             iq_note_skip(ld, note);
