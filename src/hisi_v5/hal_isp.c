@@ -1784,7 +1784,15 @@ static void iq_dispatch(hisi_state_t *st, hisi_iq_load *ld, hisi_iq_reader *r)
         iq_sect_csc(st, ld, r->key, r->val);
     else if (iq_ci_eq(s, "static_shading"))
         iq_sect_shading(st, ld, r->key, r->val);
-    else
+    else if (iq_ci_eq(s, "dynamic_linear_drc") || iq_ci_eq(s, "dynamic_dehaze") ||
+             iq_ci_eq(s, "dynamic_gamma")) {
+        /* Tables over an axis rather than values; hal_dyn.c keeps them and
+         * walks them off the AE tick. No [module_state] flag gates these
+         * three -- the vendor's own bDynamic* bits are the sample's thread
+         * switches, and a section present here is a section meant. */
+        if (!hisi_dyn_key(st, s, r->key, r->val))
+            HAL_LOG_DBG("isp tuning: [%s] %s: no mapping", s, r->key);
+    } else
         iq_note_skip(ld, s);
 }
 
@@ -1870,6 +1878,18 @@ static void hisi_isp_apply_tuning(hisi_state_t *st)
         }
     }
 
+    /* The engines, over the static values just written. */
+    {
+        char note[128];
+        int dyn_failed = 0;
+
+        applied += hisi_dyn_apply(st, &dyn_failed, note, sizeof(note));
+        if (dyn_failed) {
+            failed += dyn_failed;
+            iq_note_skip(ld, note);
+        }
+    }
+
     {
         char skipped[IQ_NOTE_MAX * IQ_NOTE_LEN];
         char disabled[IQ_NOTE_MAX * IQ_NOTE_LEN];
@@ -1902,8 +1922,13 @@ static void hisi_isp_apply_tuning(hisi_state_t *st)
  */
 void hisi_isp_note_frame(hisi_state_t *st)
 {
-    if (__atomic_test_and_set(&st->iq_load_started, __ATOMIC_ACQ_REL))
+    if (__atomic_test_and_set(&st->iq_load_started, __ATOMIC_ACQ_REL)) {
+        /* Every frame after the load: the AE tick behind the dynamic
+         * sections, which rate-limits itself and does nothing until the
+         * load has armed an engine. */
+        hisi_dyn_tick(st);
         return;
+    }
 
     if (st->iq_file[0])
         hisi_isp_apply_tuning(st);

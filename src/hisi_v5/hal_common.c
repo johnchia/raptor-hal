@@ -2031,6 +2031,11 @@ err_unload:
 err_free:
     if (g_hisi == st)
         g_hisi = NULL;
+#ifdef HAL_MODULE_VIDEO
+    /* The dynamic sections' ladders: video-only state, and hal_dyn.c is in
+     * the video archive only. */
+    hisi_dyn_free(st);
+#endif
     free(st);
     c->platform = NULL;
     return ret;
@@ -2076,6 +2081,9 @@ static int hal_deinit(void *ctx)
     v5_sys_unload(&st->sys);
     hisi_mpi_close(&st->libs);
 
+#ifdef HAL_MODULE_VIDEO
+    hisi_dyn_free(st);
+#endif
     free(st);
     c->platform = NULL;
     c->initialized = false;

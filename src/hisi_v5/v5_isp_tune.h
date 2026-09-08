@@ -110,6 +110,9 @@
 #define V5_ISP_OP_AUTO 0
 #define V5_ISP_OP_MANUAL 1
 
+/* ot_isp_gamma_curve_type: DEFAULT, SRGB, HDR (unsupported), USER_DEFINE. */
+#define V5_ISP_GAMMA_CURVE_USER 3
+
 /* ================================================================
  * EXPOSURE -- ot_isp_exposure_attr, libss_mpi_ae.so
  * ================================================================ */
@@ -325,6 +328,16 @@ _Static_assert(offsetof(v5_isp_ldci_attr, tpr_incr_coef) == 148,
  * DRC -- ot_isp_drc_attr
  * ================================================================ */
 
+/* ot_isp_drc_mixing_bright_param and ..._dark_param: identical layouts. */
+typedef struct {
+    unsigned char max;
+    unsigned char min;
+    unsigned char threshold;
+    signed char slope;
+} v5_isp_drc_mixing_param;
+
+_Static_assert(sizeof(v5_isp_drc_mixing_param) == 4, "ot_isp_drc_mixing_*_param is 4 bytes");
+
 typedef struct {
     unsigned short strength;
 } v5_isp_drc_manual;
@@ -363,8 +376,22 @@ typedef struct {
     unsigned char spatial_filter_coef;
     unsigned char range_filter_coef;
     unsigned char detail_adjust_coef;
-    unsigned char local_mixing_bright[V5_ISP_DRC_LMIX_NODES];
-    unsigned char local_mixing_dark[V5_ISP_DRC_LMIX_NODES];
+    /*
+     * Two unions in the vendor header, one per detail-mixing member: the
+     * 33-node LUT is the DV500 form, and the four-field parameter is the
+     * CV610 one. Same bytes, and the CV610 form is the first four of them
+     * -- so the LUT stays (hal_isp.c's [static_drc] writes it, and a file
+     * meant for another die is then simply ignored by this driver) and the
+     * parameter is what [dynamic_linear_drc] names.
+     */
+    union {
+        v5_isp_drc_mixing_param local_mixing_bright_param;
+        unsigned char local_mixing_bright[V5_ISP_DRC_LMIX_NODES];
+    };
+    union {
+        v5_isp_drc_mixing_param local_mixing_dark_param;
+        unsigned char local_mixing_dark[V5_ISP_DRC_LMIX_NODES];
+    };
     unsigned char high_saturation_color_ctrl;
     unsigned char global_color_ctrl;
     int shoot_reduction_en;
@@ -383,6 +410,10 @@ _Static_assert(offsetof(v5_isp_drc_attr, tone_mapping_value) == 82,
                "ot_isp_drc_attr.tone_mapping_value at +82");
 _Static_assert(offsetof(v5_isp_drc_attr, local_mixing_bright) == 485,
                "ot_isp_drc_attr.local_mixing_bright at +485");
+_Static_assert(offsetof(v5_isp_drc_attr, local_mixing_bright_param) == 485,
+               "ot_isp_drc_attr.local_mixing_bright_param shares +485");
+_Static_assert(offsetof(v5_isp_drc_attr, local_mixing_dark_param) == 518,
+               "ot_isp_drc_attr.local_mixing_dark_param shares +518");
 _Static_assert(offsetof(v5_isp_drc_attr, op_type) == 560, "ot_isp_drc_attr.op_type at +560");
 _Static_assert(offsetof(v5_isp_drc_attr, bcnr_attr) == 580, "ot_isp_drc_attr.bcnr_attr at +580");
 
@@ -903,6 +934,7 @@ static inline void v5_isp_tune_load(v5_isp_tune_impl *lib, const v5_mpi_libs *li
 
     V5_TUNE_PAIR(fnGetExposureAttr, fnSetExposureAttr, v5_isp_exp_attr, "exposure_attr");
     V5_TUNE_PAIR(fnGetAeRouteAttrEx, fnSetAeRouteAttrEx, v5_isp_ae_route_ex, "ae_route_attr_ex");
+
     V5_TUNE_PAIR(fnGetCcmAttr, fnSetCcmAttr, v5_isp_ccm_attr, "ccm_attr");
     V5_TUNE_PAIR(fnGetSaturationAttr, fnSetSaturationAttr, v5_isp_saturation_attr,
                  "saturation_attr");

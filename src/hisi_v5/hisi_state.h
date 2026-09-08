@@ -701,6 +701,15 @@ typedef struct {
     char iq_file[192];
     volatile char iq_load_started;
 
+    /*
+     * The dynamic sections' state, and the clock behind them: one AE
+     * query a second, shared by every engine, taken by whichever encoder
+     * thread gets there first. See hal_dyn.c.
+     */
+    struct hisi_dyn_set *dyn;
+    long long iso_tick_ns; /* the tick's next due time, CLOCK_MONOTONIC */
+    char iso_busy;         /* one tick at a time, across encoder threads */
+
     bool vb_private_pools;
 } hisi_state_t;
 
@@ -767,6 +776,21 @@ int hal_isp_get_sensor_fps(void *ctx, uint32_t *fps_num, uint32_t *fps_den);
 void hisi_isp_resolve_iq(hisi_state_t *st);
 void hisi_isp_tune_resolve(hisi_state_t *st);
 void hisi_isp_note_frame(hisi_state_t *st);
+
+/* hal_dyn.c -- the dynamic ISP sections, and the AE tick that drives them.
+ * The axis helpers are the scene_auto sample's, and hal_nrx.c will share
+ * them. Every entry point is safe on a state that never saw the section. */
+unsigned hisi_iso_map(unsigned iso);
+unsigned hisi_iso_lerp(unsigned long long mid, unsigned long long left, unsigned long long lv,
+                       unsigned long long right, unsigned long long rv);
+bool hisi_iso_query(hisi_state_t *st, unsigned *iso, unsigned long long *exposure);
+bool hisi_dyn_key(hisi_state_t *st, const char *sect, const char *key, const char *val);
+int hisi_dyn_apply(hisi_state_t *st, int *failed, char *note, size_t note_len);
+void hisi_dyn_on_exposure(hisi_state_t *st, unsigned iso, unsigned long long exposure);
+void hisi_dyn_tick(hisi_state_t *st);
+void hisi_dyn_drc_hold(hisi_state_t *st, bool hold);
+bool hisi_dyn_drc_curve(hisi_state_t *st);
+void hisi_dyn_free(hisi_state_t *st);
 
 /* hal_encoder.c */
 int hal_enc_create_group(void *ctx, int grp);
