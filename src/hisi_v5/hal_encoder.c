@@ -1009,6 +1009,16 @@ int hal_enc_get_frame(void *ctx, int chn, rss_frame_t *frame)
     enc->stream.pack = enc->packs;
     enc->stream.pack_cnt = packs;
 
+    /*
+     * First encoded frame anywhere = the ISP is demonstrably running; the
+     * descriptor said so, and that is enough. One atomic test per frame
+     * after that. Before get_stream on purpose: the first time through
+     * this runs the whole IQ load -- file parse plus a Get/Set round trip
+     * per module -- and doing that with a stream buffer checked out would
+     * hold the first frame for the duration. See hal_isp.c.
+     */
+    hisi_isp_note_frame(st);
+
     /* Zero timeout: the descriptor already said a frame is ready, and this
      * call moves descriptors rather than pixels. */
     ret = st->venc.fnGetStream(chn, &enc->stream, 0);

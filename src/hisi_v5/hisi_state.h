@@ -35,6 +35,7 @@
 #include "v5_vpss.h"
 #include "v5_venc.h"
 #include "v5_isp.h"
+#include "v5_isp_tune.h"
 #include "v5_snr.h"
 
 #include <pthread.h>
@@ -684,6 +685,22 @@ typedef struct {
      * the driver answers NOT_SUPPORT -- every later channel would get the
      * same answer and log the same line.
      */
+    /*
+     * IQ TUNING (Phase 3).
+     *
+     * `tune` is bound once, lazily, and every pair in it is optional --
+     * see v5_isp_tune.h for why the contract differs from `isp` above.
+     * `iq_file` is settled at bring-up and the load waits for the first
+     * encoded frame, so by the time it runs the ISP is demonstrably
+     * running and every Get returns live state. rvd runs an encoder
+     * thread per stream, so the latch is atomic and exactly one thread
+     * does the work.
+     */
+    v5_isp_tune_impl tune;
+    bool tune_resolved;
+    char iq_file[192];
+    volatile char iq_load_started;
+
     bool vb_private_pools;
 } hisi_state_t;
 
@@ -740,6 +757,16 @@ int hal_fs_get_frame_depth(void *ctx, int chn, int *depth);
 int hal_fs_get_frame(void *ctx, int chn, void **frame_data, rss_frame_info_t *info);
 int hal_fs_release_frame(void *ctx, int chn, void *frame_data);
 void hisi_fs_release_all(hisi_state_t *st);
+
+/* hal_isp.c */
+int hal_isp_get_sensor_attr(void *ctx, uint32_t *width, uint32_t *height);
+int hal_isp_set_sensor_fps(void *ctx, uint32_t fps_num, uint32_t fps_den);
+int hal_isp_get_sensor_fps(void *ctx, uint32_t *fps_num, uint32_t *fps_den);
+/* Settle which tuning file applies (bring-up), bind the tuning symbols,
+ * and apply on the first encoded frame. See the head of hal_isp.c. */
+void hisi_isp_resolve_iq(hisi_state_t *st);
+void hisi_isp_tune_resolve(hisi_state_t *st);
+void hisi_isp_note_frame(hisi_state_t *st);
 
 /* hal_encoder.c */
 int hal_enc_create_group(void *ctx, int grp);

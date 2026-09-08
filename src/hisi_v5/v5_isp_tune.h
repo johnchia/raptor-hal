@@ -1,0 +1,935 @@
+/*
+ * hisi_v5/v5_isp_tune.h -- the ISP module-attribute structs the IQ tuning
+ * loader writes, and the entry points that carry them. HiMPP V5.0.
+ *
+ * Phase 3 scope, and the same discipline gen4's v4_isp_tune.h keeps: this
+ * file transcribes exactly the attribute families hal_isp.c, hal_dyn.c and
+ * hal_knob.c apply, and nothing else. Every struct here is a byte-exact
+ * ABI promise; an unused promise is pure risk. The families deliberately
+ * left out are named at the bottom of this comment.
+ *
+ * WHERE THE SYMBOLS LIVE, which is not where the names suggest. The whole
+ * surface is spelt ss_mpi_isp_*, but it is split across three libraries:
+ *
+ *   libss_mpi_isp.so   the pipeline modules -- stats, ldci, drc, nr,
+ *                      dehaze, sharpen, dp, gamma, pregamma, black level,
+ *                      demosaic, csc, ca, anti-false-colour, shading.
+ *   libss_mpi_ae.so    ss_mpi_isp_set_exposure_attr and the AE routes.
+ *                      Declared in ss_mpi_ae.h, named ss_mpi_isp_*, and
+ *                      absent from libss_mpi_isp.so -- the same trap
+ *                      ss_mpi_isp_query_exposure_info sets in v5_isp.h.
+ *   libss_mpi_awb.so   ss_mpi_isp_set_ccm_attr, _saturation_attr,
+ *                      _color_tone_attr, _color_sector_attr, _wb_attr.
+ *
+ * v5_isp_tune_load resolves all three out of the one v5_mpi_libs search
+ * list, so the split costs nothing at the call site -- but a symbol looked
+ * for in the wrong .so is the first thing to suspect when one module of a
+ * tuning file silently does not apply.
+ *
+ * EVERY ENTRY POINT IS OPTIONAL. Unlike v5_isp.h's bring-up sequence,
+ * where a missing symbol means no image, a missing tuning setter means one
+ * section of the .ini does not apply and the rest does. The loader reports
+ * that per section and carries on, which is what makes a tuning file
+ * written for a fuller SDK usable here.
+ *
+ * PROVENANCE. openhisilicon kernel/include/hi3516cv6xx/ot_common_isp.h,
+ * ss_mpi_isp.h, ss_mpi_ae.h and ss_mpi_awb.h at 1.0.2.0 B051 -- the same
+ * headers the rest of hisi_v5 is transcribed from, and the version the
+ * CV608 bench board's libraries report. Sizes and offsets in the
+ * _Static_asserts below were read from a probe generated off those headers
+ * and compiled twice: once for the host and once with the cv6xx musl
+ * cross-compiler, with a generated assert file proving the two layouts are
+ * identical for every struct here. The probe never enters the build.
+ *
+ * Two structs are deliberately partial, both following gen4's
+ * v4_isp_stat_cfg pattern -- transcribe the half the loader writes, carry
+ * the rest as opaque bytes sized so the Get/Set round-trip moves the whole
+ * struct:
+ *
+ *   v5_isp_stats_cfg   the AE half is written (the weight table); the WB,
+ *                      focus and motion tail passes through untouched.
+ *   v5_isp_nr_attr     the bayer-NR head is written (coring, mix gain);
+ *                      the spatial/motion-detect/WDR/dering configs are a
+ *                      1336-byte tail, and the tail is where V5's own
+ *                      3DNR-adjacent knobs live -- transcribing them is a
+ *                      later phase's job, not a prerequisite for applying
+ *                      the head.
+ *
+ * NOT HERE, ON PURPOSE. 3DNR is not an ISP module on V5: the vendor's
+ * scene_auto reference writes it through ss_mpi_vi_set_pipe_3dnr_param on
+ * the VI pipe, not through the VPSS group the way gen4's hal_nrx.c does.
+ * ot_3dnr_param belongs to the VI header family and is transcribed in
+ * v5_vi.h when hal_nrx.c lands. The AWB calibration attribute
+ * (ot_isp_wb_attr, 1300 bytes) is also absent: it is sensor-calibration
+ * data, not scene tuning, and nothing raptor ships would fill it in.
+ *
+ * Copyright (C) 2026 Thingino Project
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ */
+
+#ifndef HISI_V5_ISP_TUNE_H
+#define HISI_V5_ISP_TUNE_H
+
+#include "v5_common.h"
+
+/*
+ * The array dimensions that decide every layout below. Names in the
+ * comments are the header's, so a reader can check each against
+ * ot_common_isp.h without guessing which constant a number came from.
+ */
+#define V5_ISP_ISO_NUM 16           /* OT_ISP_AUTO_ISO_NUM */
+#define V5_ISP_AE_ROUTE_EX_NODES 16 /* OT_ISP_AE_ROUTE_EX_MAX_NODES */
+#define V5_ISP_AE_ROWS 15           /* OT_ISP_AE_ZONE_ROW */
+#define V5_ISP_AE_COLS 17           /* OT_ISP_AE_ZONE_COLUMN */
+#define V5_ISP_BE_AE_ROWS 32        /* OT_ISP_BE_AE_ZONE_ROW */
+#define V5_ISP_BE_AE_COLS 32        /* OT_ISP_BE_AE_ZONE_COLUMN */
+#define V5_ISP_SHARPEN_LUMA 32      /* OT_ISP_SHARPEN_LUMA_NUM */
+#define V5_ISP_SHARPEN_GAIN 32      /* OT_ISP_SHARPEN_GAIN_NUM */
+#define V5_ISP_SHARPEN_MOT 16       /* OT_ISP_SHARPEN_MOT_NUM */
+#define V5_ISP_SHARPEN_RLYWGT 16    /* OT_ISP_SHARPEN_RLYWGT_NUM */
+#define V5_ISP_SHARPEN_STDGAIN 16   /* OT_ISP_SHARPEN_STDGAIN_NUM */
+#define V5_ISP_DRC_TM_NODES 200     /* OT_ISP_DRC_TM_NODE_NUM */
+#define V5_ISP_DRC_CC_NODES 33      /* OT_ISP_DRC_CC_NODE_NUM */
+#define V5_ISP_DRC_LMIX_NODES 33    /* OT_ISP_DRC_LMIX_NODE_NUM */
+#define V5_ISP_DRC_BCNR_NODES 16    /* OT_ISP_DRC_BCNR_NODE_NUM */
+#define V5_ISP_GAMMA_NODES 1025     /* OT_ISP_GAMMA_NODE_NUM */
+#define V5_ISP_PREGAMMA_NODES 257   /* OT_ISP_PREGAMMA_NODE_NUM */
+#define V5_ISP_BAYERNR_LUT 33       /* OT_ISP_BAYERNR_LUT_LENGTH */
+#define V5_ISP_BAYERNR_LUT1 32      /* OT_ISP_BAYERNR_LUT_LENGTH1 */
+#define V5_ISP_BAYER_CHN 4          /* OT_ISP_BAYER_CHN_NUM */
+#define V5_ISP_WDR_FRAMES 4         /* OT_ISP_WDR_MAX_FRAME_NUM */
+#define V5_ISP_DEHAZE_LUT 256       /* OT_ISP_DEHAZE_LUT_SIZE */
+#define V5_ISP_CCM_MATRIX_NUM 7     /* OT_ISP_CCM_MATRIX_NUM */
+#define V5_ISP_CCM_MATRIX_SIZE 9    /* OT_ISP_CCM_MATRIX_SIZE */
+#define V5_ISP_CA_LUT 128           /* OT_ISP_CA_YRATIO_LUT_LENGTH */
+#define V5_ISP_CSC_DC_NUM 3         /* OT_ISP_CSC_DC_NUM */
+#define V5_ISP_CSC_COEF_NUM 9       /* OT_ISP_CSC_COEF_NUM */
+
+/* ot_op_mode: 0 auto, 1 manual. Spelt out because the .ini dialect writes
+ * the word and every module below carries one. */
+#define V5_ISP_OP_AUTO 0
+#define V5_ISP_OP_MANUAL 1
+
+/* ================================================================
+ * EXPOSURE -- ot_isp_exposure_attr, libss_mpi_ae.so
+ * ================================================================ */
+
+typedef struct {
+    unsigned int max, min; /* max before min, as the header has it */
+} v5_isp_ae_range;
+
+_Static_assert(sizeof(v5_isp_ae_range) == 8, "ot_isp_ae_range is 8 bytes");
+
+typedef struct {
+    int enable;
+    unsigned char frequency; /* 50 or 60 */
+    int mode;                /* ot_isp_antiflicker_mode */
+} v5_isp_antiflicker;
+
+typedef struct {
+    int enable;
+    unsigned char luma_diff;
+} v5_isp_subflicker;
+
+typedef struct {
+    unsigned short black_delay_frame;
+    unsigned short white_delay_frame;
+} v5_isp_ae_delay;
+
+/* ot_isp_me_attr -- manual exposure. Untouched by the loader; present so
+ * the auto half lands at the right offset. */
+typedef struct {
+    int exp_time_op_type, a_gain_op_type, d_gain_op_type, ispd_gain_op_type;
+    unsigned int exp_time, a_gain, d_gain, isp_d_gain;
+} v5_isp_ae_manual;
+
+_Static_assert(sizeof(v5_isp_ae_manual) == 32, "ot_isp_me_attr is 32 bytes");
+
+/* ot_isp_ae_attr */
+typedef struct {
+    v5_isp_ae_range exp_time_range;
+    v5_isp_ae_range a_gain_range;
+    v5_isp_ae_range d_gain_range;
+    v5_isp_ae_range ispd_gain_range;
+    v5_isp_ae_range sys_gain_range;
+    unsigned int gain_threshold;
+    unsigned char speed;
+    unsigned short black_speed_bias;
+    unsigned char tolerance;
+    unsigned char compensation;
+    unsigned short ev_bias;
+    int ae_strategy_mode; /* ot_isp_ae_strategy */
+    unsigned short hist_ratio_slope;
+    unsigned char max_hist_offset;
+    int ae_mode; /* ot_isp_ae_mode */
+    v5_isp_antiflicker antiflicker;
+    v5_isp_subflicker subflicker;
+    v5_isp_ae_delay ae_delay_attr;
+    int manual_exp_value;
+    unsigned int exp_value;
+    int fswdr_mode; /* ot_isp_fswdr_mode */
+    int wdr_quick;
+    unsigned short iso_cal_coef;
+} v5_isp_ae_auto;
+
+_Static_assert(sizeof(v5_isp_ae_auto) == 108, "ot_isp_ae_attr is 108 bytes");
+_Static_assert(offsetof(v5_isp_ae_auto, speed) == 44, "ot_isp_ae_attr.speed at +44");
+_Static_assert(offsetof(v5_isp_ae_auto, tolerance) == 48, "ot_isp_ae_attr.tolerance at +48");
+_Static_assert(offsetof(v5_isp_ae_auto, hist_ratio_slope) == 56,
+               "ot_isp_ae_attr.hist_ratio_slope at +56");
+_Static_assert(offsetof(v5_isp_ae_auto, ae_mode) == 60, "ot_isp_ae_attr.ae_mode at +60");
+_Static_assert(offsetof(v5_isp_ae_auto, ae_delay_attr) == 84,
+               "ot_isp_ae_attr.ae_delay_attr at +84");
+_Static_assert(offsetof(v5_isp_ae_auto, iso_cal_coef) == 104,
+               "ot_isp_ae_attr.iso_cal_coef at +104");
+
+/*
+ * ot_isp_exposure_attr. Four bytes longer than gen4's ISP_EXPOSURE_ATTR_S
+ * -- advance_ae is new at the tail -- and the auto half moved with it, so
+ * the offsets below are the ones worth asserting.
+ */
+typedef struct {
+    int bypass;
+    int op_type;
+    unsigned char ae_run_interval;
+    int hist_stat_adjust;
+    int ae_route_ex_valid;
+    v5_isp_ae_manual manual_attr;
+    v5_isp_ae_auto auto_attr;
+    int prior_frame; /* ot_isp_prior_frame */
+    int ae_gain_sep_cfg;
+    int advance_ae;
+} v5_isp_exp_attr;
+
+_Static_assert(sizeof(v5_isp_exp_attr) == 172, "ot_isp_exposure_attr is 172 bytes");
+_Static_assert(offsetof(v5_isp_exp_attr, ae_route_ex_valid) == 16,
+               "ot_isp_exposure_attr.ae_route_ex_valid at +16");
+_Static_assert(offsetof(v5_isp_exp_attr, auto_attr) == 52, "ot_isp_exposure_attr.auto_attr at +52");
+_Static_assert(offsetof(v5_isp_exp_attr, prior_frame) == 160,
+               "ot_isp_exposure_attr.prior_frame at +160");
+
+/* ================================================================
+ * AE ROUTE EX -- ot_isp_ae_route_ex, libss_mpi_ae.so
+ * ================================================================ */
+
+typedef struct {
+    unsigned int int_time;
+    unsigned int a_gain;
+    unsigned int d_gain;
+    unsigned int isp_d_gain;
+    int iris_fno; /* ot_isp_iris_f_no */
+    unsigned int iris_fno_lin;
+} v5_isp_ae_route_ex_node;
+
+_Static_assert(sizeof(v5_isp_ae_route_ex_node) == 24, "ot_isp_ae_route_ex_node is 24 bytes");
+
+typedef struct {
+    unsigned int total_num;
+    v5_isp_ae_route_ex_node route_ex_node[V5_ISP_AE_ROUTE_EX_NODES];
+} v5_isp_ae_route_ex;
+
+_Static_assert(sizeof(v5_isp_ae_route_ex) == 388, "ot_isp_ae_route_ex is 388 bytes");
+
+/* ================================================================
+ * AE STATISTICS -- ot_isp_stats_cfg, libss_mpi_isp.so
+ *
+ * Partial by design: the loader writes the metering weight table and
+ * nothing else, so the AE half is transcribed and the WB/focus/motion tail
+ * rides along as bytes. ctrl and update are bitfield words the header
+ * spells as a struct of one td_u32 each; the loader must set the AE bit in
+ * `update` for a weight write to take, which is why they are named here
+ * rather than folded into the opaque tail.
+ * ================================================================ */
+
+typedef struct {
+    int enable;
+    unsigned short x, y, width, height;
+} v5_isp_ae_crop;
+
+_Static_assert(sizeof(v5_isp_ae_crop) == 12, "ot_isp_ae_crop is 12 bytes");
+
+typedef struct {
+    int hist_skip_x, hist_skip_y, hist_offset_x, hist_offset_y;
+} v5_isp_ae_hist_config;
+
+typedef struct {
+    int ae_switch;
+    v5_isp_ae_hist_config hist_config;
+    int four_plane_mode;
+    int hist_mode;
+    int aver_mode;
+    int max_gain_mode;
+    v5_isp_ae_crop crop;
+    v5_isp_ae_crop fe_crop;
+    unsigned char weight[V5_ISP_AE_ROWS][V5_ISP_AE_COLS];
+    unsigned char be_weight[V5_ISP_BE_AE_ROWS][V5_ISP_BE_AE_COLS];
+} v5_isp_ae_stats_cfg;
+
+_Static_assert(sizeof(v5_isp_ae_stats_cfg) == 1340, "ot_isp_ae_stats_cfg is 1340 bytes");
+_Static_assert(offsetof(v5_isp_ae_stats_cfg, weight) == 60, "ot_isp_ae_stats_cfg.weight at +60");
+_Static_assert(offsetof(v5_isp_ae_stats_cfg, be_weight) == 315,
+               "ot_isp_ae_stats_cfg.be_weight at +315");
+
+typedef struct {
+    unsigned int ctrl;   /* ot_isp_stats_ctrl, one u32 of bits */
+    unsigned int update; /* likewise; bit 0 is AE */
+    v5_isp_ae_stats_cfg ae_cfg;
+    unsigned char tail[316]; /* wb_cfg 32 + focus_cfg 276 + motion_cfg 8 */
+} v5_isp_stats_cfg;
+
+_Static_assert(sizeof(v5_isp_stats_cfg) == 1664, "ot_isp_stats_cfg is 1664 bytes");
+_Static_assert(offsetof(v5_isp_stats_cfg, ae_cfg) == 8, "ot_isp_stats_cfg.ae_cfg at +8");
+_Static_assert(offsetof(v5_isp_stats_cfg, tail) == 1348, "ot_isp_stats_cfg tail at +1348");
+
+/* ================================================================
+ * LDCI -- ot_isp_ldci_attr
+ * ================================================================ */
+
+typedef struct {
+    unsigned char wgt, sigma, mean;
+} v5_isp_ldci_gauss_coef;
+
+typedef struct {
+    v5_isp_ldci_gauss_coef he_pos_wgt;
+    v5_isp_ldci_gauss_coef he_neg_wgt;
+} v5_isp_ldci_he_wgt;
+
+_Static_assert(sizeof(v5_isp_ldci_he_wgt) == 6, "ot_isp_ldci_he_wgt_attr is 6 bytes");
+
+typedef struct {
+    v5_isp_ldci_he_wgt he_wgt;
+    unsigned short blc_ctrl;
+} v5_isp_ldci_manual;
+
+typedef struct {
+    v5_isp_ldci_he_wgt he_wgt[V5_ISP_ISO_NUM];
+    unsigned short blc_ctrl[V5_ISP_ISO_NUM];
+} v5_isp_ldci_auto;
+
+typedef struct {
+    int enable;
+    unsigned char gauss_lpf_sigma;
+    int op_type;
+    v5_isp_ldci_manual manual_attr;
+    v5_isp_ldci_auto auto_attr;
+    unsigned short tpr_incr_coef;
+    unsigned short tpr_decr_coef;
+} v5_isp_ldci_attr;
+
+_Static_assert(sizeof(v5_isp_ldci_attr) == 152, "ot_isp_ldci_attr is 152 bytes");
+_Static_assert(offsetof(v5_isp_ldci_attr, auto_attr) == 20, "ot_isp_ldci_attr.auto_attr at +20");
+_Static_assert(offsetof(v5_isp_ldci_attr, tpr_incr_coef) == 148,
+               "ot_isp_ldci_attr.tpr_incr_coef at +148");
+
+/* ================================================================
+ * DRC -- ot_isp_drc_attr
+ * ================================================================ */
+
+typedef struct {
+    unsigned short strength;
+} v5_isp_drc_manual;
+
+typedef struct {
+    unsigned short strength, strength_max, strength_min;
+} v5_isp_drc_auto;
+
+typedef struct {
+    unsigned char asymmetry, second_pole, stretch, compress;
+} v5_isp_drc_asymmetry_curve;
+
+typedef struct {
+    unsigned char brightness, contrast, tolerance;
+} v5_isp_drc_auto_curve;
+
+typedef struct {
+    int enable;
+    unsigned char detail_restore_lut[V5_ISP_DRC_BCNR_NODES];
+    unsigned char strength;
+} v5_isp_drc_bcnr;
+
+typedef struct {
+    int enable;
+    int curve_select; /* ot_isp_drc_curve_select */
+    unsigned char purple_reduction_strength;
+    unsigned char bright_gain_limit;
+    unsigned char bright_gain_limit_step;
+    unsigned char dark_gain_limit_luma;
+    unsigned char dark_gain_limit_chroma;
+    unsigned char contrast_ctrl;
+    unsigned char rim_reduction_strength;
+    unsigned char rim_reduction_threshold;
+    unsigned short color_correction_lut[V5_ISP_DRC_CC_NODES];
+    unsigned short tone_mapping_value[V5_ISP_DRC_TM_NODES];
+    unsigned char spatial_filter_coef;
+    unsigned char range_filter_coef;
+    unsigned char detail_adjust_coef;
+    unsigned char local_mixing_bright[V5_ISP_DRC_LMIX_NODES];
+    unsigned char local_mixing_dark[V5_ISP_DRC_LMIX_NODES];
+    unsigned char high_saturation_color_ctrl;
+    unsigned char global_color_ctrl;
+    int shoot_reduction_en;
+    int op_type;
+    v5_isp_drc_manual manual_attr;
+    v5_isp_drc_auto auto_attr;
+    v5_isp_drc_asymmetry_curve asymmetry_curve;
+    v5_isp_drc_auto_curve auto_curve;
+    v5_isp_drc_bcnr bcnr_attr;
+} v5_isp_drc_attr;
+
+_Static_assert(sizeof(v5_isp_drc_attr) == 604, "ot_isp_drc_attr is 604 bytes");
+_Static_assert(offsetof(v5_isp_drc_attr, color_correction_lut) == 16,
+               "ot_isp_drc_attr.color_correction_lut at +16");
+_Static_assert(offsetof(v5_isp_drc_attr, tone_mapping_value) == 82,
+               "ot_isp_drc_attr.tone_mapping_value at +82");
+_Static_assert(offsetof(v5_isp_drc_attr, local_mixing_bright) == 485,
+               "ot_isp_drc_attr.local_mixing_bright at +485");
+_Static_assert(offsetof(v5_isp_drc_attr, op_type) == 560, "ot_isp_drc_attr.op_type at +560");
+_Static_assert(offsetof(v5_isp_drc_attr, bcnr_attr) == 580, "ot_isp_drc_attr.bcnr_attr at +580");
+
+/* ================================================================
+ * BAYER NR -- ot_isp_nr_attr
+ *
+ * Partial: the head the loader writes, then the spatial/motion-detect/
+ * WDR/dering configs as bytes. See the file comment.
+ * ================================================================ */
+
+typedef struct {
+    int enable;
+    int op_type;
+    int md_en;
+    int lsc_nr_en;
+    unsigned char lsc_ratio1;
+    unsigned short coring_ratio[V5_ISP_BAYERNR_LUT];
+    unsigned short mix_gain[V5_ISP_BAYERNR_LUT1];
+    int ref_mode; /* ot_isp_bnr_ref_mode */
+    int load_ref_en;
+    unsigned char tail[1336]; /* snr_cfg 892 + md_cfg 272 + wdr_cfg 32 + dering_cfg 86, padded */
+} v5_isp_nr_attr;
+
+_Static_assert(sizeof(v5_isp_nr_attr) == 1492, "ot_isp_nr_attr is 1492 bytes");
+_Static_assert(offsetof(v5_isp_nr_attr, coring_ratio) == 18, "ot_isp_nr_attr.coring_ratio at +18");
+_Static_assert(offsetof(v5_isp_nr_attr, mix_gain) == 84, "ot_isp_nr_attr.mix_gain at +84");
+_Static_assert(offsetof(v5_isp_nr_attr, tail) == 156, "ot_isp_nr_attr tail at +156");
+
+/* ================================================================
+ * DEHAZE -- ot_isp_dehaze_attr
+ * ================================================================ */
+
+typedef struct {
+    int enable;
+    int user_lut_en;
+    unsigned char dehaze_lut[V5_ISP_DEHAZE_LUT];
+    int op_type;
+    unsigned char manual_strength;
+    unsigned char auto_strength;
+    unsigned short tmprflt_incr_coef;
+    unsigned short tmprflt_decr_coef;
+} v5_isp_dehaze_attr;
+
+_Static_assert(sizeof(v5_isp_dehaze_attr) == 276, "ot_isp_dehaze_attr is 276 bytes");
+_Static_assert(offsetof(v5_isp_dehaze_attr, op_type) == 264, "ot_isp_dehaze_attr.op_type at +264");
+_Static_assert(offsetof(v5_isp_dehaze_attr, auto_strength) == 269,
+               "ot_isp_dehaze_attr.auto_attr at +269");
+
+/* ================================================================
+ * SHARPEN -- ot_isp_sharpen_attr
+ *
+ * The largest module here, 7168 bytes, and the one whose auto half is a
+ * plain [knob][ISO] table throughout -- which is exactly the shape the
+ * .ini dialect writes, one line of sixteen numbers per knob.
+ * ================================================================ */
+
+typedef struct {
+    unsigned short shoot_inner_threshold;
+    unsigned short shoot_outer_threshold;
+    unsigned short shoot_protect_threshold;
+} v5_isp_sharpen_manual_shoot;
+
+typedef struct {
+    unsigned short edge_rly_fine_threshold;
+    unsigned short edge_rly_coarse_threshold;
+    unsigned char edge_overshoot;
+    unsigned char edge_undershoot;
+    unsigned char edge_gain_by_rly[V5_ISP_SHARPEN_RLYWGT];
+    unsigned char edge_rly_by_mot[V5_ISP_SHARPEN_STDGAIN];
+    unsigned char edge_rly_by_luma[V5_ISP_SHARPEN_STDGAIN];
+} v5_isp_sharpen_manual_edge_rly;
+
+typedef struct {
+    unsigned char mf_gain_by_mot[V5_ISP_SHARPEN_MOT];
+    unsigned char hf_gain_by_mot[V5_ISP_SHARPEN_MOT];
+    unsigned char lmf_gain_by_mot[V5_ISP_SHARPEN_MOT];
+} v5_isp_sharpen_manual_gain_by_mot;
+
+typedef struct {
+    unsigned char luma_wgt[V5_ISP_SHARPEN_LUMA];
+    unsigned short texture_strength[V5_ISP_SHARPEN_GAIN];
+    unsigned short edge_strength[V5_ISP_SHARPEN_GAIN];
+    unsigned short texture_freq;
+    unsigned short edge_freq;
+    unsigned char over_shoot;
+    unsigned char under_shoot;
+    unsigned short motion_texture_strength[V5_ISP_SHARPEN_GAIN];
+    unsigned short motion_edge_strength[V5_ISP_SHARPEN_GAIN];
+    unsigned short motion_texture_freq;
+    unsigned short motion_edge_freq;
+    unsigned char motion_over_shoot;
+    unsigned char motion_under_shoot;
+    unsigned char shoot_sup_strength;
+    unsigned char shoot_sup_adj;
+    unsigned char detail_ctrl;
+    unsigned char detail_ctrl_threshold;
+    unsigned char edge_filt_strength;
+    unsigned char edge_filt_max_cap;
+    unsigned char r_gain;
+    unsigned char g_gain;
+    unsigned char b_gain;
+    unsigned char skin_gain;
+    unsigned short max_sharp_gain;
+    v5_isp_sharpen_manual_shoot shoot_threshold_attr;
+    v5_isp_sharpen_manual_edge_rly edge_rly_attr;
+    v5_isp_sharpen_manual_gain_by_mot gain_by_mot_attr;
+} v5_isp_sharpen_manual;
+
+_Static_assert(sizeof(v5_isp_sharpen_manual) == 420, "ot_isp_sharpen_manual_attr is 420 bytes");
+_Static_assert(offsetof(v5_isp_sharpen_manual, motion_texture_strength) == 166,
+               "sharpen manual motion_texture_strength at +166");
+_Static_assert(offsetof(v5_isp_sharpen_manual, shoot_threshold_attr) == 312,
+               "sharpen manual shoot_threshold_attr at +312");
+
+typedef struct {
+    unsigned short shoot_inner_threshold[V5_ISP_ISO_NUM];
+    unsigned short shoot_outer_threshold[V5_ISP_ISO_NUM];
+    unsigned short shoot_protect_threshold[V5_ISP_ISO_NUM];
+} v5_isp_sharpen_auto_shoot;
+
+typedef struct {
+    unsigned short edge_rly_fine_threshold[V5_ISP_ISO_NUM];
+    unsigned short edge_rly_coarse_threshold[V5_ISP_ISO_NUM];
+    unsigned char edge_overshoot[V5_ISP_ISO_NUM];
+    unsigned char edge_undershoot[V5_ISP_ISO_NUM];
+    unsigned char edge_gain_by_rly[V5_ISP_SHARPEN_RLYWGT][V5_ISP_ISO_NUM];
+    unsigned char edge_rly_by_mot[V5_ISP_SHARPEN_STDGAIN][V5_ISP_ISO_NUM];
+    unsigned char edge_rly_by_luma[V5_ISP_SHARPEN_STDGAIN][V5_ISP_ISO_NUM];
+} v5_isp_sharpen_auto_edge_rly;
+
+typedef struct {
+    unsigned char mf_gain_by_mot[V5_ISP_SHARPEN_MOT][V5_ISP_ISO_NUM];
+    unsigned char hf_gain_by_mot[V5_ISP_SHARPEN_MOT][V5_ISP_ISO_NUM];
+    unsigned char lmf_gain_by_mot[V5_ISP_SHARPEN_MOT][V5_ISP_ISO_NUM];
+} v5_isp_sharpen_auto_gain_by_mot;
+
+typedef struct {
+    unsigned char luma_wgt[V5_ISP_SHARPEN_LUMA][V5_ISP_ISO_NUM];
+    unsigned short texture_strength[V5_ISP_SHARPEN_GAIN][V5_ISP_ISO_NUM];
+    unsigned short edge_strength[V5_ISP_SHARPEN_GAIN][V5_ISP_ISO_NUM];
+    unsigned short texture_freq[V5_ISP_ISO_NUM];
+    unsigned short edge_freq[V5_ISP_ISO_NUM];
+    unsigned char over_shoot[V5_ISP_ISO_NUM];
+    unsigned char under_shoot[V5_ISP_ISO_NUM];
+    unsigned short motion_texture_strength[V5_ISP_SHARPEN_GAIN][V5_ISP_ISO_NUM];
+    unsigned short motion_edge_strength[V5_ISP_SHARPEN_GAIN][V5_ISP_ISO_NUM];
+    unsigned short motion_texture_freq[V5_ISP_ISO_NUM];
+    unsigned short motion_edge_freq[V5_ISP_ISO_NUM];
+    unsigned char motion_over_shoot[V5_ISP_ISO_NUM];
+    unsigned char motion_under_shoot[V5_ISP_ISO_NUM];
+    unsigned char shoot_sup_strength[V5_ISP_ISO_NUM];
+    unsigned char shoot_sup_adj[V5_ISP_ISO_NUM];
+    unsigned char detail_ctrl[V5_ISP_ISO_NUM];
+    unsigned char detail_ctrl_threshold[V5_ISP_ISO_NUM];
+    unsigned char edge_filt_strength[V5_ISP_ISO_NUM];
+    unsigned char edge_filt_max_cap[V5_ISP_ISO_NUM];
+    unsigned char r_gain[V5_ISP_ISO_NUM];
+    unsigned char g_gain[V5_ISP_ISO_NUM];
+    unsigned char b_gain[V5_ISP_ISO_NUM];
+    unsigned char skin_gain[V5_ISP_ISO_NUM];
+    unsigned short max_sharp_gain[V5_ISP_ISO_NUM];
+    v5_isp_sharpen_auto_shoot shoot_threshold_attr;
+    v5_isp_sharpen_auto_edge_rly edge_rly_attr;
+    v5_isp_sharpen_auto_gain_by_mot gain_by_mot_attr;
+} v5_isp_sharpen_auto;
+
+_Static_assert(sizeof(v5_isp_sharpen_auto) == 6720, "ot_isp_sharpen_auto_attr is 6720 bytes");
+_Static_assert(offsetof(v5_isp_sharpen_auto, texture_strength) == 512,
+               "sharpen auto texture_strength at +512");
+_Static_assert(offsetof(v5_isp_sharpen_auto, motion_texture_strength) == 2656,
+               "sharpen auto motion_texture_strength at +2656");
+_Static_assert(offsetof(v5_isp_sharpen_auto, max_sharp_gain) == 4960,
+               "sharpen auto max_sharp_gain at +4960");
+_Static_assert(offsetof(v5_isp_sharpen_auto, edge_rly_attr) == 5088,
+               "sharpen auto edge_rly_attr at +5088");
+
+typedef struct {
+    int enable;
+    int motion_en;
+    unsigned char motion_threshold0;
+    unsigned char motion_threshold1;
+    unsigned short motion_gain0;
+    unsigned short motion_gain1;
+    unsigned char skin_umin, skin_vmin, skin_umax, skin_vmax;
+    int op_type;
+    int detail_map; /* ot_isp_sharpen_detail_map */
+    v5_isp_sharpen_manual manual_attr;
+    v5_isp_sharpen_auto auto_attr;
+} v5_isp_sharpen_attr;
+
+_Static_assert(sizeof(v5_isp_sharpen_attr) == 7168, "ot_isp_sharpen_attr is 7168 bytes");
+_Static_assert(offsetof(v5_isp_sharpen_attr, manual_attr) == 28,
+               "ot_isp_sharpen_attr.manual_attr at +28");
+_Static_assert(offsetof(v5_isp_sharpen_attr, auto_attr) == 448,
+               "ot_isp_sharpen_attr.auto_attr at +448");
+
+/* ================================================================
+ * DEFECT PIXEL, dynamic half -- ot_isp_dp_dynamic_attr
+ *
+ * The static half (ot_isp_dp_static_attr) is a 32 KB pair of calibrated
+ * pixel tables, not scene tuning, and is not transcribed.
+ * ================================================================ */
+
+typedef struct {
+    unsigned char strength;
+    unsigned char blend_ratio;
+} v5_isp_dp_dynamic_manual;
+
+typedef struct {
+    unsigned char strength[V5_ISP_ISO_NUM];
+    unsigned char blend_ratio[V5_ISP_ISO_NUM];
+} v5_isp_dp_dynamic_auto;
+
+typedef struct {
+    int sup_twinkle_en;
+    signed char soft_thr;
+    unsigned char soft_slope;
+    int op_type;
+    v5_isp_dp_dynamic_manual manual_attr;
+    v5_isp_dp_dynamic_auto auto_attr;
+    unsigned char bright_strength;
+    unsigned char dark_strength;
+} v5_isp_dp_frame_dynamic;
+
+_Static_assert(sizeof(v5_isp_dp_frame_dynamic) == 48, "ot_isp_dp_frame_dynamic_attr is 48 bytes");
+_Static_assert(offsetof(v5_isp_dp_frame_dynamic, auto_attr) == 14,
+               "dp frame dynamic auto_attr at +14");
+
+typedef struct {
+    int enable;
+    v5_isp_dp_frame_dynamic frame_dynamic[V5_ISP_WDR_FRAMES];
+} v5_isp_dp_dynamic_attr;
+
+_Static_assert(sizeof(v5_isp_dp_dynamic_attr) == 196, "ot_isp_dp_dynamic_attr is 196 bytes");
+
+/* ================================================================
+ * SATURATION and CCM -- libss_mpi_awb.so
+ * ================================================================ */
+
+typedef struct {
+    int op_type;
+    unsigned char manual_saturation;
+    unsigned char auto_sat[V5_ISP_ISO_NUM];
+} v5_isp_saturation_attr;
+
+_Static_assert(sizeof(v5_isp_saturation_attr) == 24, "ot_isp_saturation_attr is 24 bytes");
+_Static_assert(offsetof(v5_isp_saturation_attr, auto_sat) == 5,
+               "ot_isp_saturation_attr.auto_attr at +5");
+
+typedef struct {
+    unsigned short color_temp;
+    unsigned short ccm[V5_ISP_CCM_MATRIX_SIZE];
+} v5_isp_ccm_param;
+
+_Static_assert(sizeof(v5_isp_ccm_param) == 20, "ot_isp_color_matrix_param is 20 bytes");
+
+typedef struct {
+    int sat_en;
+    unsigned short ccm[V5_ISP_CCM_MATRIX_SIZE];
+} v5_isp_ccm_manual;
+
+typedef struct {
+    int iso_act_en;
+    int temp_act_en;
+    unsigned short ccm_tab_num;
+    v5_isp_ccm_param ccm_tab[V5_ISP_CCM_MATRIX_NUM];
+} v5_isp_ccm_auto;
+
+typedef struct {
+    int op_type;
+    v5_isp_ccm_manual manual_attr;
+    v5_isp_ccm_auto auto_attr;
+} v5_isp_ccm_attr;
+
+_Static_assert(sizeof(v5_isp_ccm_attr) == 180, "ot_isp_color_matrix_attr is 180 bytes");
+_Static_assert(offsetof(v5_isp_ccm_attr, auto_attr) == 28,
+               "ot_isp_color_matrix_attr.auto_attr at +28");
+_Static_assert(offsetof(v5_isp_ccm_auto, ccm_tab) == 10, "ccm auto ccm_tab at +10");
+
+/*
+ * ot_isp_color_tone_attr -- three per-channel gains applied after the CCM.
+ * A separate MPI pair from the matrix, but the same [static_ccm] section
+ * carries all four, which is why it sits here rather than under a heading
+ * of its own.
+ */
+typedef struct {
+    unsigned short red_cast_gain;
+    unsigned short green_cast_gain;
+    unsigned short blue_cast_gain;
+} v5_isp_color_tone_attr;
+
+_Static_assert(sizeof(v5_isp_color_tone_attr) == 6, "ot_isp_color_tone_attr is 6 bytes");
+
+/* ================================================================
+ * GAMMA and PREGAMMA
+ * ================================================================ */
+
+typedef struct {
+    int enable;
+    unsigned short table[V5_ISP_GAMMA_NODES];
+    int curve_type; /* ot_isp_gamma_curve_type */
+} v5_isp_gamma_attr;
+
+_Static_assert(sizeof(v5_isp_gamma_attr) == 2060, "ot_isp_gamma_attr is 2060 bytes");
+_Static_assert(offsetof(v5_isp_gamma_attr, curve_type) == 2056, "gamma curve_type at +2056");
+
+typedef struct {
+    int enable;
+    unsigned int table[V5_ISP_PREGAMMA_NODES];
+} v5_isp_pregamma_attr;
+
+_Static_assert(sizeof(v5_isp_pregamma_attr) == 1032, "ot_isp_pregamma_attr is 1032 bytes");
+
+/* ================================================================
+ * BLACK LEVEL -- ot_isp_black_level_attr
+ * ================================================================ */
+
+typedef struct {
+    unsigned short black_level[V5_ISP_WDR_FRAMES][V5_ISP_BAYER_CHN];
+} v5_isp_blc_manual;
+
+typedef struct {
+    int pattern; /* ot_isp_black_level_dynamic_pattern */
+    v5_rect ob_area;
+    unsigned short low_threshold;
+    unsigned short high_threshold;
+    signed short offset[V5_ISP_ISO_NUM];
+    unsigned short tolerance;
+    unsigned char filter_strength;
+    int separate_en;
+    unsigned short calibration_black_level[V5_ISP_ISO_NUM];
+    unsigned short filter_thr;
+} v5_isp_blc_dynamic;
+
+_Static_assert(sizeof(v5_isp_blc_dynamic) == 100, "ot_isp_black_level_dynamic_attr is 100 bytes");
+_Static_assert(offsetof(v5_isp_blc_dynamic, offset) == 24, "blc dynamic offset at +24");
+_Static_assert(offsetof(v5_isp_blc_dynamic, calibration_black_level) == 64,
+               "blc dynamic calibration_black_level at +64");
+
+typedef struct {
+    int user_black_level_en;
+    unsigned short user_black_level[V5_ISP_WDR_FRAMES][V5_ISP_BAYER_CHN];
+    int black_level_mode;
+    v5_isp_blc_manual manual_attr;
+    v5_isp_blc_dynamic dynamic_attr;
+} v5_isp_blc_attr;
+
+_Static_assert(sizeof(v5_isp_blc_attr) == 172, "ot_isp_black_level_attr is 172 bytes");
+_Static_assert(offsetof(v5_isp_blc_attr, dynamic_attr) == 72, "blc dynamic_attr at +72");
+
+/* ================================================================
+ * DEMOSAIC, CSC, CA, ANTI-FALSE-COLOUR, SHADING
+ * ================================================================ */
+
+typedef struct {
+    unsigned char nddm_strength;
+    unsigned char nddm_mf_detail_strength;
+    unsigned char hf_detail_strength;
+    unsigned char detail_smooth_range;
+    unsigned char color_noise_f_threshold;
+    unsigned char color_noise_f_strength;
+    unsigned char color_noise_y_threshold;
+    unsigned char color_noise_y_strength;
+} v5_isp_demosaic_manual;
+
+typedef struct {
+    unsigned char nddm_strength[V5_ISP_ISO_NUM];
+    unsigned char nddm_mf_detail_strength[V5_ISP_ISO_NUM];
+    unsigned char hf_detail_strength[V5_ISP_ISO_NUM];
+    unsigned char detail_smooth_range[V5_ISP_ISO_NUM];
+    unsigned char color_noise_f_threshold[V5_ISP_ISO_NUM];
+    unsigned char color_noise_f_strength[V5_ISP_ISO_NUM];
+    unsigned char color_noise_y_threshold[V5_ISP_ISO_NUM];
+    unsigned char color_noise_y_strength[V5_ISP_ISO_NUM];
+} v5_isp_demosaic_auto;
+
+typedef struct {
+    int enable;
+    int op_type;
+    unsigned short ai_detail_strength;
+    v5_isp_demosaic_manual manual_attr;
+    v5_isp_demosaic_auto auto_attr;
+} v5_isp_demosaic_attr;
+
+_Static_assert(sizeof(v5_isp_demosaic_attr) == 148, "ot_isp_demosaic_attr is 148 bytes");
+_Static_assert(offsetof(v5_isp_demosaic_attr, auto_attr) == 18, "demosaic auto_attr at +18");
+
+typedef struct {
+    signed short csc_in_dc[V5_ISP_CSC_DC_NUM];
+    signed short csc_out_dc[V5_ISP_CSC_DC_NUM];
+    signed short csc_coef[V5_ISP_CSC_COEF_NUM];
+} v5_isp_csc_matrix;
+
+typedef struct {
+    int enable;
+    int color_gamut; /* ot_color_gamut */
+    unsigned char hue, luma, contr, satu;
+    int limited_range_en;
+    int ext_csc_en;
+    int ct_mode_en;
+    v5_isp_csc_matrix csc_magtrx;
+} v5_isp_csc_attr;
+
+_Static_assert(sizeof(v5_isp_csc_attr) == 56, "ot_isp_csc_attr is 56 bytes");
+_Static_assert(offsetof(v5_isp_csc_attr, csc_magtrx) == 24, "csc csc_magtrx at +24");
+
+typedef struct {
+    unsigned int y_ratio_lut[V5_ISP_CA_LUT];
+    signed int iso_ratio[V5_ISP_ISO_NUM];
+    unsigned int y_sat_lut[V5_ISP_CA_LUT];
+} v5_isp_ca_lut;
+
+typedef struct {
+    unsigned char cp_lut_y[V5_ISP_CA_LUT];
+    unsigned char cp_lut_u[V5_ISP_CA_LUT];
+    unsigned char cp_lut_v[V5_ISP_CA_LUT];
+} v5_isp_cp_lut;
+
+typedef struct {
+    int enable;
+    int ca_cp_en; /* ot_isp_ca_type */
+    v5_isp_ca_lut ca;
+    v5_isp_cp_lut cp;
+} v5_isp_ca_attr;
+
+_Static_assert(sizeof(v5_isp_ca_attr) == 1480, "ot_isp_ca_attr is 1480 bytes");
+_Static_assert(offsetof(v5_isp_ca_attr, cp) == 1096, "ca cp at +1096");
+
+typedef struct {
+    int enable;
+    int op_type;
+    unsigned short manual_strength;
+    unsigned short auto_strength[V5_ISP_ISO_NUM];
+} v5_isp_anti_false_color_attr;
+
+_Static_assert(sizeof(v5_isp_anti_false_color_attr) == 44,
+               "ot_isp_anti_false_color_attr is 44 bytes");
+_Static_assert(offsetof(v5_isp_anti_false_color_attr, auto_strength) == 10,
+               "anti_false_color auto_attr at +10");
+
+typedef struct {
+    int enable;
+    unsigned short mesh_strength;
+    unsigned short blend_ratio;
+} v5_isp_shading_attr;
+
+_Static_assert(sizeof(v5_isp_shading_attr) == 8, "ot_isp_shading_attr is 8 bytes");
+
+/* ================================================================
+ * ENTRY POINTS
+ * ================================================================ */
+
+typedef struct {
+    /* libss_mpi_ae.so, despite the ss_mpi_isp_ spelling. */
+    int (*fnGetExposureAttr)(int vi_pipe, v5_isp_exp_attr *attr);
+    int (*fnSetExposureAttr)(int vi_pipe, const v5_isp_exp_attr *attr);
+    int (*fnGetAeRouteAttrEx)(int vi_pipe, v5_isp_ae_route_ex *attr);
+    int (*fnSetAeRouteAttrEx)(int vi_pipe, const v5_isp_ae_route_ex *attr);
+
+    /* libss_mpi_awb.so, likewise. */
+    int (*fnGetCcmAttr)(int vi_pipe, v5_isp_ccm_attr *attr);
+    int (*fnSetCcmAttr)(int vi_pipe, const v5_isp_ccm_attr *attr);
+    int (*fnGetSaturationAttr)(int vi_pipe, v5_isp_saturation_attr *attr);
+    int (*fnSetSaturationAttr)(int vi_pipe, const v5_isp_saturation_attr *attr);
+    int (*fnGetColorToneAttr)(int vi_pipe, v5_isp_color_tone_attr *attr);
+    int (*fnSetColorToneAttr)(int vi_pipe, const v5_isp_color_tone_attr *attr);
+
+    /* libss_mpi_isp.so. */
+    int (*fnGetStatsCfg)(int vi_pipe, v5_isp_stats_cfg *attr);
+    int (*fnSetStatsCfg)(int vi_pipe, const v5_isp_stats_cfg *attr);
+    int (*fnGetLdciAttr)(int vi_pipe, v5_isp_ldci_attr *attr);
+    int (*fnSetLdciAttr)(int vi_pipe, const v5_isp_ldci_attr *attr);
+    int (*fnGetDrcAttr)(int vi_pipe, v5_isp_drc_attr *attr);
+    int (*fnSetDrcAttr)(int vi_pipe, const v5_isp_drc_attr *attr);
+    int (*fnGetNrAttr)(int vi_pipe, v5_isp_nr_attr *attr);
+    int (*fnSetNrAttr)(int vi_pipe, const v5_isp_nr_attr *attr);
+    int (*fnGetDehazeAttr)(int vi_pipe, v5_isp_dehaze_attr *attr);
+    int (*fnSetDehazeAttr)(int vi_pipe, const v5_isp_dehaze_attr *attr);
+    int (*fnGetSharpenAttr)(int vi_pipe, v5_isp_sharpen_attr *attr);
+    int (*fnSetSharpenAttr)(int vi_pipe, const v5_isp_sharpen_attr *attr);
+    int (*fnGetDpDynamicAttr)(int vi_pipe, v5_isp_dp_dynamic_attr *attr);
+    int (*fnSetDpDynamicAttr)(int vi_pipe, const v5_isp_dp_dynamic_attr *attr);
+    int (*fnGetGammaAttr)(int vi_pipe, v5_isp_gamma_attr *attr);
+    int (*fnSetGammaAttr)(int vi_pipe, const v5_isp_gamma_attr *attr);
+    int (*fnGetPregammaAttr)(int vi_pipe, v5_isp_pregamma_attr *attr);
+    int (*fnSetPregammaAttr)(int vi_pipe, const v5_isp_pregamma_attr *attr);
+    int (*fnGetBlackLevelAttr)(int vi_pipe, v5_isp_blc_attr *attr);
+    int (*fnSetBlackLevelAttr)(int vi_pipe, const v5_isp_blc_attr *attr);
+    int (*fnGetDemosaicAttr)(int vi_pipe, v5_isp_demosaic_attr *attr);
+    int (*fnSetDemosaicAttr)(int vi_pipe, const v5_isp_demosaic_attr *attr);
+    int (*fnGetCscAttr)(int vi_pipe, v5_isp_csc_attr *attr);
+    int (*fnSetCscAttr)(int vi_pipe, const v5_isp_csc_attr *attr);
+    int (*fnGetCaAttr)(int vi_pipe, v5_isp_ca_attr *attr);
+    int (*fnSetCaAttr)(int vi_pipe, const v5_isp_ca_attr *attr);
+    int (*fnGetAntiFalseColorAttr)(int vi_pipe, v5_isp_anti_false_color_attr *attr);
+    int (*fnSetAntiFalseColorAttr)(int vi_pipe, const v5_isp_anti_false_color_attr *attr);
+    int (*fnGetShadingAttr)(int vi_pipe, v5_isp_shading_attr *attr);
+    int (*fnSetShadingAttr)(int vi_pipe, const v5_isp_shading_attr *attr);
+} v5_isp_tune_impl;
+
+/*
+ * v5_isp_tune_load -- bind whatever of the tuning surface this image has.
+ *
+ * Never fails. A module whose pair does not resolve is a module the
+ * loader skips with one note; the caller checks the pair it is about to
+ * use, not the return value. That is the whole difference in contract
+ * between this and v5_isp_load.
+ */
+static inline void v5_isp_tune_load(v5_isp_tune_impl *lib, const v5_mpi_libs *libs)
+{
+    memset(lib, 0, sizeof(*lib));
+
+#define V5_TUNE_PAIR(getter, setter, type, name)                                                   \
+    do {                                                                                           \
+        lib->getter = (int (*)(int, type *))v5_symbol_opt(libs, "ss_mpi_isp_get_" name);           \
+        lib->setter = (int (*)(int, const type *))v5_symbol_opt(libs, "ss_mpi_isp_set_" name);     \
+    } while (0)
+
+    V5_TUNE_PAIR(fnGetExposureAttr, fnSetExposureAttr, v5_isp_exp_attr, "exposure_attr");
+    V5_TUNE_PAIR(fnGetAeRouteAttrEx, fnSetAeRouteAttrEx, v5_isp_ae_route_ex, "ae_route_attr_ex");
+    V5_TUNE_PAIR(fnGetCcmAttr, fnSetCcmAttr, v5_isp_ccm_attr, "ccm_attr");
+    V5_TUNE_PAIR(fnGetSaturationAttr, fnSetSaturationAttr, v5_isp_saturation_attr,
+                 "saturation_attr");
+    V5_TUNE_PAIR(fnGetColorToneAttr, fnSetColorToneAttr, v5_isp_color_tone_attr, "color_tone_attr");
+    V5_TUNE_PAIR(fnGetStatsCfg, fnSetStatsCfg, v5_isp_stats_cfg, "stats_cfg");
+    V5_TUNE_PAIR(fnGetLdciAttr, fnSetLdciAttr, v5_isp_ldci_attr, "ldci_attr");
+    V5_TUNE_PAIR(fnGetDrcAttr, fnSetDrcAttr, v5_isp_drc_attr, "drc_attr");
+    V5_TUNE_PAIR(fnGetNrAttr, fnSetNrAttr, v5_isp_nr_attr, "nr_attr");
+    V5_TUNE_PAIR(fnGetDehazeAttr, fnSetDehazeAttr, v5_isp_dehaze_attr, "dehaze_attr");
+    V5_TUNE_PAIR(fnGetSharpenAttr, fnSetSharpenAttr, v5_isp_sharpen_attr, "sharpen_attr");
+    V5_TUNE_PAIR(fnGetDpDynamicAttr, fnSetDpDynamicAttr, v5_isp_dp_dynamic_attr, "dp_dynamic_attr");
+    V5_TUNE_PAIR(fnGetGammaAttr, fnSetGammaAttr, v5_isp_gamma_attr, "gamma_attr");
+    V5_TUNE_PAIR(fnGetPregammaAttr, fnSetPregammaAttr, v5_isp_pregamma_attr, "pregamma_attr");
+    V5_TUNE_PAIR(fnGetBlackLevelAttr, fnSetBlackLevelAttr, v5_isp_blc_attr, "black_level_attr");
+    V5_TUNE_PAIR(fnGetDemosaicAttr, fnSetDemosaicAttr, v5_isp_demosaic_attr, "demosaic_attr");
+    V5_TUNE_PAIR(fnGetCscAttr, fnSetCscAttr, v5_isp_csc_attr, "csc_attr");
+    V5_TUNE_PAIR(fnGetCaAttr, fnSetCaAttr, v5_isp_ca_attr, "ca_attr");
+    V5_TUNE_PAIR(fnGetAntiFalseColorAttr, fnSetAntiFalseColorAttr, v5_isp_anti_false_color_attr,
+                 "anti_false_color_attr");
+    V5_TUNE_PAIR(fnGetShadingAttr, fnSetShadingAttr, v5_isp_shading_attr, "mesh_shading_attr");
+
+#undef V5_TUNE_PAIR
+}
+
+static inline void v5_isp_tune_unload(v5_isp_tune_impl *lib)
+{
+    memset(lib, 0, sizeof(*lib));
+}
+
+#endif /* HISI_V5_ISP_TUNE_H */

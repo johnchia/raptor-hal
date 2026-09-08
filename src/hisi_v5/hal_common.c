@@ -2005,6 +2005,10 @@ static int hal_init(void *ctx, const rss_multi_sensor_config_t *cfg)
     ret = hisi_video_bringup(st, &cfg->sensors[0]);
     if (ret)
         goto err_teardown;
+
+    /* Settle which IQ tuning file applies; the load itself waits for the
+     * first encoded frame. Never a failure -- see hal_isp.c. */
+    hisi_isp_resolve_iq(st);
 #endif
 
     c->initialized = true;
@@ -2231,6 +2235,14 @@ static const rss_hal_ops_t g_ops = {
     .enc_get_avg_bitrate = hal_enc_get_avg_bitrate,
     .enc_query = hal_enc_query,
     .enc_get_fd = hal_enc_get_fd,
+
+    /* ISP -- geometry, rate, and the IQ tuning load. hal_isp.c. The knob
+     * half of this surface (brightness, contrast, saturation and the
+     * rest) is absent until hal_knob.c, and RSS_HAL_CALL turns that into
+     * RSS_ERR_NOTSUP rather than a stub that lies. */
+    .isp_get_sensor_attr = hal_isp_get_sensor_attr,
+    .isp_set_sensor_fps = hal_isp_set_sensor_fps,
+    .isp_get_sensor_fps = hal_isp_get_sensor_fps,
 #endif
 };
 
