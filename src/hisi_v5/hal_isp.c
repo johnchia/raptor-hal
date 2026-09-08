@@ -296,7 +296,24 @@ void hisi_isp_resolve_iq(hisi_state_t *st)
  * THE TUNING FILE READER
  * ================================================================ */
 
-#define HISI_IQ_LINE_MAX 512
+/*
+ * One physical line. Far larger than gen4's 512, and measured rather than
+ * guessed: this dialect puts a whole 1025-node gamma curve on ONE line --
+ * `[dynamic_gamma] table_0` is 5075 bytes in the sc4336p file, and the
+ * widest line across every scene_auto param file on hand (five CV610
+ * sensors plus the DV500 set) is 5095. The vendor's own files use the
+ * backslash continuation for some tables and not for others, so a reader
+ * that only handles continuations is not enough.
+ *
+ * A truncated line is not cosmetic: for a whole table it trips the
+ * exact-node-count rule and drops the module's table, and for a per-ISO
+ * column it would quietly apply the first few entries. 512 truncated the
+ * first vendor file this loader was pointed at.
+ *
+ * Heap, alongside the assembled value, because it is read on an encoder
+ * thread whose stack rvd sized for encoding.
+ */
+#define HISI_IQ_LINE_MAX 8192
 
 /*
  * The assembled value, continuations and all. The widest thing this
@@ -314,7 +331,8 @@ typedef struct {
     const char *path;
     char sect[40];
     char key[64];
-    char *val; /* HISI_IQ_VAL_MAX, heap */
+    char *line; /* HISI_IQ_LINE_MAX, heap */
+    char *val;  /* HISI_IQ_VAL_MAX, heap */
     bool long_line_warned;
     bool truncated_warned;
     bool bad_sect_warned;
@@ -361,8 +379,9 @@ static char *iq_trim(char *s)
 
 /* One physical line: read, guard against over-length, strip comment, trim.
  * Returns NULL at EOF. */
-static char *iq_line(hisi_iq_reader *r, char *buf)
+static char *iq_line(hisi_iq_reader *r)
 {
+    char *buf = r->line;
     char *comment;
 
     if (!fgets(buf, HISI_IQ_LINE_MAX, r->f))
@@ -416,10 +435,9 @@ static void iq_val_append(hisi_iq_reader *r, const char *piece)
  */
 static bool iq_next(hisi_iq_reader *r)
 {
-    char buf[HISI_IQ_LINE_MAX];
     char *p;
 
-    while ((p = iq_line(r, buf))) {
+    while ((p = iq_line(r))) {
         char *eq;
         bool cont;
 
@@ -465,7 +483,7 @@ static bool iq_next(hisi_iq_reader *r)
 
             if (!cont)
                 break;
-            if (!(p = iq_line(r, buf)))
+            if (!(p = iq_line(r)))
                 break;
         }
         return true;
@@ -558,6 +576,9 @@ static void iq_fill_s32(signed int *dst, int dn, const long *src, int sn)
  * THE LOAD
  * ================================================================ */
 
+#define IQ_NOTE_MAX 64
+#define IQ_NOTE_LEN 32
+
 enum {
     IQ_EXP = 1u << 0,
     IQ_ROUTE = 1u << 1,
@@ -611,8 +632,20 @@ typedef struct {
     unsigned int state;   /* [module_state]; MS_ALL when the file carries none */
 
     long nums[V5_ISP_DEHAZE_LUT]; /* the largest table parsed here */
-    char skipped[224];            /* section names for the summary line */
-    char disabled[224];           /* sections [module_state] turned off */
+
+    /*
+     * The two lists the summary line ends with, kept as names rather than
+     * as one assembled string. A V5 file carries forty-odd sections and
+     * most of them are ones this loader does not apply, so the summary
+     * runs long -- and a name arrives once per *key*, not once per
+     * section, so the de-duplication has to be by name. Sixty-four slots
+     * is past every file on hand; the counter is what happens if a file
+     * ever goes past that.
+     */
+    char skipped[IQ_NOTE_MAX][IQ_NOTE_LEN];  /* sections with no handler here */
+    char disabled[IQ_NOTE_MAX][IQ_NOTE_LEN]; /* sections [module_state] turned off */
+    int skipped_n, skipped_more;
+    int disabled_n, disabled_more;
 } hisi_iq_load;
 
 static const struct {
@@ -1519,21 +1552,44 @@ static void iq_sect_shading(hisi_state_t *st, hisi_iq_load *ld, const char *key,
 
 /* ---------------- the summary line ---------------- */
 
-static void iq_note_into(char *buf, size_t cap, const char *sect)
+/*
+ * Record a section name once. The caller hands the same name in for every
+ * key the section carries, so the search is by exact name rather than the
+ * substring test gen4 gets away with on a shorter list.
+ */
+static void iq_note_into(char list[][IQ_NOTE_LEN], int *n, int *more, const char *sect)
 {
-    size_t have = strlen(buf);
+    int i;
 
-    /* Already noted? A substring match is enough at this scale. */
-    if (strstr(buf, sect))
+    for (i = 0; i < *n; i++) {
+        if (iq_ci_eq(list[i], sect))
+            return;
+    }
+    if (*n >= IQ_NOTE_MAX) {
+        (*more)++;
         return;
-    if (have + strlen(sect) + 2 >= cap)
-        return;
-    snprintf(buf + have, cap - have, "%s%s", have ? " " : "", sect);
+    }
+    snprintf(list[*n], IQ_NOTE_LEN, "%s", sect);
+    (*n)++;
 }
 
 static void iq_note_skip(hisi_iq_load *ld, const char *sect)
 {
-    iq_note_into(ld->skipped, sizeof(ld->skipped), sect);
+    iq_note_into(ld->skipped, &ld->skipped_n, &ld->skipped_more, sect);
+}
+
+/* The list, joined for the log line. Returns buf so it can be an argument. */
+static const char *iq_note_join(char list[][IQ_NOTE_LEN], int n, int more, char *buf, size_t cap)
+{
+    size_t have = 0;
+    int i;
+
+    buf[0] = '\0';
+    for (i = 0; i < n && have + 1 < cap; i++)
+        have += (size_t)snprintf(buf + have, cap - have, "%s%s", have ? " " : "", list[i]);
+    if (more && have + 1 < cap)
+        snprintf(buf + have, cap - have, " +%d more", more);
+    return buf;
 }
 
 /* ---------------- [module_state] ---------------- */
@@ -1690,7 +1746,7 @@ static void iq_dispatch(hisi_state_t *st, hisi_iq_load *ld, hisi_iq_reader *r)
      * needs no flag and keeps going. */
     bits = iq_state_bits(s);
     if (bits && (ld->state & bits) != bits) {
-        iq_note_into(ld->disabled, sizeof(ld->disabled), s);
+        iq_note_into(ld->disabled, &ld->disabled_n, &ld->disabled_more, s);
         return;
     }
 
@@ -1766,8 +1822,11 @@ static void hisi_isp_apply_tuning(hisi_state_t *st)
         HAL_LOG_WARN("isp tuning: %s vanished between resolve and load", st->iq_file);
         return;
     }
-    if (!(ld = calloc(1, sizeof(*ld))) || !(r.val = malloc(HISI_IQ_VAL_MAX))) {
+    if (!(ld = calloc(1, sizeof(*ld))) || !(r.val = malloc(HISI_IQ_VAL_MAX)) ||
+        !(r.line = malloc(HISI_IQ_LINE_MAX))) {
         HAL_LOG_WARN("isp tuning: out of memory; running untuned");
+        free(r.line);
+        free(r.val);
         free(ld);
         fclose(r.f);
         return;
@@ -1811,15 +1870,24 @@ static void hisi_isp_apply_tuning(hisi_state_t *st)
         }
     }
 
-    if (failed)
-        HAL_LOG_WARN("isp tuning: %s: %d modules applied, %d failed%s%s%s%s", st->iq_file, applied,
-                     failed, ld->skipped[0] ? "; skipped: " : "", ld->skipped,
-                     ld->disabled[0] ? "; [module_state] off: " : "", ld->disabled);
-    else
-        HAL_LOG_INFO("isp tuning: %s: %d modules applied%s%s%s%s", st->iq_file, applied,
-                     ld->skipped[0] ? "; skipped: " : "", ld->skipped,
-                     ld->disabled[0] ? "; [module_state] off: " : "", ld->disabled);
+    {
+        char skipped[IQ_NOTE_MAX * IQ_NOTE_LEN];
+        char disabled[IQ_NOTE_MAX * IQ_NOTE_LEN];
 
+        iq_note_join(ld->skipped, ld->skipped_n, ld->skipped_more, skipped, sizeof(skipped));
+        iq_note_join(ld->disabled, ld->disabled_n, ld->disabled_more, disabled, sizeof(disabled));
+
+        if (failed)
+            HAL_LOG_WARN("isp tuning: %s: %d modules applied, %d failed%s%s%s%s", st->iq_file,
+                         applied, failed, skipped[0] ? "; skipped: " : "", skipped,
+                         disabled[0] ? "; [module_state] off: " : "", disabled);
+        else
+            HAL_LOG_INFO("isp tuning: %s: %d modules applied%s%s%s%s", st->iq_file, applied,
+                         skipped[0] ? "; skipped: " : "", skipped,
+                         disabled[0] ? "; [module_state] off: " : "", disabled);
+    }
+
+    free(r.line);
     free(r.val);
     free(ld);
 }
