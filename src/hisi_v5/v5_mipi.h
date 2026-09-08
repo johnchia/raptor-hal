@@ -84,8 +84,24 @@ typedef enum {
     V5_MIPI_DATA_RATE_X2 = 1,
 } v5_mipi_data_rate;
 
-/* data_type_t (ot_mipi_rx.h:69-79). The wire format, which the sensor INI
- * gives as a raw bit depth and hisi_sensor.c maps to one of these. */
+/*
+ * data_type_t (ot_mipi_rx.h:69-79). The wire format, which the sensor INI
+ * gives as a raw bit depth and hisi_sensor.c maps to one of these.
+ *
+ * THE VALUES MOVED BETWEEN SDK DROPS. The 1.0.1.0 drop -- and the PQTools
+ * configs shipped with it, which is where raptor's sensor mode files got
+ * their numbers -- has a DATA_TYPE_RAW_16BIT at 4, putting YUV420_8BIT_NORMAL
+ * at 5 and everything after it one higher. **1.0.2.0 B051, which is what
+ * the board runs, does not**: there is no 16-bit entry and YUV420 starts at
+ * 4. Transcribed from the 1.0.2.0 header because the driver on the board is
+ * built from it.
+ *
+ * This only bites a caller that writes the number rather than the name.
+ * raptor writes a raw bit depth and maps it here, so a RAW sensor never
+ * reaches the ambiguous range at all -- but a mode file that set
+ * mipi_attr.input_data_type numerically, the way the vendor's own configs
+ * do, would select YUV420 on a 16-bit sensor. Hence raw_bitness.
+ */
 typedef enum {
     V5_DATA_TYPE_RAW_8BIT = 0,
     V5_DATA_TYPE_RAW_10BIT = 1,

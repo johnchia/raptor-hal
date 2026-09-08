@@ -29,6 +29,10 @@
 #include "v5_common.h"
 #include "v5_sys.h"
 #include "v5_vb.h"
+#include "v5_video.h"
+#include "v5_mipi.h"
+#include "v5_vi.h"
+#include "v5_snr.h"
 
 /* ================================================================
  * FIXED TOPOLOGY
@@ -95,6 +99,109 @@
  * commit defines it beside the measurement that produced it, and
  * hisi_vpss_phy() arrives with it.
  */
+
+/* ================================================================
+ * SENSOR MODE
+ *
+ * Everything bring-up needs about the sensor that raptor's own config does
+ * not carry. Read from an INI, for the reason hisi_sensor.c states at
+ * length: a table in the code covers whichever sensors somebody tested and
+ * silently excludes the rest.
+ *
+ * The V5 file layout differs from gen4's in three ways, and hisi_sensor.c
+ * has the account. In short: the object symbol is spelled g_sns_<name>_obj;
+ * the I2C bus is part of the mode rather than assumed; and the *die* caps
+ * the geometry, so a mode file carries per-die overrides.
+ * ================================================================ */
+
+typedef struct {
+    /* As configured, or as detected. */
+    char name[32];
+    char ini_path[192];
+    char dll_file[64];
+    char obj_name[64];
+
+    /* Which [<section>.<die>] overrides were applied, for the log. Empty
+     * when the file has no per-die block for this part. */
+    char die_suffix[24];
+
+    /* [mode]. The two formats derived from raw_bitness are derived once,
+     * here, rather than read as separate keys that could disagree. */
+    v5_input_mode input_mode;
+    int raw_bitness;
+    v5_mipi_data_type mipi_data_type;
+    v5_pixel_format pixel_format;
+
+    /*
+     * [mipi]. lane_id is board wiring, not a sensor property: the same
+     * sensor is 0|1 on one layout and 0|2 on another, and the vendor's own
+     * per-sensor configs disagree for exactly that reason (sc4336p is 0|2
+     * where gc4023 beside it is 0|1). Getting it wrong gives a MIPI
+     * receiver that never completes a line.
+     */
+    short lane_id[V5_MIPI_LANE_NUM];
+    v5_lane_divide_mode lane_divide_mode;
+    v5_mipi_data_rate mipi_data_rate;
+
+    /* [isp_image] -- ot_isp_pub_attr's half. frame_rate is a float in the
+     * vendor struct and is carried as one so no conversion happens twice. */
+    float frame_rate;
+    v5_bayer_format bayer;
+    v5_wdr_mode wdr_mode;
+    unsigned char sns_mode;
+
+    /*
+     * [i2c]. New against gen4, where the bus was implicit. On V5 the
+     * sensor library takes it through pfn_set_bus_info before registration,
+     * and it is passed *by value* in a one-byte union -- see
+     * v5_isp_sns_commbus. -1 means "the library's own default", which is
+     * what the vendor's dual-sensor configs use for the second sensor.
+     */
+    int i2c_dev;
+
+    /*
+     * [vi_dev] -- the VI device attribute, from the vendor's own file.
+     * The sync-timing block is dead on a MIPI sensor and carried anyway,
+     * for gen4's reason: skipping it would be a guess about which fields
+     * the driver reads.
+     */
+    v5_vi_intf_mode intf_mode;
+    v5_vi_work_mode work_mode;
+    unsigned int component_mask[V5_VI_COMPONENT_MASK_NUM];
+    v5_vi_scan_mode scan_mode;
+    v5_vi_data_seq data_seq;
+    v5_vi_sync_cfg sync_cfg;
+    v5_vi_data_type data_type;
+    int data_reverse;
+    v5_data_rate data_rate;
+
+    /*
+     * The sensor's output geometry, which is also the MIPI receiver's
+     * img_rect and the ISP's wnd_rect. One size, three consumers: the
+     * vendor's configs repeat it three times and they are always equal.
+     */
+    v5_rect dev_rect;
+} hisi_sensor_mode_t;
+
+/*
+ * hisi_sensor_mode_load -- fill in everything bring-up needs.
+ *
+ * chip_name is hisi_state_t's, e.g. "0X3516C608": it selects the per-die
+ * override sections. Pass NULL or "" to take the file's defaults.
+ */
+int hisi_sensor_mode_load(hisi_sensor_mode_t *m, const char *sensor_name, const char *chip_name);
+
+/*
+ * hisi_sensor_obj_find -- resolve the sensor object out of an open library.
+ *
+ * Tries the name the mode gives, then "g_sns_<sensor>_obj", then scans the
+ * library's dynamic symbol table for any g_sns_*_obj. The scan is not
+ * belt-and-braces: libsns_sp2308.so exports g_sns_os02m10_obj, so a loader
+ * that only derives the symbol from the file name finds nothing at all.
+ *
+ * On success writes the symbol it used into m->obj_name.
+ */
+v5_isp_sns_obj *hisi_sensor_obj_find(hisi_sensor_mode_t *m, void *handle);
 
 /* ================================================================
  * BACKEND STATE

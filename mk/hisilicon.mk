@@ -99,10 +99,16 @@ ifneq ($(filter $(PLATFORM),$(HISI_GEN5_PLATFORMS)),)
 # it the factory, the ops vtable and the logging hook, and every audio op is
 # absent rather than stubbed.
 #
-# Phase 2 adds hisi_sensor.c hal_framesource.c hal_encoder.c; Phase 3
-# hal_isp.c hal_dyn.c hal_nrx.c hal_knob.c; Phase 4 hal_audio.c to
-# AUDIO_SRCS; Phase 5 hal_osd.c.
-VIDEO_SRCS := src/hal_gpio.c
+# hisi_sensor.c is video-only, and hal_common.c's call to it is inside
+# `#ifdef HAL_MODULE_VIDEO` for that reason: the same file is compiled into
+# both archives, so an unguarded call from it would leave rad's link short a
+# symbol that only the video list provides.
+#
+# Phase 2 adds hal_framesource.c and hal_encoder.c; Phase 3 hal_isp.c
+# hal_dyn.c hal_nrx.c hal_knob.c; Phase 4 hal_audio.c to AUDIO_SRCS;
+# Phase 5 hal_osd.c.
+VIDEO_SRCS := $(BACKEND_DIR)/hisi_sensor.c \
+              src/hal_gpio.c
 AUDIO_SRCS :=
 
 else
