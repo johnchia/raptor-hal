@@ -28,9 +28,13 @@
 
 #include "hisi_state.h"
 
+#include <errno.h>
+#include <fcntl.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <sys/ioctl.h>
+#include <sys/select.h>
 #include <syslog.h>
 #include <unistd.h>
 
@@ -388,6 +392,1107 @@ static bool hisi_chip_is_gen5(const char *name)
     return name && strncmp(name, "0X3516C6", 8) == 0;
 }
 
+#ifdef HAL_MODULE_VIDEO
+
+/* ================================================================
+ * THE ISP TIER
+ *
+ * Opened separately from the MPI set and later than it, because opening it
+ * is what closes the dlopen cycle the forwarders above exist to break: the
+ * algorithm code inside libot_mpi_isp.so resolves eight symbols that only
+ * the executable defines, so the forwarder targets have to be filled in
+ * from the same handles in the same call.
+ *
+ * Four libraries, and where each entry point lives is not what its name
+ * suggests -- see v5_isp.h. libot_mpi_isp.so is the implementation,
+ * libss_mpi_isp.so a four-byte-per-entry facade over it, and the two 3A
+ * libraries carry ss_mpi_ae_register / ss_mpi_awb_register plus, in ae
+ * rather than isp, ss_mpi_isp_query_exposure_info.
+ * ================================================================ */
+
+/*
+ * The forwarder targets, resolved out of the ISP tier once it is open.
+ *
+ * Every one is optional. A library build that has none of them is a build
+ * where the cycle does not exist, and the forwarders then return
+ * V5_FAILURE to a caller that never calls them. A missing *subset* is the
+ * interesting case and is logged, because it means the algorithm set on
+ * this image is not the one the survey measured.
+ */
+/*
+ * One row per forwarder: the library that defines it, the symbol, and
+ * where in hisi_state_t the pointer goes.
+ *
+ * The pairing is one-to-one and was read off the images' export tables
+ * rather than out of a header -- none of the eight appears in any public
+ * header in the 1.0.2.0 set, because the vendor links these statically in
+ * its own build and never has to name the boundary.
+ */
+static const struct {
+    const char *lib;
+    const char *name;
+    size_t offset;
+} hisi_isp_alg_table[HISI_ISP_ALG_LIB_NUM] = {
+    {"libldci.so", "isp_alg_register_ldci", offsetof(hisi_state_t, fn_alg_register_ldci)},
+    {"libdrc.so", "isp_alg_register_drc", offsetof(hisi_state_t, fn_alg_register_drc)},
+    {"libdehaze.so", "isp_alg_register_dehaze", offsetof(hisi_state_t, fn_alg_register_dehaze)},
+    {"libbnr.so", "isp_alg_register_bayer_nr", offsetof(hisi_state_t, fn_alg_register_bayer_nr)},
+    {"libacs.so", "isp_alg_register_acs", offsetof(hisi_state_t, fn_alg_register_acs)},
+    {"libir_auto.so", "isp_ir_auto_run_once", offsetof(hisi_state_t, fn_ir_auto_run_once)},
+    {"libextend_stats.so", "isp_be_stats_estimate", offsetof(hisi_state_t, fn_be_stats_estimate)},
+    {"libcalcflicker.so", "calc_flicker_type", offsetof(hisi_state_t, fn_calc_flicker_type)},
+};
+
+/*
+ * hisi_isp_open_alg_libs -- open the eight and point the forwarders at them.
+ *
+ * THE CYCLE, CONCRETELY. libot_mpi_isp.so leaves these eight symbols
+ * undefined; each of the eight libraries below defines exactly one of them
+ * and calls back into libot_mpi_isp.so (18 back-references for ldci, 32 for
+ * bnr, 1 for ir_auto -- measured). Neither side can be opened first with
+ * RTLD_NOW unless something else already answers for the missing
+ * direction, and on musl there is no lazy binding to fall back on. The
+ * executable's forwarders are that something: libot_mpi_isp.so opens
+ * against them, the eight then open against libot_mpi_isp.so, and the
+ * forwarders are repointed here at the real implementations.
+ *
+ * Every one is optional. A missing algorithm library costs its feature --
+ * the ISP asks for it once per pipeline and takes V5_FAILURE for an
+ * answer -- and a missing *subset* is worth a line, because it means the
+ * image's algorithm set is not the one this backend was measured against.
+ */
+static void hisi_isp_open_alg_libs(hisi_state_t *st)
+{
+    static const int flags = RTLD_NOW | RTLD_GLOBAL;
+    size_t i;
+    int found = 0;
+
+    for (i = 0; i < HISI_ISP_ALG_LIB_NUM; i++) {
+        void *fn = NULL;
+
+        st->isp_alg[i] = dlopen(hisi_isp_alg_table[i].lib, flags);
+        if (!st->isp_alg[i]) {
+            HAL_LOG_WARN("isp: %s: %s", hisi_isp_alg_table[i].lib, dlerror());
+        } else if (!(fn = dlsym(st->isp_alg[i], hisi_isp_alg_table[i].name))) {
+            HAL_LOG_WARN("isp: %s has no %s", hisi_isp_alg_table[i].lib,
+                         hisi_isp_alg_table[i].name);
+        } else {
+            found++;
+        }
+
+        /* Writing through a byte offset rather than eight assignments: the
+         * eight have different prototypes and a switch on the name would
+         * be the same table with more places to mistype it. */
+        memcpy((char *)st + hisi_isp_alg_table[i].offset, &fn, sizeof(fn));
+    }
+
+    if (found != HISI_ISP_ALG_LIB_NUM)
+        HAL_LOG_WARN("isp: %d of %d algorithm libraries bound -- the rest of the ISP runs and "
+                     "those features do not",
+                     found, HISI_ISP_ALG_LIB_NUM);
+    else
+        HAL_LOG_DBG("isp: all %d algorithm libraries bound", HISI_ISP_ALG_LIB_NUM);
+}
+
+static void hisi_isp_close_alg_libs(hisi_state_t *st)
+{
+    size_t i;
+
+    for (i = 0; i < HISI_ISP_ALG_LIB_NUM; i++) {
+        void *none = NULL;
+
+        /* The forwarder goes first: from here on it must decline rather
+         * than call into a mapping being dropped. */
+        memcpy((char *)st + hisi_isp_alg_table[i].offset, &none, sizeof(none));
+        if (st->isp_alg[i])
+            dlclose(st->isp_alg[i]);
+        st->isp_alg[i] = NULL;
+    }
+}
+
+static int hisi_isp_open(hisi_state_t *st)
+{
+    static const int flags = RTLD_NOW | RTLD_GLOBAL;
+    int ret;
+
+    /*
+     * The implementation first, then the facade. Order matters only for
+     * the log: opening libss_mpi_isp.so pulls nothing in by itself -- its
+     * only DT_NEEDED is libc.so -- so a missing libot_mpi_isp.so would
+     * otherwise surface as an unresolved symbol at the first ss_mpi_isp_*
+     * call rather than here.
+     */
+    if (!(st->libs.isp_impl = dlopen("libot_mpi_isp.so", flags))) {
+        HAL_LOG_ERR("hisi_isp: libot_mpi_isp.so: %s", dlerror());
+        return RSS_ERR_NOENT;
+    }
+    if (!(st->libs.isp = dlopen("libss_mpi_isp.so", flags))) {
+        HAL_LOG_ERR("hisi_isp: libss_mpi_isp.so: %s", dlerror());
+        return RSS_ERR_NOENT;
+    }
+    if (!(st->libs.ae = dlopen("libss_mpi_ae.so", flags))) {
+        HAL_LOG_ERR("hisi_isp: libss_mpi_ae.so: %s", dlerror());
+        return RSS_ERR_NOENT;
+    }
+    if (!(st->libs.awb = dlopen("libss_mpi_awb.so", flags))) {
+        HAL_LOG_ERR("hisi_isp: libss_mpi_awb.so: %s", dlerror());
+        return RSS_ERR_NOENT;
+    }
+
+    v5_libs_add_search(&st->libs, st->libs.isp);
+    v5_libs_add_search(&st->libs, st->libs.ae);
+    v5_libs_add_search(&st->libs, st->libs.awb);
+    v5_libs_add_search(&st->libs, st->libs.isp_impl);
+
+    /* After libot_mpi_isp.so and not before: the eight need it. */
+    hisi_isp_open_alg_libs(st);
+
+    if ((ret = v5_isp_load(&st->isp, &st->libs)) != RSS_OK)
+        return ret;
+
+    HAL_LOG_DBG("hisi_isp: libot_mpi_isp.so + facade + ae + awb loaded");
+    return RSS_OK;
+}
+
+/* ================================================================
+ * MIPI
+ * ================================================================ */
+
+/*
+ * The receiver is a character device, not an MPI module: /dev/ot_mipi_rx,
+ * driven entirely by ioctl. The older spelling /dev/mipi_rx is tried too,
+ * because OpenIPC's own module has shipped under both names.
+ */
+static int hisi_mipi_open(void)
+{
+    int fd = open(V5_MIPI_DEV_NAME, O_RDWR);
+
+    if (fd >= 0)
+        return fd;
+    return open(V5_MIPI_DEV_NAME_ALT, O_RDWR);
+}
+
+static int hisi_mipi_ioctl(int fd, unsigned long req, void *arg, const char *what)
+{
+    if (ioctl(fd, req, arg) < 0) {
+        HAL_LOG_ERR("mipi: %s failed: %s", what, strerror(errno));
+        return RSS_ERR_IO;
+    }
+    return RSS_OK;
+}
+
+/*
+ * hisi_mipi_configure -- the receiver, in the vendor's order.
+ *
+ * The order is SAMPLE_COMM_VI_StartMIPI's and every step of it is
+ * load-bearing. The one worth calling out is ENABLE_SENSOR_CLOCK: **until
+ * it runs the sensor has no MCLK and does not answer on I2C at all**. That
+ * is why a bench i2cdetect finds nothing on a board whose sensor is
+ * perfectly well wired, and why "the sensor is missing" is not a diagnosis
+ * that can be made before this function has run.
+ *
+ * lane_divide_mode is set through SET_HS_MODE before anything else,
+ * because it decides whether the phy is one four-lane receiver or two
+ * two-lane ones, and the device attribute that follows is interpreted
+ * under it.
+ */
+static int hisi_mipi_configure(hisi_state_t *st)
+{
+    const hisi_sensor_mode_t *m = &st->mode;
+    v5_combo_dev_attr attr;
+    unsigned int devno = HISI_VI_DEV;
+    unsigned int sns_src = 0;
+    v5_lane_divide_mode hs_mode = m->lane_divide_mode;
+    int fd;
+    int ret;
+
+    fd = hisi_mipi_open();
+    if (fd < 0) {
+        HAL_LOG_ERR("mipi: %s: %s", V5_MIPI_DEV_NAME, strerror(errno));
+        return RSS_ERR_NOENT;
+    }
+
+    memset(&attr, 0, sizeof(attr));
+    attr.devno = devno;
+    attr.input_mode = m->input_mode;
+    attr.data_rate = m->mipi_data_rate;
+
+    /* (0,0), not the mode's DevRect_x/y: this window is a crop out of what
+     * the sensor actually sends, and it sends exactly DevRect_w by
+     * DevRect_h. See hisi_sensor_mode_load. */
+    attr.img_rect.x = 0;
+    attr.img_rect.y = 0;
+    attr.img_rect.width = m->dev_rect.width;
+    attr.img_rect.height = m->dev_rect.height;
+
+    attr.mipi_attr.input_data_type = m->mipi_data_type;
+    attr.mipi_attr.wdr_mode = V5_MIPI_WDR_MODE_NONE;
+    memcpy(attr.mipi_attr.lane_id, m->lane_id, sizeof(attr.mipi_attr.lane_id));
+
+    ret = hisi_mipi_ioctl(fd, V5_MIPI_SET_HS_MODE, &hs_mode, "SET_HS_MODE");
+    if (ret)
+        goto out;
+    ret = hisi_mipi_ioctl(fd, V5_MIPI_ENABLE_MIPI_CLOCK, &devno, "ENABLE_MIPI_CLOCK");
+    if (ret)
+        goto out;
+    ret = hisi_mipi_ioctl(fd, V5_MIPI_RESET_MIPI, &devno, "RESET_MIPI");
+    if (ret)
+        goto out;
+    ret = hisi_mipi_ioctl(fd, V5_MIPI_ENABLE_SENSOR_CLOCK, &sns_src, "ENABLE_SENSOR_CLOCK");
+    if (ret)
+        goto out;
+    ret = hisi_mipi_ioctl(fd, V5_MIPI_RESET_SENSOR, &sns_src, "RESET_SENSOR");
+    if (ret)
+        goto out;
+    ret = hisi_mipi_ioctl(fd, V5_MIPI_SET_DEV_ATTR, &attr, "SET_DEV_ATTR");
+    if (ret)
+        goto out;
+    ret = hisi_mipi_ioctl(fd, V5_MIPI_UNRESET_MIPI, &devno, "UNRESET_MIPI");
+    if (ret)
+        goto out;
+    ret = hisi_mipi_ioctl(fd, V5_MIPI_UNRESET_SENSOR, &sns_src, "UNRESET_SENSOR");
+    if (ret)
+        goto out;
+
+    st->mipi_configured = true;
+    HAL_LOG_INFO("mipi: dev %u, RAW%d, %ux%u, lanes %d|%d|%d|%d, divide %d", devno, m->raw_bitness,
+                 m->dev_rect.width, m->dev_rect.height, m->lane_id[0], m->lane_id[1], m->lane_id[2],
+                 m->lane_id[3], (int)m->lane_divide_mode);
+
+out:
+    close(fd);
+    return ret;
+}
+
+/* Reverse of the above: reset the sensor, stop its clock, reset the
+ * receiver, stop its clock. Failures are logged and never propagated --
+ * this runs during teardown, where stopping halfway is worse than any
+ * individual failure. */
+static void hisi_mipi_shutdown(hisi_state_t *st)
+{
+    unsigned int devno = HISI_VI_DEV;
+    unsigned int sns_src = 0;
+    int fd;
+
+    if (!st->mipi_configured)
+        return;
+
+    fd = hisi_mipi_open();
+    if (fd < 0) {
+        HAL_LOG_WARN("mipi: %s on shutdown: %s", V5_MIPI_DEV_NAME, strerror(errno));
+        st->mipi_configured = false;
+        return;
+    }
+
+    hisi_mipi_ioctl(fd, V5_MIPI_RESET_SENSOR, &sns_src, "RESET_SENSOR");
+    hisi_mipi_ioctl(fd, V5_MIPI_DISABLE_SENSOR_CLOCK, &sns_src, "DISABLE_SENSOR_CLOCK");
+    hisi_mipi_ioctl(fd, V5_MIPI_RESET_MIPI, &devno, "RESET_MIPI");
+    hisi_mipi_ioctl(fd, V5_MIPI_DISABLE_MIPI_CLOCK, &devno, "DISABLE_MIPI_CLOCK");
+
+    close(fd);
+    st->mipi_configured = false;
+}
+
+/* ================================================================
+ * SENSOR
+ * ================================================================ */
+
+/*
+ * hisi_sensor_bringup -- open the driver and hand it to the ISP.
+ *
+ * The order is the vendor's and it is not interchangeable:
+ * pfn_set_bus_info before pfn_register_callback, because the library talks
+ * I2C during registration and a library that does not yet know its bus
+ * writes to adapter 0.
+ *
+ * Note what is *not* called. pfn_mirror_flip is null on every sensor
+ * library that ships with this image -- checked by resolving the objects'
+ * relocations, see v5_snr.h -- so orientation is the VPSS channels', which
+ * is where raptor wants it anyway. pfn_set_fast_ae is not called either,
+ * and there the reason is sharper: three of the nine libraries export a
+ * 44-byte object with no such member, and calling it would read four bytes
+ * past the end of the mapping.
+ */
+static int hisi_sensor_bringup(hisi_state_t *st, const rss_sensor_config_t *cfg)
+{
+    hisi_sensor_mode_t *m = &st->mode;
+    v5_isp_sns_commbus bus;
+    char path[288];
+    int i2c;
+    int ret;
+
+    if (m->dll_file[0] == '/')
+        snprintf(path, sizeof(path), "%s", m->dll_file);
+    else
+        snprintf(path, sizeof(path), "%s/%s", V5_SNS_LIB_DIR, m->dll_file);
+
+    st->snr_handle = dlopen(path, RTLD_NOW | RTLD_GLOBAL);
+    if (!st->snr_handle) {
+        /* Bare name too: a library already in the loader's search path
+         * opens under it, and a board that keeps its sensors elsewhere is
+         * then not a board this backend refuses. */
+        st->snr_handle = dlopen(m->dll_file, RTLD_NOW | RTLD_GLOBAL);
+    }
+    if (!st->snr_handle) {
+        HAL_LOG_ERR("sensor: %s: %s", path, dlerror());
+        return RSS_ERR_NOENT;
+    }
+
+    if (!(st->snr_obj = hisi_sensor_obj_find(m, st->snr_handle)))
+        return RSS_ERR_NOTSUP;
+
+    if (!st->snr_obj->pfn_set_bus_info || !st->snr_obj->pfn_register_callback) {
+        HAL_LOG_ERR("sensor: %s's object has no %s", m->obj_name,
+                    st->snr_obj->pfn_set_bus_info ? "pfn_register_callback" : "pfn_set_bus_info");
+        return RSS_ERR_NOTSUP;
+    }
+
+    /*
+     * The I2C adapter, passed **by value** in one byte -- a struct that
+     * small goes in a register, so the type has to be exactly right or the
+     * calling convention changes rather than the contents.
+     *
+     * raptor's config wins over the mode file, because the bus is a
+     * property of the board and the config is the board's file.
+     */
+    i2c = (cfg && cfg->i2c_adapter >= 0) ? cfg->i2c_adapter : m->i2c_dev;
+    memset(&bus, 0, sizeof(bus));
+    bus.i2c_dev = (signed char)i2c;
+    ret = st->snr_obj->pfn_set_bus_info(HISI_VI_PIPE, bus);
+    if (ret) {
+        HAL_LOG_ERR("sensor: pfn_set_bus_info(pipe %d, i2c %d) failed: 0x%x", HISI_VI_PIPE, i2c,
+                    ret);
+        return RSS_ERR_IO;
+    }
+
+    /*
+     * The 3A descriptors, and **the caller fills in the names**.
+     *
+     * This is the one place a gen4 habit is actively wrong. On gen4 the
+     * sensor library filled the pair in and the caller passed them on; on
+     * V5 the library *validates* them -- cis_register_callback calls
+     * ae_check_lib_name, which compares against what the AE library
+     * registered under -- and an empty name fails with 0xa01c8007 and
+     * "Illegal lib name !" on stderr.
+     *
+     * The names are the vendor's constants: OT_AE_LIB_NAME
+     * (ot_common_ae.h:18) and OT_AWB_LIB_NAME (ot_common_awb.h:18), and
+     * both appear verbatim in the shipped libss_mpi_ae.so and
+     * libss_mpi_awb.so, which is the check that matters -- the header is
+     * a claim and the string table is the fact.
+     *
+     * id is the VI pipe, which is also the ISP index.
+     */
+    memset(&st->ae_lib, 0, sizeof(st->ae_lib));
+    memset(&st->awb_lib, 0, sizeof(st->awb_lib));
+    st->ae_lib.id = HISI_VI_PIPE;
+    st->awb_lib.id = HISI_VI_PIPE;
+    snprintf(st->ae_lib.lib_name, sizeof(st->ae_lib.lib_name), "%s", V5_AE_LIB_NAME);
+    snprintf(st->awb_lib.lib_name, sizeof(st->awb_lib.lib_name), "%s", V5_AWB_LIB_NAME);
+
+    ret = st->snr_obj->pfn_register_callback(HISI_VI_PIPE, &st->ae_lib, &st->awb_lib);
+    if (ret) {
+        HAL_LOG_ERR("sensor: pfn_register_callback(pipe %d) failed: 0x%x", HISI_VI_PIPE, ret);
+        return RSS_ERR_IO;
+    }
+    st->sensor_registered = true;
+
+    ret = st->isp.fnAeRegister(HISI_VI_PIPE, &st->ae_lib);
+    if (ret) {
+        HAL_LOG_ERR("ss_mpi_ae_register(pipe %d, \"%s\") failed: 0x%x -- the ISP registers "
+                    "algorithms by name, so a mismatch here is a naming mismatch",
+                    HISI_VI_PIPE, st->ae_lib.lib_name, ret);
+        return RSS_ERR_IO;
+    }
+    st->ae_registered = true;
+
+    ret = st->isp.fnAwbRegister(HISI_VI_PIPE, &st->awb_lib);
+    if (ret) {
+        HAL_LOG_ERR("ss_mpi_awb_register(pipe %d, \"%s\") failed: 0x%x", HISI_VI_PIPE,
+                    st->awb_lib.lib_name, ret);
+        return RSS_ERR_IO;
+    }
+    st->awb_registered = true;
+
+    HAL_LOG_INFO("sensor: %s registered on i2c %d, ae \"%s\", awb \"%s\"", m->obj_name, i2c,
+                 st->ae_lib.lib_name, st->awb_lib.lib_name);
+    return RSS_OK;
+}
+
+static void hisi_sensor_teardown(hisi_state_t *st)
+{
+    if (st->awb_registered && st->isp.fnAwbUnRegister)
+        st->isp.fnAwbUnRegister(HISI_VI_PIPE, &st->awb_lib);
+    st->awb_registered = false;
+
+    if (st->ae_registered && st->isp.fnAeUnRegister)
+        st->isp.fnAeUnRegister(HISI_VI_PIPE, &st->ae_lib);
+    st->ae_registered = false;
+
+    if (st->sensor_registered && st->snr_obj && st->snr_obj->pfn_un_register_callback)
+        st->snr_obj->pfn_un_register_callback(HISI_VI_PIPE, &st->ae_lib, &st->awb_lib);
+    st->sensor_registered = false;
+
+    /* The object points into the mapping, so it dies with the handle. */
+    st->snr_obj = NULL;
+    if (st->snr_handle)
+        dlclose(st->snr_handle);
+    st->snr_handle = NULL;
+}
+
+/* ================================================================
+ * ISP
+ * ================================================================ */
+
+/*
+ * The 3A loop. ss_mpi_isp_run does not return while the ISP is up, so it
+ * gets a thread of its own, and teardown stops it by calling
+ * ss_mpi_isp_exit -- which is what makes run return -- rather than by
+ * cancelling it. A thread cancelled inside the vendor library leaves its
+ * locks held, and the next ss_mpi_isp_init in the same process then blocks
+ * forever.
+ */
+static void *hisi_isp_thread(void *arg)
+{
+    hisi_state_t *st = (hisi_state_t *)arg;
+    int ret;
+
+    ret = st->isp.fnRun(HISI_VI_PIPE);
+
+    if (__atomic_load_n(&st->isp_thread_running, __ATOMIC_ACQUIRE))
+        HAL_LOG_ERR("ss_mpi_isp_run(pipe %d) returned 0x%x -- the ISP has stopped", HISI_VI_PIPE,
+                    ret);
+
+    __atomic_store_n(&st->isp_thread_done, 1, __ATOMIC_RELEASE);
+    return NULL;
+}
+
+/*
+ * Join the 3A thread, but not forever.
+ *
+ * ss_mpi_isp_exit is what makes ss_mpi_isp_run return, so the thread should
+ * be gone within a frame or two. A plain pthread_join would be correct
+ * whenever that holds -- and would hang rvd's shutdown permanently on any
+ * board or library build where it does not, a failure mode raptor has
+ * already paid for on another vendor. Cancelling is not the alternative:
+ * it trades a hang at shutdown for a hang at the next start.
+ */
+#define HISI_ISP_JOIN_TIMEOUT_MS 2000
+#define HISI_ISP_JOIN_POLL_MS 10
+
+static bool hisi_isp_thread_stop(hisi_state_t *st)
+{
+    int waited;
+
+    for (waited = 0; waited < HISI_ISP_JOIN_TIMEOUT_MS; waited += HISI_ISP_JOIN_POLL_MS) {
+        struct timeval tv;
+
+        if (__atomic_load_n(&st->isp_thread_done, __ATOMIC_ACQUIRE)) {
+            pthread_join(st->isp_thread, NULL);
+            return true;
+        }
+
+        /* select with no descriptors is the sleep this file can reach:
+         * nanosleep and usleep are both behind POSIX feature macros under
+         * -std=c11. */
+        tv.tv_sec = 0;
+        tv.tv_usec = HISI_ISP_JOIN_POLL_MS * 1000;
+        select(0, NULL, NULL, NULL, &tv);
+    }
+
+    HAL_LOG_ERR("isp: ss_mpi_isp_run did not return %d ms after ss_mpi_isp_exit; detaching the "
+                "3A thread rather than blocking shutdown",
+                HISI_ISP_JOIN_TIMEOUT_MS);
+    pthread_detach(st->isp_thread);
+    return false;
+}
+
+static int hisi_isp_bringup(hisi_state_t *st)
+{
+    const hisi_sensor_mode_t *m = &st->mode;
+    v5_isp_pub_attr pub;
+    int ret;
+
+    ret = st->isp.fnMemInit(HISI_VI_PIPE);
+    if (ret) {
+        HAL_LOG_ERR("ss_mpi_isp_mem_init(pipe %d) failed: 0x%x", HISI_VI_PIPE, ret);
+        return RSS_ERR_IO;
+    }
+
+    memset(&pub, 0, sizeof(pub));
+    pub.wnd_rect.x = 0;
+    pub.wnd_rect.y = 0;
+    pub.wnd_rect.width = m->dev_rect.width;
+    pub.wnd_rect.height = m->dev_rect.height;
+    pub.sns_size.width = m->dev_rect.width;
+    pub.sns_size.height = m->dev_rect.height;
+    pub.frame_rate = m->frame_rate;
+    pub.bayer_format = m->bayer;
+    pub.wdr_mode = V5_WDR_MODE_NONE;
+    pub.sns_mode = m->sns_mode;
+    /* Orientation is the VPSS channels'; turning the picture at the sensor
+     * as well would turn it back. */
+    pub.sns_flip_en = 0;
+    pub.sns_mirror_en = 0;
+
+    ret = st->isp.fnSetPubAttr(HISI_VI_PIPE, &pub);
+    if (ret) {
+        HAL_LOG_ERR("ss_mpi_isp_set_pub_attr(pipe %d) failed: 0x%x", HISI_VI_PIPE, ret);
+        return RSS_ERR_IO;
+    }
+
+    ret = st->isp.fnInit(HISI_VI_PIPE);
+    if (ret) {
+        HAL_LOG_ERR("ss_mpi_isp_init(pipe %d) failed: 0x%x", HISI_VI_PIPE, ret);
+        return RSS_ERR_IO;
+    }
+    st->isp_inited = true;
+
+    /* The flag goes up before the thread starts, so the thread's own exit
+     * path can never observe it unset while the ISP is genuinely running. */
+    __atomic_store_n(&st->isp_thread_running, 1, __ATOMIC_RELEASE);
+    __atomic_store_n(&st->isp_thread_done, 0, __ATOMIC_RELEASE);
+    ret = pthread_create(&st->isp_thread, NULL, hisi_isp_thread, st);
+    if (ret) {
+        __atomic_store_n(&st->isp_thread_running, 0, __ATOMIC_RELEASE);
+        HAL_LOG_ERR("isp: cannot start the 3A thread: %s", strerror(ret));
+        return RSS_ERR_IO;
+    }
+    st->isp_thread_started = true;
+
+    HAL_LOG_INFO("isp: pipe %d running, %ux%u @ %.2f fps, bayer %d", HISI_VI_PIPE,
+                 m->dev_rect.width, m->dev_rect.height, (double)m->frame_rate, (int)m->bayer);
+    return RSS_OK;
+}
+
+static void hisi_isp_teardown(hisi_state_t *st)
+{
+    if (st->isp_thread_started)
+        __atomic_store_n(&st->isp_thread_running, 0, __ATOMIC_RELEASE);
+
+    /*
+     * Unconditional, not gated on isp_inited: ss_mpi_isp_mem_init has
+     * already taken the virtual registers by the time init can fail, and
+     * only exit gives them back. Exiting an ISP that was never inited
+     * returns an error and does nothing, which is the cheap half of the
+     * trade.
+     */
+    if (st->isp.fnExit)
+        st->isp.fnExit(HISI_VI_PIPE);
+    st->isp_inited = false;
+
+    if (st->isp_thread_started)
+        hisi_isp_thread_stop(st);
+    st->isp_thread_started = false;
+}
+
+/* ================================================================
+ * VI -- DEVICE, PIPE, CHANNEL
+ * ================================================================ */
+
+/*
+ * hisi_vi_vpss_mode -- read-modify-write the VI/VPSS coupling.
+ *
+ * Must run before ss_mpi_sys_init: the coupling is fixed when the system
+ * starts and setting it afterwards is accepted and ignored. That is why
+ * this is called from hal_init rather than from the VI bring-up, and it is
+ * how the vendor sequences it too.
+ *
+ * VI_OFFLINE_VPSS_OFFLINE: the VI pipe writes raw to DDR, the VI channel
+ * writes YUV to a VB block, and VPSS reads them over an explicit bind. The
+ * offline/offline pair is chosen for gen4's reasons -- an online VPSS is
+ * fed in hardware, which makes the software bind wrong and the channel
+ * enable a no-op -- and asking for it explicitly matters because the board
+ * does not necessarily boot in it.
+ *
+ * Read-modify-write rather than build-and-set, following the vendor: the
+ * array has an entry per pipe and writing a fresh one would reset the mode
+ * of a pipe this backend does not drive. **V5's array is four wide, not
+ * gen4's two**: two physical pipes plus two virtual ones.
+ *
+ * Failure is a warning, not an error. The driver has a default, and
+ * refusing to start a pipeline because the mode could not be confirmed
+ * would trade a working camera for a tidier log.
+ */
+static void hisi_vi_vpss_mode(hisi_state_t *st)
+{
+    v5_vi_vpss_mode mode;
+    int ret;
+
+    if (!st->sys.fnGetViVpssMode || !st->sys.fnSetViVpssMode) {
+        HAL_LOG_DBG("vi: no ss_mpi_sys_get/set_vi_vpss_mode; leaving the coupling alone");
+        return;
+    }
+
+    memset(&mode, 0, sizeof(mode));
+    if ((ret = st->sys.fnGetViVpssMode(&mode)) != 0) {
+        HAL_LOG_WARN("ss_mpi_sys_get_vi_vpss_mode failed: 0x%x", ret);
+        return;
+    }
+
+    HAL_LOG_DBG("vi: coupling on entry %d|%d|%d|%d", (int)mode.mode[0], (int)mode.mode[1],
+                (int)mode.mode[2], (int)mode.mode[3]);
+
+    if (mode.mode[HISI_VI_PIPE] == V5_VI_OFFLINE_VPSS_OFFLINE) {
+        st->vi_vpss_mode = mode;
+        return;
+    }
+
+    mode.mode[HISI_VI_PIPE] = V5_VI_OFFLINE_VPSS_OFFLINE;
+
+    if ((ret = st->sys.fnSetViVpssMode(&mode)) != 0) {
+        HAL_LOG_WARN("ss_mpi_sys_set_vi_vpss_mode(pipe %d = offline/offline) failed: 0x%x -- "
+                     "continuing on the board's default coupling",
+                     HISI_VI_PIPE, ret);
+        return;
+    }
+
+    /* Read back rather than assume: the driver may clamp, and the value in
+     * force is what decides whether VI -> VPSS is a software bind at all. */
+    if (st->sys.fnGetViVpssMode(&mode) == 0)
+        st->vi_vpss_mode = mode;
+
+    HAL_LOG_DBG("vi: pipe %d coupling %d (0 = offline/offline)", HISI_VI_PIPE,
+                (int)st->vi_vpss_mode.mode[HISI_VI_PIPE]);
+}
+
+/*
+ * hisi_vi_bringup -- device, then bind, then pipe, then channel.
+ *
+ * **The bind is new against gen4 and it is the whole trap.** gen4 had
+ * VI_PIPE == VI_DEV by construction; V5 requires ss_mpi_vi_bind(dev, pipe)
+ * between enable_dev and create_pipe. Omit it and create_pipe succeeds, the
+ * pipe never receives a frame, and /proc/umap/vi shows an empty "vi bind
+ * attr" table with no error anywhere.
+ */
+static int hisi_vi_bringup(hisi_state_t *st)
+{
+    const hisi_sensor_mode_t *m = &st->mode;
+    v5_vi_dev_attr dev;
+    v5_vi_pipe_attr pipe;
+    v5_vi_chn_attr chn;
+    int ret;
+
+    memset(&dev, 0, sizeof(dev));
+    dev.intf_mode = m->intf_mode;
+    dev.work_mode = m->work_mode;
+    dev.component_mask[0] = m->component_mask[0];
+    dev.component_mask[1] = m->component_mask[1];
+    dev.scan_mode = m->scan_mode;
+    /* -1 on every entry: ad_chn_id names an analogue decoder channel and
+     * there is none. memset would leave 0, which is a real channel. */
+    dev.ad_chn_id[0] = -1;
+    dev.ad_chn_id[1] = -1;
+    dev.ad_chn_id[2] = -1;
+    dev.ad_chn_id[3] = -1;
+    dev.data_seq = m->data_seq;
+    dev.sync_cfg = m->sync_cfg;
+    dev.data_type = m->data_type;
+    dev.data_reverse = m->data_reverse;
+    dev.in_size.width = m->dev_rect.width;
+    dev.in_size.height = m->dev_rect.height;
+    dev.data_rate = m->data_rate;
+
+    ret = st->vi.fnSetDevAttr(HISI_VI_DEV, &dev);
+    if (ret) {
+        HAL_LOG_ERR("ss_mpi_vi_set_dev_attr(dev %d) failed: 0x%x", HISI_VI_DEV, ret);
+        return RSS_ERR_IO;
+    }
+
+    ret = st->vi.fnEnableDev(HISI_VI_DEV);
+    if (ret) {
+        HAL_LOG_ERR("ss_mpi_vi_enable_dev(dev %d) failed: 0x%x", HISI_VI_DEV, ret);
+        return RSS_ERR_IO;
+    }
+    st->vi_dev_enabled = true;
+
+    ret = st->vi.fnBind(HISI_VI_DEV, HISI_VI_PIPE);
+    if (ret) {
+        HAL_LOG_ERR("ss_mpi_vi_bind(dev %d, pipe %d) failed: 0x%x", HISI_VI_DEV, HISI_VI_PIPE, ret);
+        return RSS_ERR_IO;
+    }
+    st->vi_bound = true;
+
+    /*
+     * The pipe. isp_bypass false and bypass_mode NONE: the ISP is the
+     * point of the pipe, and the bypass modes exist for a YUV sensor that
+     * needs none of it.
+     *
+     * pixel_format is the *pipe's* output to DDR, which in an offline
+     * pipeline is the raw the ISP will read back, so it follows the
+     * sensor's bit depth rather than the YUV the channel produces.
+     */
+    memset(&pipe, 0, sizeof(pipe));
+    pipe.pipe_bypass_mode = V5_VI_PIPE_BYPASS_NONE;
+    pipe.isp_bypass = 0;
+    pipe.size.width = m->dev_rect.width;
+    pipe.size.height = m->dev_rect.height;
+    pipe.pixel_format = m->pixel_format;
+    pipe.compress_mode = V5_COMPRESS_MODE_NONE;
+    pipe.frame_rate_ctrl.src_frame_rate = -1;
+    pipe.frame_rate_ctrl.dst_frame_rate = -1;
+
+    ret = st->vi.fnCreatePipe(HISI_VI_PIPE, &pipe);
+    if (ret) {
+        HAL_LOG_ERR("ss_mpi_vi_create_pipe(pipe %d) failed: 0x%x", HISI_VI_PIPE, ret);
+        return RSS_ERR_IO;
+    }
+    st->vi_pipe_created = true;
+
+    ret = st->vi.fnStartPipe(HISI_VI_PIPE);
+    if (ret) {
+        HAL_LOG_ERR("ss_mpi_vi_start_pipe(pipe %d) failed: 0x%x", HISI_VI_PIPE, ret);
+        return RSS_ERR_IO;
+    }
+    st->vi_pipe_started = true;
+
+    /*
+     * The channel, which is where YUV comes out.
+     *
+     * YVU_SEMIPLANAR_420 is NV21 -- V plane first -- and is what VPSS and
+     * VENC expect throughout this backend. The neighbouring
+     * YUV_SEMIPLANAR_420 (NV12) differs only in chroma order, so choosing
+     * wrong costs swapped colours rather than an error.
+     *
+     * depth 0: nothing reads frames off the VI channel by hand. Every
+     * nonzero value costs that many frames of VB for a queue no consumer
+     * drains.
+     */
+    memset(&chn, 0, sizeof(chn));
+    chn.size.width = m->dev_rect.width;
+    chn.size.height = m->dev_rect.height;
+    chn.pixel_format = V5_PIXEL_FORMAT_YVU_SEMIPLANAR_420;
+    chn.dynamic_range = V5_DYNAMIC_RANGE_SDR8;
+    chn.video_format = V5_VIDEO_FORMAT_LINEAR;
+    chn.compress_mode = V5_COMPRESS_MODE_NONE;
+    chn.mirror_en = 0;
+    chn.flip_en = 0;
+    chn.depth = 0;
+    chn.frame_rate_ctrl.src_frame_rate = -1;
+    chn.frame_rate_ctrl.dst_frame_rate = -1;
+
+    ret = st->vi.fnSetChnAttr(HISI_VI_PIPE, HISI_VI_CHN, &chn);
+    if (ret) {
+        HAL_LOG_ERR("ss_mpi_vi_set_chn_attr(pipe %d, chn %d) failed: 0x%x", HISI_VI_PIPE,
+                    HISI_VI_CHN, ret);
+        return RSS_ERR_IO;
+    }
+
+    ret = st->vi.fnEnableChn(HISI_VI_PIPE, HISI_VI_CHN);
+    if (ret) {
+        HAL_LOG_ERR("ss_mpi_vi_enable_chn(pipe %d, chn %d) failed: 0x%x", HISI_VI_PIPE, HISI_VI_CHN,
+                    ret);
+        return RSS_ERR_IO;
+    }
+    st->vi_chn_enabled = true;
+
+    HAL_LOG_INFO("vi: dev %d -> pipe %d -> chn %d, %ux%u", HISI_VI_DEV, HISI_VI_PIPE, HISI_VI_CHN,
+                 m->dev_rect.width, m->dev_rect.height);
+    return RSS_OK;
+}
+
+static void hisi_vi_teardown(hisi_state_t *st)
+{
+    if (st->vi_chn_enabled)
+        st->vi.fnDisableChn(HISI_VI_PIPE, HISI_VI_CHN);
+    st->vi_chn_enabled = false;
+
+    if (st->vi_pipe_started)
+        st->vi.fnStopPipe(HISI_VI_PIPE);
+    st->vi_pipe_started = false;
+
+    if (st->vi_pipe_created)
+        st->vi.fnDestroyPipe(HISI_VI_PIPE);
+    st->vi_pipe_created = false;
+
+    if (st->vi_bound)
+        st->vi.fnUnbind(HISI_VI_DEV, HISI_VI_PIPE);
+    st->vi_bound = false;
+
+    if (st->vi_dev_enabled)
+        st->vi.fnDisableDev(HISI_VI_DEV);
+    st->vi_dev_enabled = false;
+}
+
+/* ================================================================
+ * VPSS
+ * ================================================================ */
+
+/*
+ * hisi_vpss_bringup -- the group, and the bind that feeds it.
+ *
+ * One group per sensor. Its channels are created by the framesource ops as
+ * rvd asks for streams; the group itself is a property of the pipeline.
+ *
+ * max_width/max_height are the group's *allocation*, so they are the
+ * sensor's full output whatever the streams turn out to be: a channel
+ * cannot ask for more than the group was built for, and growing the group
+ * later means destroying it, which drops the bind with it.
+ */
+static int hisi_vpss_bringup(hisi_state_t *st)
+{
+    const hisi_sensor_mode_t *m = &st->mode;
+    v5_vpss_grp_attr grp;
+    v5_mpp_chn src;
+    v5_mpp_chn dst;
+    int ret;
+
+    memset(&grp, 0, sizeof(grp));
+    grp.max_width = m->dev_rect.width;
+    grp.max_height = m->dev_rect.height;
+    grp.pixel_format = V5_PIXEL_FORMAT_YVU_SEMIPLANAR_420;
+    grp.dynamic_range = V5_DYNAMIC_RANGE_SDR8;
+    grp.dei_mode = V5_VPSS_DEI_MODE_OFF;
+    /*
+     * 0, not V5_VPSS_CHN_INVALID. buf_share_en is off, so the field is
+     * inert -- but the driver range-checks it anyway and create_grp
+     * returns OT_ERR_VPSS_ILLEGAL_PARAM (0xa0078007) for -1. Measured on
+     * the bench; there is nothing in the header that says so.
+     */
+    grp.buf_share_chn = 0;
+    grp.frame_rate.src_frame_rate = -1;
+    grp.frame_rate.dst_frame_rate = -1;
+
+    ret = st->vpss.fnCreateGrp(HISI_VPSS_GRP, &grp);
+    if (ret) {
+        HAL_LOG_ERR("ss_mpi_vpss_create_grp(grp %d) failed: 0x%x", HISI_VPSS_GRP, ret);
+        return RSS_ERR_IO;
+    }
+    st->vpss_grp_created = true;
+
+    ret = st->vpss.fnStartGrp(HISI_VPSS_GRP);
+    if (ret) {
+        HAL_LOG_ERR("ss_mpi_vpss_start_grp(grp %d) failed: 0x%x", HISI_VPSS_GRP, ret);
+        return RSS_ERR_IO;
+    }
+    st->vpss_grp_started = true;
+
+    /*
+     * VI channel -> VPSS group. A software bind, and correct only because
+     * the coupling was set to VPSS-offline before ss_mpi_sys_init; with
+     * VPSS online the group is fed in hardware and this call is wrong.
+     *
+     * The destination channel is 0 by convention -- a group has one input
+     * -- which is also the reason gen4 cannot use physical channel 0 as an
+     * output. Whether that holds here is plan risk R4 and the framesource
+     * is what answers it.
+     */
+    memset(&src, 0, sizeof(src));
+    memset(&dst, 0, sizeof(dst));
+    src.mod_id = V5_MOD_VI;
+    src.dev_id = HISI_VI_PIPE;
+    src.chn_id = HISI_VI_CHN;
+    dst.mod_id = V5_MOD_VPSS;
+    dst.dev_id = HISI_VPSS_GRP;
+    dst.chn_id = 0;
+
+    if (!st->sys.fnBind) {
+        HAL_LOG_ERR("vpss: no ss_mpi_sys_bind; VI cannot be connected to VPSS");
+        return RSS_ERR_NOTSUP;
+    }
+
+    ret = st->sys.fnBind(&src, &dst);
+    if (ret) {
+        HAL_LOG_ERR("ss_mpi_sys_bind(VI %d/%d -> VPSS %d/0) failed: 0x%x", HISI_VI_PIPE,
+                    HISI_VI_CHN, HISI_VPSS_GRP, ret);
+        return RSS_ERR_IO;
+    }
+    st->vi_vpss_bound = true;
+
+    HAL_LOG_INFO("vpss: grp %d up, %ux%u, fed from VI %d/%d", HISI_VPSS_GRP, grp.max_width,
+                 grp.max_height, HISI_VI_PIPE, HISI_VI_CHN);
+    return RSS_OK;
+}
+
+static void hisi_vpss_teardown(hisi_state_t *st)
+{
+    v5_mpp_chn src;
+    v5_mpp_chn dst;
+
+    if (st->vi_vpss_bound && st->sys.fnUnbind) {
+        memset(&src, 0, sizeof(src));
+        memset(&dst, 0, sizeof(dst));
+        src.mod_id = V5_MOD_VI;
+        src.dev_id = HISI_VI_PIPE;
+        src.chn_id = HISI_VI_CHN;
+        dst.mod_id = V5_MOD_VPSS;
+        dst.dev_id = HISI_VPSS_GRP;
+        dst.chn_id = 0;
+        st->sys.fnUnbind(&src, &dst);
+    }
+    st->vi_vpss_bound = false;
+
+    if (st->vpss_grp_started)
+        st->vpss.fnStopGrp(HISI_VPSS_GRP);
+    st->vpss_grp_started = false;
+
+    if (st->vpss_grp_created)
+        st->vpss.fnDestroyGrp(HISI_VPSS_GRP);
+    st->vpss_grp_created = false;
+}
+
+/* ================================================================
+ * THE PIPELINE
+ * ================================================================ */
+
+/*
+ * hisi_video_bringup -- MIPI, VI, sensor, ISP, VPSS, in that order.
+ *
+ * The order is sample_comm_vi_start_vi's and the three constraints inside
+ * it are:
+ *
+ *   - MIPI before everything, because ENABLE_SENSOR_CLOCK is what gives
+ *     the sensor an MCLK. Before it, every I2C write NAKs.
+ *
+ *   - **VI before the ISP, which is the reverse of gen4.** gen4 brought
+ *     the ISP up first and attached the pipe to it; V5's
+ *     ss_mpi_isp_mem_init reads the pipe's distribute-group attribute out
+ *     of VI, so with no pipe it fails with a bare -1 (TD_FAILURE, not an
+ *     MPP error word) after printing
+ *
+ *       [Func]:isp_get_wdr_dist_attr [Line]:372 [Info]:ISP[0] get WDR attr failed
+ *
+ *     -- measured on the bench. The message names WDR, which a linear
+ *     pipeline has nothing to do with, and that is why it is worth
+ *     writing down: the missing thing is the pipe, not a WDR setting.
+ *
+ *   - The sensor's 3A registration before ss_mpi_isp_mem_init, because
+ *     mem_init allocates against the geometry it learns through those
+ *     callbacks. Registering afterwards gives an ISP that comes up and
+ *     produces a green frame.
+ *
+ * Partial failure unwinds through hisi_video_teardown, which is flag-driven
+ * and safe to call at any point.
+ */
+static int hisi_video_bringup(hisi_state_t *st, const rss_sensor_config_t *cfg)
+{
+    int ret;
+
+    if ((ret = hisi_mipi_configure(st)) != RSS_OK)
+        return ret;
+
+    /*
+     * Teardown-first, for the ISP as for SYS and VB, and **before the
+     * sensor registration rather than at the top of hisi_isp_bringup**.
+     *
+     * The ISP's virtual registers are not process memory:
+     * ss_mpi_isp_mem_init asks the kernel for them out of MMZ, and only
+     * ss_mpi_isp_exit gives them back. A previous consumer that was killed
+     * rather than closed -- on a camera the normal case, not the
+     * exceptional one -- leaves them allocated *and leaves its sensor
+     * registered*. Exiting after registering ours then runs the stale
+     * sensor's cmos_isp_exit over our registration, and mem_init fails
+     * with a bare -1 while the vendor prints the *other* sensor's name:
+     *
+     *   [Func]:cmos_isp_exit [Line]:886 [Info]:SC500AI exit failed!
+     *   ss_mpi_isp_mem_init(pipe 0) failed: 0xffffffff
+     *
+     * -- measured on the bench with an os04d10 in the socket. Exiting
+     * first makes that message the stale registration's own epitaph.
+     *
+     * The result is ignored on purpose, as with sys_exit and vb_exit: on a
+     * clean boot there is nothing to exit and the call fails.
+     */
+    if (st->isp.fnExit)
+        st->isp.fnExit(HISI_VI_PIPE);
+
+    if ((ret = hisi_vi_bringup(st)) != RSS_OK)
+        return ret;
+    if ((ret = hisi_sensor_bringup(st, cfg)) != RSS_OK)
+        return ret;
+    if ((ret = hisi_isp_bringup(st)) != RSS_OK)
+        return ret;
+    if ((ret = hisi_vpss_bringup(st)) != RSS_OK)
+        return ret;
+
+    return RSS_OK;
+}
+
+static void hisi_video_teardown(hisi_state_t *st)
+{
+    hisi_vpss_teardown(st);
+    hisi_isp_teardown(st);
+    hisi_sensor_teardown(st);
+    hisi_vi_teardown(st);
+    hisi_mipi_shutdown(st);
+}
+
+#endif /* HAL_MODULE_VIDEO */
+
+/* ================================================================
+ * VB
+ * ================================================================ */
+
+/*
+ * hisi_vb_fill_cfg -- the common pool configuration.
+ *
+ * Two pools, and the split is the usual one: everything in this pipeline
+ * carries an NV12 frame, and VB hands a request the smallest pool whose
+ * blocks are big enough, so a pool per size class is what stops a 640x360
+ * sub-stream frame from consuming a full-sensor block.
+ *
+ *   pool 0   one full sensor frame. Feeds the VI channel and, through the
+ *            bind, the VPSS group's input -- and any VPSS channel asking
+ *            for close to the sensor's size, which the main stream is.
+ *   pool 1   a quarter of that in each dimension, so a sixteenth of the
+ *            area. Everything smaller lands here.
+ *
+ * THE BLOCK COUNTS ARE PROVISIONAL AND SAY SO. They are sized to fit the
+ * CV608 bench board's 32 MB MMZ with room for the encoder's own stream
+ * buffers, which do not come out of VB -- 4 full frames and 8 quarter ones
+ * is 22 MB of a 32 MB zone at 2304x1296. That is an arithmetic guess, not
+ * a measurement: Phase 7 reads /proc/umap/media-mem against a running
+ * pipeline and replaces it. Undersized here does not fail at init -- it
+ * fails as a VPSS channel that never delivers a frame, which is why the
+ * numbers are logged.
+ *
+ * The audio archive compiles this file too and has no sensor mode, so the
+ * whole thing is video-only and hal_init falls back to no pools.
+ */
+#ifdef HAL_MODULE_VIDEO
+
+#define HISI_VB_FULL_BLK_CNT 4u
+#define HISI_VB_SMALL_BLK_CNT 8u
+#define HISI_VB_SMALL_DIVISOR 4u
+
+static void hisi_vb_fill_cfg(const hisi_state_t *st, v5_vb_cfg *cfg)
+{
+    const hisi_sensor_mode_t *m = &st->mode;
+    unsigned int sw = m->dev_rect.width / HISI_VB_SMALL_DIVISOR;
+    unsigned int sh = m->dev_rect.height / HISI_VB_SMALL_DIVISOR;
+    unsigned long long full = hisi_vb_nv12_size(m->dev_rect.width, m->dev_rect.height);
+    unsigned long long small = hisi_vb_nv12_size(sw ? sw : 1u, sh ? sh : 1u);
+
+    memset(cfg, 0, sizeof(*cfg));
+    cfg->max_pool_cnt = 2;
+
+    cfg->common_pool[0].blk_size = full;
+    cfg->common_pool[0].blk_cnt = HISI_VB_FULL_BLK_CNT;
+    cfg->common_pool[0].remap_mode = V5_VB_REMAP_NONE;
+
+    cfg->common_pool[1].blk_size = small;
+    cfg->common_pool[1].blk_cnt = HISI_VB_SMALL_BLK_CNT;
+    cfg->common_pool[1].remap_mode = V5_VB_REMAP_NONE;
+
+    /*
+     * REMAP_NONE on both: nothing in the streaming path reads a VB block
+     * from userspace -- VPSS feeds VENC over a bind and VENC's output is a
+     * stream buffer, not a VB block. A mapping nobody uses costs address
+     * space and cache-maintenance bookkeeping. The snapshot path is what
+     * would want CACHED, and it gets a pool of its own when it exists.
+     *
+     * mmz_name left empty, which means the anonymous zone -- the only one
+     * this board has (/proc/umap/media-mem shows one ZONE named
+     * "anonymous").
+     */
+    HAL_LOG_INFO("vb: pool 0 %ux%u x%u = %llu KiB, pool 1 %ux%u x%u = %llu KiB (provisional)",
+                 m->dev_rect.width, m->dev_rect.height, HISI_VB_FULL_BLK_CNT,
+                 (full * HISI_VB_FULL_BLK_CNT) >> 10, sw, sh, HISI_VB_SMALL_BLK_CNT,
+                 (small * HISI_VB_SMALL_BLK_CNT) >> 10);
+}
+
+#endif /* HAL_MODULE_VIDEO */
+
 /* ================================================================
  * LIFECYCLE
  * ================================================================ */
@@ -405,6 +1510,12 @@ static bool hisi_chip_is_gen5(const char *name)
  */
 static void hisi_teardown(hisi_state_t *st)
 {
+#ifdef HAL_MODULE_VIDEO
+    /* The pipeline before SYS: ss_mpi_sys_exit with VI or VPSS still
+     * holding blocks is the same OT_ERR_VB_BUSY problem one level up. */
+    hisi_video_teardown(st);
+#endif
+
     if (st->sys_inited) {
         if (st->sys.fnExit)
             st->sys.fnExit();
@@ -482,6 +1593,19 @@ static int hal_init(void *ctx, const rss_multi_sensor_config_t *cfg)
         return RSS_ERR_NOMEM;
     c->platform = st;
 
+    /*
+     * Published here, not at the end of a successful hal_init.
+     *
+     * The forwarders reach the algorithm libraries through g_hisi, and the
+     * ISP calls them *during* bring-up -- ss_mpi_isp_init registers ldci,
+     * drc, dehaze, bayer_nr and acs before it returns. With g_hisi still
+     * NULL at that point every one of them declines and the ISP comes up
+     * with no algorithms and five lines of "called with no ISP loaded" in
+     * the log, which is exactly what the bench showed. hal_deinit clears
+     * it again after the teardown, for the symmetric reason.
+     */
+    g_hisi = st;
+
     snprintf(st->sensor_name, sizeof(st->sensor_name), "%s", cfg->sensors[0].name);
 
     /*
@@ -501,6 +1625,22 @@ static int hal_init(void *ctx, const rss_multi_sensor_config_t *cfg)
     ret = v5_vb_load(&st->vb, &st->libs);
     if (ret)
         goto err_unload;
+
+#ifdef HAL_MODULE_VIDEO
+    if ((ret = v5_vi_load(&st->vi, &st->libs)) != RSS_OK)
+        goto err_unload;
+    if ((ret = v5_vpss_load(&st->vpss, &st->libs)) != RSS_OK)
+        goto err_unload;
+    if ((ret = v5_venc_load(&st->venc, &st->libs)) != RSS_OK)
+        goto err_unload;
+
+    /*
+     * The ISP tier last of the libraries, because opening it is what closes
+     * the dlopen cycle -- see hisi_isp_open and the FORWARDERS block.
+     */
+    if ((ret = hisi_isp_open(st)) != RSS_OK)
+        goto err_unload;
+#endif
 
     /*
      * Identity, logged before anything is initialised so that a bring-up
@@ -563,9 +1703,27 @@ static int hal_init(void *ctx, const rss_multi_sensor_config_t *cfg)
     (void)st->sys.fnExit();
     (void)st->vb.fnExit();
 
-    /* Phase 1: no common pools. See the function comment. */
+#ifdef HAL_MODULE_VIDEO
+    /*
+     * The sensor mode, before VB and not with the rest of the video
+     * bring-up, because the pool sizes come out of it and VB has to be
+     * configured before ss_mpi_sys_init. Failing here costs nothing: no
+     * MPP state has been created yet.
+     */
+    ret = hisi_sensor_mode_load(&st->mode, cfg->sensors[0].name, st->chip_name);
+    if (ret)
+        goto err_unload;
+    /* The mode load is where a name the config left out gets resolved. */
+    snprintf(st->sensor_name, sizeof(st->sensor_name), "%s", st->mode.name);
+
+    hisi_vb_fill_cfg(st, &vb_cfg);
+#else
+    /* The audio archive has no sensor and needs no pools; VB still has to
+     * be configured, because ss_mpi_sys_init will not run on an
+     * unconfigured VB. */
     memset(&vb_cfg, 0, sizeof(vb_cfg));
     vb_cfg.max_pool_cnt = 0;
+#endif
 
     ret = st->vb.fnSetCfg(&vb_cfg);
     if (ret) {
@@ -582,6 +1740,12 @@ static int hal_init(void *ctx, const rss_multi_sensor_config_t *cfg)
     }
     st->vb_inited = true;
 
+#ifdef HAL_MODULE_VIDEO
+    /* Before sys_init, and only there: the coupling is fixed when the
+     * system starts and setting it afterwards is accepted and ignored. */
+    hisi_vi_vpss_mode(st);
+#endif
+
     ret = st->sys.fnInit();
     if (ret) {
         HAL_LOG_ERR("sys: ss_mpi_sys_init failed 0x%x (err %u)", (unsigned)ret, V5_ERR_ID(ret));
@@ -590,19 +1754,32 @@ static int hal_init(void *ctx, const rss_multi_sensor_config_t *cfg)
     }
     st->sys_inited = true;
 
-    HAL_LOG_INFO("hal_init: MPP up to SYS; the pipeline is not implemented yet (Phase 2)");
+#ifdef HAL_MODULE_VIDEO
+    ret = hisi_video_bringup(st, &cfg->sensors[0]);
+    if (ret)
+        goto err_teardown;
+#endif
 
-    g_hisi = st;
     c->initialized = true;
     return RSS_OK;
 
 err_teardown:
     hisi_teardown(st);
 err_unload:
+#ifdef HAL_MODULE_VIDEO
+    hisi_sensor_teardown(st);
+    hisi_isp_close_alg_libs(st);
+    v5_isp_unload(&st->isp);
+    v5_venc_unload(&st->venc);
+    v5_vpss_unload(&st->vpss);
+    v5_vi_unload(&st->vi);
+#endif
     v5_vb_unload(&st->vb);
     v5_sys_unload(&st->sys);
     hisi_mpi_close(&st->libs);
 err_free:
+    if (g_hisi == st)
+        g_hisi = NULL;
     free(st);
     c->platform = NULL;
     return ret;
@@ -633,6 +1810,17 @@ static int hal_deinit(void *ctx)
     if (g_hisi == st)
         g_hisi = NULL;
 
+#ifdef HAL_MODULE_VIDEO
+    /* After hisi_teardown, which has already unregistered 3A and stopped
+     * the ISP thread: the sensor library is dlclosed here and the object
+     * inside it dies with the mapping. */
+    hisi_sensor_teardown(st);
+    hisi_isp_close_alg_libs(st);
+    v5_isp_unload(&st->isp);
+    v5_venc_unload(&st->venc);
+    v5_vpss_unload(&st->vpss);
+    v5_vi_unload(&st->vi);
+#endif
     v5_vb_unload(&st->vb);
     v5_sys_unload(&st->sys);
     hisi_mpi_close(&st->libs);

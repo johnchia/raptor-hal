@@ -32,7 +32,12 @@
 #include "v5_video.h"
 #include "v5_mipi.h"
 #include "v5_vi.h"
+#include "v5_vpss.h"
+#include "v5_venc.h"
+#include "v5_isp.h"
 #include "v5_snr.h"
+
+#include <pthread.h>
 
 /* ================================================================
  * FIXED TOPOLOGY
@@ -204,6 +209,41 @@ int hisi_sensor_mode_load(hisi_sensor_mode_t *m, const char *sensor_name, const 
 v5_isp_sns_obj *hisi_sensor_obj_find(hisi_sensor_mode_t *m, void *handle);
 
 /* ================================================================
+ * VB GEOMETRY
+ *
+ * The block size for one NV12 frame, which is what every pool in this
+ * backend holds.
+ *
+ * Transcribed rather than approximated because an undersized VB block is
+ * the classic bring-up failure on this family: ss_mpi_sys_init succeeds,
+ * the pipeline builds, and VI silently delivers nothing.
+ *
+ * ot_common_get_uncompressed_yuv_buf_cfg (ot_buffer_detail.h:216-267),
+ * reduced to the one case this backend needs -- 8-bit NV12, uncompressed,
+ * automatic alignment:
+ *
+ *   align        = OT_DEFAULT_ALIGN (8; ot_defines.h:45), which is what
+ *                  ot_common_get_valid_align returns for align == 0
+ *   stride       = ALIGN_UP((width * 8 + 7) >> 3, align) = ALIGN_UP(width, 8)
+ *   align_height = ALIGN_UP(height, 2)
+ *   size         = stride * align_height * 3 / 2
+ *
+ * Same arithmetic as gen4's, including the alignment: V5 did not change
+ * OT_DEFAULT_ALIGN. It is transcribed again rather than shared because the
+ * two generations are free to diverge and a shared helper would hide it.
+ * ================================================================ */
+
+#define HISI_VB_ALIGN 8u
+
+static inline unsigned long long hisi_vb_nv12_size(unsigned int width, unsigned int height)
+{
+    unsigned int stride = ((width + HISI_VB_ALIGN - 1u) / HISI_VB_ALIGN) * HISI_VB_ALIGN;
+    unsigned int rows = (height + 1u) & ~1u;
+
+    return (unsigned long long)stride * rows * 3u / 2u;
+}
+
+/* ================================================================
  * BACKEND STATE
  * ================================================================ */
 
@@ -216,6 +256,37 @@ typedef struct {
     v5_mpi_libs libs;
     v5_sys_impl sys;
     v5_vb_impl vb;
+    v5_vi_impl vi;
+    v5_vpss_impl vpss;
+    v5_venc_impl venc;
+    v5_isp_impl isp;
+
+    /*
+     * The sensor library, which is not part of the MPI set: one
+     * libsns_<name>.so opened by name from the mode file, and the object
+     * inside it. The object is a pointer into that mapping, so it is valid
+     * exactly as long as the handle.
+     */
+    void *snr_handle;
+    v5_isp_sns_obj *snr_obj;
+
+    /*
+     * The eight ISP algorithm libraries -- libldci, libdrc, libdehaze,
+     * libbnr, libacs, libir_auto, libextend_stats, libcalcflicker -- one
+     * per forwarder. They are the far end of the dlopen cycle: each needs
+     * symbols out of libot_mpi_isp.so, and libot_mpi_isp.so needs exactly
+     * one symbol out of each. Held so they can be closed again; nothing is
+     * resolved out of them except that one symbol apiece.
+     */
+#define HISI_ISP_ALG_LIB_NUM 8
+    void *isp_alg[HISI_ISP_ALG_LIB_NUM];
+
+    /* The algorithm library names the sensor driver registers under, as
+     * filled in by pfn_register_callback and handed to ss_mpi_ae_register /
+     * ss_mpi_awb_register unchanged. Kept because teardown needs them
+     * again for the unregister pair. */
+    v5_isp_3a_alg_lib ae_lib;
+    v5_isp_3a_alg_lib awb_lib;
 
     /*
      * SoC identity.
@@ -305,6 +376,48 @@ typedef struct {
      */
     bool vb_inited;
     bool sys_inited;
+
+#ifdef HAL_MODULE_VIDEO
+    /* The sensor mode, read once during hal_init. Video-only: the audio
+     * archive compiles the same hal_common.c and must not reference
+     * hisi_sensor.c, which is in VIDEO_SRCS alone. */
+    hisi_sensor_mode_t mode;
+
+    /*
+     * The VI/VPSS coupling actually in force, read back after setting it.
+     *
+     * Kept for gen4's reason: in a VPSS-*online* mode the two are wired in
+     * hardware and ss_mpi_sys_bind must not be called for that edge.
+     */
+    v5_vi_vpss_mode vi_vpss_mode;
+
+    /*
+     * The ISP's 3A loop. ss_mpi_isp_run does not return while the ISP is
+     * up, so it owns a thread, and teardown stops it with ss_mpi_isp_exit
+     * rather than by cancelling -- a thread cancelled inside the vendor
+     * library leaves its locks held and the next isp_init blocks forever.
+     */
+    pthread_t isp_thread;
+    volatile int isp_thread_running;
+    volatile int isp_thread_done;
+    bool isp_thread_started;
+
+    /* Pipeline unwind flags, in bring-up order so teardown can read the
+     * list backwards. */
+    bool mipi_configured;
+    bool sensor_registered;
+    bool ae_registered;
+    bool awb_registered;
+    bool isp_inited;
+    bool vi_dev_enabled;
+    bool vi_bound;
+    bool vi_pipe_created;
+    bool vi_pipe_started;
+    bool vi_chn_enabled;
+    bool vpss_grp_created;
+    bool vpss_grp_started;
+    bool vi_vpss_bound;
+#endif
 } hisi_state_t;
 
 static inline hisi_state_t *hisi_state(void *ctx)
@@ -336,7 +449,7 @@ static inline hisi_state_t *hisi_state(void *ctx)
 
 #define HISI_UMAP_SYS_PATH "/proc/umap/sys"
 
-#define HISI_CHIP_HI3516CV608 "0X3516C608" /* measured, 192.168.1.233 */
+#define HISI_CHIP_HI3516CV608 "0X3516C608" /* measured, 192.168.1.238 */
 #define HISI_CHIP_HI3516CV610 "0X3516C610" /* the family's other die, not yet held */
 
 #endif /* HISI_V5_STATE_H */

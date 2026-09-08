@@ -66,6 +66,21 @@
 #define V5_ALG_LIB_NAME_SIZE_MAX 20
 
 /*
+ * OT_AE_LIB_NAME (ot_common_ae.h:18) and OT_AWB_LIB_NAME
+ * (ot_common_awb.h:18), and both appear verbatim in the shipped
+ * libss_mpi_ae.so and libss_mpi_awb.so string tables -- checked, because a
+ * header is a claim and the string table is the fact.
+ *
+ * **The caller fills these in before pfn_register_callback**, which is the
+ * reverse of gen4's habit of letting the sensor library name them. V5's
+ * cis_register_callback validates the name through ae_check_lib_name, and
+ * an empty one fails with 0xa01c8007 and "Illegal lib name !" on stderr --
+ * a message that names neither the caller nor the field.
+ */
+#define V5_AE_LIB_NAME "ot_ae_lib"
+#define V5_AWB_LIB_NAME "ot_awb_lib"
+
+/*
  * ot_isp_3a_alg_lib (ot_common_3a.h:486-489).
  *
  * Filled in by the sensor library's pfn_register_callback and then handed

@@ -803,12 +803,18 @@ static void hisi_die_suffix(const char *chip_name, char *out, size_t out_len)
 
     if (!chip_name || !chip_name[0])
         return;
-    /* "0X3516C608" -- ten characters, "0X" then four digits, 'C', three. */
+    /*
+     * "0X3516C608" -- ten characters: "0X", four digits, a family letter,
+     * three more digits. The die spelling puts a 'v' in front of the last
+     * three and keeps the family letter, so "0X3516C608" is "hi3516cv608"
+     * and not "hi3516v608".
+     */
     if (strlen(chip_name) != 10 || (chip_name[0] != '0' && chip_name[0] != 'O') ||
         (chip_name[1] != 'X' && chip_name[1] != 'x'))
         return;
 
-    snprintf(out, out_len, "hi%.4sv%s", chip_name + 2, chip_name + 7);
+    snprintf(out, out_len, "hi%.4s%cv%s", chip_name + 2, tolower((unsigned char)chip_name[6]),
+             chip_name + 7);
 }
 
 int hisi_sensor_mode_load(hisi_sensor_mode_t *m, const char *sensor_name, const char *chip_name)
