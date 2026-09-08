@@ -140,6 +140,7 @@ typedef enum {
 
 /* ot_errno.h:49-88. Only the codes this backend acts on differently from
  * "it failed"; the rest are logged as numbers. */
+#define V5_ERR_EXIST 0x8u
 #define V5_ERR_UNEXIST 0x9u
 #define V5_ERR_NOT_CFG 0xbu
 #define V5_ERR_NOT_SUPPORT 0xcu

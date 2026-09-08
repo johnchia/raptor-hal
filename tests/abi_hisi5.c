@@ -41,6 +41,12 @@
 #include "v5_snr.h"
 #include "v5_isp.h"
 
+/* Phase 3's tuning transcriptions, Phase 4's audio and Phase 5's RGN. */
+#include "v5_isp_tune.h"
+#include "v5_nr.h"
+#include "v5_aud.h"
+#include "v5_rgn.h"
+
 int abi_hisi5_compiled(void)
 {
     return 1;

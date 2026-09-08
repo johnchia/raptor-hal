@@ -1544,43 +1544,111 @@ int hisi_unbind_vpss_venc(hisi_state_t *st, int fs_chn, int enc_chn)
 }
 
 /*
- * hal_bind / hal_unbind -- rvd's cell pairs.
+ * hisi_bind_collapse -- turn rvd's cell pair into (framesource, encoder).
  *
- * FS -> ENC is the only chain this backend has. rvd builds
- * FS [-> IVS] [-> OSD] -> ENC and leaves out the stages the caps say are
- * missing, which for a Phase 2 build is both of them -- there is no IVS on
- * this backend at all and OSD lands in Phase 5, where RGN regions attach
- * to a VENC channel and the pair collapses the way the gen4 backend's
- * does. Until then an OSD stage is refused rather than silently dropped:
- * a stream that quietly loses its overlay is worse than one that says why.
+ * rvd expresses an overlaid stream as FS -> OSD -> ENC, two binds where
+ * only the first names the framesource. HiMPP has no OSD stage in the
+ * datapath: RGN regions attach to a VENC channel, so the pair collapses to
+ * one FS -> VENC bind and the first half is recorded rather than acted on.
+ * Same shape as the gen4 backend and the SigmaStar one, and for the same
+ * reason. There is no IVS on this backend at all, so FS [-> OSD] -> ENC is
+ * the whole grammar.
  */
+static int hisi_bind_collapse(hisi_state_t *st, const rss_cell_t *src, const rss_cell_t *dst,
+                              int *fs_chn, int *enc_chn, bool *collapsed)
+{
+    *collapsed = false;
+
+    if (!src || !dst)
+        return RSS_ERR_INVAL;
+
+    if (src->device == RSS_DEV_FS && dst->device == RSS_DEV_ENC) {
+        *fs_chn = src->group;
+        *enc_chn = dst->group;
+        return RSS_OK;
+    }
+
+    if (src->device == RSS_DEV_FS && dst->device == RSS_DEV_OSD) {
+        if (dst->group < 0 || dst->group >= HISI_VENC_CHN_NUM)
+            return RSS_ERR_INVAL;
+        st->osd_src_fs[dst->group] = src->group;
+        *collapsed = true;
+        return RSS_OK;
+    }
+
+    if (src->device == RSS_DEV_OSD && dst->device == RSS_DEV_ENC) {
+        if (src->group < 0 || src->group >= HISI_VENC_CHN_NUM)
+            return RSS_ERR_INVAL;
+        *fs_chn = st->osd_src_fs[src->group];
+        *enc_chn = dst->group;
+        if (*fs_chn < 0) {
+            HAL_LOG_ERR("bind: OSD %d -> ENC %d without a preceding FS -> OSD", src->group,
+                        dst->group);
+            return RSS_ERR_INVAL;
+        }
+        return RSS_OK;
+    }
+
+    HAL_LOG_ERR("bind: FS -> [OSD ->] ENC is the only chain this backend supports (got %d -> %d)",
+                src->device, dst->device);
+    return RSS_ERR_NOTSUP;
+}
+
+/* hal_bind / hal_unbind -- rvd's cell pairs, through the collapse above. */
 static int hal_bind(void *ctx, const rss_cell_t *src, const rss_cell_t *dst)
 {
     hisi_state_t *st = hisi_state(ctx);
+    bool collapsed;
+    int fs_chn = -1;
+    int enc_chn = -1;
+    int ret;
 
-    if (!st || !src || !dst)
+    if (!st)
         return RSS_ERR_INVAL;
 
-    if (src->device != RSS_DEV_FS || dst->device != RSS_DEV_ENC) {
-        HAL_LOG_ERR("bind: FS -> ENC is the only chain this backend supports (got %d -> %d)",
-                    src->device, dst->device);
-        return RSS_ERR_NOTSUP;
-    }
+    ret = hisi_bind_collapse(st, src, dst, &fs_chn, &enc_chn, &collapsed);
+    if (ret)
+        return ret;
+    if (collapsed)
+        return RSS_OK; /* Recorded; the OSD -> ENC step does the work. */
 
-    return hisi_bind_vpss_venc(st, src->group, dst->group);
+    ret = hisi_bind_vpss_venc(st, fs_chn, enc_chn);
+    if (ret)
+        return ret;
+
+    /*
+     * Attach any region registered on this encoder channel before the
+     * channel could take one. rvd sets region attributes before the bind
+     * exists on every platform; see hal_osd.c's WHY ATTACH IS DEFERRED.
+     * Deliberately after the bind and deliberately not checked: a region
+     * that will not attach costs an overlay, and failing the bind over it
+     * would cost the stream.
+     */
+    hisi_osd_flush_pending(st, enc_chn);
+
+    return RSS_OK;
 }
 
 static int hal_unbind(void *ctx, const rss_cell_t *src, const rss_cell_t *dst)
 {
     hisi_state_t *st = hisi_state(ctx);
+    bool collapsed;
+    int fs_chn = -1;
+    int enc_chn = -1;
+    int ret;
 
-    if (!st || !src || !dst)
+    if (!st)
         return RSS_ERR_INVAL;
 
-    if (src->device != RSS_DEV_FS || dst->device != RSS_DEV_ENC)
-        return RSS_ERR_NOTSUP;
+    ret = hisi_bind_collapse(st, src, dst, &fs_chn, &enc_chn, &collapsed);
+    if (ret)
+        return ret;
+    if (collapsed) {
+        st->osd_src_fs[dst->group] = -1;
+        return RSS_OK;
+    }
 
-    return hisi_unbind_vpss_venc(st, src->group, dst->group);
+    return hisi_unbind_vpss_venc(st, fs_chn, enc_chn);
 }
 
 /* ================================================================
@@ -1662,9 +1730,13 @@ static int hisi_video_bringup(hisi_state_t *st, const rss_sensor_config_t *cfg)
 
 static void hisi_video_teardown(hisi_state_t *st)
 {
-    /* Encoders first, then framesources, then the group: an encoder still
-     * bound to a VPSS channel that is about to be disabled is the state
-     * that leaves the kernel side holding buffers. */
+    /* Overlays before the encoders, then framesources, then the group. The
+     * first step is not tidiness: RGN refuses to let a VENC channel be
+     * destroyed while a region is still attached to it (OT_ERR_RGN_BUSY is
+     * documented as exactly that case). The rest is the old rule -- an
+     * encoder still bound to a VPSS channel that is about to be disabled is
+     * the state that leaves the kernel side holding buffers. */
+    hisi_osd_release_all(st);
     hisi_enc_release_all(st);
     hisi_fs_release_all(st);
     hisi_vpss_teardown(st);
@@ -1935,6 +2007,17 @@ static int hal_init(void *ctx, const rss_multi_sensor_config_t *cfg)
      * otherwise close(0) in hal_deinit and ioctl(0, ...) from the volume
      * and gain setters before audio_init opened it. */
     st->acodec_fd = -1;
+    /*
+     * -1, not the 0 calloc left behind: framesource 0 is a real
+     * framesource, so "no FS -> OSD half seen yet" needs a value of its
+     * own. See hisi_bind_collapse.
+     */
+    {
+        int i;
+
+        for (i = 0; i < HISI_VENC_CHN_NUM; i++)
+            st->osd_src_fs[i] = -1;
+    }
     c->platform = st;
 
     /*
@@ -1977,6 +2060,18 @@ static int hal_init(void *ctx, const rss_multi_sensor_config_t *cfg)
         goto err_unload;
     if ((ret = v5_venc_load(&st->venc, &st->libs)) != RSS_OK)
         goto err_unload;
+
+    /*
+     * RGN is the exception to the pattern above: its failure is recorded,
+     * not propagated. A board whose libss_mpi.so has no RGN is a board
+     * without overlays, and the supported way to say that is for the osd_*
+     * ops to answer RSS_ERR_NOTSUP -- which rvd turns into "overlays
+     * disabled" and keeps streaming. Refusing hal_init would take the video
+     * down over the text drawn on top of it.
+     */
+    st->rgn_loaded = v5_rgn_load(&st->rgn, &st->libs) == RSS_OK;
+    if (!st->rgn_loaded)
+        HAL_LOG_WARN("osd: ss_mpi_rgn unavailable; overlays disabled");
 
     /*
      * Can a VPSS channel be given a pool of its own? All three calls are
@@ -2137,6 +2232,8 @@ err_unload:
     hisi_sensor_teardown(st);
     hisi_isp_close_alg_libs(st);
     v5_isp_unload(&st->isp);
+    v5_rgn_unload(&st->rgn);
+    st->rgn_loaded = false;
     v5_venc_unload(&st->venc);
     v5_vpss_unload(&st->vpss);
     v5_vi_unload(&st->vi);
@@ -2197,6 +2294,8 @@ static int hal_deinit(void *ctx)
     hisi_sensor_teardown(st);
     hisi_isp_close_alg_libs(st);
     v5_isp_unload(&st->isp);
+    v5_rgn_unload(&st->rgn);
+    st->rgn_loaded = false;
     v5_venc_unload(&st->venc);
     v5_vpss_unload(&st->vpss);
     v5_vi_unload(&st->vi);
@@ -2305,7 +2404,7 @@ static int hal_sys_rebase_timestamp(void *ctx, int64_t base)
  * banner, finds no framesource and exits cleanly.
  *
  * The video pipeline (fs_*, enc_*, isp_*) landed in Phase 2, ISP tuning in
- * Phase 3, audio in Phase 4; OSD is Phase 5.
+ * Phase 3, audio in Phase 4, OSD in Phase 5.
  * ================================================================ */
 
 static const rss_hal_ops_t g_ops = {
@@ -2328,8 +2427,8 @@ static const rss_hal_ops_t g_ops = {
     .gpio_get = hal_gpio_get,
     .ircut_set = hal_ircut_set,
 
-    /* Datapath. One edge, VPSS -> VENC; the IVS and OSD stages rvd can put
-     * in a chain do not exist on this backend yet. */
+    /* Datapath. One edge, VPSS -> VENC. rvd's OSD stage collapses into it
+     * (hisi_bind_collapse); the IVS stage does not exist on this backend. */
     .bind = hal_bind,
     .unbind = hal_unbind,
 
@@ -2392,6 +2491,22 @@ static const rss_hal_ops_t g_ops = {
     .isp_set_hflip = hal_isp_set_hflip,
     .isp_set_vflip = hal_isp_set_vflip,
     .isp_get_hvflip = hal_isp_get_hvflip,
+
+    /* OSD -- RGN overlays on a VENC channel. hal_osd.c, whose OP COVERAGE
+     * block argues the five ops rvd never calls and the one region type
+     * this silicon will not composite. */
+    .osd_set_pool_size = hal_osd_set_pool_size,
+    .osd_create_group = hal_osd_create_group,
+    .osd_destroy_group = hal_osd_destroy_group,
+    .osd_start = hal_osd_start,
+    .osd_stop = hal_osd_stop,
+    .osd_create_region = hal_osd_create_region,
+    .osd_destroy_region = hal_osd_destroy_region,
+    .osd_register_region = hal_osd_register_region,
+    .osd_unregister_region = hal_osd_unregister_region,
+    .osd_set_region_attr = hal_osd_set_region_attr,
+    .osd_update_region_data = hal_osd_update_region_data,
+    .osd_show_region = hal_osd_show_region,
 #endif
 
 #ifdef HAL_MODULE_AUDIO
@@ -2458,10 +2573,16 @@ rss_hal_ctx_t *rss_hal_create_backend(const char *backend)
      * rvd reads caps before that. The honest report of a board without one
      * is the ops answering RSS_ERR_NOTSUP, which rvd already handles.
      *
-     * has_osd stays false until Phase 5.
+     * has_osd is true from Phase 5, and it says the *backend* has an OSD
+     * rather than that this board does: whether ss_mpi_rgn resolved is not
+     * known until hal_init, and rvd reads caps before that. The honest
+     * report of a board without RGN is the ops answering RSS_ERR_NOTSUP,
+     * which rvd already handles -- rvd_osd.c takes a NOTSUP from
+     * osd_create_region as "overlays disabled" and carries on.
      */
     ctx->caps.has_framesource = true;
     ctx->caps.has_jpeg = true;
+    ctx->caps.has_osd = true;
 #endif
 
     return ctx;

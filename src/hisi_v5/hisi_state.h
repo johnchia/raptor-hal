@@ -39,6 +39,7 @@
 #include "v5_nr.h"
 #include "v5_snr.h"
 #include "v5_aud.h"
+#include "v5_rgn.h"
 
 #include <pthread.h>
 
@@ -394,6 +395,74 @@ typedef struct {
     rss_nal_unit_t nals[HISI_VENC_MAX_NALS];
 } hisi_venc_chn_t;
 
+/*
+ * OSD regions the backend will track at once.
+ *
+ * Not the vendor's OT_RGN_HANDLE_MAX (128): the limit a caller runs into is
+ * OT_RGN_VENC_MAX_OVERLAY_NUM, which is 8 overlays per *encoder channel*,
+ * and the handle space is only how those are numbered. 16 is two channels'
+ * worth and matches rvd's largest per-platform region budget in hal_caps.c,
+ * so a config that works on Ingenic is not silently truncated here. A
+ * region costs a handle and its conversion buffer, nothing per-slot, so the
+ * array is cheap. hal_osd.c enforces the per-channel 8 at register time.
+ */
+#define HISI_OSD_REGION_MAX 16
+
+/*
+ * One OSD region.
+ *
+ * Everything is tracked rather than read back from RGN, for the reason the
+ * SigmaStar backend gives and one more of its own: the values raptor asks
+ * for are split between the region attr (geometry) and the *per-channel*
+ * display attr (position, alpha, layer, show), and the display attr does
+ * not exist until the region is attached -- which on this family cannot
+ * happen until the VENC channel exists, which is later than rvd sets them.
+ *
+ * `attached` is the distinction that matters. Registered means rvd asked
+ * for the region to appear on a group; attached means
+ * ss_mpi_rgn_attach_to_chn has actually been called. See
+ * hisi_osd_flush_pending.
+ *
+ * `grp` is the VENC channel, and carrying it here is the fix for divinus's
+ * per-stream OSD defect -- see hal_osd.c.
+ */
+typedef struct {
+    bool used;
+    rss_osd_type_t type;
+
+    int x;
+    int y;
+    /* The region as RGN sees it: even, at least 2. */
+    unsigned int width;
+    unsigned int height;
+    /* The bitmap as the caller renders it, which may be a pixel narrower or
+     * shorter than the above. Kept separately so the conversion never reads
+     * past the caller's buffer; see hisi_osd_convert. */
+    unsigned int src_w;
+    unsigned int src_h;
+    int layer;
+
+    bool global_alpha_en;
+    unsigned char fg_alpha;
+    unsigned char bg_alpha;
+
+    /* Registered VENC channel, or -1. */
+    int grp;
+    bool attached;
+    bool show;
+
+    /* ARGB1555 conversion buffer handed to ss_mpi_rgn_set_bmp. Kept per
+     * region so a per-frame update does not allocate, and resized only when
+     * the geometry changes. */
+    void *bmp;
+    size_t bmp_size;
+
+    /* Set once the first bitmap has been accepted, so that fact can be
+     * logged exactly once per region: without it "attached but never fed"
+     * and "fed but not composited" look identical in the log. */
+    bool bmp_logged;
+} hisi_osd_region_t;
+
 /* ================================================================
  * VB GEOMETRY
  *
@@ -562,6 +631,14 @@ typedef struct {
     v5_isp_impl isp;
 
     /*
+     * RGN, the overlay compositor (Phase 5). Separate from the flags below
+     * because its absence is not a failure: rgn_loaded false is a board
+     * without overlays, and every osd_* op answers RSS_ERR_NOTSUP.
+     */
+    v5_rgn_impl rgn;
+    bool rgn_loaded;
+
+    /*
      * The sensor library, which is not part of the MPI set: one
      * libsns_<name>.so opened by name from the mode file, and the object
      * inside it. The object is a pointer into that mapping, so it is valid
@@ -725,6 +802,32 @@ typedef struct {
     /* Per-channel bookkeeping. */
     hisi_vpss_chn_t fs[HISI_VPSS_CHN_NUM];
     hisi_venc_chn_t enc[HISI_VENC_CHN_NUM];
+
+    /*
+     * The framesource half of an FS -> OSD -> ENC pair, per encoder
+     * channel, or -1.
+     *
+     * rvd expresses an overlaid stream as two binds and names the
+     * framesource only in the first. HiMPP has no OSD stage in the
+     * datapath -- RGN regions attach to a VENC channel -- so the pair
+     * collapses to one FS -> VENC bind and the first half has to be
+     * remembered rather than acted on. -1 rather than 0 because
+     * framesource 0 is a real framesource.
+     */
+    int osd_src_fs[HISI_VENC_CHN_NUM];
+
+    /*
+     * The regions themselves, and which groups rvd has asked for.
+     *
+     * A group is an encoder channel and has no RGN object of its own, so
+     * osd_grp only records that rvd created one -- what it buys is a
+     * destroy_group that knows which regions to detach. osd_pool_logged
+     * makes the "there is no pool to size" line once per process rather
+     * than once per rvd osd-restart.
+     */
+    hisi_osd_region_t osd[HISI_OSD_REGION_MAX];
+    bool osd_grp[HISI_VENC_CHN_NUM];
+    bool osd_pool_logged;
 
     bool vpss_grp_created;
     bool vpss_grp_started;
@@ -1019,5 +1122,29 @@ void hisi_enc_refresh_rc(hisi_state_t *st, int enc_chn);
  * hal_common.c's generic bind op: both express the same thing. */
 int hisi_bind_vpss_venc(hisi_state_t *st, int fs_chn, int enc_chn);
 int hisi_unbind_vpss_venc(hisi_state_t *st, int fs_chn, int enc_chn);
+
+/* OSD == RGN overlays attached to a VENC channel -- src/hisi_v5/hal_osd.c. */
+int hal_osd_set_pool_size(void *ctx, uint32_t bytes);
+int hal_osd_create_group(void *ctx, int grp);
+int hal_osd_destroy_group(void *ctx, int grp);
+int hal_osd_start(void *ctx, int grp);
+int hal_osd_stop(void *ctx, int grp);
+int hal_osd_create_region(void *ctx, int *handle, const rss_osd_region_t *attr);
+int hal_osd_destroy_region(void *ctx, int handle);
+int hal_osd_register_region(void *ctx, int handle, int grp);
+int hal_osd_unregister_region(void *ctx, int handle, int grp);
+int hal_osd_set_region_attr(void *ctx, int handle, const rss_osd_region_t *attr);
+int hal_osd_update_region_data(void *ctx, int handle, const uint8_t *data);
+int hal_osd_show_region(void *ctx, int handle, int grp, int show, int layer);
+
+/*
+ * The attach is deferred until the VENC channel exists, so three places
+ * outside hal_osd.c drive it: hal_bind and hal_enc_create_channel flush,
+ * hal_enc_destroy_channel detaches, and hisi_video_teardown releases. See
+ * hal_osd.c's WHY ATTACH IS DEFERRED.
+ */
+void hisi_osd_flush_pending(hisi_state_t *st, int chn);
+void hisi_osd_detach_chn(hisi_state_t *st, int chn);
+void hisi_osd_release_all(hisi_state_t *st);
 
 #endif /* HISI_V5_STATE_H */

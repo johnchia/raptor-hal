@@ -511,6 +511,15 @@ int hal_enc_create_channel(void *ctx, int chn, const rss_video_config_t *cfg)
         }
     }
 
+    /*
+     * The channel now exists, which is the first moment an OSD region
+     * registered against it can be attached -- and, on a restart, the
+     * moment its regions come back. hal_bind flushes too; this is the
+     * earlier of the two and the one that makes an encoder destroy/create
+     * transparent to the overlay. Idempotent, so both firing costs nothing.
+     */
+    hisi_osd_flush_pending(st, chn);
+
     HAL_LOG_INFO("venc chn %d: %ux%u codec %d, %u bps (%u kbps to the driver), gop %u, buf %u", chn,
                  enc->width, enc->height, (int)enc->codec, enc->bitrate,
                  hisi_enc_kbps(enc->bitrate), enc->gop, attr.venc_attr.buf_size);
@@ -525,6 +534,17 @@ int hal_enc_destroy_channel(void *ctx, int chn)
 
     if (!enc->created)
         return RSS_OK;
+
+    /*
+     * Overlays first, and this one is not optional: RGN refuses to let a
+     * VENC channel be destroyed while a region is still attached, and
+     * documents the refusal as exactly that case (OT_ERR_RGN_BUSY,
+     * "resource is busy, e.g. destroy a venc chn without unregistering
+     * it"). The registration survives -- only the attach is undone -- so
+     * the flush in hal_enc_create_channel puts them back if the channel
+     * comes back.
+     */
+    hisi_osd_detach_chn(st, chn);
 
     /* Order: release any held stream, stop receiving, unbind, close the
      * fd, then destroy. Each step undoes exactly one thing create-and-

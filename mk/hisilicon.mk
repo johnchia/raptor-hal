@@ -105,8 +105,7 @@ ifneq ($(filter $(PLATFORM),$(HISI_GEN5_PLATFORMS)),)
 # symbol that only the video list provides.
 #
 # Phase 3 added hal_isp.c, hal_dyn.c, hal_ladder.c, hal_knob.c and hal_nrx.c;
-# Phase 4
-# adds hal_audio.c to AUDIO_SRCS; Phase 5 hal_osd.c.
+# Phase 4 added hal_audio.c to AUDIO_SRCS; Phase 5 hal_osd.c.
 VIDEO_SRCS := $(BACKEND_DIR)/hisi_sensor.c \
               $(BACKEND_DIR)/hal_framesource.c \
               $(BACKEND_DIR)/hal_encoder.c \
@@ -115,6 +114,7 @@ VIDEO_SRCS := $(BACKEND_DIR)/hisi_sensor.c \
               $(BACKEND_DIR)/hal_ladder.c \
               $(BACKEND_DIR)/hal_knob.c \
               $(BACKEND_DIR)/hal_nrx.c \
+              $(BACKEND_DIR)/hal_osd.c \
               src/hal_gpio.c
 # Phase 4: AI capture plus the inner codec. hal_common.c is compiled into
 # both archives; hal_audio.c only into this one.
