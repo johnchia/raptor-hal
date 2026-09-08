@@ -185,13 +185,14 @@ const rss_hal_caps_t g_hal_caps = {
 #elif defined(PLATFORM_HI3516CV610)
 /*
  * ═══════════════════════════════════════════════════════════════════════
- * NOTHING MEASURED YET -- HiMPP V5, hi3516cv6xx family
+ * MEASURED THROUGH PHASE 2 -- HiMPP V5, hi3516cv6xx family
  *
- * Phase 0 wires the platform through the build and stops there: no op in
- * src/hisi_v5/ exists, so every flag is false and every number is 0, which
- * rvd reads as "this platform cannot" and "do not test against". Each one
- * rises in the commit that publishes its op, never ahead of it -- the same
- * rule the gen4 block above was built under.
+ * The video pipeline is up, so the numbers below are what a CV608 bench
+ * board (192.168.1.238, os04d10) actually did: four encoder channels
+ * across two framesources, H.264 and JPEG, streaming at once. Everything
+ * Phase 3 and later owns is still false and still 0. Each flag rises in
+ * the commit that publishes its op, never ahead of it -- the same rule the
+ * gen4 block above was built under.
  *
  * ONE PLATFORM, TWO DIES. soc_name is the ABI's name (see
  * hal_internal_hisilicon.h); the die reaches raptor as soc_model, which the
@@ -214,10 +215,13 @@ const rss_hal_caps_t g_hal_caps = {
  *                            OT_VI_MAX_PHYS_PIPE_NUM  2   OT_RGN_HANDLE_MAX  128
  *                            OT_AI_MAX_CHN_NUM        4
  *
- * max_fs_channels is deliberately 0 rather than a guess at 3: gen4's mapping
- * of framesource n to physical VPSS channel n+1 is under challenge (Majestic
- * streams from channel 0 there), and the V5 answer depends on the VI/VPSS
- * coupling mode the backend selects. Plan, bench item 5.
+ * BENCH ITEM 5 IS ANSWERED: physical VPSS channel 0 is a usable output on
+ * V5, where gen4 reserves it because HI_MPI_SYS_Bind forces a VPSS
+ * destination's channel to 0. Here the group's input port and the output
+ * channels are numbered separately, so HISI_VPSS_CHN_BASE is 0 and
+ * framesource n is physical channel n. Measured: with channels 0 and 1
+ * enabled at 1920x1080 and 640x360, /proc/umap/vpss shows send_ok climbing
+ * on both.
  * ═══════════════════════════════════════════════════════════════════════
  */
 const rss_hal_caps_t g_hal_caps = {
@@ -226,20 +230,39 @@ const rss_hal_caps_t g_hal_caps = {
      * running MPP's own string once Phase 1 can ask it. */
     .sdk_version = "HiMPP",
 
-    /* Encoder. H.265 and rotation are both expected to be true -- the headers
-     * carry OT_PT_H265 and ot_vpss_chn_attr has a rotation field -- and both
-     * stay false until an op services them in Phase 2. */
-    .has_h265 = false,
+    /*
+     * Encoder.
+     *
+     * has_rotation stays false: ot_vpss_chn_attr does carry a rotation
+     * field, but hal_fs_set_rotation accepts 0 and answers NOTSUP to
+     * anything else, and a cap for an op that refuses the only interesting
+     * arguments would be a lie.
+     *
+     * has_gop_attr, has_capped_rc and has_smart_rc stay false for gen4's
+     * reasons: SMART_P changes which arm of the GOP union is read, and
+     * AVBR/QVBR/CVBR each need parameters rvd does not carry.
+     */
+    .has_h265 = true,
     .has_rotation = false,
-    .has_set_bitrate = false,
+    .has_set_bitrate = true,
     .has_gop_attr = false,
     .has_capped_rc = false,
     .has_smart_rc = false,
 
-    /* JPEG. Phase 2. */
-    .has_jpeg = false,
-    .has_jpeg_qp = false,
-    .jpeg_pulse = false,
+    /*
+     * JPEG. Every JPEG-class channel here is PT_MJPEG -- see
+     * hisi_enc_payload -- so quality is the FIXQP rc's qfactor, reached
+     * through the ordinary reconfigure, and rvd's 1..100 quality maps onto
+     * the driver's 1..99 the same way up. jpeg_pulse says rvd owns the
+     * channel's duty cycle: it starts the channel when a snapshot consumer
+     * appears and stops it when the last one leaves, and the backend
+     * defers the bind across that stop.
+     *
+     * max_jpeg_pixels stays 0 -- unmeasured, per the rule above.
+     */
+    .has_jpeg = true,
+    .has_jpeg_qp = true,
+    .jpeg_pulse = true,
 
     /* ISP. Phase 3, and this is where V5 diverges most from gen4: the tuning
      * is a 46-section .ini dialect and several of these knobs have no direct
@@ -251,12 +274,30 @@ const rss_hal_caps_t g_hal_caps = {
     .has_temper = false,
     .has_ae_comp = false,
 
-    /* 0, not 1: no sensor op exists, so there is no sensor this backend can
-     * bring up. Phase 2's hisi_sensor.c makes it 1. */
-    .max_sensors = 0,
+    /* One sensor on VI device 0, pipe 0, which is the topology
+     * src/hisi_v5/hisi_state.h fixes. */
+    .max_sensors = 1,
 
-    .max_enc_channels = 0,
-    .max_fs_channels = 0,
+    /*
+     * Four encoder channels, which is what ran together on the bench: two
+     * H.264 and two MJPEG, all bound and all delivering. Not the eight
+     * OpenIPC's load_hisilicon gives the driver (g_venc_max_chn_num=8, read
+     * back from /sys/module/open_venc/parameters) and not the header's 16
+     * -- a channel needs a stream buffer out of a 32 MB MMZ that is already
+     * 30 MB full with four, so the module's number is a ceiling rather than
+     * a capability. Phase 7's memory work is where that gets revisited.
+     *
+     * Two framesources, for the same reason: the part has three physical
+     * VPSS channels and channel 0 is usable (see above), but two is what
+     * rvd builds for one sensor and two is what was measured.
+     *
+     * max_enc_pixel_rate stays 0: what the bench measured -- 1920x1080 and
+     * 640x360 at 16.7 fps each -- is VB starvation on a 32 MB MMZ, not the
+     * encoder's ceiling, and publishing a number the encoder was never
+     * asked for would be publishing a guess.
+     */
+    .max_enc_channels = 4,
+    .max_fs_channels = 2,
     .max_enc_pixel_rate = 0,
 
     /* OSD -- Phase 5, over ss_mpi_rgn. */
