@@ -1332,6 +1332,181 @@ static void hisi_vpss_teardown(hisi_state_t *st)
 }
 
 /* ================================================================
+ * THE VPSS -> VENC EDGE
+ *
+ * Shared by the encoder's register path and by the generic bind op below,
+ * because both express the same thing: a framesource's pictures going to
+ * an encoder channel.
+ * ================================================================ */
+
+int hisi_bind_vpss_venc(hisi_state_t *st, int fs_chn, int enc_chn)
+{
+    v5_mpp_chn src, dst;
+    int ret;
+
+    if (!st)
+        return RSS_ERR_INVAL;
+    if (fs_chn < 0 || fs_chn >= HISI_VPSS_CHN_NUM || enc_chn < 0 || enc_chn >= HISI_VENC_CHN_NUM)
+        return RSS_ERR_INVAL;
+    if (!st->sys.fnBind)
+        return RSS_ERR_NOTSUP;
+
+    /*
+     * Idempotence, because rvd asks twice per stream: once through
+     * enc_register_channel and once through the FS -> ENC bind chain.
+     * Without this the second bind of the same edge returns NOT_PERM,
+     * which the recovery below would misread as another process's
+     * leftovers -- it would unbind the edge made a moment ago and remake
+     * it, turning every normal stream start into a spurious stale-bind
+     * warning with a sourceless window in the middle.
+     */
+    if (st->enc[enc_chn].bound_fs == fs_chn)
+        return RSS_OK;
+
+    /*
+     * An MJPEG channel that is not yet receiving records the edge instead
+     * of making it. rvd binds its snapshot channels while they are idle,
+     * and an idle-but-bound destination is the VB wedge hal_enc_stop
+     * describes -- so the bind waits for enc_start, which makes the
+     * channel receive and then calls back here.
+     */
+    if (st->enc[enc_chn].payload == V5_PT_MJPEG && !st->enc[enc_chn].receiving) {
+        st->enc[enc_chn].idle_fs = fs_chn;
+        HAL_LOG_DBG("bind: VPSS(%d,%d) -> VENC(%d) deferred until the channel receives",
+                    HISI_VPSS_GRP, hisi_vpss_phy(fs_chn), enc_chn);
+        return RSS_OK;
+    }
+
+    memset(&src, 0, sizeof(src));
+    src.mod_id = V5_MOD_VPSS;
+    src.dev_id = HISI_VPSS_GRP;
+    src.chn_id = hisi_vpss_phy(fs_chn);
+
+    memset(&dst, 0, sizeof(dst));
+    dst.mod_id = V5_MOD_VENC;
+    dst.dev_id = 0;
+    dst.chn_id = enc_chn;
+
+    ret = st->sys.fnBind(&src, &dst);
+
+    /*
+     * A bind that survived the last process.
+     *
+     * The kernel holds the bind table, so a VPSS -> VENC edge outlives the
+     * rvd that made it: a crash or a kill during bring-up leaves
+     * VENC(enc_chn) still bound, and the next start gets NOT_PERM from a
+     * bind nothing in userspace remembers making. Same class of leak the
+     * rest of this backend answers by tearing down first.
+     *
+     * ss_mpi_sys_unbind matches on the source as well as the destination,
+     * so clearing the destination means naming a source that is exactly
+     * what is not known here. Sweeping the group's channels covers it:
+     * the stale edge can only have come from this group.
+     */
+    if (ret && V5_ERR_ID(ret) == V5_ERR_NOT_PERM && st->sys.fnUnbind) {
+        int chn;
+
+        HAL_LOG_WARN("VENC(%d) still bound from a previous process; clearing", enc_chn);
+
+        for (chn = 0; chn < HISI_VPSS_CHN_NUM; chn++) {
+            v5_mpp_chn stale = src;
+
+            stale.chn_id = hisi_vpss_phy(chn);
+            if (st->sys.fnUnbind(&stale, &dst) == 0)
+                break;
+        }
+
+        ret = st->sys.fnBind(&src, &dst);
+    }
+
+    if (ret) {
+        HAL_LOG_ERR("ss_mpi_sys_bind VPSS(%d,%d) -> VENC(%d) failed: 0x%x", HISI_VPSS_GRP,
+                    hisi_vpss_phy(fs_chn), enc_chn, ret);
+        return RSS_ERR_IO;
+    }
+
+    st->enc[enc_chn].bound_fs = fs_chn;
+    st->enc[enc_chn].idle_fs = -1;
+    /* The rc attribute written at create predates the bind and so named
+     * the sensor's frame rate as its source; now that the source channel
+     * is known, re-derive it. See hisi_enc_refresh_rc. */
+    hisi_enc_refresh_rc(st, enc_chn);
+    HAL_LOG_DBG("bind: VPSS(%d,%d) -> VENC(%d)", HISI_VPSS_GRP, hisi_vpss_phy(fs_chn), enc_chn);
+    return RSS_OK;
+}
+
+int hisi_unbind_vpss_venc(hisi_state_t *st, int fs_chn, int enc_chn)
+{
+    v5_mpp_chn src, dst;
+    int ret;
+
+    if (!st)
+        return RSS_ERR_INVAL;
+    if (fs_chn < 0 || fs_chn >= HISI_VPSS_CHN_NUM || enc_chn < 0 || enc_chn >= HISI_VENC_CHN_NUM)
+        return RSS_ERR_INVAL;
+    if (!st->sys.fnUnbind)
+        return RSS_ERR_NOTSUP;
+
+    memset(&src, 0, sizeof(src));
+    src.mod_id = V5_MOD_VPSS;
+    src.dev_id = HISI_VPSS_GRP;
+    src.chn_id = hisi_vpss_phy(fs_chn);
+
+    memset(&dst, 0, sizeof(dst));
+    dst.mod_id = V5_MOD_VENC;
+    dst.dev_id = 0;
+    dst.chn_id = enc_chn;
+
+    ret = st->sys.fnUnbind(&src, &dst);
+    if (ret)
+        HAL_LOG_WARN("ss_mpi_sys_unbind VPSS(%d,%d) -> VENC(%d) failed: 0x%x", HISI_VPSS_GRP,
+                     hisi_vpss_phy(fs_chn), enc_chn, ret);
+
+    st->enc[enc_chn].bound_fs = -1;
+    return RSS_OK;
+}
+
+/*
+ * hal_bind / hal_unbind -- rvd's cell pairs.
+ *
+ * FS -> ENC is the only chain this backend has. rvd builds
+ * FS [-> IVS] [-> OSD] -> ENC and leaves out the stages the caps say are
+ * missing, which for a Phase 2 build is both of them -- there is no IVS on
+ * this backend at all and OSD lands in Phase 5, where RGN regions attach
+ * to a VENC channel and the pair collapses the way the gen4 backend's
+ * does. Until then an OSD stage is refused rather than silently dropped:
+ * a stream that quietly loses its overlay is worse than one that says why.
+ */
+static int hal_bind(void *ctx, const rss_cell_t *src, const rss_cell_t *dst)
+{
+    hisi_state_t *st = hisi_state(ctx);
+
+    if (!st || !src || !dst)
+        return RSS_ERR_INVAL;
+
+    if (src->device != RSS_DEV_FS || dst->device != RSS_DEV_ENC) {
+        HAL_LOG_ERR("bind: FS -> ENC is the only chain this backend supports (got %d -> %d)",
+                    src->device, dst->device);
+        return RSS_ERR_NOTSUP;
+    }
+
+    return hisi_bind_vpss_venc(st, src->group, dst->group);
+}
+
+static int hal_unbind(void *ctx, const rss_cell_t *src, const rss_cell_t *dst)
+{
+    hisi_state_t *st = hisi_state(ctx);
+
+    if (!st || !src || !dst)
+        return RSS_ERR_INVAL;
+
+    if (src->device != RSS_DEV_FS || dst->device != RSS_DEV_ENC)
+        return RSS_ERR_NOTSUP;
+
+    return hisi_unbind_vpss_venc(st, src->group, dst->group);
+}
+
+/* ================================================================
  * THE PIPELINE
  * ================================================================ */
 
@@ -1410,6 +1585,11 @@ static int hisi_video_bringup(hisi_state_t *st, const rss_sensor_config_t *cfg)
 
 static void hisi_video_teardown(hisi_state_t *st)
 {
+    /* Encoders first, then framesources, then the group: an encoder still
+     * bound to a VPSS channel that is about to be disabled is the state
+     * that leaves the kernel side holding buffers. */
+    hisi_enc_release_all(st);
+    hisi_fs_release_all(st);
     hisi_vpss_teardown(st);
     hisi_isp_teardown(st);
     hisi_sensor_teardown(st);
@@ -1942,6 +2122,48 @@ static const rss_hal_ops_t g_ops = {
     .gpio_set = hal_gpio_set,
     .gpio_get = hal_gpio_get,
     .ircut_set = hal_ircut_set,
+
+    /* Datapath. One edge, VPSS -> VENC; the IVS and OSD stages rvd can put
+     * in a chain do not exist on this backend yet. */
+    .bind = hal_bind,
+    .unbind = hal_unbind,
+
+    /* Framesources -- VPSS channels. hal_framesource.c. */
+    .fs_create_channel = hal_fs_create_channel,
+    .fs_set_channel_attr = hal_fs_set_channel_attr,
+    .fs_destroy_channel = hal_fs_destroy_channel,
+    .fs_enable_channel = hal_fs_enable_channel,
+    .fs_disable_channel = hal_fs_disable_channel,
+    .fs_get_frame = hal_fs_get_frame,
+    .fs_release_frame = hal_fs_release_frame,
+    .fs_set_frame_depth = hal_fs_set_frame_depth,
+    .fs_get_frame_depth = hal_fs_get_frame_depth,
+    .fs_set_rotation = hal_fs_set_rotation,
+
+    /* Encoders -- VENC channels. hal_encoder.c. */
+    .enc_create_group = hal_enc_create_group,
+    .enc_destroy_group = hal_enc_destroy_group,
+    .enc_create_channel = hal_enc_create_channel,
+    .enc_destroy_channel = hal_enc_destroy_channel,
+    .enc_register_channel = hal_enc_register_channel,
+    .enc_unregister_channel = hal_enc_unregister_channel,
+    .enc_start = hal_enc_start,
+    .enc_stop = hal_enc_stop,
+    .enc_poll = hal_enc_poll,
+    .enc_get_frame = hal_enc_get_frame,
+    .enc_release_frame = hal_enc_release_frame,
+    .enc_request_idr = hal_enc_request_idr,
+    .enc_set_rc_mode = hal_enc_set_rc_mode,
+    .enc_set_bitrate = hal_enc_set_bitrate,
+    .enc_set_gop = hal_enc_set_gop,
+    .enc_set_fps = hal_enc_set_fps,
+    .enc_set_jpeg_qp = hal_enc_set_jpeg_qp,
+    .enc_get_jpeg_qp = hal_enc_get_jpeg_qp,
+    .enc_get_channel_attr = hal_enc_get_channel_attr,
+    .enc_get_fps = hal_enc_get_fps,
+    .enc_get_avg_bitrate = hal_enc_get_avg_bitrate,
+    .enc_query = hal_enc_query,
+    .enc_get_fd = hal_enc_get_fd,
 #endif
 };
 
@@ -1983,6 +2205,22 @@ rss_hal_ctx_t *rss_hal_create_backend(const char *backend)
 
     ctx->ops = &g_ops;
     memcpy(&ctx->caps, &g_hal_caps, sizeof(ctx->caps));
+
+#ifdef HAL_MODULE_VIDEO
+    /*
+     * The backend surface, as of Phase 2: there is a framesource and an
+     * encoder, and the encoder can make JPEGs.
+     *
+     * These say what the *backend* has rather than what this board has --
+     * whether the VENC symbols resolved is not known until hal_init, and
+     * rvd reads caps before that. The honest report of a board without one
+     * is the ops answering RSS_ERR_NOTSUP, which rvd already handles.
+     *
+     * has_osd stays false until Phase 5.
+     */
+    ctx->caps.has_framesource = true;
+    ctx->caps.has_jpeg = true;
+#endif
 
     return ctx;
 }

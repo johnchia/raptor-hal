@@ -84,6 +84,7 @@ const unsigned int sizes[] __attribute__((section(".rodata.sizes"))) = {
     S(ot_vpss_grp_param),
     S(ot_venc_attr),
     S(ot_venc_rc_attr),
+    S(ot_venc_mjpeg_fixqp),
     S(ot_venc_gop_attr),
     S(ot_venc_pack_info),
     S(ot_venc_start_param),

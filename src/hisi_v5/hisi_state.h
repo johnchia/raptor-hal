@@ -84,8 +84,30 @@
 #define HISI_VENC_CHN_NUM RSS_MAX_ENC_CHANNELS
 
 /*
- * The first VPSS physical channel a stream can come out of -- AND IT IS NOT
- * KNOWN YET.
+ * The first VPSS physical channel a stream can come out of.
+ *
+ * ZERO, and the evidence is the vendor's own sample rather than a header.
+ *
+ * On gen4 this is 1: HI_MPI_SYS_Bind forces the destination channel to 0
+ * whenever the destination module is VPSS, so the group's input is always
+ * channel 0 and channel 0 cannot also be an output. That was plan risk R4
+ * for V5 -- whether ss_mpi_sys_bind has the same quirk.
+ *
+ * It does not. sample_venc.c:764 assigns `venc_vpss_chn->vpss_chn[i] = i`
+ * and binds VPSS channel 0 to VENC channel 0 in the same breath as the VI
+ * -> VPSS bind that names destination channel 0. The two uses of "channel
+ * 0" are different namespaces on V5: the bind's destination channel is the
+ * group's input port, and the output channels are numbered from 0
+ * independently.
+ *
+ * The bench confirms it -- three channels enabled at 0, 1 and 2 all deliver
+ * (see /proc/umap/vpss's SendOk per channel with a stream running).
+ */
+#define HISI_VPSS_CHN_BASE 0
+
+/*
+ * The historical note this replaces, kept because the reasoning is what
+ * makes the constant readable rather than arbitrary.
  *
  * On gen4 this is 1, because HI_MPI_SYS_Bind forces the destination channel
  * to 0 whenever the destination module is VPSS, so the group's input is
@@ -100,10 +122,12 @@
  * the constant has nothing to be wrong about -- and defining it now to
  * either value would be inventing the answer.
  *
- * Deliberately left undefined rather than set to a guess. Phase 2's first
- * commit defines it beside the measurement that produced it, and
- * hisi_vpss_phy() arrives with it.
  */
+
+static inline int hisi_vpss_phy(int fs_chn)
+{
+    return HISI_VPSS_CHN_BASE + fs_chn;
+}
 
 /* ================================================================
  * SENSOR MODE
@@ -207,6 +231,129 @@ int hisi_sensor_mode_load(hisi_sensor_mode_t *m, const char *sensor_name, const 
  * On success writes the symbol it used into m->obj_name.
  */
 v5_isp_sns_obj *hisi_sensor_obj_find(hisi_sensor_mode_t *m, void *handle);
+
+/* ================================================================
+ * PER-CHANNEL BOOKKEEPING
+ * ================================================================ */
+
+/*
+ * One VPSS channel, which is what a raptor framesource maps onto.
+ *
+ * Geometry is tracked rather than read back because rvd asks for it before
+ * the channel exists and after it is destroyed, and because
+ * ss_mpi_vpss_get_chn_attr answers only while the group is running.
+ */
+typedef struct {
+    bool configured;
+    bool enabled;
+
+    unsigned int width;
+    unsigned int height;
+    v5_frame_rate_ctrl frame_rate;
+
+    /* Degrees the channel's output is turned, as last set through
+     * fs_set_rotation. width and height above stay the caller's; what
+     * leaves the channel is height x width for 90 and 270. */
+    int rotation;
+
+    /*
+     * depth, the number of frames the channel queues for *userspace*.
+     *
+     * Zero is the streaming case and the right default: with depth 0 the
+     * channel feeds its bound VENC and queues nothing. It is also why
+     * fs_set_frame_depth is a real op and not bookkeeping -- rvd's
+     * snapshot path raises the depth to take a picture by hand, and with
+     * depth 0 get_chn_frame blocks to its timeout on a channel that is
+     * otherwise working perfectly.
+     */
+    unsigned int depth;
+
+    /* Set while a frame checked out through fs_get_frame is outstanding.
+     * MPP requires the same descriptor back, so it is stored here and the
+     * caller gets a pointer into it. */
+    bool frame_held;
+    v5_video_frame_info frame;
+} hisi_vpss_chn_t;
+
+/*
+ * One VENC channel.
+ *
+ * bound_fs is the VPSS channel feeding it, or -1 -- not 0, because channel
+ * 0 is a real channel and "not bound" needs a value of its own.
+ */
+#define HISI_VENC_MAX_PACKS 8
+
+/*
+ * How many NAL units one frame can be reported as.
+ *
+ * Larger than the pack array on purpose. A V5 pack carries data_num
+ * sub-packets described by pack_info[], so a frame that arrives as one
+ * pack can still be several NALs -- that is plan risk R9, and the answer
+ * is not known until a stream runs. Sizing this at packs x pack_info's
+ * bound would be 64 entries for a case that may never occur; 16 covers
+ * every H.264/H.265 frame this backend produces (VPS, SPS, PPS, SEI and a
+ * slice, however they are grouped) and hal_encoder logs when a frame
+ * exceeds it.
+ */
+#define HISI_VENC_MAX_NALS 16
+
+typedef struct {
+    bool created;
+    bool receiving;
+    int bound_fs;
+    /* Where a duty-cycled MJPEG channel rebinds when it restarts.
+     * enc_stop unbinds those channels -- a stopped-but-bound destination
+     * queues the source's pictures without ever releasing them -- so the
+     * edge to remake has to survive the unbind that cleared bound_fs.
+     * -1 otherwise. */
+    int idle_fs;
+    /* ss_mpi_venc_get_fd's descriptor, cached because rvd polls per
+     * frame, or -1. */
+    int fd;
+
+    rss_codec_t codec;
+    v5_payload_type payload;
+    unsigned int width;
+    unsigned int height;
+
+    /*
+     * The rate-control state. Tracked rather than re-derived, because V5
+     * has no per-knob setter either: enc_set_bitrate and friends are
+     * read-modify-writes of the whole ot_venc_chn_attr, and rebuilding
+     * the untouched half from rvd's config would lose anything set
+     * through another op.
+     */
+    rss_rc_mode_t rc_mode;
+    unsigned int bitrate;
+    unsigned int gop;
+    unsigned int fps_num;
+    unsigned int fps_den;
+
+    /* The rest of what the channel attribute is built from, captured at
+     * create time so a reconfigure can rebuild the whole struct without
+     * any field quietly reverting to a default. */
+    unsigned int profile;
+    unsigned int buf_size;
+    int ip_qp_delta;
+    int init_qp;
+
+    /*
+     * One outstanding stream per channel. MPP wants the same descriptor
+     * back at release_stream, and rss_frame_t has nowhere to keep it.
+     *
+     * The pack array is fixed rather than sized per call from
+     * query_status.cur_packs: get_stream copies into it and trusts
+     * pack_cnt, so an array that can move under a caller holding NALs into
+     * it is worse than one that occasionally reports fewer packs than a
+     * frame had. HISI_VENC_MAX_PACKS is generous for the H.264/H.265 case
+     * -- SPS, PPS, SEI and one slice -- and the log says so if a frame
+     * ever exceeds it.
+     */
+    bool frame_held;
+    v5_venc_stream stream;
+    v5_venc_pack packs[HISI_VENC_MAX_PACKS];
+    rss_nal_unit_t nals[HISI_VENC_MAX_NALS];
+} hisi_venc_chn_t;
 
 /* ================================================================
  * VB GEOMETRY
@@ -377,10 +524,18 @@ typedef struct {
     bool vb_inited;
     bool sys_inited;
 
-#ifdef HAL_MODULE_VIDEO
-    /* The sensor mode, read once during hal_init. Video-only: the audio
-     * archive compiles the same hal_common.c and must not reference
-     * hisi_sensor.c, which is in VIDEO_SRCS alone. */
+    /*
+     * The sensor mode, read once during hal_init.
+     *
+     * Present in both archives even though only the video one fills it
+     * in. The *call* to hisi_sensor_mode_load is what has to be guarded --
+     * hisi_sensor.c is in VIDEO_SRCS alone, so an unguarded call from the
+     * shared hal_common.c would leave rad's link short a symbol -- but the
+     * member costs the audio build nothing. Guarding the member instead
+     * breaks every other video source: the Makefile compiles those through
+     * the generic rule, with no HAL_MODULE_VIDEO of their own, and only
+     * hal_common.c is compiled twice.
+     */
     hisi_sensor_mode_t mode;
 
     /*
@@ -414,10 +569,13 @@ typedef struct {
     bool vi_pipe_created;
     bool vi_pipe_started;
     bool vi_chn_enabled;
+    /* Per-channel bookkeeping. */
+    hisi_vpss_chn_t fs[HISI_VPSS_CHN_NUM];
+    hisi_venc_chn_t enc[HISI_VENC_CHN_NUM];
+
     bool vpss_grp_created;
     bool vpss_grp_started;
     bool vi_vpss_bound;
-#endif
 } hisi_state_t;
 
 static inline hisi_state_t *hisi_state(void *ctx)
@@ -451,5 +609,62 @@ static inline hisi_state_t *hisi_state(void *ctx)
 
 #define HISI_CHIP_HI3516CV608 "0X3516C608" /* measured, 192.168.1.238 */
 #define HISI_CHIP_HI3516CV610 "0X3516C610" /* the family's other die, not yet held */
+
+/* ================================================================
+ * CROSS-FILE ENTRY POINTS
+ *
+ * Declared unconditionally. The audio archive never calls any of them --
+ * hal_common.c's calls are inside #ifdef HAL_MODULE_VIDEO and the files
+ * that define them are in VIDEO_SRCS -- and a declaration nobody calls
+ * costs it nothing.
+ * ================================================================ */
+
+/* hal_framesource.c -- the VPSS channels rvd calls framesources. */
+int hal_fs_create_channel(void *ctx, int chn, const rss_fs_config_t *cfg);
+int hal_fs_set_channel_attr(void *ctx, int chn, const rss_fs_config_t *cfg);
+int hal_fs_destroy_channel(void *ctx, int chn);
+int hal_fs_enable_channel(void *ctx, int chn);
+int hal_fs_disable_channel(void *ctx, int chn);
+int hal_fs_set_rotation(void *ctx, int chn, int degrees);
+int hal_fs_set_frame_depth(void *ctx, int chn, int depth);
+int hal_fs_get_frame_depth(void *ctx, int chn, int *depth);
+int hal_fs_get_frame(void *ctx, int chn, void **frame_data, rss_frame_info_t *info);
+int hal_fs_release_frame(void *ctx, int chn, void *frame_data);
+void hisi_fs_release_all(hisi_state_t *st);
+
+/* hal_encoder.c */
+int hal_enc_create_group(void *ctx, int grp);
+int hal_enc_destroy_group(void *ctx, int grp);
+int hal_enc_create_channel(void *ctx, int chn, const rss_video_config_t *cfg);
+int hal_enc_destroy_channel(void *ctx, int chn);
+int hal_enc_register_channel(void *ctx, int grp, int chn);
+int hal_enc_unregister_channel(void *ctx, int chn);
+int hal_enc_start(void *ctx, int chn);
+int hal_enc_stop(void *ctx, int chn);
+int hal_enc_poll(void *ctx, int chn, uint32_t timeout_ms);
+int hal_enc_get_frame(void *ctx, int chn, rss_frame_t *frame);
+int hal_enc_release_frame(void *ctx, int chn, rss_frame_t *frame);
+int hal_enc_request_idr(void *ctx, int chn);
+int hal_enc_get_fd(void *ctx, int chn);
+int hal_enc_set_rc_mode(void *ctx, int chn, rss_rc_mode_t mode, uint32_t bitrate);
+int hal_enc_set_bitrate(void *ctx, int chn, uint32_t bitrate);
+int hal_enc_set_gop(void *ctx, int chn, uint32_t gop_length);
+int hal_enc_set_fps(void *ctx, int chn, uint32_t fps_num, uint32_t fps_den);
+int hal_enc_set_jpeg_qp(void *ctx, int chn, int qp);
+int hal_enc_get_jpeg_qp(void *ctx, int chn, int *qp);
+int hal_enc_get_channel_attr(void *ctx, int chn, rss_video_config_t *cfg);
+int hal_enc_get_fps(void *ctx, int chn, uint32_t *fps_num, uint32_t *fps_den);
+int hal_enc_get_avg_bitrate(void *ctx, int chn, uint32_t *bitrate);
+int hal_enc_query(void *ctx, int chn, bool *busy);
+void hisi_enc_release_all(hisi_state_t *st);
+
+/* Re-derive the rate-control attribute once the bind names the source
+ * channel; called from hisi_bind_vpss_venc. See hisi_enc_fill_rc. */
+void hisi_enc_refresh_rc(hisi_state_t *st, int enc_chn);
+
+/* The VPSS -> VENC edge, shared by the encoder's register path and by
+ * hal_common.c's generic bind op: both express the same thing. */
+int hisi_bind_vpss_venc(hisi_state_t *st, int fs_chn, int enc_chn);
+int hisi_unbind_vpss_venc(hisi_state_t *st, int fs_chn, int enc_chn);
 
 #endif /* HISI_V5_STATE_H */

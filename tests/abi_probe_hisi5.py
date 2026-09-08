@@ -19,7 +19,7 @@ NAMES = ("MAGIC ot_vi_dev_attr ot_vi_pipe_attr ot_vi_chn_attr ot_vi_vpss_mode "
          "ot_video_frame ot_video_frame_info ot_video_supplement ot_frame_rate_ctrl "
          "ot_border ot_aspect_ratio mipi_dev_attr_t img_rect_t ot_vi_sync_cfg "
          "ot_vi_timing_blank ot_vpss_crop_info ot_vpss_grp_param ot_venc_attr "
-         "ot_venc_rc_attr ot_venc_gop_attr ot_venc_pack_info ot_venc_start_param "
+         "ot_venc_rc_attr ot_venc_mjpeg_fixqp ot_venc_gop_attr ot_venc_pack_info ot_venc_start_param "
          "ot_venc_chn_param ot_venc_jpeg_attr ot_venc_jpeg_param ot_venc_mpf_cfg "
          "ot_venc_stream_buf_info ot_mipi_crop_attr ot_isp_sns_attr_info "
          "ot_crop_info").split()

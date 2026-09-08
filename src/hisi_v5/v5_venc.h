@@ -306,6 +306,23 @@ typedef struct {
 } v5_venc_mjpeg_cbr;
 
 /*
+ * ot_venc_mjpeg_fixqp (ot_common_rc.h:154-158).
+ *
+ * Three words where every other MJPEG arm is four, and it is the field
+ * order that matters rather than the size: qfactor sits where mjpeg_cbr's
+ * dst_frame_rate does. Writing the quality through the CBR arm -- which
+ * looks harmless, the two structs being neighbours -- sets the frame rate
+ * to the quality and leaves the quality at zero.
+ */
+typedef struct {
+    unsigned int src_frame_rate;
+    unsigned int dst_frame_rate;
+    unsigned int qfactor;
+} v5_venc_mjpeg_fixqp;
+
+_Static_assert(sizeof(v5_venc_mjpeg_fixqp) == 12, "ot_venc_mjpeg_fixqp is 12 bytes");
+
+/*
  * ot_venc_rc_attr (ot_common_rc.h:196-234).
  *
  * The pad is ot_venc_h264_rangeqp, the union's largest arm and one raptor
@@ -327,6 +344,8 @@ typedef struct {
         v5_venc_cvbr h265_cvbr;
         v5_venc_fixqp h265_fixqp;
         v5_venc_mjpeg_cbr mjpeg_cbr;
+        v5_venc_mjpeg_cbr mjpeg_vbr;
+        v5_venc_mjpeg_fixqp mjpeg_fixqp;
         unsigned int pad[14];
     } attr;
 } v5_venc_rc_attr;
