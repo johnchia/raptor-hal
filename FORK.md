@@ -1,9 +1,14 @@
 # Maintaining this fork
 
 This is a long-lived downstream fork of [gtxaspec/raptor-hal][upstream] adding
-SigmaStar Infinity6 support. It is not a staging area for upstreaming the
-backends: upstream targets Ingenic, and the MI backends are expected to live
-here indefinitely.
+SigmaStar Infinity6 and HiSilicon Hi3516 support. It is not a staging area for
+upstreaming the backends: upstream targets Ingenic, and the MI and HiSilicon
+backends are expected to live here indefinitely.
+
+The HiSilicon backends -- `src/hisi_v4/` for gen4 (EV200/EV300) and
+`src/hisi_v5/` for gen5 (CV610/CV608) -- are additive in exactly the same way
+as the SigmaStar ones, and hook into the same shared files through the same
+three chains. Nothing below is specific to one vendor.
 
 Which makes exactly one thing worth engineering for: **the cost of taking
 upstream's next commit.**
@@ -25,11 +30,11 @@ Additive files cannot conflict. Shared files always can. So:
 
 | kind | where | conflict cost |
 |---|---|---|
-| backend implementations | `src/star/`, `src/infinity6c/` | none |
-| vendor ABI declarations | `sigmastar-headers/` (submodule) | none |
-| capability tables | `src/caps_sigmastar.inc` | none |
-| platform identity, vendor select | `src/hal_internal_sigmastar.h` | none |
-| build settings | `mk/sigmastar.mk` | none |
+| backend implementations | `src/star/`, `src/infinity6c/`, `src/hisi_v4/`, `src/hisi_v5/` | none |
+| vendor ABI declarations | `sigmastar-headers/` (submodule), `src/hisi_v4/v4_*.h`, `src/hisi_v5/v5_*.h` | none |
+| capability tables | `src/caps_sigmastar.inc`, `src/caps_hisilicon.inc` | none |
+| platform identity, vendor select | `src/hal_internal_sigmastar.h`, `src/hal_internal_hisilicon.h` | none |
+| build settings | `mk/sigmastar.mk`, `mk/hisilicon.mk` | none |
 | host tests | `tests/` | none |
 | **hooks into the above** | 7 shared files | **the whole cost** |
 
