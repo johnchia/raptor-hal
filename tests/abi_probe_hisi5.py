@@ -14,7 +14,8 @@ NAMES = ("MAGIC ot_vi_dev_attr ot_vi_pipe_attr ot_vi_chn_attr ot_vi_vpss_mode "
          "ot_venc_chn_status ot_venc_rc_param ot_vb_cfg ot_vb_pool_cfg ot_mpp_chn "
          "ot_isp_pub_attr ot_isp_exp_info ot_isp_3a_alg_lib ot_isp_sns_obj ot_isp_sns_commbus "
          "ot_rgn_attr ot_rgn_chn_attr ot_rgn_canvas_info ot_aio_attr ot_audio_frame "
-         "combo_dev_attr_t ot_mpp_version").split()
+         "combo_dev_attr_t ot_mpp_version "
+         "ot_size ot_rect ot_vb_pool_info ot_vb_pool_status ot_vb_supplement_cfg").split()
 
 b = open(sys.argv[1], "rb").read()
 v = struct.unpack("<%dI" % (len(b) // 4), b)

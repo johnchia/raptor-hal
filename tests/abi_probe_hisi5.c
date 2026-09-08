@@ -31,11 +31,40 @@
 #include "ot_mipi_rx.h"
 #define S(t) sizeof(t)
 const unsigned int sizes[] __attribute__((section(".rodata.sizes"))) = {
-    0xC0DE0001,         S(ot_vi_dev_attr),    S(ot_vi_pipe_attr),    S(ot_vi_chn_attr),
-    S(ot_vi_vpss_mode), S(ot_vpss_grp_attr),  S(ot_vpss_chn_attr),   S(ot_venc_chn_attr),
-    S(ot_venc_stream),  S(ot_venc_pack),      S(ot_venc_chn_status), S(ot_venc_rc_param),
-    S(ot_vb_cfg),       S(ot_vb_pool_cfg),    S(ot_mpp_chn),         S(ot_isp_pub_attr),
-    S(ot_isp_exp_info), S(ot_isp_3a_alg_lib), S(ot_isp_sns_obj),     S(ot_isp_sns_commbus),
-    S(ot_rgn_attr),     S(ot_rgn_chn_attr),   S(ot_rgn_canvas_info), S(ot_aio_attr),
-    S(ot_audio_frame),  S(combo_dev_attr_t),  S(ot_mpp_version),
+    0xC0DE0001,
+    S(ot_vi_dev_attr),
+    S(ot_vi_pipe_attr),
+    S(ot_vi_chn_attr),
+    S(ot_vi_vpss_mode),
+    S(ot_vpss_grp_attr),
+    S(ot_vpss_chn_attr),
+    S(ot_venc_chn_attr),
+    S(ot_venc_stream),
+    S(ot_venc_pack),
+    S(ot_venc_chn_status),
+    S(ot_venc_rc_param),
+    S(ot_vb_cfg),
+    S(ot_vb_pool_cfg),
+    S(ot_mpp_chn),
+    S(ot_isp_pub_attr),
+    S(ot_isp_exp_info),
+    S(ot_isp_3a_alg_lib),
+    S(ot_isp_sns_obj),
+    S(ot_isp_sns_commbus),
+    S(ot_rgn_attr),
+    S(ot_rgn_chn_attr),
+    S(ot_rgn_canvas_info),
+    S(ot_aio_attr),
+    S(ot_audio_frame),
+    S(combo_dev_attr_t),
+    S(ot_mpp_version),
+    /* Appended by Phase 1, which transcribed them: the two geometry structs
+     * every attribute embeds, and the VB readback trio v5_vb.h declares.
+     * Appended rather than inserted -- the order is the contract with
+     * abi_probe_hisi5.py's name list, so a new struct goes at the end. */
+    S(ot_size),
+    S(ot_rect),
+    S(ot_vb_pool_info),
+    S(ot_vb_pool_status),
+    S(ot_vb_supplement_cfg),
 };

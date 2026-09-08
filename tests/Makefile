@@ -213,12 +213,29 @@ else
 	@echo "abi-check-hisi: gen4 ABI transcriptions hold ($$(grep -c _Static_assert ../src/hisi_v4/v4_*.h | awk -F: '{n+=$$2} END {print n}') asserts)"
 endif
 
-# The V5 (HiMPP V5.0, hi3516cv6xx) size oracle. Not the same kind of target as
-# the three above: there are no v5_*.h transcriptions to check yet, so this
-# compiles the *vendor* headers -- openhisilicon's GPL copy of the 1.0.2.0 set,
-# the version OpenIPC's hi3516cv6xx libraries were built from -- and prints
-# sizeof() for every struct those transcriptions will have to match. Phase 1
-# adds abi-check-hisi5 beside it, which is the check.
+# The gen5 (HiMPP V5.0) layouts, the same shape of check as abi-check-hisi
+# above. Different from it in one respect worth knowing: V5's structs are
+# almost all pointer-free, so most of these asserts also hold on the host and
+# the gen5 test suites carry no -D'_Static_assert(c,m)=' override. "Almost
+# all" is why this target exists anyway -- the exceptions are 32-bit ARM facts
+# and only a cross-compile evaluates them.
+abi-check-hisi5:
+ifeq ($(CROSS_COMPILE),)
+	@echo "abi-check-hisi5: skipped, set CROSS_COMPILE=arm-openipc-linux-musleabi-"
+else
+	$(ABI_CC) -Wall -Wextra -std=c11 -DPLATFORM_HI3516CV610=1 \
+	    -I../src/hisi_v5 -I../src -I../include -I../../raptor-common/include \
+	    -c -o /dev/null abi_hisi5.c
+	@echo "abi-check-hisi5: gen5 ABI transcriptions hold ($$(grep -c _Static_assert ../src/hisi_v5/v5_*.h | awk -F: '{n+=$$2} END {print n}') asserts)"
+endif
+
+# The V5 (HiMPP V5.0, hi3516cv6xx) size oracle, and the other half of
+# abi-check-hisi5 above. The check compiles raptor's *transcription* and says
+# whether it is internally consistent; this compiles the *vendor* headers --
+# openhisilicon's GPL copy of the 1.0.2.0 set, the version OpenIPC's
+# hi3516cv6xx libraries were built from -- and prints sizeof() for every
+# struct the transcription has to match. A disagreement between the two is
+# the transcription's fault; a number that moves here is the headers'.
 #
 # Needs CROSS_COMPILE for the target's ABI (the numbers are the whole point, so
 # a host compile would be worthless) and OPENHISILICON for the header tree:
@@ -242,6 +259,7 @@ endif
 clean:
 	rm -f $(BINS) abi_probe_hisi5.o abi_probe_hisi5.bin
 
-.PHONY: test clean abi-check abi-check-i6c abi-check-hisi abi-probe-hisi5 \
+.PHONY: test clean abi-check abi-check-i6c abi-check-hisi abi-check-hisi5 \
+	abi-probe-hisi5 \
 	test-isp_i6c test-enc_i6c \
 	test-hisi_iq test-hisi_osd $(addprefix test-,$(SUITES))

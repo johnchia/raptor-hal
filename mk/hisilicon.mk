@@ -88,14 +88,20 @@ HAL_COMMON_SRC := $(BACKEND_DIR)/hal_common.c
 # build on eight missing rules at once and hide the one that matters.
 ifneq ($(filter $(PLATFORM),$(HISI_GEN5_PLATFORMS)),)
 
-# V5, Phase 0: nothing of the backend exists yet. HAL_COMMON_SRC below is the
-# one file every build needs, so a Phase 0 build fails naming
-# src/hisi_v5/hal_common.c and nothing else -- which is the phase's acceptance
-# test. hal_gpio.c is vendor-neutral and already builds.
+# V5, Phase 1: the skeleton. The one file every build needs is
+# src/hisi_v5/hal_common.c, and it is HAL_COMMON_SRC above rather than an
+# entry here -- the shared Makefile compiles it into both archives, which is
+# the build-every-daemon rule. So this list holds only hal_gpio.c, which is
+# vendor-neutral and the one piece of the video surface that owes nothing to
+# MPP.
 #
-# Phase 1 adds no entry here (hal_common.c is HAL_COMMON_SRC); Phase 2 adds
-# hisi_sensor.c hal_framesource.c hal_encoder.c; Phase 3 hal_isp.c hal_dyn.c
-# hal_nrx.c hal_knob.c; Phase 4 hal_audio.c to AUDIO_SRCS; Phase 5 hal_osd.c.
+# AUDIO_SRCS is empty and the audio archive still builds: hal_common.c gives
+# it the factory, the ops vtable and the logging hook, and every audio op is
+# absent rather than stubbed.
+#
+# Phase 2 adds hisi_sensor.c hal_framesource.c hal_encoder.c; Phase 3
+# hal_isp.c hal_dyn.c hal_nrx.c hal_knob.c; Phase 4 hal_audio.c to
+# AUDIO_SRCS; Phase 5 hal_osd.c.
 VIDEO_SRCS := src/hal_gpio.c
 AUDIO_SRCS :=
 
