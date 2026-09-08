@@ -225,7 +225,7 @@ static const char *hisi_ini_str(const hisi_ini *ini, const char *section, const 
 /*
  * A value that may be decimal, 0x-hex, or TRUE/FALSE.
  *
- * strtol with base 0 covers the first two; the booleans are spelt out
+ * strtoll with base 0 covers the first two; the booleans are spelt out
  * because the vendor's files use them for td_bool fields and strtol would
  * quietly return 0 for both.
  */
@@ -233,7 +233,7 @@ static int hisi_ini_int(const hisi_ini *ini, const char *section, const char *ke
 {
     const char *v = hisi_ini_str(ini, section, key, NULL);
     char *end;
-    long n;
+    long long n;
 
     if (!v || !*v)
         return fallback;
@@ -242,10 +242,17 @@ static int hisi_ini_int(const hisi_ini *ini, const char *section, const char *ke
     if (hisi_ci_eq(v, "false"))
         return 0;
 
-    n = strtol(v, &end, 0);
+    /*
+     * strtoll, not strtol. The target is 32-bit, and the vendor's files
+     * carry values such as Mask_0 = 0xfff00000 that sit above INT_MAX:
+     * strtol clamps those to LONG_MAX, and 0x7fffffff went into the VI
+     * device as its component mask. The callers that want such a value
+     * cast the result back to unsigned, so hand them the bit pattern.
+     */
+    n = strtoll(v, &end, 0);
     if (end == v)
         return fallback;
-    return (int)n;
+    return (int)(unsigned int)(unsigned long long)n;
 }
 
 static float hisi_ini_float(const hisi_ini *ini, const char *section, const char *key,
