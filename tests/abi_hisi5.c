@@ -29,6 +29,18 @@
 #include "v5_sys.h"
 #include "v5_vb.h"
 
+/* Phase 2, the video pipeline. v5_video.h is included by the three that
+ * need it, but naming it here keeps the list readable as "everything the
+ * backend transcribes" rather than "everything that is not reachable from
+ * something else". */
+#include "v5_video.h"
+#include "v5_mipi.h"
+#include "v5_vi.h"
+#include "v5_vpss.h"
+#include "v5_venc.h"
+#include "v5_snr.h"
+#include "v5_isp.h"
+
 int abi_hisi5_compiled(void)
 {
     return 1;

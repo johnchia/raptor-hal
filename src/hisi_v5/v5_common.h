@@ -241,15 +241,62 @@ typedef struct {
     void *sysbind; /* libss_mpi_sysbind.so */
 
     /*
-     * NULL-terminated resolution order for v5_symbol(). Ordered
-     * most-specific-first only by accident: the three libraries export
-     * disjoint symbol sets, so the order is a formality and any of them
-     * answering is the right answer. Kept as a list rather than keying
-     * each module to a handle because a future OpenIPC build that merges
-     * or splits a library again should cost nothing here.
+     * The ISP tier, opened later by hisi_isp_open() in hal_common.c once
+     * the executable's forwarders are in place. Held here so v5_symbol()
+     * can reach them: they are libraries like any other, and the only
+     * thing special about them is when they may be opened.
+     *
+     * libot_mpi_isp.so is the implementation; libss_mpi_isp.so is a facade
+     * over it -- ss_mpi_isp_init is *four bytes* of code, a branch -- and
+     * both are opened because the facade is where the ss_mpi_ spellings
+     * live. libss_mpi_ae.so and libss_mpi_awb.so hold the 3A registration
+     * calls, and ss_mpi_isp_query_exposure_info is in **ae**, not isp.
      */
-    void *search[4];
+    void *isp_impl; /* libot_mpi_isp.so */
+    void *isp;      /* libss_mpi_isp.so */
+    void *ae;       /* libss_mpi_ae.so */
+    void *awb;      /* libss_mpi_awb.so */
+
+    /*
+     * NULL-terminated resolution order for v5_symbol(). Ordered
+     * most-specific-first only by accident: the libraries export disjoint
+     * symbol sets, so the order is a formality and any of them answering
+     * is the right answer. Kept as a list rather than keying each module
+     * to a handle because a future OpenIPC build that merges or splits a
+     * library again should cost nothing here.
+     *
+     * Sized for the three MPI libraries plus the four ISP ones plus the
+     * terminator. v5_libs_add_search() is what grows it.
+     */
+    void *search[8];
 } v5_mpi_libs;
+
+/*
+ * v5_libs_add_search -- append one open handle to the resolution order.
+ *
+ * Silently ignores a NULL handle, so a caller can pass the result of an
+ * optional dlopen straight through. Returns 0 when the list is full, which
+ * is a programming error rather than a runtime condition -- the array is
+ * sized for every library this backend knows about.
+ */
+static inline int v5_libs_add_search(v5_mpi_libs *libs, void *handle)
+{
+    size_t i, n = sizeof(libs->search) / sizeof(libs->search[0]);
+
+    if (!handle)
+        return 1;
+
+    for (i = 0; i + 1 < n; i++) {
+        if (!libs->search[i]) {
+            libs->search[i] = handle;
+            libs->search[i + 1] = NULL;
+            return 1;
+        }
+    }
+
+    HAL_LOG_ERR("hisi_mpi: symbol search list full, %p dropped", handle);
+    return 0;
+}
 
 /*
  * v5_symbol -- resolve one MPI entry point across the loaded libraries.
@@ -352,7 +399,6 @@ static inline void hisi_mpi_close(v5_mpi_libs *libs);
 static inline int hisi_mpi_open(v5_mpi_libs *libs)
 {
     static const int flags = RTLD_NOW | RTLD_GLOBAL;
-    int n = 0;
 
     memset(libs, 0, sizeof(*libs));
 
@@ -379,10 +425,9 @@ static inline int hisi_mpi_open(v5_mpi_libs *libs)
         goto fail;
     }
 
-    libs->search[n++] = libs->mpi;
-    libs->search[n++] = libs->sysbind;
-    libs->search[n++] = libs->sysmem;
-    libs->search[n] = NULL;
+    v5_libs_add_search(libs, libs->mpi);
+    v5_libs_add_search(libs, libs->sysbind);
+    v5_libs_add_search(libs, libs->sysmem);
 
     HAL_LOG_DBG("hisi_mpi: libss_mpi.so + sysbind + sysmem loaded");
     return RSS_OK;
@@ -399,6 +444,15 @@ static inline void hisi_mpi_close(v5_mpi_libs *libs)
     /* Reverse of the open order. dlclose on a library something else still
      * holds only drops this reference, so the order is bookkeeping rather
      * than a lifetime rule -- but it costs nothing to state it. */
+    if (libs->awb)
+        dlclose(libs->awb);
+    if (libs->ae)
+        dlclose(libs->ae);
+    if (libs->isp)
+        dlclose(libs->isp);
+    if (libs->isp_impl)
+        dlclose(libs->isp_impl);
+
     if (libs->sysbind)
         dlclose(libs->sysbind);
     if (libs->mpi)
