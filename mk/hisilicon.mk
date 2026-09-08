@@ -95,9 +95,9 @@ ifneq ($(filter $(PLATFORM),$(HISI_GEN5_PLATFORMS)),)
 # vendor-neutral and the one piece of the video surface that owes nothing to
 # MPP.
 #
-# AUDIO_SRCS is empty and the audio archive still builds: hal_common.c gives
-# it the factory, the ops vtable and the logging hook, and every audio op is
-# absent rather than stubbed.
+# AUDIO_SRCS carried nothing until Phase 4 and the audio archive still
+# built: hal_common.c gives it the factory, the ops vtable and the logging
+# hook, and every audio op was absent rather than stubbed.
 #
 # hisi_sensor.c is video-only, and hal_common.c's call to it is inside
 # `#ifdef HAL_MODULE_VIDEO` for that reason: the same file is compiled into
@@ -116,7 +116,9 @@ VIDEO_SRCS := $(BACKEND_DIR)/hisi_sensor.c \
               $(BACKEND_DIR)/hal_knob.c \
               $(BACKEND_DIR)/hal_nrx.c \
               src/hal_gpio.c
-AUDIO_SRCS :=
+# Phase 4: AI capture plus the inner codec. hal_common.c is compiled into
+# both archives; hal_audio.c only into this one.
+AUDIO_SRCS := $(BACKEND_DIR)/hal_audio.c
 
 else
 

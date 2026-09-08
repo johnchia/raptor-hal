@@ -258,6 +258,17 @@ typedef struct {
     void *awb;      /* libss_mpi_awb.so */
 
     /*
+     * The audio tier, opened by v5_aud_open_libs (v5_aud.h) from the
+     * audio archive only. The three algorithm libraries are opened for
+     * their side effect -- libss_mpi_audio.so imports from them by symbol
+     * and is opened RTLD_NOW -- and nothing dlsyms out of them.
+     */
+    void *upvqe; /* libupvqe.so */
+    void *dnvqe; /* libdnvqe.so */
+    void *voice; /* libvoice_engine.so */
+    void *audio; /* libss_mpi_audio.so */
+
+    /*
      * NULL-terminated resolution order for v5_symbol(). Ordered
      * most-specific-first only by accident: the libraries export disjoint
      * symbol sets, so the order is a formality and any of them answering
@@ -265,10 +276,11 @@ typedef struct {
      * to a handle because a future OpenIPC build that merges or splits a
      * library again should cost nothing here.
      *
-     * Sized for the three MPI libraries plus the four ISP ones plus the
-     * terminator. v5_libs_add_search() is what grows it.
+     * Sized for the three MPI libraries, the four ISP ones, the audio one
+     * and the terminator, with room to spare. v5_libs_add_search() is
+     * what grows it.
      */
-    void *search[8];
+    void *search[12];
 } v5_mpi_libs;
 
 /*
@@ -444,6 +456,15 @@ static inline void hisi_mpi_close(v5_mpi_libs *libs)
     /* Reverse of the open order. dlclose on a library something else still
      * holds only drops this reference, so the order is bookkeeping rather
      * than a lifetime rule -- but it costs nothing to state it. */
+    if (libs->audio)
+        dlclose(libs->audio);
+    if (libs->voice)
+        dlclose(libs->voice);
+    if (libs->dnvqe)
+        dlclose(libs->dnvqe);
+    if (libs->upvqe)
+        dlclose(libs->upvqe);
+
     if (libs->awb)
         dlclose(libs->awb);
     if (libs->ae)

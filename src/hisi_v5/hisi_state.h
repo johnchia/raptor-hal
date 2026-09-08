@@ -38,6 +38,7 @@
 #include "v5_isp_tune.h"
 #include "v5_nr.h"
 #include "v5_snr.h"
+#include "v5_aud.h"
 
 #include <pthread.h>
 
@@ -776,6 +777,37 @@ typedef struct {
     struct hisi_lad_set *lad;
 
     /*
+     * Phase 4 -- audio. One AI device, one channel, one frame in flight;
+     * the codec fd is /dev/acodec, held open because volume, gain and
+     * mute all go through it at runtime. gen4's arrangement, on V5's
+     * structs.
+     *
+     * aud_owns_sys records that audio_init did the SYS attach itself
+     * (rad's normal path -- it never calls hal_init). Note what it does
+     * NOT drive: an exit. SYS and VB state are kernel-global and rvd may
+     * be streaming in another process, so the audio archive never calls
+     * ss_mpi_sys_exit -- the process's own exit is the real detach. See
+     * hal_audio.c.
+     */
+    v5_aud_impl aud;
+    bool aud_loaded;
+    bool aud_owns_sys;
+    bool aud_dev_enabled;
+    bool aud_chn_enabled;
+    bool aud_first_frame; /* log the first frame's numbers, the layout check */
+    int aud_dev;
+    int acodec_fd;
+    int aud_rate;
+    /* No cached volume/gain here on purpose: both analog controls are
+     * pure /dev/acodec pass-throughs, so the getters read the codec and
+     * a cache would only ever hold what the codec already knows. */
+    bool aud_gain_clamped; /* the "gain exceeds the codec max" warning is once-only */
+    v5_audio_frame aud_frame;
+    v5_aec_frame aud_aec;
+    bool aud_frame_held;
+    int aud_last_err;
+
+    /*
      * The [image] knobs. rvd sets them before the ISP runs and the tuning
      * load rewrites the same attributes on the first frame, so each is
      * remembered and re-applied around a load. The two baselines are
@@ -915,6 +947,22 @@ void hisi_lad_free(hisi_state_t *st);
 
 /* hal_isp.c: the sensor rate, for rvd and the fps ladder alike. */
 int hisi_isp_fps_write(hisi_state_t *st, float fps);
+
+/* hal_common.c: the forwarder check every MPP attach runs first, which
+ * hal_audio.c's audio_init is the second entry point for. */
+void hisi_check_trampolines(void);
+
+/* hal_audio.c -- the audio archive only; hal_common.c's calls are under
+ * HAL_MODULE_AUDIO. */
+int hal_audio_init(void *ctx, const rss_audio_config_t *cfg);
+int hal_audio_deinit(void *ctx);
+int hal_audio_read_frame(void *ctx, int dev, int chn, rss_audio_frame_t *frame, bool block);
+int hal_audio_release_frame(void *ctx, int dev, int chn, rss_audio_frame_t *frame);
+int hal_audio_set_volume(void *ctx, int dev, int chn, int vol);
+int hal_audio_get_volume(void *ctx, int dev, int chn, int *vol);
+int hal_audio_set_gain(void *ctx, int dev, int chn, int gain);
+int hal_audio_get_gain(void *ctx, int dev, int chn, int *gain);
+int hal_audio_set_mute(void *ctx, int dev, int chn, int mute);
 
 /* hal_knob.c -- the [image] knobs, the exposure readback and orientation. */
 int hal_isp_set_brightness(void *ctx, int val);

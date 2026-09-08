@@ -1931,6 +1931,10 @@ static int hal_init(void *ctx, const rss_multi_sensor_config_t *cfg)
     st = (hisi_state_t *)calloc(1, sizeof(*st));
     if (!st)
         return RSS_ERR_NOMEM;
+    /* The codec fd too: a video-only run of an audio-enabled build would
+     * otherwise close(0) in hal_deinit and ioctl(0, ...) from the volume
+     * and gain setters before audio_init opened it. */
+    st->acodec_fd = -1;
     c->platform = st;
 
     /*
@@ -2166,6 +2170,12 @@ static int hal_deinit(void *ctx)
     if (!st)
         return RSS_OK;
 
+#ifdef HAL_MODULE_AUDIO
+    /* A caller that skips the audio_deinit op still must not free state
+     * under a running AI device or an open /dev/acodec. Idempotent. */
+    hal_audio_deinit(ctx);
+#endif
+
     hisi_teardown(st);
 
     /*
@@ -2294,8 +2304,8 @@ static int hal_sys_rebase_timestamp(void *ctx, int64_t base)
  * build useful rather than merely compilable: rvd starts, prints its
  * banner, finds no framesource and exits cleanly.
  *
- * The video pipeline (fs_*, enc_*, isp_*) lands in Phase 2, ISP tuning in
- * Phase 3, audio in Phase 4, OSD in Phase 5.
+ * The video pipeline (fs_*, enc_*, isp_*) landed in Phase 2, ISP tuning in
+ * Phase 3, audio in Phase 4; OSD is Phase 5.
  * ================================================================ */
 
 static const rss_hal_ops_t g_ops = {
@@ -2382,6 +2392,20 @@ static const rss_hal_ops_t g_ops = {
     .isp_set_hflip = hal_isp_set_hflip,
     .isp_set_vflip = hal_isp_set_vflip,
     .isp_get_hvflip = hal_isp_get_hvflip,
+#endif
+
+#ifdef HAL_MODULE_AUDIO
+    /* AI capture + the inner codec (src/hisi_v5/hal_audio.c). The OP
+     * COVERAGE block there argues each absence -- VQE, AENC, AO. */
+    .audio_init = hal_audio_init,
+    .audio_deinit = hal_audio_deinit,
+    .audio_read_frame = hal_audio_read_frame,
+    .audio_release_frame = hal_audio_release_frame,
+    .audio_set_volume = hal_audio_set_volume,
+    .audio_get_volume = hal_audio_get_volume,
+    .audio_set_gain = hal_audio_set_gain,
+    .audio_get_gain = hal_audio_get_gain,
+    .audio_set_mute = hal_audio_set_mute,
 #endif
 };
 
