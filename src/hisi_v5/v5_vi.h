@@ -194,6 +194,26 @@ typedef enum {
 } v5_vi_pipe_bypass_mode;
 
 /*
+ * ot_3dnr_attr (ot_common_video.h:1173-1178): the pipe's 3DNR switch.
+ * Read back from a CV608 at bring-up: enable 0, nr_type NORM, compress
+ * FRAME, motion NORM -- so the pipe is created ready for it and only the
+ * enable is missing. Turning it on allocates the reference frames in MMZ
+ * (vi(0)_3dnr_ref, _mad, _stt in the tuning guide's list), which is what
+ * it answers OT_ERR_NO_MEM about when there is none left.
+ */
+typedef struct {
+    int enable;         /* td_bool */
+    int nr_type;        /* ot_nr_type: 0 VIDEO_NORM */
+    int compress_mode;  /* ot_compress_mode: 5 FRAME is the only one 3DNR takes */
+    int nr_motion_mode; /* ot_nr_motion_mode: 0 NORM */
+} v5_3dnr_attr;
+
+_Static_assert(sizeof(v5_3dnr_attr) == 16, "ot_3dnr_attr is 16 bytes");
+
+#define V5_NR_TYPE_VIDEO_NORM 0
+#define V5_NR_MOTION_MODE_NORM 0
+
+/*
  * ot_vi_pipe_attr.
  *
  * isp_bypass is the second bypass and it is not the same switch as
@@ -299,8 +319,8 @@ typedef struct {
      * depends on ss_mpi_sys_set_3dnr_pos (v5_sys.h), so Phase 3 resolves
      * both and calls one. Optional here for the same reason.
      */
-    int (*fnSetPipe3dnrAttr)(int pipe, const void *attr);
-    int (*fnGetPipe3dnrAttr)(int pipe, void *attr);
+    int (*fnSetPipe3dnrAttr)(int pipe, const v5_3dnr_attr *attr);
+    int (*fnGetPipe3dnrAttr)(int pipe, v5_3dnr_attr *attr);
     int (*fnSetPipe3dnrParam)(int pipe, const void *param);
     int (*fnGetPipe3dnrParam)(int pipe, void *param);
 } v5_vi_impl;
@@ -355,9 +375,9 @@ static inline int v5_vi_load(v5_vi_impl *lib, const v5_mpi_libs *libs)
     lib->fnGetChnFd = (int (*)(int, int))v5_symbol_opt(libs, "ss_mpi_vi_get_chn_fd");
 
     lib->fnSetPipe3dnrAttr =
-        (int (*)(int, const void *))v5_symbol_opt(libs, "ss_mpi_vi_set_pipe_3dnr_attr");
+        (int (*)(int, const v5_3dnr_attr *))v5_symbol_opt(libs, "ss_mpi_vi_set_pipe_3dnr_attr");
     lib->fnGetPipe3dnrAttr =
-        (int (*)(int, void *))v5_symbol_opt(libs, "ss_mpi_vi_get_pipe_3dnr_attr");
+        (int (*)(int, v5_3dnr_attr *))v5_symbol_opt(libs, "ss_mpi_vi_get_pipe_3dnr_attr");
     lib->fnSetPipe3dnrParam =
         (int (*)(int, const void *))v5_symbol_opt(libs, "ss_mpi_vi_set_pipe_3dnr_param");
     lib->fnGetPipe3dnrParam =

@@ -145,6 +145,22 @@ typedef struct {
     v5_aspect_ratio aspect_ratio;
 } v5_vpss_chn_attr;
 
+/*
+ * ot_vpss_chn_buf_wrap_attr (ot_common_vpss.h:138-142). Physical channel
+ * 0 only, set between set_chn_attr and enable_chn, and while it is on the
+ * channel writes a ring of buf_line lines into one block it takes from
+ * the common pools instead of whole frames into its own. buf_size is the
+ * caller's arithmetic (ot_comm_get_vpss_venc_wrap_buf_size, ported as
+ * hisi_vb_wrap_size) and the block it takes has to be at least that.
+ */
+typedef struct {
+    int enable; /* td_bool */
+    unsigned int buf_line;
+    unsigned int buf_size;
+} v5_vpss_chn_buf_wrap_attr;
+
+_Static_assert(sizeof(v5_vpss_chn_buf_wrap_attr) == 12, "ot_vpss_chn_buf_wrap_attr is 12 bytes");
+
 _Static_assert(sizeof(v5_vpss_chn_attr) == 96, "ot_vpss_chn_attr is 96 bytes");
 _Static_assert(offsetof(v5_vpss_chn_attr, width) == 12, "ot_vpss_chn_attr.width at +12");
 _Static_assert(offsetof(v5_vpss_chn_attr, chn_mode) == 24, "ot_vpss_chn_attr.chn_mode at +24");
@@ -250,6 +266,11 @@ typedef struct {
     /* Rotation, for a mounted-upside-down camera. Phase 3's. */
     int (*fnSetChnRotation)(int grp, int chn, const void *rotation);
     int (*fnGetChnRotation)(int grp, int chn, void *rotation);
+
+    /* The chn0 -> VENC ring. Optional: a driver without it streams from
+     * whole frames, which is correct and costs the private pool. */
+    int (*fnSetChnBufWrap)(int grp, int chn, const v5_vpss_chn_buf_wrap_attr *attr);
+    int (*fnGetChnBufWrap)(int grp, int chn, v5_vpss_chn_buf_wrap_attr *attr);
 } v5_vpss_impl;
 
 /*
@@ -329,6 +350,10 @@ static inline int v5_vpss_load(v5_vpss_impl *lib, const v5_mpi_libs *libs)
         (int (*)(int, int, const void *))v5_symbol_opt(libs, "ss_mpi_vpss_set_chn_rotation");
     lib->fnGetChnRotation =
         (int (*)(int, int, void *))v5_symbol_opt(libs, "ss_mpi_vpss_get_chn_rotation");
+    lib->fnSetChnBufWrap = (int (*)(int, int, const v5_vpss_chn_buf_wrap_attr *))v5_symbol_opt(
+        libs, "ss_mpi_vpss_set_chn_buf_wrap");
+    lib->fnGetChnBufWrap = (int (*)(int, int, v5_vpss_chn_buf_wrap_attr *))v5_symbol_opt(
+        libs, "ss_mpi_vpss_get_chn_buf_wrap");
 
     return RSS_OK;
 }

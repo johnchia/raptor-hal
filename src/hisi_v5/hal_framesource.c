@@ -21,7 +21,11 @@
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
 
+#define _POSIX_C_SOURCE 200809L /* nanosleep */
+
 #include "hisi_state.h"
+
+#include <time.h>
 
 #include <stdio.h>
 
@@ -120,7 +124,9 @@ static v5_compress_mode hisi_fs_compress(const hisi_vpss_chn_t *fs, int phy)
  * ================================================================ */
 
 /*
- * How many blocks one channel's pool holds.
+ * How many blocks one channel's pool holds. (Channel 0 normally holds
+ * none: it streams through the wrap ring below, and takes a pool only
+ * while a snapshot has its depth up.)
  *
  * One being written, one in flight, one held by the bound encoder. gen4
  * uses four; three is chosen here because this part's MMZ is the binding
@@ -142,6 +148,9 @@ static unsigned long long hisi_fs_pool_want(const hisi_state_t *st, const hisi_v
     unsigned long long want, common;
 
     if (!fs->width || !fs->height)
+        return 0;
+    /* A wrapped channel writes into the ring, not into frames. */
+    if (fs->wrapped)
         return 0;
 
     want = hisi_vb_yuv_size(fs->width, fs->height, fs->compress_mode);
@@ -257,6 +266,151 @@ static void hisi_fs_pool_release(hisi_state_t *st, int chn, hisi_vpss_chn_t *fs)
     fs->vb_pool_blk_size = 0;
 }
 
+/* ================================================================
+ * THE CHANNEL 0 WRAP RING
+ *
+ * VPSS physical channel 0 can feed its encoder from a ring of buf_line
+ * lines instead of whole frames: ss_mpi_vpss_set_chn_buf_wrap, CV610
+ * only, set between the channel attribute and the enable. While it is on
+ * the channel takes one block from the common pools -- the one hal_init
+ * cut in pool 1 for exactly this -- and needs no pool of its own, which
+ * on this board is 6.2 MB of a 32 MB MMZ at 1080p, and the room the VI
+ * pipe's 3DNR reference frames were refused for.
+ *
+ * What it costs, from the VPSS reference's list for this call: no flip
+ * on the channel (orientation is VI's here anyway), no channel
+ * post-processing, no low-delay and no buffer-share on the same channel,
+ * and the bound encoders may not re-encode oversize frames -- none of
+ * which this backend uses. A JPEG and an H.26x channel may both hang off
+ * the wrapped channel, which is what rvd binds. What it cannot do is hand
+ * a frame to userspace, and the depth that would ask for one is refused
+ * rather than taken off the ring -- see hal_fs_set_frame_depth for the
+ * measured reason.
+ *
+ * The line count is the driver's (ss_mpi_sys_get_vpss_venc_wrap_buf_line)
+ * and the byte count is its formula (hisi_vb_wrap_size); the sizes are
+ * remembered so a geometry change knows whether the ring has to be cut
+ * again. Every failure here leaves the channel streaming from whole
+ * frames, the way it did before the ring existed.
+ * ================================================================ */
+
+static bool hisi_fs_wrap_want(const hisi_state_t *st, const hisi_vpss_chn_t *fs, int phy)
+{
+    return phy == 0 && !fs->depth && st->vb_wrap_blk && st->vpss.fnSetChnBufWrap &&
+           st->sys.fnGetVpssVencWrapBufLine;
+}
+
+/* The ring this channel would ask for now. False when it cannot be had. */
+static bool hisi_fs_wrap_attr(const hisi_state_t *st, int chn, const hisi_vpss_chn_t *fs,
+                              v5_vpss_chn_buf_wrap_attr *w)
+{
+    v5_vpss_venc_wrap_param p;
+    unsigned int line = 0;
+    int ret;
+
+    memset(&p, 0, sizeof(p));
+    p.all_online = 0; /* VI online, VPSS offline */
+    p.frame_rate = st->mode.frame_rate > 1.0f ? (unsigned int)(st->mode.frame_rate + 0.5f) : 30u;
+    p.full_lines_std = st->mode.dev_rect.height; /* see v5_vpss_venc_wrap_param */
+    p.large_stream_size.width = fs->width;
+    p.large_stream_size.height = fs->height;
+    p.small_stream_size = p.large_stream_size;
+
+    ret = st->sys.fnGetVpssVencWrapBufLine(&p, &line);
+    if (ret || !line) {
+        HAL_LOG_WARN("fs%d: ss_mpi_sys_get_vpss_venc_wrap_buf_line -> 0x%x, %u lines; streaming "
+                     "from whole frames",
+                     chn, ret, line);
+        return false;
+    }
+    if (line > fs->height)
+        line = fs->height;
+
+    memset(w, 0, sizeof(*w));
+    w->enable = 1;
+    w->buf_line = line;
+    w->buf_size = (unsigned int)hisi_vb_wrap_size(fs->width, fs->height, line, fs->compress_mode);
+    if (w->buf_size > st->vb_wrap_blk) {
+        HAL_LOG_WARN("fs%d: a %u-line ring is %u B and pool 1's block is %llu; streaming from "
+                     "whole frames",
+                     chn, line, w->buf_size, st->vb_wrap_blk);
+        return false;
+    }
+    return true;
+}
+
+/*
+ * hisi_fs_wrap_apply -- put the channel on the ring, or take it off.
+ *
+ * The channel has to be disabled and its attribute already set; every
+ * caller is on that path. A failed enable is a warning and an unwrapped
+ * channel, never an error to the caller.
+ */
+static void hisi_fs_wrap_apply(hisi_state_t *st, int chn, hisi_vpss_chn_t *fs, bool want)
+{
+    v5_vpss_chn_buf_wrap_attr w;
+    int phy = hisi_vpss_phy(chn);
+    int ret;
+
+    if (want && !hisi_fs_wrap_attr(st, chn, fs, &w))
+        want = false;
+
+    if (!want) {
+        if (fs->wrapped && st->vpss.fnSetChnBufWrap) {
+            memset(&w, 0, sizeof(w));
+            ret = st->vpss.fnSetChnBufWrap(HISI_VPSS_GRP, phy, &w);
+            if (ret)
+                HAL_LOG_WARN("fs%d: ss_mpi_vpss_set_chn_buf_wrap(off) failed: 0x%x", chn, ret);
+            else
+                HAL_LOG_INFO("fs%d: wrap off; streaming from whole frames", chn);
+        }
+        fs->wrapped = false;
+        fs->wrap_line = 0;
+        fs->wrap_size = 0;
+        return;
+    }
+
+    /*
+     * Measured: a ring turned off and back on in the same call --
+     * which a geometry change on channel 0 has to do, the attribute
+     * being refused while the ring is on -- answers 0xa0078014 (NO_MEM)
+     * the first time and succeeds 20 ms later. The block is back in the
+     * pool by then (/proc/umap/vb shows it free); whatever the driver
+     * tears down on the way out is not quite gone. So: a few tries, a
+     * blink apart.
+     */
+    {
+        int tries = 10;
+
+        for (;;) {
+            ret = st->vpss.fnSetChnBufWrap(HISI_VPSS_GRP, phy, &w);
+            if (!ret || V5_ERR_ID(ret) != V5_ERR_NO_MEM || --tries <= 0)
+                break;
+            {
+                struct timespec blink = {0, 20000000L};
+
+                nanosleep(&blink, NULL);
+            }
+        }
+    }
+    if (ret) {
+        HAL_LOG_WARN("fs%d: ss_mpi_vpss_set_chn_buf_wrap(%u lines, %u B) failed: 0x%x; streaming "
+                     "from whole frames",
+                     chn, w.buf_line, w.buf_size, ret);
+        fs->wrapped = false;
+        fs->wrap_line = 0;
+        fs->wrap_size = 0;
+        return;
+    }
+    fs->wrapped = true;
+    fs->wrap_line = w.buf_line;
+    fs->wrap_size = w.buf_size;
+    HAL_LOG_INFO("fs%d: wrapped: a %u-line ring of %u B for %ux%u%s, out of common pool 1; no "
+                 "private pool",
+                 chn, w.buf_line, w.buf_size, fs->width, fs->height,
+                 fs->compress_mode == V5_COMPRESS_MODE_SEG_COMPACT ? " compressed" : "");
+}
+
 /*
  * hisi_fs_pool_refresh -- keep the pool matched to a geometry that changed.
  *
@@ -268,19 +422,39 @@ static void hisi_fs_pool_release(hisi_state_t *st, int chn, hisi_vpss_chn_t *fs)
  *
  * The channel has to be down while its pool is swapped, so this disables
  * and re-enables around the swap and leaves the channel as it found it.
+ * `attr` is the channel attribute to set inside that window, for the
+ * caller that could not set it live; NULL when it already has.
  */
-static void hisi_fs_pool_refresh(hisi_state_t *st, int chn, hisi_vpss_chn_t *fs)
+static void hisi_fs_pool_refresh(hisi_state_t *st, int chn, hisi_vpss_chn_t *fs,
+                                 const v5_vpss_chn_attr *attr)
 {
     unsigned long long want;
-    bool was_enabled;
+    bool was_enabled, want_wrap, wrap_change;
     int phy = hisi_vpss_phy(chn);
     int ret;
 
-    if (!st->vb_private_pools)
+    /*
+     * The ring first: whether the channel should be on one now, and if it
+     * already is, whether the geometry it was cut for is still the
+     * geometry. Only then can the pool question be asked, because a
+     * wrapped channel wants no pool at all.
+     */
+    want_wrap = hisi_fs_wrap_want(st, fs, phy);
+    wrap_change = want_wrap != fs->wrapped;
+    if (want_wrap && fs->wrapped) {
+        v5_vpss_chn_buf_wrap_attr w;
+
+        wrap_change = !hisi_fs_wrap_attr(st, chn, fs, &w) || w.buf_size != fs->wrap_size ||
+                      w.buf_line != fs->wrap_line;
+    }
+
+    /* An attribute to set is always a reason to cycle: it is the fps-only
+     * reconfigure on a wrapped channel, which changes no block. */
+    if (!attr && !st->vb_private_pools && !wrap_change)
         return;
 
-    want = hisi_fs_pool_want(st, fs);
-    if (want == (fs->vb_pool_owned ? fs->vb_pool_blk_size : 0ull))
+    want = wrap_change ? 0 : hisi_fs_pool_want(st, fs);
+    if (!attr && !wrap_change && want == (fs->vb_pool_owned ? fs->vb_pool_blk_size : 0ull))
         return;
 
     was_enabled = fs->enabled;
@@ -293,6 +467,22 @@ static void hisi_fs_pool_refresh(hisi_state_t *st, int chn, hisi_vpss_chn_t *fs)
         fs->enabled = false;
     }
 
+    /*
+     * Ring off, attribute, ring on -- in that order. A channel on the ring
+     * refuses a new attribute whether enabled or not (0xa007800d,
+     * NOT_PERM, measured both ways), and the reference wants the ring set
+     * after the attribute; so the ring comes off first whenever there is
+     * an attribute to set or a ring to re-cut, and goes back on after.
+     */
+    if (fs->wrapped && (wrap_change || attr))
+        hisi_fs_wrap_apply(st, chn, fs, false);
+    if (attr) {
+        ret = st->vpss.fnSetChnAttr(HISI_VPSS_GRP, phy, attr);
+        if (ret)
+            HAL_LOG_ERR("fs%d: ss_mpi_vpss_set_chn_attr while cycling failed: 0x%x", chn, ret);
+    }
+    if (want_wrap && !fs->wrapped)
+        hisi_fs_wrap_apply(st, chn, fs, true);
     hisi_fs_pool_release(st, chn, fs);
     hisi_fs_pool_acquire(st, chn, fs);
 
@@ -410,8 +600,11 @@ int hal_fs_create_channel(void *ctx, int chn, const rss_fs_config_t *cfg)
     }
     fs->configured = true;
 
-    /* Before the enable: a channel that comes up on the common pool and is
-     * moved to its own afterwards has to be cycled to do it. */
+    /* Before the enable: the ring has to be set while the channel is down,
+     * and a channel that comes up on the common pool and is moved to its
+     * own afterwards has to be cycled to do it. The ring first, because a
+     * wrapped channel wants no pool. */
+    hisi_fs_wrap_apply(st, chn, fs, hisi_fs_wrap_want(st, fs, phy));
     hisi_fs_pool_acquire(st, chn, fs);
 
     ret = st->vpss.fnEnableChn(HISI_VPSS_GRP, phy);
@@ -458,6 +651,13 @@ int hal_fs_set_channel_attr(void *ctx, int chn, const rss_fs_config_t *cfg)
     phy = hisi_vpss_phy(chn);
     hisi_fs_fill_attr(st, fs, phy, &attr);
 
+    if (fs->wrapped) {
+        /* Refused live on a wrapped channel; set inside the cycle, where
+         * the ring is re-cut for the new geometry as well. */
+        hisi_fs_pool_refresh(st, chn, fs, &attr);
+        return RSS_OK;
+    }
+
     ret = st->vpss.fnSetChnAttr(HISI_VPSS_GRP, phy, &attr);
     if (ret) {
         HAL_LOG_ERR("ss_mpi_vpss_set_chn_attr(grp %d, chn %d) failed: 0x%x", HISI_VPSS_GRP, phy,
@@ -467,7 +667,7 @@ int hal_fs_set_channel_attr(void *ctx, int chn, const rss_fs_config_t *cfg)
 
     /* A new geometry is a new block size. No-op when the size did not
      * actually change, which is the fps-only reconfigure. */
-    hisi_fs_pool_refresh(st, chn, fs);
+    hisi_fs_pool_refresh(st, chn, fs, NULL);
 
     HAL_LOG_INFO("fs%d: now %ux%u, rate %d/%d", chn, fs->width, fs->height,
                  fs->frame_rate.src_frame_rate, fs->frame_rate.dst_frame_rate);
@@ -557,7 +757,8 @@ int hal_fs_destroy_channel(void *ctx, int chn)
         return ret;
 
     /* After the disable, so the pool's blocks are back before it is
-     * destroyed. */
+     * destroyed; the ring's block goes back to common the same way. */
+    hisi_fs_wrap_apply(st, chn, fs, false);
     hisi_fs_pool_release(st, chn, fs);
 
     memset(fs, 0, sizeof(*fs));
@@ -618,11 +819,29 @@ int hal_fs_set_frame_depth(void *ctx, int chn, int depth)
     if ((unsigned int)depth == fs->depth)
         return RSS_OK;
 
-    fs->depth = (unsigned int)depth;
-
-    if (!fs->configured)
+    if (!fs->configured) {
+        fs->depth = (unsigned int)depth;
         return RSS_OK;
+    }
 
+    /*
+     * Not on the ring. A depth would take channel 0 off it, and what it
+     * would then need -- three uncompressed 1080p frames of its own,
+     * 9.3 MB -- does not exist beside 3DNR's reference frames; the
+     * measured alternative was the channel drawing sensor-sized blocks
+     * from the VI pool and VI failing 73 allocations in two seconds.
+     * NOTSUP is what rvd's raw-snapshot path reports as "not supported
+     * on this SoC", which for now is the truth: hal_fs_get_frame also
+     * never maps the block it checks out, so the path has no user yet.
+     */
+    if (depth && fs->wrapped) {
+        HAL_LOG_INFO("fs%d: depth %d refused: the channel streams through the wrap ring and "
+                     "queues nothing for userspace",
+                     chn, depth);
+        return RSS_ERR_NOTSUP;
+    }
+
+    fs->depth = (unsigned int)depth;
     phy = hisi_vpss_phy(chn);
     hisi_fs_fill_attr(st, fs, phy, &attr);
     ret = st->vpss.fnSetChnAttr(HISI_VPSS_GRP, phy, &attr);
@@ -634,9 +853,10 @@ int hal_fs_set_frame_depth(void *ctx, int chn, int depth)
     /*
      * Raising the depth turns compression off on channel 0 and lowering it
      * turns it back on -- see hisi_fs_compress -- and either way the
-     * block size just changed underneath the pool.
+     * block size just changed underneath the pool. (A channel that was
+     * never wrapped, that is; one on the ring was refused above.)
      */
-    hisi_fs_pool_refresh(st, chn, fs);
+    hisi_fs_pool_refresh(st, chn, fs, NULL);
 
     return RSS_OK;
 }

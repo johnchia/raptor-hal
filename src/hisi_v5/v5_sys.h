@@ -100,6 +100,28 @@ typedef enum {
     V5_3DNR_POS_VPSS = 1,
 } v5_3dnr_pos_type;
 
+/*
+ * ot_vpss_venc_wrap_param (ot_common_sys.h:153-163): what
+ * ss_mpi_sys_get_vpss_venc_wrap_buf_line wants to know before it says how
+ * many lines the VPSS chn0 -> VENC ring has to hold. full_lines_std is the
+ * sensor's VTS, blanking included. Measured on the CV608 (MPP 1.0.2.0
+ * B051): with all_online false the answer is 128 -- the attribute's own
+ * floor -- for every stream size, frame rate and VTS tried, so the VTS
+ * this backend passes is the sensor height, and the call is still made
+ * because the number is the driver's to change.
+ */
+typedef struct {
+    int all_online; /* td_bool: VI online and VPSS online */
+    unsigned int frame_rate;
+    unsigned int full_lines_std;
+    v5_size large_stream_size;
+    v5_size small_stream_size;
+} v5_vpss_venc_wrap_param;
+
+_Static_assert(sizeof(v5_vpss_venc_wrap_param) == 28, "ot_vpss_venc_wrap_param is 28 bytes");
+_Static_assert(offsetof(v5_vpss_venc_wrap_param, large_stream_size) == 12,
+               "ot_vpss_venc_wrap_param.large_stream_size at +12");
+
 /* ================================================================
  * LOADER
  * ================================================================ */
@@ -158,6 +180,10 @@ typedef struct {
     int (*fnGetViVpssMode)(v5_vi_vpss_mode *mode);
     int (*fnSet3dnrPos)(v5_3dnr_pos_type pos);
     int (*fnGet3dnrPos)(v5_3dnr_pos_type *pos);
+    /* The chn0 wrap ring's line count. A pure computation: it answers
+     * before ss_mpi_sys_init, which is when the VB pool that holds the
+     * ring has to be sized. Optional; without it there is no wrap. */
+    int (*fnGetVpssVencWrapBufLine)(const v5_vpss_venc_wrap_param *param, unsigned int *buf_line);
 
     /*
      * The memory surface, from libss_mpi_sysmem.so.
@@ -227,6 +253,9 @@ static inline int v5_sys_load(v5_sys_impl *lib, const v5_mpi_libs *libs)
         (int (*)(v5_vi_vpss_mode *))v5_symbol_opt(libs, "ss_mpi_sys_get_vi_vpss_mode");
     lib->fnSet3dnrPos = (int (*)(v5_3dnr_pos_type))v5_symbol_opt(libs, "ss_mpi_sys_set_3dnr_pos");
     lib->fnGet3dnrPos = (int (*)(v5_3dnr_pos_type *))v5_symbol_opt(libs, "ss_mpi_sys_get_3dnr_pos");
+    lib->fnGetVpssVencWrapBufLine =
+        (int (*)(const v5_vpss_venc_wrap_param *, unsigned int *))v5_symbol_opt(
+            libs, "ss_mpi_sys_get_vpss_venc_wrap_buf_line");
 
     lib->fnMmap = (void *(*)(unsigned int, unsigned int))v5_symbol_opt(libs, "ss_mpi_sys_mmap");
     lib->fnMunmap = (int (*)(void *))v5_symbol_opt(libs, "ss_mpi_sys_munmap");

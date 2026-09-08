@@ -1080,6 +1080,56 @@ static void hisi_vi_vpss_mode(hisi_state_t *st)
 }
 
 /*
+ * hisi_vi_enable_3dnr -- the pipe's temporal noise reduction, after the
+ * channel is up (the sample's order, sample_comm_vi_start_chn).
+ *
+ * The pipe comes up ready for it -- nr_type NORM, compress FRAME, motion
+ * NORM, enable 0 -- and the enable is what allocates the reference
+ * frames, in MMZ rather than VB. On a 32 MB MMZ that allocation and
+ * channel 0's 6.2 MB frame pool did not both fit (OT_ERR_NO_MEM, measured
+ * 2026-09-08), which is why this is tied to the wrap ring: with channel 0
+ * streaming from a 0.4 MB ring the room is there. The [static_3dnr]
+ * ladder hal_nrx.c writes is what these frames get filtered with.
+ *
+ * Never fatal. A pipe without 3DNR is the pipe this backend shipped with
+ * until today.
+ */
+static void hisi_vi_enable_3dnr(hisi_state_t *st)
+{
+    v5_3dnr_attr attr;
+    int ret;
+
+    if (!st->vb_wrap_blk || !st->vi.fnGetPipe3dnrAttr || !st->vi.fnSetPipe3dnrAttr)
+        return;
+
+    memset(&attr, 0, sizeof(attr));
+    ret = st->vi.fnGetPipe3dnrAttr(HISI_VI_PIPE, &attr);
+    if (ret) {
+        HAL_LOG_WARN("ss_mpi_vi_get_pipe_3dnr_attr(%d) failed: 0x%x; 3DNR stays off", HISI_VI_PIPE,
+                     ret);
+        return;
+    }
+    if (attr.enable) {
+        st->vi_3dnr_enabled = true;
+        return;
+    }
+    attr.enable = 1;
+    attr.nr_type = V5_NR_TYPE_VIDEO_NORM;
+    attr.compress_mode = V5_COMPRESS_MODE_FRAME;
+    attr.nr_motion_mode = V5_NR_MOTION_MODE_NORM;
+    ret = st->vi.fnSetPipe3dnrAttr(HISI_VI_PIPE, &attr);
+    if (ret) {
+        HAL_LOG_WARN("ss_mpi_vi_set_pipe_3dnr_attr(%d, enable) failed: 0x%x%s; 3DNR stays off",
+                     HISI_VI_PIPE, ret,
+                     V5_ERR_ID(ret) == V5_ERR_NO_MEM ? " (NO_MEM: no room for the reference frames)"
+                                                     : "");
+        return;
+    }
+    st->vi_3dnr_enabled = true;
+    HAL_LOG_INFO("vi: pipe %d 3DNR on (NORM, reference frames FRAME-compressed)", HISI_VI_PIPE);
+}
+
+/*
  * hisi_vi_bringup -- device, then bind, then pipe, then channel.
  *
  * **The bind is new against gen4 and it is the whole trap.** gen4 had
@@ -1213,6 +1263,8 @@ static int hisi_vi_bringup(hisi_state_t *st)
 
     HAL_LOG_INFO("vi: dev %d -> pipe %d -> chn %d, %ux%u", HISI_VI_DEV, HISI_VI_PIPE, HISI_VI_CHN,
                  m->dev_rect.width, m->dev_rect.height);
+
+    hisi_vi_enable_3dnr(st);
     return RSS_OK;
 }
 
@@ -1694,7 +1746,51 @@ static void hisi_video_teardown(hisi_state_t *st)
 
 #define HISI_VB_VI_BLK_CNT 3u
 
-static void hisi_vb_fill_cfg(const hisi_state_t *st, v5_vb_cfg *cfg)
+/*
+ * hisi_vb_wrap_blk -- the block channel 0's wrap ring will take.
+ *
+ * The ring is drawn from the common pools when the channel enables its
+ * wrap ("从公共VB池拿取合适的卷绕VB", the VPSS reference's note on
+ * set_chn_buf_wrap), and the common pools are fixed before ss_mpi_sys_init
+ * -- so the block has to be cut now, for a stream whose size rvd has not
+ * said yet. What bounds it is the sensor: channel 0 cannot be larger, the
+ * ring's line count is the driver's answer for the sensor-sized stream
+ * (128 on this part whatever is asked), and the compressed header grows
+ * with height, so the sensor-sized ring is the largest any stream can
+ * want. About 0.4 MB at 2304x1296 against the 6.2 MB pool it stands in
+ * for at 1080p. Returns 0, and no pool is cut, when the driver cannot be
+ * asked.
+ */
+static unsigned long long hisi_vb_wrap_blk(const hisi_state_t *st)
+{
+    const hisi_sensor_mode_t *m = &st->mode;
+    v5_vpss_venc_wrap_param p;
+    unsigned int line = 0;
+    int ret;
+
+    if (!st->sys.fnGetVpssVencWrapBufLine || !st->vpss.fnSetChnBufWrap)
+        return 0;
+
+    memset(&p, 0, sizeof(p));
+    p.all_online = 0; /* VI online, VPSS offline: hisi_vi_vpss_mode */
+    p.frame_rate = m->frame_rate > 1.0f ? (unsigned int)(m->frame_rate + 0.5f) : 30u;
+    p.full_lines_std = m->dev_rect.height; /* see v5_vpss_venc_wrap_param */
+    p.large_stream_size.width = m->dev_rect.width;
+    p.large_stream_size.height = m->dev_rect.height;
+    p.small_stream_size = p.large_stream_size;
+
+    ret = st->sys.fnGetVpssVencWrapBufLine(&p, &line);
+    if (ret || !line || line > m->dev_rect.height) {
+        HAL_LOG_INFO("vb: ss_mpi_sys_get_vpss_venc_wrap_buf_line -> 0x%x, %u lines; channel 0 "
+                     "streams from whole frames",
+                     ret, line);
+        return 0;
+    }
+    return hisi_vb_wrap_size(m->dev_rect.width, m->dev_rect.height, line,
+                             V5_COMPRESS_MODE_SEG_COMPACT);
+}
+
+static void hisi_vb_fill_cfg(hisi_state_t *st, v5_vb_cfg *cfg)
 {
     const hisi_sensor_mode_t *m = &st->mode;
     unsigned long long full = hisi_vb_nv12_size(m->dev_rect.width, m->dev_rect.height);
@@ -1705,6 +1801,20 @@ static void hisi_vb_fill_cfg(const hisi_state_t *st, v5_vb_cfg *cfg)
     cfg->common_pool[0].blk_size = full;
     cfg->common_pool[0].blk_cnt = HISI_VB_VI_BLK_CNT;
     cfg->common_pool[0].remap_mode = V5_VB_REMAP_NONE;
+
+    /*
+     * pool 1   channel 0's wrap ring, one block. VB hands a request the
+     *          smallest block that fits, so this one is never mistaken
+     *          for a VI frame and a VI frame never lands in it.
+     */
+    st->vb_wrap_blk = hisi_vb_wrap_blk(st);
+    if (st->vb_wrap_blk) {
+        cfg->max_pool_cnt = 2;
+        cfg->common_pool[1].blk_size = st->vb_wrap_blk;
+        cfg->common_pool[1].blk_cnt = 1;
+        cfg->common_pool[1].remap_mode = V5_VB_REMAP_NONE;
+        HAL_LOG_INFO("vb: pool 1 = VPSS chn 0 wrap ring, %llu B x1", st->vb_wrap_blk);
+    }
 
     /*
      * REMAP_NONE: nothing in the streaming path reads a VB block from

@@ -294,6 +294,17 @@ typedef struct {
     bool vb_pool_owned;
     unsigned int vb_pool;
     unsigned long long vb_pool_blk_size;
+
+    /*
+     * Channel 0 streaming through a line ring instead of whole frames
+     * -- see hisi_fs_wrap in hal_framesource.c. While wrapped the channel
+     * owns no pool: its one block comes from the common pool hal_init cut
+     * for it. wrap_size is what was asked for, so a geometry change can
+     * tell whether the ring has to be re-sized.
+     */
+    bool wrapped;
+    unsigned int wrap_line;
+    unsigned long long wrap_size;
 } hisi_vpss_chn_t;
 
 /* One [image] knob: what was asked for, and whether anything asked. */
@@ -470,19 +481,34 @@ static inline unsigned long long hisi_vb_raw_size(unsigned int width, unsigned i
 #define HISI_VB_SEG_RATIO_LUMA 1430u
 #define HISI_VB_SEG_RATIO_CHROMA 1800u
 
-static inline unsigned long long hisi_vb_seg_compact_size(unsigned int width, unsigned int height)
+/* The compression header: sized by the frame's height, not by how many
+ * of its lines a buffer holds, which is why the wrap ring below wants it
+ * separately from the payload. */
+static inline unsigned long long hisi_vb_seg_compact_head(unsigned int height)
 {
     unsigned int rows = (height + 1u) & ~1u;
     unsigned int crows = rows / 2u;
-    unsigned long long head, y, c;
+    unsigned long long head;
 
     head = hisi_vb_align_up((unsigned long long)HISI_VB_SEG_HEAD_STRIDE * (rows + crows)) * 2u;
     head += hisi_vb_align_up(64u) * 2u;
+    return head;
+}
+
+static inline unsigned long long hisi_vb_seg_compact_main(unsigned int width, unsigned int height)
+{
+    unsigned int rows = (height + 1u) & ~1u;
+    unsigned int crows = rows / 2u;
+    unsigned long long y, c;
 
     y = hisi_vb_align_up((unsigned long long)width * rows * 1000ull / HISI_VB_SEG_RATIO_LUMA);
     c = hisi_vb_align_up((unsigned long long)width * crows * 1000ull / HISI_VB_SEG_RATIO_CHROMA);
+    return y + c;
+}
 
-    return head + y + c;
+static inline unsigned long long hisi_vb_seg_compact_size(unsigned int width, unsigned int height)
+{
+    return hisi_vb_seg_compact_head(height) + hisi_vb_seg_compact_main(width, height);
 }
 
 /*
@@ -497,6 +523,23 @@ static inline unsigned long long hisi_vb_yuv_size(unsigned int width, unsigned i
     if (compress == V5_COMPRESS_MODE_SEG_COMPACT)
         return hisi_vb_seg_compact_size(width, height);
     return hisi_vb_nv12_size(width, height);
+}
+
+/*
+ * ot_comm_get_vpss_venc_wrap_buf_size (ot_buffer.h:47-70): the chn0 ->
+ * VENC ring. buf_line lines of payload, plus -- when the channel is
+ * compressed -- the header for the *whole* frame, since the header
+ * indexes every line whether or not its pixels are still in the ring.
+ * A ring of the full height collapses to the frame.
+ */
+static inline unsigned long long hisi_vb_wrap_size(unsigned int width, unsigned int height,
+                                                   unsigned int buf_line, v5_compress_mode compress)
+{
+    if (!buf_line || buf_line >= height)
+        return hisi_vb_yuv_size(width, height, compress);
+    if (compress == V5_COMPRESS_MODE_SEG_COMPACT)
+        return hisi_vb_seg_compact_head(height) + hisi_vb_seg_compact_main(width, buf_line);
+    return hisi_vb_nv12_size(width, buf_line);
 }
 
 /* ================================================================
@@ -753,6 +796,16 @@ typedef struct {
     int flip;
 
     bool vb_private_pools;
+    /*
+     * The block hal_init set aside in common pool 1 for channel 0's wrap
+     * ring, 0 when there is none -- the driver cannot say how many lines
+     * the ring needs, or the pool cannot be sized. Channel 0 wraps only
+     * when this is nonzero, and the VI pipe's 3DNR is enabled only then
+     * too: the reference frames it allocates are about what the ring
+     * saves. See hisi_vb_fill_cfg and hisi_vi_enable_3dnr.
+     */
+    unsigned long long vb_wrap_blk;
+    bool vi_3dnr_enabled;
 } hisi_state_t;
 
 static inline hisi_state_t *hisi_state(void *ctx)
