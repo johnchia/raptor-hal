@@ -1188,8 +1188,10 @@ static int hisi_vi_bringup(hisi_state_t *st)
     chn.dynamic_range = V5_DYNAMIC_RANGE_SDR8;
     chn.video_format = V5_VIDEO_FORMAT_LINEAR;
     chn.compress_mode = V5_COMPRESS_MODE_NONE;
-    chn.mirror_en = 0;
-    chn.flip_en = 0;
+    /* Whatever [image] asked for before bring-up; hisi_vi_apply_orien
+     * writes the same pair afterwards. */
+    chn.mirror_en = st->mirror;
+    chn.flip_en = st->flip;
     chn.depth = 0;
     chn.frame_rate_ctrl.src_frame_rate = -1;
     chn.frame_rate_ctrl.dst_frame_rate = -1;
@@ -2251,6 +2253,21 @@ static const rss_hal_ops_t g_ops = {
     .isp_get_sensor_attr = hal_isp_get_sensor_attr,
     .isp_set_sensor_fps = hal_isp_set_sensor_fps,
     .isp_get_sensor_fps = hal_isp_get_sensor_fps,
+    .isp_get_exposure = hal_isp_get_exposure,
+    .isp_set_brightness = hal_isp_set_brightness,
+    .isp_get_brightness = hal_isp_get_brightness,
+    .isp_set_contrast = hal_isp_set_contrast,
+    .isp_get_contrast = hal_isp_get_contrast,
+    .isp_set_saturation = hal_isp_set_saturation,
+    .isp_get_saturation = hal_isp_get_saturation,
+    .isp_set_ae_comp = hal_isp_set_ae_comp,
+    .isp_get_ae_comp = hal_isp_get_ae_comp,
+    .isp_set_drc_strength = hal_isp_set_drc_strength,
+    .isp_get_drc_strength = hal_isp_get_drc_strength,
+    .isp_get_knob_caps = hal_isp_get_knob_caps,
+    .isp_set_hflip = hal_isp_set_hflip,
+    .isp_set_vflip = hal_isp_set_vflip,
+    .isp_get_hvflip = hal_isp_get_hvflip,
 #endif
 };
 

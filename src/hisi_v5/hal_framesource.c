@@ -344,6 +344,13 @@ static void hisi_fs_fill_attr(const hisi_state_t *st, hisi_vpss_chn_t *fs, int p
      * per-stream here, which is what raptor wants, and they follow the
      * backend's orientation state rather than the caller's config.
      */
+    /*
+     * Not the VPSS channel's. This driver answers 0xa007800d
+     * (OT_ERR_VPSS_NOT_PERM) to a channel attribute carrying a mirror,
+     * enabled or disabled, so orientation is the VI channel's here --
+     * hisi_vi_apply_orien in hal_knob.c -- and turns all three streams
+     * together.
+     */
     attr->mirror_en = 0;
     attr->flip_en = 0;
 

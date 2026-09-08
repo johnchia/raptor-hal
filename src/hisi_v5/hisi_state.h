@@ -295,6 +295,12 @@ typedef struct {
     unsigned long long vb_pool_blk_size;
 } hisi_vpss_chn_t;
 
+/* One [image] knob: what was asked for, and whether anything asked. */
+typedef struct {
+    bool asked;
+    int val;
+} hisi_knob_slot_t;
+
 /*
  * One VENC channel.
  *
@@ -710,6 +716,33 @@ typedef struct {
     long long iso_tick_ns; /* the tick's next due time, CLOCK_MONOTONIC */
     char iso_busy;         /* one tick at a time, across encoder threads */
 
+    /*
+     * The [image] knobs. rvd sets them before the ISP runs and the tuning
+     * load rewrites the same attributes on the first frame, so each is
+     * remembered and re-applied around a load. The two baselines are
+     * learned from the first Get after each load and deliberately
+     * forgotten at every load. See hal_knob.c.
+     */
+    struct {
+        hisi_knob_slot_t brightness, contrast, saturation, ae_comp, drc;
+        bool ae_base_known;
+        int ae_base;
+        bool drc_base_known;
+        int drc_base;
+        int drc_base_op;
+        bool exp_warned;
+    } knob;
+
+    /*
+     * Orientation. The VI *channel's* mirror and flip, not the sensor's --
+     * every sensor library on this image has a null pfn_mirror_flip -- and
+     * not VPSS's, which refuses a mirror outright (0xa007800d). So it
+     * turns all three streams together, which is what [image] means by
+     * hflip and vflip anyway.
+     */
+    int mirror;
+    int flip;
+
     bool vb_private_pools;
 } hisi_state_t;
 
@@ -791,6 +824,27 @@ void hisi_dyn_tick(hisi_state_t *st);
 void hisi_dyn_drc_hold(hisi_state_t *st, bool hold);
 bool hisi_dyn_drc_curve(hisi_state_t *st);
 void hisi_dyn_free(hisi_state_t *st);
+
+/* hal_knob.c -- the [image] knobs, the exposure readback and orientation. */
+int hal_isp_set_brightness(void *ctx, int val);
+int hal_isp_get_brightness(void *ctx, int *val);
+int hal_isp_set_contrast(void *ctx, int val);
+int hal_isp_get_contrast(void *ctx, int *val);
+int hal_isp_set_saturation(void *ctx, int val);
+int hal_isp_get_saturation(void *ctx, int *val);
+int hal_isp_set_ae_comp(void *ctx, int val);
+int hal_isp_get_ae_comp(void *ctx, int *val);
+int hal_isp_set_drc_strength(void *ctx, int val);
+int hal_isp_get_drc_strength(void *ctx, int *val);
+int hal_isp_get_knob_caps(void *ctx, const char *name, rss_isp_knob_t *caps);
+int hal_isp_get_exposure(void *ctx, rss_exposure_t *exposure);
+void hisi_knob_before_load(hisi_state_t *st);
+void hisi_knob_reapply(hisi_state_t *st);
+/* Orientation, on the VPSS channels; see hisi_state_t.mirror. */
+int hal_isp_set_hflip(void *ctx, int enable);
+int hal_isp_set_vflip(void *ctx, int enable);
+int hal_isp_get_hvflip(void *ctx, int *hflip, int *vflip);
+int hisi_vi_apply_orien(hisi_state_t *st);
 
 /* hal_encoder.c */
 int hal_enc_create_group(void *ctx, int grp);

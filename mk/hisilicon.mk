@@ -104,13 +104,14 @@ ifneq ($(filter $(PLATFORM),$(HISI_GEN5_PLATFORMS)),)
 # both archives, so an unguarded call from it would leave rad's link short a
 # symbol that only the video list provides.
 #
-# Phase 3 added hal_isp.c and hal_dyn.c, and adds hal_nrx.c hal_knob.c
+# Phase 3 added hal_isp.c, hal_dyn.c and hal_knob.c, and adds hal_nrx.c
 # next; Phase 4 hal_audio.c to AUDIO_SRCS; Phase 5 hal_osd.c.
 VIDEO_SRCS := $(BACKEND_DIR)/hisi_sensor.c \
               $(BACKEND_DIR)/hal_framesource.c \
               $(BACKEND_DIR)/hal_encoder.c \
               $(BACKEND_DIR)/hal_isp.c \
               $(BACKEND_DIR)/hal_dyn.c \
+              $(BACKEND_DIR)/hal_knob.c \
               src/hal_gpio.c
 AUDIO_SRCS :=
 

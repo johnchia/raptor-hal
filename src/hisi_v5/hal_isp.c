@@ -1823,6 +1823,9 @@ static void hisi_isp_apply_tuning(hisi_state_t *st)
     unsigned int i;
 
     hisi_isp_tune_resolve(st);
+    /* A pinned knob is lifted back to its baseline first, so the file
+     * lands on what the tuner meant rather than on the knob. */
+    hisi_knob_before_load(st);
 
     memset(&r, 0, sizeof(r));
     r.path = st->iq_file;
@@ -1910,6 +1913,9 @@ static void hisi_isp_apply_tuning(hisi_state_t *st)
     free(r.line);
     free(r.val);
     free(ld);
+
+    /* The [image] knobs, over the baseline the file just laid down. */
+    hisi_knob_reapply(st);
 }
 
 /*
