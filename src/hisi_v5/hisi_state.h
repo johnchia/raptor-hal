@@ -769,6 +769,13 @@ typedef struct {
     struct hisi_nrx_set *nrx;
 
     /*
+     * The other eight per-light sections -- AE, fps, LDCI on exposure;
+     * DPC, BLC, colour sector, CA on ISO; bayer-NR's WDR half read and
+     * left alone -- on the same tick. See hal_ladder.c.
+     */
+    struct hisi_lad_set *lad;
+
+    /*
      * The [image] knobs. rvd sets them before the ISP runs and the tuning
      * load rewrites the same attributes on the first frame, so each is
      * remembered and re-applied around a load. The two baselines are
@@ -895,6 +902,19 @@ int hisi_nrx_apply(hisi_state_t *st, int *failed, char *note, size_t note_len);
 bool hisi_nrx_armed(hisi_state_t *st);
 void hisi_nrx_on_iso(hisi_state_t *st, unsigned iso);
 void hisi_nrx_free(hisi_state_t *st);
+
+/* hal_ladder.c */
+bool hisi_lad_key(hisi_state_t *st, const char *sect, const char *key, const char *val);
+int hisi_lad_apply(hisi_state_t *st, int *failed, char *note, size_t note_len);
+bool hisi_lad_armed(hisi_state_t *st);
+void hisi_lad_on_exposure(hisi_state_t *st, unsigned iso, unsigned long long exposure);
+void hisi_lad_ae_hold(hisi_state_t *st, bool hold);
+bool hisi_lad_ae_curve(hisi_state_t *st);
+void hisi_lad_fps_base(hisi_state_t *st, float fps);
+void hisi_lad_free(hisi_state_t *st);
+
+/* hal_isp.c: the sensor rate, for rvd and the fps ladder alike. */
+int hisi_isp_fps_write(hisi_state_t *st, float fps);
 
 /* hal_knob.c -- the [image] knobs, the exposure readback and orientation. */
 int hal_isp_set_brightness(void *ctx, int val);

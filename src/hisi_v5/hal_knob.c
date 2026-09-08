@@ -28,25 +28,30 @@
  *   ae_comp                ot_isp_exposure_attr auto_attr.compensation,
  *                          0..255: the setpoint the AE converges its
  *                          target luma on, read afresh by the loop every
- *                          frame and moved by nothing else. A constant,
- *                          not a curve -- no engine here varies it and
- *                          the driver does not either.
+ *                          frame. The driver never moves it; the
+ *                          [dynamic_ae] ladder (hal_ladder.c) does, by
+ *                          exposure band, when the tuning file has one.
  *
  *                          The baseline is learned rather than named.
  *                          iq_sect_static_ae maps the [static_ae] keys and
- *                          compensation is not among them, so nothing in a
- *                          load writes this field and the value at the
- *                          first read after ISP init is the AE library's
- *                          own. Learned rather than promised, and
+ *                          compensation is not among them, so the value
+ *                          at the first read after a load is the AE
+ *                          library's own -- or the ladder's column for
+ *                          the light at the time, where there is a
+ *                          ladder. Learned rather than promised, and
  *                          re-learned at each load for the same reason.
  *
- *                          So the caps offer no auto: there is nothing to
- *                          hand the field back to, which is what has_auto
- *                          means everywhere else in the HAL. The sentinel
- *                          is still accepted -- a config written before
- *                          this says `ae_comp = auto` and has to keep
- *                          loading -- and reset-isp reaches the same value
- *                          by writing caps.neutral.
+ *                          `auto` is offered exactly when the file varies
+ *                          the field: a pin holds the ladder's AE engine
+ *                          for as long as it stands and `auto` hands the
+ *                          field back, the drc_strength arrangement
+ *                          below. A file with no curve has nothing for
+ *                          auto to hand back that `neutral` does not
+ *                          already say, so the caps withhold it; the
+ *                          sentinel is still accepted -- a config written
+ *                          before this says `ae_comp = auto` and has to
+ *                          keep loading -- and reset-isp reaches the same
+ *                          value by writing caps.neutral.
  *   drc_strength           ot_isp_drc_attr strength, 0..1023, pinned in
  *                          manual mode. The [dynamic_linear_drc] engine
  *                          (hal_dyn.c) writes the same field by ISO, so a
@@ -279,6 +284,8 @@ static int knob_ae_write(hisi_state_t *st, int val, const char *why)
     ret = knob_ae_get(st, &a);
     if (ret)
         return ret;
+    /* The ladder's band and the pin write the same field. */
+    hisi_lad_ae_hold(st, true);
     if (a.auto_attr.compensation == val)
         return RSS_OK;
     a.auto_attr.compensation = (unsigned char)val;
@@ -287,7 +294,7 @@ static int knob_ae_write(hisi_state_t *st, int val, const char *why)
         HAL_LOG_ERR("ss_mpi_isp_set_exposure_attr(compensation %d) failed: 0x%x", val, ret);
         return RSS_ERR_IO;
     }
-    HAL_LOG_INFO("ae_comp: %d%s (the AE's own is %d)", val, why, st->knob.ae_base);
+    HAL_LOG_INFO("ae_comp: %d%s (the baseline is %d)", val, why, st->knob.ae_base);
     return RSS_OK;
 }
 
@@ -301,8 +308,11 @@ int hal_isp_set_ae_comp(void *ctx, int val)
         int ret = RSS_OK;
 
         st->knob.ae_comp.asked = false;
-        if (knob_live(st) && st->knob.ae_base_known)
-            ret = knob_ae_write(st, st->knob.ae_base, ", the AE's own, put back");
+        if (knob_live(st)) {
+            if (st->knob.ae_base_known)
+                ret = knob_ae_write(st, st->knob.ae_base, ", the baseline, put back");
+            hisi_lad_ae_hold(st, false);
+        }
         return ret;
     }
     if (val < 0 || val > KNOB_AE_MAX) {
@@ -486,14 +496,16 @@ int hal_isp_get_knob_caps(void *ctx, const char *name, rss_isp_knob_t *caps)
         caps->min = 0;
         caps->max = KNOB_AE_MAX;
         /*
-         * No auto, for the reason every other backend gives for this same
-         * knob: nothing varies compensation, so there is no curve to hand
-         * it back to. A knob whose only hand-back is a constant is what
-         * `neutral` is for, and reset-isp takes that branch. The sentinel
-         * stays legal in the setter regardless -- this flag is advice to a
-         * client about which control to draw.
+         * Auto is the [dynamic_ae] band for the exposure AE is reporting,
+         * offered when the loaded tuning has that curve and not otherwise:
+         * a knob whose only hand-back is a constant is what `neutral` is
+         * for, and reset-isp takes that branch. Before the file has been
+         * read the optimistic answer is the right one, as for drc_strength
+         * below. The sentinel stays legal in the setter regardless -- this
+         * flag is advice to a client about which control to draw.
          */
-        caps->has_auto = false;
+        caps->has_auto =
+            !__atomic_load_n(&st->iq_load_started, __ATOMIC_ACQUIRE) || hisi_lad_ae_curve(st);
         /* The neutral is the AE library's, learned by the first look;
          * before the ISP runs there is nothing to look at. */
         if (!st->knob.ae_base_known && knob_live(st))
@@ -530,7 +542,7 @@ int hal_isp_get_knob_caps(void *ctx, const char *name, rss_isp_knob_t *caps)
 void hisi_knob_before_load(hisi_state_t *st)
 {
     if (st->knob.ae_comp.asked && st->knob.ae_base_known)
-        knob_ae_write(st, st->knob.ae_base, ", the AE's own, back for the load");
+        knob_ae_write(st, st->knob.ae_base, ", the baseline, back for the load");
     if (st->knob.drc.asked && st->knob.drc_base_known)
         knob_drc_release(st);
     st->knob.ae_base_known = false;

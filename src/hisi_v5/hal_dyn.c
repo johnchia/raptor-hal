@@ -33,10 +33,10 @@
  * ONE TICK FOR EVERYTHING. AE's ISO is one ss_mpi_isp_query_exposure_info
  * call -- 5484 bytes, most of it a histogram, for two fields -- so there
  * is one clock here (hisi_dyn_tick, off the encoder's frame hook, once a
- * second, one thread at a time). It is the clock the 3DNR ladder hangs
- * off as well -- see hal_nrx.c. Each engine keeps its own "moved a
- * step" test and its own failure count: three failed writes in a row stop
- * that engine and leave the others running.
+ * second, one thread at a time). It is the clock the 3DNR ladder and
+ * the eight ladders of hal_ladder.c hang off as well. Each engine keeps
+ * its own "moved a step" test and its own failure count: three failed
+ * writes in a row stop that engine and leave the others running.
  *
  * GAMMA FADES RATHER THAN CUTS. The sample writes its `interval` steps
  * back to back with a 30 ms sleep between them, which would block an
@@ -1197,11 +1197,12 @@ void hisi_dyn_tick(hisi_state_t *st)
     struct hisi_dyn_set *d = st->dyn;
     bool dyn_on = d && __atomic_load_n(&d->engine, __ATOMIC_ACQUIRE);
     bool nrx_on = hisi_nrx_armed(st);
+    bool lad_on = hisi_lad_armed(st);
     unsigned iso = 0;
     unsigned long long exposure = 0;
     long long now;
 
-    if (!dyn_on && !nrx_on)
+    if (!dyn_on && !nrx_on && !lad_on)
         return;
     now = dyn_now_ns();
     if (now < st->iso_tick_ns)
@@ -1214,6 +1215,8 @@ void hisi_dyn_tick(hisi_state_t *st)
             hisi_dyn_on_exposure(st, iso, exposure);
         if (nrx_on)
             hisi_nrx_on_iso(st, iso);
+        if (lad_on)
+            hisi_lad_on_exposure(st, iso, exposure);
     }
     /* A gamma fade in flight steps every 100 ms; otherwise once a second. */
     st->iso_tick_ns = now + ((d && d->gamma.fade_i > 0) ? 100000000LL : 1000000000LL);

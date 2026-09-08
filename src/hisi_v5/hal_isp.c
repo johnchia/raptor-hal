@@ -44,6 +44,9 @@
  * Sections applied by the two engine files, which keep their tables and
  * walk them off the AE tick rather than writing once:
  *   dynamic_linear_drc, dynamic_dehaze, dynamic_gamma   hal_dyn.c
+ *   dynamic_ae, dynamic_fps, dynamic_ldci, dynamic_dpc,  hal_ladder.c, on
+ *   dynamic_blc, dynamic_color_sector, dynamic_ca,       the same AE tick;
+ *   dynamic_nr                                          nr is WDR-only
  *   static_3dnr                                         hal_nrx.c, which
  *                  writes it through ss_mpi_vi_set_pipe_3dnr_param on the
  *                  VI pipe rather than to an ISP module -- on V5 3DNR is
@@ -158,17 +161,8 @@ int hal_isp_get_sensor_attr(void *ctx, uint32_t *width, uint32_t *height)
  * drop. Unlike gen4's, V5's mode carries the rate as the float the
  * attribute wants, so nothing is rounded on the way through.
  */
-int hal_isp_set_sensor_fps(void *ctx, uint32_t fps_num, uint32_t fps_den)
+int hisi_isp_fps_write(hisi_state_t *st, float fps)
 {
-    hisi_state_t *st = hisi_state(ctx);
-    float fps;
-
-    if (!st || !fps_num || !fps_den)
-        return RSS_ERR_INVAL;
-    fps = (float)fps_num / (float)fps_den;
-    if (fps < 1.0f)
-        return RSS_ERR_INVAL;
-
     if (__atomic_load_n(&st->isp_thread_running, __ATOMIC_ACQUIRE)) {
         v5_isp_pub_attr pub;
         int ret;
@@ -184,12 +178,10 @@ int hal_isp_set_sensor_fps(void *ctx, uint32_t fps_num, uint32_t fps_den)
             pub.frame_rate = fps;
             ret = st->isp.fnSetPubAttr(HISI_VI_PIPE, &pub);
             if (ret) {
-                HAL_LOG_ERR("ss_mpi_isp_set_pub_attr(%u/%u fps) failed: 0x%x", fps_num, fps_den,
-                            ret);
+                HAL_LOG_ERR("ss_mpi_isp_set_pub_attr(%.2f fps) failed: 0x%x", (double)fps, ret);
                 return RSS_ERR_IO;
             }
-            HAL_LOG_INFO("sensor: %u/%u fps (the mode file said %.2f)", fps_num, fps_den,
-                         (double)st->mode.frame_rate);
+            HAL_LOG_INFO("sensor: %.2f fps (was %.2f)", (double)fps, (double)st->mode.frame_rate);
         }
     } else if (fps != st->mode.frame_rate) {
         HAL_LOG_INFO("sensor: %.2f fps for bring-up (the mode file said %.2f)", (double)fps,
@@ -197,6 +189,29 @@ int hal_isp_set_sensor_fps(void *ctx, uint32_t fps_num, uint32_t fps_den)
     }
     st->mode.frame_rate = fps;
     return RSS_OK;
+}
+
+/*
+ * rvd's own set is the write above plus a word to the [dynamic_fps]
+ * ladder (hal_ladder.c), whose night-time rate is capped at whatever rvd
+ * asked for last. The ladder's own writes come through hisi_isp_fps_write
+ * directly, so they do not move their own ceiling.
+ */
+int hal_isp_set_sensor_fps(void *ctx, uint32_t fps_num, uint32_t fps_den)
+{
+    hisi_state_t *st = hisi_state(ctx);
+    float fps;
+    int ret;
+
+    if (!st || !fps_num || !fps_den)
+        return RSS_ERR_INVAL;
+    fps = (float)fps_num / (float)fps_den;
+    if (fps < 1.0f)
+        return RSS_ERR_INVAL;
+    ret = hisi_isp_fps_write(st, fps);
+    if (ret == RSS_OK)
+        hisi_lad_fps_base(st, fps);
+    return ret;
 }
 
 int hal_isp_get_sensor_fps(void *ctx, uint32_t *fps_num, uint32_t *fps_den)
@@ -1635,7 +1650,16 @@ enum {
     MS_STATIC_BLC = 1u << 13,
     MS_STATIC_CSC = 1u << 14,
     MS_STATIC_SHADING = 1u << 15,
-    MS_ALL = (1u << 16) - 1,
+    /* hal_ladder.c's sections, which honour their flags -- see there. */
+    MS_DYN_AE = 1u << 16,
+    MS_DYN_FPS = 1u << 17,
+    MS_DYN_LDCI = 1u << 18,
+    MS_DYN_DPC = 1u << 19,
+    MS_DYN_BLC = 1u << 20,
+    MS_DYN_CS = 1u << 21,
+    MS_DYN_CA = 1u << 22, /* bDynamicCA or bDynamicLinearCA: either means the CA ladder */
+    MS_DYN_NR = 1u << 23,
+    MS_ALL = (1u << 24) - 1,
 };
 
 static const struct {
@@ -1658,6 +1682,15 @@ static const struct {
     {"bStaticBlc", MS_STATIC_BLC},
     {"bStaticCSC", MS_STATIC_CSC},
     {"bStaticShading", MS_STATIC_SHADING},
+    {"bDynamicAE", MS_DYN_AE},
+    {"bDynamicFps", MS_DYN_FPS},
+    {"bDynamicLdci", MS_DYN_LDCI},
+    {"bDynamicDpc", MS_DYN_DPC},
+    {"bDynamicBLC", MS_DYN_BLC},
+    {"bDynamicColorSector", MS_DYN_CS},
+    {"bDynamicCA", MS_DYN_CA},
+    {"bDynamicLinearCA", MS_DYN_CA},
+    {"bDynamicNr", MS_DYN_NR},
 };
 
 /* Which flags a section needs; 0 for one the mask does not cover. */
@@ -1695,6 +1728,22 @@ static unsigned int iq_state_bits(const char *s)
         return MS_STATIC_CSC;
     if (iq_ci_eq(s, "static_shading"))
         return MS_STATIC_SHADING;
+    if (iq_ci_eq(s, "dynamic_ae"))
+        return MS_DYN_AE;
+    if (iq_ci_eq(s, "dynamic_fps"))
+        return MS_DYN_FPS;
+    if (iq_ci_eq(s, "dynamic_ldci"))
+        return MS_DYN_LDCI;
+    if (iq_ci_eq(s, "dynamic_dpc"))
+        return MS_DYN_DPC;
+    if (iq_ci_eq(s, "dynamic_blc"))
+        return MS_DYN_BLC;
+    if (iq_ci_eq(s, "dynamic_color_sector"))
+        return MS_DYN_CS;
+    if (iq_ci_eq(s, "dynamic_ca"))
+        return MS_DYN_CA;
+    if (iq_ci_eq(s, "dynamic_nr"))
+        return MS_DYN_NR;
     return 0;
 }
 
@@ -1804,6 +1853,14 @@ static void iq_dispatch(hisi_state_t *st, hisi_iq_load *ld, hisi_iq_reader *r)
          * switches, and a section present here is a section meant. */
         if (!hisi_dyn_key(st, s, r->key, r->val))
             HAL_LOG_DBG("isp tuning: [%s] %s: no mapping", s, r->key);
+    } else if (iq_ci_eq(s, "dynamic_ae") || iq_ci_eq(s, "dynamic_fps") ||
+               iq_ci_eq(s, "dynamic_ldci") || iq_ci_eq(s, "dynamic_dpc") ||
+               iq_ci_eq(s, "dynamic_blc") || iq_ci_eq(s, "dynamic_color_sector") ||
+               iq_ci_eq(s, "dynamic_ca") || iq_ci_eq(s, "dynamic_nr")) {
+        /* The other eight ladders, gated above by their own [module_state]
+         * flags -- those carry intent, see the head of hal_ladder.c. */
+        if (!hisi_lad_key(st, s, r->key, r->val))
+            HAL_LOG_DBG("isp tuning: [%s] %s: no mapping", s, r->key);
     } else
         iq_note_skip(ld, s);
 }
@@ -1900,6 +1957,13 @@ static void hisi_isp_apply_tuning(hisi_state_t *st)
         int dyn_failed = 0;
 
         applied += hisi_dyn_apply(st, &dyn_failed, note, sizeof(note));
+        if (dyn_failed) {
+            failed += dyn_failed;
+            iq_note_skip(ld, note);
+        }
+
+        dyn_failed = 0;
+        applied += hisi_lad_apply(st, &dyn_failed, note, sizeof(note));
         if (dyn_failed) {
             failed += dyn_failed;
             iq_note_skip(ld, note);

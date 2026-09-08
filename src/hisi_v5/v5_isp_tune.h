@@ -3,10 +3,10 @@
  * loader writes, and the entry points that carry them. HiMPP V5.0.
  *
  * Phase 3 scope, and the same discipline gen4's v4_isp_tune.h keeps: this
- * file transcribes exactly the attribute families hal_isp.c, hal_dyn.c and
- * hal_knob.c apply, and nothing else. Every struct here is a byte-exact
- * ABI promise; an unused promise is pure risk. The families deliberately
- * left out are named at the bottom of this comment.
+ * file transcribes exactly the attribute families hal_isp.c, hal_dyn.c,
+ * hal_ladder.c and hal_knob.c apply, and nothing else. Every struct here
+ * is a byte-exact ABI promise; an unused promise is pure risk. The
+ * families deliberately left out are named at the bottom of this comment.
  *
  * WHERE THE SYMBOLS LIVE, which is not where the names suggest. The whole
  * surface is spelt ss_mpi_isp_*, but it is split across three libraries:
@@ -102,6 +102,7 @@
 #define V5_ISP_CCM_MATRIX_NUM 7     /* OT_ISP_CCM_MATRIX_NUM */
 #define V5_ISP_CCM_MATRIX_SIZE 9    /* OT_ISP_CCM_MATRIX_SIZE */
 #define V5_ISP_CA_LUT 128           /* OT_ISP_CA_YRATIO_LUT_LENGTH */
+#define V5_ISP_COLOR_SECTORS 6      /* OT_ISP_COLOR_SECTOR_NUM */
 #define V5_ISP_CSC_DC_NUM 3         /* OT_ISP_CSC_DC_NUM */
 #define V5_ISP_CSC_COEF_NUM 9       /* OT_ISP_CSC_COEF_NUM */
 
@@ -707,6 +708,31 @@ typedef struct {
 
 _Static_assert(sizeof(v5_isp_color_tone_attr) == 6, "ot_isp_color_tone_attr is 6 bytes");
 
+/*
+ * ot_isp_color_sector_attr, libss_mpi_awb.so. Seven tables of six hue and
+ * six saturation shifts -- one table per CCM matrix, which is the AWB's
+ * colour-temperature axis, not the ISO axis the other auto halves run on.
+ * [dynamic_color_sector] (hal_ladder.c) writes all seven per ISO.
+ */
+typedef struct {
+    unsigned char hue_shift[V5_ISP_COLOR_SECTORS];
+    unsigned char sat_shift[V5_ISP_COLOR_SECTORS];
+} v5_isp_color_sector_param;
+
+typedef struct {
+    v5_isp_color_sector_param color_tab[V5_ISP_CCM_MATRIX_NUM];
+} v5_isp_color_sector_auto;
+
+typedef struct {
+    int enable;
+    v5_isp_color_sector_param manual_attr;
+    v5_isp_color_sector_auto auto_attr;
+} v5_isp_color_sector_attr;
+
+_Static_assert(sizeof(v5_isp_color_sector_attr) == 100, "ot_isp_color_sector_attr is 100 bytes");
+_Static_assert(offsetof(v5_isp_color_sector_attr, auto_attr) == 16,
+               "ot_isp_color_sector_attr.auto_attr at +16");
+
 /* ================================================================
  * GAMMA and PREGAMMA
  * ================================================================ */
@@ -880,6 +906,8 @@ typedef struct {
     int (*fnSetSaturationAttr)(int vi_pipe, const v5_isp_saturation_attr *attr);
     int (*fnGetColorToneAttr)(int vi_pipe, v5_isp_color_tone_attr *attr);
     int (*fnSetColorToneAttr)(int vi_pipe, const v5_isp_color_tone_attr *attr);
+    int (*fnGetColorSectorAttr)(int vi_pipe, v5_isp_color_sector_attr *attr);
+    int (*fnSetColorSectorAttr)(int vi_pipe, const v5_isp_color_sector_attr *attr);
 
     /* libss_mpi_isp.so. */
     int (*fnGetStatsCfg)(int vi_pipe, v5_isp_stats_cfg *attr);
@@ -939,6 +967,8 @@ static inline void v5_isp_tune_load(v5_isp_tune_impl *lib, const v5_mpi_libs *li
     V5_TUNE_PAIR(fnGetSaturationAttr, fnSetSaturationAttr, v5_isp_saturation_attr,
                  "saturation_attr");
     V5_TUNE_PAIR(fnGetColorToneAttr, fnSetColorToneAttr, v5_isp_color_tone_attr, "color_tone_attr");
+    V5_TUNE_PAIR(fnGetColorSectorAttr, fnSetColorSectorAttr, v5_isp_color_sector_attr,
+                 "color_sector_attr");
     V5_TUNE_PAIR(fnGetStatsCfg, fnSetStatsCfg, v5_isp_stats_cfg, "stats_cfg");
     V5_TUNE_PAIR(fnGetLdciAttr, fnSetLdciAttr, v5_isp_ldci_attr, "ldci_attr");
     V5_TUNE_PAIR(fnGetDrcAttr, fnSetDrcAttr, v5_isp_drc_attr, "drc_attr");

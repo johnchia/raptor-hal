@@ -2148,6 +2148,7 @@ err_free:
      * the video archive only. */
     hisi_dyn_free(st);
     hisi_nrx_free(st);
+    hisi_lad_free(st);
 #endif
     free(st);
     c->platform = NULL;
@@ -2197,6 +2198,7 @@ static int hal_deinit(void *ctx)
 #ifdef HAL_MODULE_VIDEO
     hisi_dyn_free(st);
     hisi_nrx_free(st);
+    hisi_lad_free(st);
 #endif
     free(st);
     c->platform = NULL;
