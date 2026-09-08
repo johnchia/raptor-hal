@@ -178,6 +178,29 @@ _Static_assert(offsetof(v5_vpss_chn_attr, aspect_ratio) == 72,
  * whether crop_rect is in pixels (ABS) or in 1/1000ths (RATIO) -- see
  * v5_coord in v5_video.h.
  */
+/*
+ * ot_frame_interrupt_attr (ot_common_video.h:470-473) and the two of its
+ * four types that matter here. The attribute is the VPSS group's, it only
+ * applies in the all-online coupling, and CV610 with channel 0 wrapped
+ * takes only START and EARLY_END -- with early_line at half the group's
+ * max height, which the vendor's own samples write literally
+ * (sample_vie.c's sample_vie_vpss_set_wrap_grp_int_attr and
+ * sample_ir_auto.c do the same eight lines).
+ */
+typedef enum {
+    V5_FRAME_INTERRUPT_START = 0,
+    V5_FRAME_INTERRUPT_EARLY = 1,
+    V5_FRAME_INTERRUPT_EARLY_END = 2,
+    V5_FRAME_INTERRUPT_EARLY_EARLY = 3,
+} v5_frame_interrupt_type;
+
+typedef struct {
+    v5_frame_interrupt_type interrupt_type;
+    unsigned int early_line;
+} v5_frame_interrupt_attr;
+
+_Static_assert(sizeof(v5_frame_interrupt_attr) == 8, "ot_frame_interrupt_attr is 8 bytes");
+
 typedef struct {
     int enable;
     v5_coord crop_mode;
@@ -270,6 +293,7 @@ typedef struct {
     /* The chn0 -> VENC ring. Optional: a driver without it streams from
      * whole frames, which is correct and costs the private pool. */
     int (*fnSetChnBufWrap)(int grp, int chn, const v5_vpss_chn_buf_wrap_attr *attr);
+    int (*fnSetGrpFrameInterrupt)(int grp, const v5_frame_interrupt_attr *attr);
     int (*fnGetChnBufWrap)(int grp, int chn, v5_vpss_chn_buf_wrap_attr *attr);
 } v5_vpss_impl;
 
@@ -354,6 +378,8 @@ static inline int v5_vpss_load(v5_vpss_impl *lib, const v5_mpi_libs *libs)
         libs, "ss_mpi_vpss_set_chn_buf_wrap");
     lib->fnGetChnBufWrap = (int (*)(int, int, v5_vpss_chn_buf_wrap_attr *))v5_symbol_opt(
         libs, "ss_mpi_vpss_get_chn_buf_wrap");
+    lib->fnSetGrpFrameInterrupt = (int (*)(int, const v5_frame_interrupt_attr *))v5_symbol_opt(
+        libs, "ss_mpi_vpss_set_grp_frame_interrupt_attr");
 
     return RSS_OK;
 }

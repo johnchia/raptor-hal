@@ -279,6 +279,17 @@ typedef struct {
     v5_video_frame_info frame;
 
     /*
+     * What hal_fs_get_frame mapped for the caller. The common and private
+     * pools are all REMAP_NONE -- nothing in the streaming path reads a
+     * block from userspace -- so a frame checked out for a snapshot comes
+     * back with virt_addr NULL and has to be mapped for the one read.
+     * Undone in hal_fs_release_frame.
+     */
+    void *frame_map;
+    unsigned int frame_map_phys;
+    unsigned int frame_map_size;
+
+    /*
      * What this channel's output is compressed with, decided by
      * hisi_fs_compress and cached because the pool's block size has to
      * agree with it. Changing one without the other is how a channel ends
@@ -596,6 +607,47 @@ static inline unsigned long long hisi_vb_yuv_size(unsigned int width, unsigned i
 }
 
 /*
+ * hisi_wrap_param -- what ss_mpi_sys_get_vpss_venc_wrap_buf_line has to be
+ * asked, for a large stream of width x height.
+ *
+ * The driver validates these fields under the all-online coupling and does
+ * not validate them at all under the offline one. Measured on the CV608
+ * (MPP 1.0.2.0 B051) by walking the whole grid -- coupling, frame rate,
+ * VTS, both stream sizes:
+ *
+ *   all_online 0   success and 128 lines for every combination tried,
+ *                  including a zero VTS and a small stream equal to the
+ *                  large one.
+ *   all_online 1   ILLEGAL_PARAM (0xa0028007) unless full_lines_std is
+ *                  strictly greater than the large stream's height *and*
+ *                  the small stream is smaller than the large one. 1300
+ *                  passes for a 1296-line stream where 1296 fails, and a
+ *                  small stream equal to the large is refused at every VTS.
+ *
+ * So neither field can be a repeat of the large stream. full_lines_std is
+ * the sensor's VTS with blanking included -- the vendor's own table says
+ * 1500 for an OS04D10 whose active height is 1296 -- and nothing in this
+ * backend reads a VTS from the sensor, so this uses a nominal eighth of
+ * blanking, which clears the check with room to spare. The small stream is
+ * half the large in each dimension, the conventional sub-stream.
+ *
+ * Neither choice moves the answer on this part: 128 is the wrap
+ * attribute's own floor and every accepted combination returns it. They
+ * are here so the call is answered rather than refused.
+ */
+static inline void hisi_wrap_param(v5_vpss_venc_wrap_param *p, int all_online,
+                                   unsigned int frame_rate, unsigned int width, unsigned int height)
+{
+    p->all_online = all_online;
+    p->frame_rate = frame_rate ? frame_rate : 30u;
+    p->full_lines_std = height + height / 8u;
+    p->large_stream_size.width = width;
+    p->large_stream_size.height = height;
+    p->small_stream_size.width = width / 2u;
+    p->small_stream_size.height = height / 2u;
+}
+
+/*
  * ot_comm_get_vpss_venc_wrap_buf_size (ot_buffer.h:47-70): the chn0 ->
  * VENC ring. buf_line lines of payload, plus -- when the channel is
  * compressed -- the header for the *whole* frame, since the header
@@ -771,10 +823,22 @@ typedef struct {
     /*
      * The VI/VPSS coupling actually in force, read back after setting it.
      *
-     * Kept for gen4's reason: in a VPSS-*online* mode the two are wired in
-     * hardware and ss_mpi_sys_bind must not be called for that edge.
+     * Not for gen4's reason. There, a VPSS-online mode wired the two in
+     * hardware and ss_mpi_sys_bind had to be skipped for that edge; V5's
+     * own all-online sample binds anyway. What the value decides here is
+     * memory: whether a sensor-sized frame ever lands in DDR between VI
+     * and VPSS, and so whether VB carries a pool for one.
      */
     v5_vi_vpss_mode vi_vpss_mode;
+
+    /*
+     * The coupling hal_init asked for on the way in, and what it got on
+     * the way out: true means VI and VPSS are both online, which is what
+     * decides whether VB carries a sensor-sized common pool at all.
+     * hisi_vi_vpss_mode writes it from the read-back mode, so after
+     * hisi_sys_bringup it is a fact rather than an intention.
+     */
+    bool vi_all_online;
 
     /*
      * The ISP's 3A loop. ss_mpi_isp_run does not return while the ISP is

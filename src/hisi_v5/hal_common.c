@@ -993,13 +993,8 @@ static void hisi_isp_teardown(hisi_state_t *st)
 /*
  * hisi_vi_vpss_mode -- read-modify-write the VI/VPSS coupling.
  *
- * Must run before ss_mpi_sys_init: the coupling is fixed when the system
- * starts and setting it afterwards is accepted and ignored. That is why
- * this is called from hal_init rather than from the VI bring-up, and it is
- * how the vendor sequences it too.
- *
- * VI_ONLINE_VPSS_OFFLINE, which is the vendor's own default
- * (sample_comm_sys.c's sample_comm_sys_get_default_cfg sets exactly this).
+ * Runs after ss_mpi_sys_init and before any pipe exists; the call site in
+ * hisi_sys_bringup says why that order and not the other one.
  *
  * The two halves are independent and are chosen for different reasons.
  *
@@ -1012,12 +1007,23 @@ static void hisi_isp_teardown(hisi_state_t *st)
  * ("性能╱带宽╱延时╱内存调优指南", 各模块内存相关可优化配置 / VI) puts the
  * saving at 1-2 VB for the online couplings against full offline.
  *
- * VPSS stays OFFLINE for gen4's reason: an online VPSS is fed in
- * hardware, which makes the software bind wrong and the channel enable a
- * no-op. Going online there as well would take a second block, and is
- * the next thing to measure -- but it also restricts the group to one
- * pipe and forbids VI channel post-processing, so it is a Phase 7
- * decision with a bench behind it rather than a default.
+ * VPSS ONLINE is the other half, and Phase 7 measured it rather than
+ * inheriting gen4's caution. An online VPSS is fed in hardware, so no
+ * sensor-sized frame lands in DDR between the two -- which is the whole
+ * of the common pool the offline path needs, three blocks of 4,478,976 B,
+ * 13,122 KiB of a 32 MiB MMZ. It is also the vendor's own low-memory
+ * configuration: sample_venc.c's sample_venc_online_wrap_get_default_sys_cfg
+ * sets OT_VI_ONLINE_VPSS_ONLINE together with vpss_wrap_en, and the VB
+ * configuration beside it starts at pool 1 -- there is no sensor-sized
+ * pool in it at all. What it costs is the VI channel's own frames, which
+ * this backend never reads, and a group restricted to one pipe, which is
+ * all raptor drives.
+ *
+ * st->vi_all_online carries the intent in and the answer out. The pool
+ * configuration has to be fixed before SYS starts and this call is the
+ * first point at which the driver can refuse, so hal_init asks for the
+ * pair, reads back what it got, and rebuilds VB in the shape that matches
+ * if the coupling did not take.
  *
  * Asking explicitly matters either way: the board does not necessarily
  * boot in any particular coupling.
@@ -1033,35 +1039,34 @@ static void hisi_isp_teardown(hisi_state_t *st)
  */
 static void hisi_vi_vpss_mode(hisi_state_t *st)
 {
+    v5_vi_vpss_mode_type want =
+        st->vi_all_online ? V5_VI_ONLINE_VPSS_ONLINE : V5_VI_ONLINE_VPSS_OFFLINE;
     v5_vi_vpss_mode mode;
     int ret;
 
     if (!st->sys.fnGetViVpssMode || !st->sys.fnSetViVpssMode) {
         HAL_LOG_DBG("vi: no ss_mpi_sys_get/set_vi_vpss_mode; leaving the coupling alone");
+        st->vi_all_online = false;
         return;
     }
 
     memset(&mode, 0, sizeof(mode));
     if ((ret = st->sys.fnGetViVpssMode(&mode)) != 0) {
         HAL_LOG_WARN("ss_mpi_sys_get_vi_vpss_mode failed: 0x%x", ret);
+        st->vi_all_online = false;
         return;
     }
 
     HAL_LOG_DBG("vi: coupling on entry %d|%d|%d|%d", (int)mode.mode[0], (int)mode.mode[1],
                 (int)mode.mode[2], (int)mode.mode[3]);
 
-    if (mode.mode[HISI_VI_PIPE] == V5_VI_ONLINE_VPSS_OFFLINE) {
-        st->vi_vpss_mode = mode;
-        return;
-    }
+    if (mode.mode[HISI_VI_PIPE] != want) {
+        mode.mode[HISI_VI_PIPE] = want;
 
-    mode.mode[HISI_VI_PIPE] = V5_VI_ONLINE_VPSS_OFFLINE;
-
-    if ((ret = st->sys.fnSetViVpssMode(&mode)) != 0) {
-        HAL_LOG_WARN("ss_mpi_sys_set_vi_vpss_mode(pipe %d = online/offline) failed: 0x%x -- "
-                     "continuing on the board's default coupling",
-                     HISI_VI_PIPE, ret);
-        return;
+        if ((ret = st->sys.fnSetViVpssMode(&mode)) != 0)
+            HAL_LOG_WARN("ss_mpi_sys_set_vi_vpss_mode(pipe %d = %d) failed: 0x%x -- continuing "
+                         "on the board's default coupling",
+                         HISI_VI_PIPE, (int)want, ret);
     }
 
     /*
@@ -1075,8 +1080,10 @@ static void hisi_vi_vpss_mode(hisi_state_t *st)
     if (st->sys.fnGetViVpssMode(&mode) == 0)
         st->vi_vpss_mode = mode;
 
-    HAL_LOG_INFO("vi: pipe %d coupling %d (0 = offline/offline, 2 = online/offline)", HISI_VI_PIPE,
-                 (int)st->vi_vpss_mode.mode[HISI_VI_PIPE]);
+    st->vi_all_online = st->vi_vpss_mode.mode[HISI_VI_PIPE] == V5_VI_ONLINE_VPSS_ONLINE;
+
+    HAL_LOG_INFO("vi: pipe %d coupling %d (2 = VI online, VPSS offline; 3 = both online)",
+                 HISI_VI_PIPE, (int)st->vi_vpss_mode.mode[HISI_VI_PIPE]);
 }
 
 /*
@@ -1337,6 +1344,39 @@ static int hisi_vpss_bringup(hisi_state_t *st)
     }
     st->vpss_grp_created = true;
 
+    /*
+     * The wrap ring's precondition under the all-online coupling, and the
+     * reason channel 0 was taking a 6.1 MB private pool where the ring is
+     * 0.4: CV610 accepts ss_mpi_vpss_set_chn_buf_wrap there only with the
+     * group's frame interrupt at START or EARLY_END and early_line at half
+     * the group's max height. Both the interrupt attribute's page and the
+     * wrap attribute's say so ("4 视频处理子系统"), and the vendor's own
+     * samples write exactly these two values
+     * (sample_vie.c's sample_vie_vpss_set_wrap_grp_int_attr,
+     * sample_ir_auto.c). Without it the wrap call answers NOT_PERM.
+     *
+     * Asked for only in that coupling -- the attribute is documented as
+     * valid in no other -- and here, with the group created and no
+     * physical channel enabled yet, which is the state a change of
+     * interrupt mode requires.
+     */
+    if (st->vi_all_online && st->vb_wrap_blk && st->vpss.fnSetGrpFrameInterrupt) {
+        v5_frame_interrupt_attr fi;
+
+        fi.interrupt_type = V5_FRAME_INTERRUPT_EARLY_END;
+        fi.early_line = grp.max_height / 2u;
+
+        ret = st->vpss.fnSetGrpFrameInterrupt(HISI_VPSS_GRP, &fi);
+        if (ret)
+            HAL_LOG_WARN("vpss: ss_mpi_vpss_set_grp_frame_interrupt_attr(EARLY_END, line %u) "
+                         "failed: 0x%x; channel 0 cannot take the wrap ring",
+                         fi.early_line, ret);
+        else
+            HAL_LOG_INFO("vpss: frame interrupt EARLY_END at line %u -- what the all-online "
+                         "coupling wants before channel 0 can wrap",
+                         fi.early_line);
+    }
+
     ret = st->vpss.fnStartGrp(HISI_VPSS_GRP);
     if (ret) {
         HAL_LOG_ERR("ss_mpi_vpss_start_grp(grp %d) failed: 0x%x", HISI_VPSS_GRP, ret);
@@ -1345,9 +1385,13 @@ static int hisi_vpss_bringup(hisi_state_t *st)
     st->vpss_grp_started = true;
 
     /*
-     * VI channel -> VPSS group. A software bind, and correct only because
-     * the coupling was set to VPSS-offline before ss_mpi_sys_init; with
-     * VPSS online the group is fed in hardware and this call is wrong.
+     * VI channel -> VPSS group. Called on either coupling, which is worth
+     * saying because gen4's rule was the opposite: there, a VPSS-online
+     * mode wired the two in hardware and the software bind had to be
+     * skipped. V5's own all-online sample binds anyway
+     * (sample_venc_online_wrap_start_sys_vi_vpss calls
+     * sample_comm_vi_bind_vpss, and that helper checks no mode), so the
+     * bind is the declaration of the edge rather than the plumbing of it.
      *
      * The destination channel is 0 by convention -- a group has one input
      * -- which is also the reason gen4 cannot use physical channel 0 as an
@@ -1776,13 +1820,23 @@ static void hisi_video_teardown(hisi_state_t *st)
  * side:
  *
  *   pool 0   the VI channel's NV21 output at the sensor's size, which is
- *            also what the VPSS group reads over the bind.
+ *            also what the VPSS group reads over the bind -- **and only
+ *            when the VPSS is offline**. Under the all-online coupling
+ *            (hisi_vi_vpss_mode) nothing between VI and VPSS goes through
+ *            DDR at all, so this pool would be 13,122 KiB of a 32 MiB MMZ
+ *            that no consumer can ask for, and it is not configured. The
+ *            vendor's own all-online configuration has no such pool
+ *            either: sample_venc_online_wrap_get_default_vb_cfg starts its
+ *            loop at pool 1.
  *
  * The VPSS channels are deliberately not here. Their geometry is rvd's
  * and arrives later, and each gets a pool cut to its own stream in
  * hisi_fs_pool_acquire. A channel whose pool could not be created falls
  * back to these common pools, which is the other reason pool 0 is sized
- * for the largest frame in the pipeline rather than the VI channel alone.
+ * for the largest frame in the pipeline rather than the VI channel alone
+ * -- and, where the all-online coupling leaves no pool 0, the reason that
+ * function's failure path is worth reading: there is then nothing behind
+ * it.
  *
  * WHY THERE IS NO RAW POOL. The VI pipe puts a raw Bayer frame in a VB
  * block only while it is offline, and hisi_vi_vpss_mode asks for VI
@@ -1817,6 +1871,89 @@ static void hisi_video_teardown(hisi_state_t *st)
 #ifdef HAL_MODULE_VIDEO
 
 #define HISI_VB_VI_BLK_CNT 3u
+#define HISI_VB_VI_BLK_CNT_MIN 2u
+
+/*
+ * The share of the zone the VI pool may take. Three sensor-sized blocks
+ * are 13,122 KiB of the CV608's 32 MiB, or 40%, and the rest of the
+ * pipeline -- encoder reconstruction and stream buffers, JPEG, the VI
+ * pipe's 3DNR and BNR references, ISP statistics, the sub-stream's own
+ * pool -- measured 14.4 MiB beside it. 45% is that measurement rounded up
+ * to the nearest number that still yields three here, so this board is
+ * unchanged and a part with a smaller zone gets a count that fits rather
+ * than a VB init that fails or an encoder that cannot find room.
+ */
+#define HISI_VB_MMZ_PERCENT 45u
+#define HISI_MMZ_PROC "/proc/umap/media-mem"
+
+/* The MMZ's total size in KiB, or 0 when it cannot be read -- an
+ * unreadable node is not a reason to fail, only a reason to keep the
+ * measured count. gen4 reads the same summary line out of
+ * /proc/media-mem; V5 moved the node under umap. */
+static unsigned long hisi_mmz_total_kib(void)
+{
+    char line[256];
+    unsigned long kib = 0;
+    FILE *f = fopen(HISI_MMZ_PROC, "r");
+
+    if (!f)
+        return 0;
+
+    /* "total size=32768KB(32MB),used=32KB(...)" -- the first field of the
+     * MMZ_USE_INFO summary. */
+    while (fgets(line, sizeof(line), f)) {
+        const char *p = strstr(line, "total size=");
+
+        if (p && sscanf(p, "total size=%luKB", &kib) == 1)
+            break;
+        kib = 0;
+    }
+
+    fclose(f);
+    return kib;
+}
+
+/*
+ * How many sensor-sized blocks the VI pool gets, given what one costs and
+ * what the wrap ring has already taken.
+ *
+ * The budget is the whole VB configuration's, so the ring comes off the
+ * top: charging only this pool against the bound would put the total over
+ * it by exactly the ring's size. Bounded above by the tuning guide's rule
+ * -- a VI pipe holds at most three frame VBs, one filling, one ready, one
+ * downstream -- and below by two, which is a single channel's working set
+ * and the point past which the pipeline is not worth starting.
+ */
+static unsigned int hisi_vb_vi_blk_cnt(unsigned long long blk_size, unsigned long long reserved_kib)
+{
+    unsigned long total_kib = hisi_mmz_total_kib();
+    unsigned long long budget_kib;
+    unsigned long long blk_kib;
+    unsigned int cnt;
+
+    if (!total_kib || !blk_size) {
+        HAL_LOG_INFO("vb: MMZ size unknown, asking for the measured %u blocks", HISI_VB_VI_BLK_CNT);
+        return HISI_VB_VI_BLK_CNT;
+    }
+
+    blk_kib = (blk_size + 1023ull) / 1024ull;
+    budget_kib = (unsigned long long)total_kib * HISI_VB_MMZ_PERCENT / 100ull;
+    budget_kib = budget_kib > reserved_kib ? budget_kib - reserved_kib : 0ull;
+    cnt = (unsigned int)(budget_kib / blk_kib);
+
+    if (cnt >= HISI_VB_VI_BLK_CNT)
+        return HISI_VB_VI_BLK_CNT;
+    if (cnt < HISI_VB_VI_BLK_CNT_MIN)
+        cnt = HISI_VB_VI_BLK_CNT_MIN;
+
+    /* Worth a line at INFO: it decides how many frames VI has in flight,
+     * so it is the first thing to look at if vb_fail climbs. */
+    HAL_LOG_INFO("vb: MMZ is %lu KiB, so %u blocks of %llu KiB rather than %u -- three would be "
+                 "%llu%% of the zone with the ring's %llu KiB beside them",
+                 total_kib, cnt, blk_kib, HISI_VB_VI_BLK_CNT,
+                 (blk_kib * HISI_VB_VI_BLK_CNT + reserved_kib) * 100ull / total_kib, reserved_kib);
+    return cnt;
+}
 
 /*
  * hisi_vb_wrap_blk -- the block channel 0's wrap ring will take.
@@ -1843,13 +1980,15 @@ static unsigned long long hisi_vb_wrap_blk(const hisi_state_t *st)
     if (!st->sys.fnGetVpssVencWrapBufLine || !st->vpss.fnSetChnBufWrap)
         return 0;
 
+    /* The coupling is part of the question -- the sample fills this field
+     * from the same mode value (sample_comm_vpss.c's
+     * sample_comm_vpss_get_wrap_cfg) -- and under the all-online one the
+     * driver checks the rest of it; hisi_wrap_param carries the measured
+     * rules. */
     memset(&p, 0, sizeof(p));
-    p.all_online = 0; /* VI online, VPSS offline: hisi_vi_vpss_mode */
-    p.frame_rate = m->frame_rate > 1.0f ? (unsigned int)(m->frame_rate + 0.5f) : 30u;
-    p.full_lines_std = m->dev_rect.height; /* see v5_vpss_venc_wrap_param */
-    p.large_stream_size.width = m->dev_rect.width;
-    p.large_stream_size.height = m->dev_rect.height;
-    p.small_stream_size = p.large_stream_size;
+    hisi_wrap_param(&p, st->vi_all_online ? 1 : 0,
+                    m->frame_rate > 1.0f ? (unsigned int)(m->frame_rate + 0.5f) : 30u,
+                    m->dev_rect.width, m->dev_rect.height);
 
     ret = st->sys.fnGetVpssVencWrapBufLine(&p, &line);
     if (ret || !line || line > m->dev_rect.height) {
@@ -1866,27 +2005,43 @@ static void hisi_vb_fill_cfg(hisi_state_t *st, v5_vb_cfg *cfg)
 {
     const hisi_sensor_mode_t *m = &st->mode;
     unsigned long long full = hisi_vb_nv12_size(m->dev_rect.width, m->dev_rect.height);
+    unsigned int pool = 0;
 
     memset(cfg, 0, sizeof(*cfg));
-    cfg->max_pool_cnt = 1;
 
-    cfg->common_pool[0].blk_size = full;
-    cfg->common_pool[0].blk_cnt = HISI_VB_VI_BLK_CNT;
-    cfg->common_pool[0].remap_mode = V5_VB_REMAP_NONE;
+    /* The ring first, because the VI pool's count is what is left of the
+     * budget once the ring has taken its block. */
+    st->vb_wrap_blk = hisi_vb_wrap_blk(st);
+
+    if (!st->vi_all_online) {
+        unsigned int cnt = hisi_vb_vi_blk_cnt(full, (st->vb_wrap_blk + 1023ull) / 1024ull);
+
+        cfg->common_pool[pool].blk_size = full;
+        cfg->common_pool[pool].blk_cnt = cnt;
+        cfg->common_pool[pool].remap_mode = V5_VB_REMAP_NONE;
+        HAL_LOG_INFO("vb: pool %u = VI chn %ux%u NV21, %llu B x%u = %llu KiB", pool,
+                     m->dev_rect.width, m->dev_rect.height, full, cnt, (full * cnt) >> 10);
+        pool++;
+    } else {
+        HAL_LOG_INFO("vb: VI and VPSS both online, so no sensor-sized common pool -- %llu KiB the "
+                     "offline coupling would have spent on frames nothing reads",
+                     (full * HISI_VB_VI_BLK_CNT) >> 10);
+    }
 
     /*
-     * pool 1   channel 0's wrap ring, one block. VB hands a request the
-     *          smallest block that fits, so this one is never mistaken
-     *          for a VI frame and a VI frame never lands in it.
+     * channel 0's wrap ring, one block. VB hands a request the smallest
+     * block that fits, so this one is never mistaken for a VI frame and a
+     * VI frame never lands in it.
      */
-    st->vb_wrap_blk = hisi_vb_wrap_blk(st);
     if (st->vb_wrap_blk) {
-        cfg->max_pool_cnt = 2;
-        cfg->common_pool[1].blk_size = st->vb_wrap_blk;
-        cfg->common_pool[1].blk_cnt = 1;
-        cfg->common_pool[1].remap_mode = V5_VB_REMAP_NONE;
-        HAL_LOG_INFO("vb: pool 1 = VPSS chn 0 wrap ring, %llu B x1", st->vb_wrap_blk);
+        cfg->common_pool[pool].blk_size = st->vb_wrap_blk;
+        cfg->common_pool[pool].blk_cnt = 1;
+        cfg->common_pool[pool].remap_mode = V5_VB_REMAP_NONE;
+        HAL_LOG_INFO("vb: pool %u = VPSS chn 0 wrap ring, %llu B x1", pool, st->vb_wrap_blk);
+        pool++;
     }
+
+    cfg->max_pool_cnt = pool;
 
     /*
      * REMAP_NONE: nothing in the streaming path reads a VB block from
@@ -1899,8 +2054,6 @@ static void hisi_vb_fill_cfg(hisi_state_t *st, v5_vb_cfg *cfg)
      * this board has (/proc/umap/media-mem shows one ZONE named
      * "anonymous").
      */
-    HAL_LOG_INFO("vb: pool 0 = VI chn %ux%u NV21, %llu B x%u = %llu KiB", m->dev_rect.width,
-                 m->dev_rect.height, full, HISI_VB_VI_BLK_CNT, (full * HISI_VB_VI_BLK_CNT) >> 10);
 }
 
 #endif /* HAL_MODULE_VIDEO */
@@ -1947,6 +2100,73 @@ static void hisi_teardown(hisi_state_t *st)
 }
 
 /*
+ * hisi_sys_bringup -- VB configured, VB up, SYS up, and the coupling asked
+ * for.
+ *
+ * Its own function because it runs more than once. The pool configuration
+ * has to be handed to VB before SYS starts, the VI/VPSS coupling cannot be
+ * asked for until after SYS has started, and the two have to agree: the
+ * all-online coupling makes the sensor-sized pool dead weight, the offline
+ * one cannot run without it. So hal_init lays the pools down for the
+ * coupling it wants, this reports what the driver actually gave, and when
+ * those differ the whole of VB and SYS goes back down (hisi_teardown, which
+ * undoes exactly the three steps here) and comes up again in the shape that
+ * matches.
+ *
+ * The audio archive has no sensor and no pools; it still needs VB
+ * configured, because ss_mpi_sys_init will not run on an unconfigured VB.
+ */
+static int hisi_sys_bringup(hisi_state_t *st)
+{
+    v5_vb_cfg vb_cfg;
+    int ret;
+
+#ifdef HAL_MODULE_VIDEO
+    hisi_vb_fill_cfg(st, &vb_cfg);
+#else
+    memset(&vb_cfg, 0, sizeof(vb_cfg));
+    vb_cfg.max_pool_cnt = 0;
+#endif
+
+    ret = st->vb.fnSetCfg(&vb_cfg);
+    if (ret) {
+        HAL_LOG_ERR("vb: ss_mpi_vb_set_cfg failed 0x%x (err %u)", (unsigned)ret, V5_ERR_ID(ret));
+        return RSS_ERR_IO;
+    }
+
+    ret = st->vb.fnInit();
+    if (ret) {
+        HAL_LOG_ERR("vb: ss_mpi_vb_init failed 0x%x (err %u)", (unsigned)ret, V5_ERR_ID(ret));
+        return RSS_ERR_IO;
+    }
+    st->vb_inited = true;
+
+    ret = st->sys.fnInit();
+    if (ret) {
+        HAL_LOG_ERR("sys: ss_mpi_sys_init failed 0x%x (err %u)", (unsigned)ret, V5_ERR_ID(ret));
+        return RSS_ERR_IO;
+    }
+    st->sys_inited = true;
+
+#ifdef HAL_MODULE_VIDEO
+    /*
+     * AFTER sys_init and before the VI bring-up, which is where the vendor
+     * puts it: sample_vio_sys_init calls sample_comm_sys_init (vb_set_cfg,
+     * vb_init, sys_init) and only then sample_comm_vi_set_vi_vpss_mode.
+     *
+     * This was between vb_init and sys_init and looked correct there --
+     * the coupling does have to be settled before VI is created. It is
+     * not: ss_mpi_sys_set_vi_vpss_mode returns 0xa002800d, NOT_PERM, on an
+     * uninitialised SYS. Nothing said so, because the value asked for used
+     * to be the value already in force and the call was never reached.
+     */
+    hisi_vi_vpss_mode(st);
+#endif
+
+    return RSS_OK;
+}
+
+/*
  * hal_init -- open the libraries and bring MPP up as far as SYS.
  *
  * The sequence, and every step of it is load-bearing:
@@ -1982,7 +2202,6 @@ static int hal_init(void *ctx, const rss_multi_sensor_config_t *cfg)
 {
     rss_hal_ctx_t *c = (rss_hal_ctx_t *)ctx;
     hisi_state_t *st;
-    v5_vb_cfg vb_cfg;
     int ret;
 
     if (!c || !cfg || cfg->sensor_count < 1 || cfg->sensor_count > RSS_MAX_SENSORS)
@@ -2154,6 +2373,11 @@ static int hal_init(void *ctx, const rss_multi_sensor_config_t *cfg)
     (void)st->sys.fnExit();
     (void)st->vb.fnExit();
 
+#ifndef HAL_MODULE_VIDEO
+    if ((ret = hisi_sys_bringup(st)) != RSS_OK)
+        goto err_teardown;
+#endif
+
 #ifdef HAL_MODULE_VIDEO
     /*
      * The sensor mode, before VB and not with the rest of the video
@@ -2167,54 +2391,42 @@ static int hal_init(void *ctx, const rss_multi_sensor_config_t *cfg)
     /* The mode load is where a name the config left out gets resolved. */
     snprintf(st->sensor_name, sizeof(st->sensor_name), "%s", st->mode.name);
 
-    hisi_vb_fill_cfg(st, &vb_cfg);
-#else
-    /* The audio archive has no sensor and needs no pools; VB still has to
-     * be configured, because ss_mpi_sys_init will not run on an
-     * unconfigured VB. */
-    memset(&vb_cfg, 0, sizeof(vb_cfg));
-    vb_cfg.max_pool_cnt = 0;
-#endif
-
-    ret = st->vb.fnSetCfg(&vb_cfg);
-    if (ret) {
-        HAL_LOG_ERR("vb: ss_mpi_vb_set_cfg failed 0x%x (err %u)", (unsigned)ret, V5_ERR_ID(ret));
-        ret = RSS_ERR_IO;
-        goto err_unload;
-    }
-
-    ret = st->vb.fnInit();
-    if (ret) {
-        HAL_LOG_ERR("vb: ss_mpi_vb_init failed 0x%x (err %u)", (unsigned)ret, V5_ERR_ID(ret));
-        ret = RSS_ERR_IO;
-        goto err_unload;
-    }
-    st->vb_inited = true;
-
-    ret = st->sys.fnInit();
-    if (ret) {
-        HAL_LOG_ERR("sys: ss_mpi_sys_init failed 0x%x (err %u)", (unsigned)ret, V5_ERR_ID(ret));
-        ret = RSS_ERR_IO;
-        goto err_teardown;
-    }
-    st->sys_inited = true;
-
-#ifdef HAL_MODULE_VIDEO
     /*
-     * AFTER sys_init and before the VI bring-up, which is where the vendor
-     * puts it: sample_vio_sys_init calls sample_comm_sys_init (vb_set_cfg,
-     * vb_init, sys_init) and only then sample_comm_vi_set_vi_vpss_mode.
-     *
-     * This was between vb_init and sys_init and looked correct there --
-     * the coupling does have to be settled before VI is created. It is
-     * not: ss_mpi_sys_set_vi_vpss_mode returns 0xa002800d, NOT_PERM, on an
-     * uninitialised SYS. Nothing said so, because the value asked for used
-     * to be the value already in force and the call was never reached.
+     * Ask for the coupling that costs the least memory, and be ready to be
+     * told no. Neither of the two attempts below is error handling: the
+     * pools are laid down for a coupling that has not been granted yet,
+     * and the grant is the first thing hisi_sys_bringup can report.
      */
-    hisi_vi_vpss_mode(st);
+    st->vi_all_online = true;
+    if ((ret = hisi_sys_bringup(st)) != RSS_OK)
+        goto err_teardown;
+
+    if (!st->vi_all_online) {
+        HAL_LOG_INFO("vb: the all-online coupling was not granted; rebuilding VB with the "
+                     "sensor-sized pool the offline path reads from");
+        hisi_teardown(st);
+        if ((ret = hisi_sys_bringup(st)) != RSS_OK)
+            goto err_teardown;
+    }
 
     ret = hisi_video_bringup(st, &cfg->sensors[0]);
-    if (ret)
+    if (ret != RSS_OK && st->vi_all_online) {
+        /*
+         * The coupling was granted and the pipeline still did not come up
+         * on it. Rather than guess which stage minded, put the whole of
+         * MPP back down and bring it up on the coupling gen4 used, with
+         * the pool that feeds it -- a camera on the expensive coupling
+         * beats a correct diagnosis and no video.
+         */
+        HAL_LOG_WARN("video: bring-up failed (%d) with VI and VPSS both online; retrying on the "
+                     "online/offline coupling",
+                     ret);
+        hisi_teardown(st);
+        st->vi_all_online = false;
+        if ((ret = hisi_sys_bringup(st)) == RSS_OK)
+            ret = hisi_video_bringup(st, &cfg->sensors[0]);
+    }
+    if (ret != RSS_OK)
         goto err_teardown;
 
     /* Settle which IQ tuning file applies; the load itself waits for the

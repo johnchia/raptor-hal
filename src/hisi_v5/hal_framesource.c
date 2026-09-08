@@ -309,12 +309,9 @@ static bool hisi_fs_wrap_attr(const hisi_state_t *st, int chn, const hisi_vpss_c
     int ret;
 
     memset(&p, 0, sizeof(p));
-    p.all_online = 0; /* VI online, VPSS offline */
-    p.frame_rate = st->mode.frame_rate > 1.0f ? (unsigned int)(st->mode.frame_rate + 0.5f) : 30u;
-    p.full_lines_std = st->mode.dev_rect.height; /* see v5_vpss_venc_wrap_param */
-    p.large_stream_size.width = fs->width;
-    p.large_stream_size.height = fs->height;
-    p.small_stream_size = p.large_stream_size;
+    hisi_wrap_param(&p, st->vi_all_online ? 1 : 0,
+                    st->mode.frame_rate > 1.0f ? (unsigned int)(st->mode.frame_rate + 0.5f) : 30u,
+                    fs->width, fs->height);
 
     ret = st->sys.fnGetVpssVencWrapBufLine(&p, &line);
     if (ret || !line) {
@@ -824,26 +821,34 @@ int hal_fs_set_frame_depth(void *ctx, int chn, int depth)
         return RSS_OK;
     }
 
-    /*
-     * Not on the ring. A depth would take channel 0 off it, and what it
-     * would then need -- three uncompressed 1080p frames of its own,
-     * 9.3 MB -- does not exist beside 3DNR's reference frames; the
-     * measured alternative was the channel drawing sensor-sized blocks
-     * from the VI pool and VI failing 73 allocations in two seconds.
-     * NOTSUP is what rvd's raw-snapshot path reports as "not supported
-     * on this SoC", which for now is the truth: hal_fs_get_frame also
-     * never maps the block it checks out, so the path has no user yet.
-     */
-    if (depth && fs->wrapped) {
-        HAL_LOG_INFO("fs%d: depth %d refused: the channel streams through the wrap ring and "
-                     "queues nothing for userspace",
-                     chn, depth);
-        return RSS_ERR_NOTSUP;
-    }
-
     fs->depth = (unsigned int)depth;
     phy = hisi_vpss_phy(chn);
     hisi_fs_fill_attr(st, fs, phy, &attr);
+
+    /*
+     * A depth on the wrapped channel used to be refused here. It is not
+     * any more, because the all-online coupling changed the arithmetic
+     * behind the refusal: the three uncompressed 1080p frames a depth
+     * needs are 9.3 MB, and where the offline coupling left 4.8 MB of the
+     * zone free the all-online one leaves 17.9. What the refusal was
+     * protecting against -- the channel falling back to sensor-sized
+     * blocks and VI failing 73 allocations in two seconds -- cannot happen
+     * from a pool that fits.
+     *
+     * So the ring comes off for the duration instead. hisi_fs_pool_refresh
+     * is the path that can do it: a wrapped channel refuses a new
+     * attribute (0xa007800d), and refresh knows to disable, unwrap, set,
+     * re-pool and enable in that order. hisi_fs_wrap_want already answers
+     * false for a channel with a depth, so this direction takes the ring
+     * off and the return to depth 0 puts it back.
+     */
+    if (fs->wrapped || hisi_fs_wrap_want(st, fs, phy) != fs->wrapped) {
+        hisi_fs_pool_refresh(st, chn, fs, &attr);
+        HAL_LOG_INFO("fs%d: depth %u, %s", chn, fs->depth,
+                     fs->wrapped ? "back on the wrap ring" : "off the wrap ring, on its own pool");
+        return RSS_OK;
+    }
+
     ret = st->vpss.fnSetChnAttr(HISI_VPSS_GRP, phy, &attr);
     if (ret) {
         HAL_LOG_ERR("fs%d: depth %d rejected: 0x%x", chn, depth, ret);
@@ -869,6 +874,18 @@ int hal_fs_get_frame_depth(void *ctx, int chn, int *depth)
         return RSS_ERR_INVAL;
     *depth = (int)fs->depth;
     return RSS_OK;
+}
+
+/* Give back whatever hal_fs_get_frame mapped, if it mapped anything. */
+static void hisi_fs_frame_unmap(hisi_state_t *st, hisi_vpss_chn_t *fs)
+{
+    if (!fs->frame_map)
+        return;
+    if (st->sys.fnMunmap)
+        st->sys.fnMunmap(fs->frame_map);
+    fs->frame_map = NULL;
+    fs->frame_map_phys = 0;
+    fs->frame_map_size = 0;
 }
 
 /*
@@ -918,10 +935,51 @@ int hal_fs_get_frame(void *ctx, int chn, void **frame_data, rss_frame_info_t *in
 
     *frame_data = &fs->frame;
     if (info) {
+        const v5_video_frame *f = &fs->frame.video_frame;
+        unsigned int luma = f->stride[0] * f->height;
+        unsigned int chroma = f->stride[1] ? f->stride[1] * (f->height / 2u) : luma / 2u;
+
         memset(info, 0, sizeof(*info));
-        info->width = fs->frame.video_frame.width;
-        info->height = fs->frame.video_frame.height;
-        info->timestamp = (int64_t)fs->frame.video_frame.pts;
+        info->width = (uint16_t)f->width;
+        info->height = (uint16_t)f->height;
+        info->pixfmt = f->pixel_format == V5_PIXEL_FORMAT_YVU_SEMIPLANAR_420 ? RSS_PIXFMT_NV21
+                                                                             : RSS_PIXFMT_NV12;
+        info->timestamp = (int64_t)f->pts;
+        info->phys_addr = f->phys_addr[0];
+
+        /*
+         * The two planes are one allocation and the chroma plane's own
+         * physical address says where in it; a stride-derived guess would
+         * be wrong the moment the driver pads between them.
+         */
+        info->size = f->phys_addr[1] > f->phys_addr[0]
+                         ? (f->phys_addr[1] - f->phys_addr[0]) + chroma
+                         : luma + chroma;
+
+        /*
+         * REMAP_NONE pools hand back a null virt_addr, so the block is
+         * mapped here for the one read the caller is about to do and
+         * unmapped in hal_fs_release_frame. Cached, then flushed: the
+         * snapshot copies megabytes and an uncached read of that is slow
+         * enough to notice.
+         */
+        info->virt_addr = f->virt_addr[0];
+        if (!info->virt_addr && st->sys.fnMmapCached && info->size) {
+            void *virt = st->sys.fnMmapCached(info->phys_addr, info->size);
+
+            if (virt) {
+                if (st->sys.fnFlushCache)
+                    st->sys.fnFlushCache(info->phys_addr, virt, info->size);
+                fs->frame_map = virt;
+                fs->frame_map_phys = info->phys_addr;
+                fs->frame_map_size = info->size;
+                info->virt_addr = virt;
+            } else {
+                HAL_LOG_WARN("fs%d: ss_mpi_sys_mmap_cached(0x%08x, %u) failed; the caller gets a "
+                             "frame it cannot read",
+                             chn, info->phys_addr, info->size);
+            }
+        }
     }
 
     return RSS_OK;
@@ -942,6 +1000,8 @@ int hal_fs_release_frame(void *ctx, int chn, void *frame_data)
      * mismatch is a caller bug and releasing anyway would hide it. */
     if (frame_data && frame_data != &fs->frame)
         return RSS_ERR_INVAL;
+
+    hisi_fs_frame_unmap(st, fs);
 
     phy = hisi_vpss_phy(chn);
     ret =
@@ -975,6 +1035,7 @@ void hisi_fs_release_all(hisi_state_t *st)
         int phy = hisi_vpss_phy(chn);
 
         if (fs->frame_held) {
+            hisi_fs_frame_unmap(st, fs);
             if (st->vpss.fnReleaseChnFrame)
                 st->vpss.fnReleaseChnFrame(HISI_VPSS_GRP, phy, &fs->frame);
             fs->frame_held = false;
