@@ -31,12 +31,13 @@
  *
  * WHICH OF THEM APPLY. Unlike hal_dyn.c's three, these are gated by
  * [module_state] -- bDynamicAE, bDynamicFps, bDynamicLdci, bDynamicDpc,
- * bDynamicBLC, bDynamicColorSector, bDynamicNr, and bDynamicCA or
- * bDynamicLinearCA for the CA ladder -- through the same mask hal_isp.c
- * keeps for the static sections. Those flags carry real intent here: the
- * vendor's own OS04D10 profile ships a full [dynamic_nr] under
- * bDynamicNr=0 and chooses the linear CA path over the WDR one by flag,
- * and a file with no [module_state] at all gets everything, as before.
+ * bDynamicBLC, bDynamicColorSector, bDynamicNr, bDynamicShading, and
+ * bDynamicCA or bDynamicLinearCA for the CA ladder -- through the same
+ * mask hal_isp.c keeps for the static sections. Those flags carry real
+ * intent here: the vendor's own OS04D10 profile ships a full [dynamic_nr]
+ * under bDynamicNr=0 and a full [dynamic_shading] under bDynamicShading=0,
+ * and chooses the linear CA path over the WDR one by flag; a file with no
+ * [module_state] at all gets everything, as before.
  *
  * WHAT dynamic_fps IS ALLOWED TO DO. The vendor's version drops the
  * sensor to 5 fps at night, lengthens the AE's shutter to match, and
@@ -99,7 +100,7 @@
  * THE ENGINES AND THEIR ROWS
  * ================================================================ */
 
-enum { LAD_AE, LAD_FPS, LAD_LDCI, LAD_DPC, LAD_BLC, LAD_CS, LAD_CA, LAD_NR, LAD_N };
+enum { LAD_AE, LAD_FPS, LAD_LDCI, LAD_DPC, LAD_BLC, LAD_CS, LAD_CA, LAD_NR, LAD_SHADING, LAD_N };
 
 /*
  * One flat row space across the scalar engines, so parsing, validation
@@ -122,6 +123,7 @@ enum {
     R_BLC_GR,
     R_BLC_GB,
     R_BLC_B,
+    R_SHADING_MESH,
     R_CS_0, /* color_tab<j>_{hue,sat}_shift_<i>: R_CS_0 + (j * 2 + kind) * 6 + i */
     R_NF = R_CS_0 + V5_ISP_CCM_MATRIX_NUM * 2 * V5_ISP_COLOR_SECTORS
 };
@@ -150,6 +152,7 @@ static const struct {
     [R_BLC_GR] = {LAD_BLC, "blc_gr", 0, 0xFFFF, 0},
     [R_BLC_GB] = {LAD_BLC, "blc_gb", 0, 0xFFFF, 0},
     [R_BLC_B] = {LAD_BLC, "blc_b", 0, 0xFFFF, 0},
+    [R_SHADING_MESH] = {LAD_SHADING, "mesh_strength", 0, 16383, 0},
 };
 
 #define CS_LO 0
@@ -170,6 +173,7 @@ static const struct {
     [LAD_CS] = {"dynamic_color_sector", "iso_count", "iso_level", true},
     [LAD_CA] = {"dynamic_ca", "iso_count", "iso_level", true},
     [LAD_NR] = {"dynamic_nr", "coring_ratio_count", "coring_ratio_iso", true},
+    [LAD_SHADING] = {"dynamic_shading", "exp_thresh_cnt", "exp_thresh_ltoh", false},
 };
 
 /*
@@ -679,6 +683,41 @@ static int lad_write_ldci(hisi_state_t *st, struct hisi_lad_set *d, unsigned lon
 }
 
 /*
+ * The lens-shading strength, on exposure. The mesh itself is the sensor
+ * driver's; this scales it, and the vendor's own ladder fades it to zero
+ * as the shutter lengthens -- a correction that multiplies the corners
+ * multiplies their noise with them.
+ */
+static int lad_write_shading(hisi_state_t *st, struct hisi_lad_set *d, unsigned long long exposure)
+{
+    v5_isp_shading_attr a;
+    int lvl, ret;
+
+    d->err = "get/set_mesh_shading_attr";
+    if (!st->tune.fnGetShadingAttr || !st->tune.fnSetShadingAttr)
+        return -1;
+    d->err = "get_mesh_shading_attr";
+    ret = st->tune.fnGetShadingAttr(HISI_VI_PIPE, &a);
+    if (ret)
+        return ret;
+
+    lvl = lad_level(exposure, d->e[LAD_SHADING].n, d->e[LAD_SHADING].thr);
+    lad_lay(d, LAD_SHADING, exposure, lvl);
+    a.mesh_strength = (unsigned short)d->cur[R_SHADING_MESH];
+
+    d->err = "set_mesh_shading_attr";
+    ret = st->tune.fnSetShadingAttr(HISI_VI_PIPE, &a);
+    if (ret == 0) {
+        if (lvl != d->e[LAD_SHADING].last_lvl && d->e[LAD_SHADING].engine)
+            HAL_LOG_INFO("shading: exposure %llu -> %llu, band %d (<= %llu); mesh_strength %d",
+                         d->last_exp, exposure, lvl, d->e[LAD_SHADING].thr[lvl],
+                         d->cur[R_SHADING_MESH]);
+        lad_landed(d, LAD_SHADING, lvl);
+    }
+    return ret;
+}
+
+/*
  * The fps ladder's two halves. The rate goes through hisi_isp_fps_write,
  * the same path rvd's own set takes, capped at rvd's number; the shutter
  * limit is a get-modify-set of the exposure attribute. Either half alone
@@ -926,6 +965,8 @@ static int lad_write(hisi_state_t *st, struct hisi_lad_set *d, int eng, unsigned
         return lad_write_cs(st, d, (unsigned)v);
     case LAD_CA:
         return lad_write_ca(st, d, (unsigned)v);
+    case LAD_SHADING:
+        return lad_write_shading(st, d, v);
     default:
         return -1;
     }
@@ -933,8 +974,8 @@ static int lad_write(hisi_state_t *st, struct hisi_lad_set *d, int eng, unsigned
 
 static const char *lad_what(int eng)
 {
-    static const char *const names[LAD_N] = {"ae",  "fps",          "ldci", "dpc",
-                                             "blc", "color_sector", "ca",   "nr"};
+    static const char *const names[LAD_N] = {"ae",           "fps", "ldci", "dpc",    "blc",
+                                             "color_sector", "ca",  "nr",   "shading"};
     return names[eng];
 }
 

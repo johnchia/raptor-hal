@@ -115,6 +115,9 @@
 #define V5_ISP_AWB_ZONE_NUM 1024    /* OT_ISP_AWB_ZONE_ORIG_ROW * _COLUMN, 32 x 32 */
 #define V5_ISP_CSC_DC_NUM 3         /* OT_ISP_CSC_DC_NUM */
 #define V5_ISP_CSC_COEF_NUM 9       /* OT_ISP_CSC_COEF_NUM */
+#define V5_ISP_CAC_THR_NUM 2        /* OT_ISP_CAC_THR_NUM */
+#define V5_ISP_CAC_CURVE_NUM 3      /* OT_ISP_CAC_CURVE_NUM */
+#define V5_ISP_CAC_EXP_RATIO_NUM 16 /* OT_ISP_CAC_EXP_RATIO_NUM */
 
 /* ot_op_mode: 0 auto, 1 manual. Spelt out because the .ini dialect writes
  * the word and every module below carries one. */
@@ -1195,6 +1198,97 @@ _Static_assert(sizeof(v5_isp_anti_false_color_attr) == 44,
 _Static_assert(offsetof(v5_isp_anti_false_color_attr, auto_strength) == 10,
                "anti_false_color auto_attr at +10");
 
+/* ================================================================
+ * CHROMATIC ABERRATION -- ot_isp_cac_attr
+ *
+ * Two correctors in one attribute. ACAC works on the edge itself, gated
+ * by a pair of per-ISO thresholds; LCAC works on the purple cast around
+ * it, by exposure ratio rather than ISO. The .ini dialect gives them one
+ * section and one [module_state] flag, bStaticCac, and so does the
+ * vendor's own loader -- bStaticLocalCac is read there and never used.
+ *
+ * Two constraints are cross-key and so are left to the driver's own
+ * check, which reports them: purple_upper_limit must be strictly above
+ * purple_lower_limit, and edge_threshold_0 strictly below
+ * edge_threshold_1 in every ISO column.
+ * ================================================================ */
+
+typedef struct {
+    unsigned short edge_threshold[V5_ISP_CAC_THR_NUM];
+    unsigned short edge_gain;
+    unsigned short cac_rb_strength;
+    unsigned short purple_alpha;
+    unsigned short edge_alpha;
+    unsigned short satu_low_threshold;
+    unsigned short satu_high_threshold; /* not a CV610 field */
+} v5_isp_cac_acac_manual;
+
+_Static_assert(sizeof(v5_isp_cac_acac_manual) == 16, "ot_isp_cac_acac_manual_attr is 16 bytes");
+
+typedef struct {
+    unsigned short edge_threshold[V5_ISP_CAC_THR_NUM][V5_ISP_ISO_NUM];
+    unsigned short edge_gain[V5_ISP_ISO_NUM];
+    unsigned short cac_rb_strength[V5_ISP_ISO_NUM];
+    unsigned short purple_alpha[V5_ISP_ISO_NUM];
+    unsigned short edge_alpha[V5_ISP_ISO_NUM];
+    unsigned short satu_low_threshold[V5_ISP_ISO_NUM];
+    unsigned short satu_high_threshold[V5_ISP_ISO_NUM]; /* not a CV610 field */
+} v5_isp_cac_acac_auto;
+
+_Static_assert(sizeof(v5_isp_cac_acac_auto) == 256, "ot_isp_cac_acac_auto_attr is 256 bytes");
+_Static_assert(offsetof(v5_isp_cac_acac_auto, edge_gain) == 64,
+               "ot_isp_cac_acac_auto_attr.edge_gain at +64");
+_Static_assert(offsetof(v5_isp_cac_acac_auto, satu_low_threshold) == 192,
+               "ot_isp_cac_acac_auto_attr.satu_low_threshold at +192");
+
+typedef struct {
+    v5_isp_cac_acac_manual acac_manual;
+    v5_isp_cac_acac_auto acac_auto;
+} v5_isp_cac_acac;
+
+_Static_assert(sizeof(v5_isp_cac_acac) == 272, "ot_isp_cac_acac_attr is 272 bytes");
+
+typedef struct {
+    unsigned char de_purple_cr_strength;
+    unsigned char de_purple_cb_strength;
+} v5_isp_cac_lcac_manual;
+
+typedef struct {
+    unsigned char de_purple_cr_strength[V5_ISP_CAC_EXP_RATIO_NUM];
+    unsigned char de_purple_cb_strength[V5_ISP_CAC_EXP_RATIO_NUM];
+} v5_isp_cac_lcac_auto;
+
+typedef struct {
+    unsigned short purple_detect_range;
+    unsigned short var_threshold;
+    unsigned short r_detect_threshold[V5_ISP_CAC_CURVE_NUM];
+    unsigned short g_detect_threshold[V5_ISP_CAC_CURVE_NUM];
+    unsigned short b_detect_threshold[V5_ISP_CAC_CURVE_NUM];
+    v5_isp_cac_lcac_manual lcac_manual;
+    v5_isp_cac_lcac_auto lcac_auto;
+} v5_isp_cac_lcac;
+
+_Static_assert(sizeof(v5_isp_cac_lcac) == 56, "ot_isp_cac_lcac_attr is 56 bytes");
+_Static_assert(offsetof(v5_isp_cac_lcac, b_detect_threshold) == 16,
+               "ot_isp_cac_lcac_attr.b_detect_threshold at +16");
+_Static_assert(offsetof(v5_isp_cac_lcac, lcac_auto) == 24, "ot_isp_cac_lcac_attr.lcac_auto at +24");
+
+typedef struct {
+    int enable;
+    int op_type;
+    unsigned char detect_mode; /* not a CV610 field */
+    signed short purple_upper_limit;
+    signed short purple_lower_limit;
+    v5_isp_cac_acac acac_cfg;
+    v5_isp_cac_lcac lcac_cfg;
+} v5_isp_cac_attr;
+
+_Static_assert(sizeof(v5_isp_cac_attr) == 344, "ot_isp_cac_attr is 344 bytes");
+_Static_assert(offsetof(v5_isp_cac_attr, purple_upper_limit) == 10,
+               "ot_isp_cac_attr.purple_upper_limit at +10");
+_Static_assert(offsetof(v5_isp_cac_attr, acac_cfg) == 14, "ot_isp_cac_attr.acac_cfg at +14");
+_Static_assert(offsetof(v5_isp_cac_attr, lcac_cfg) == 286, "ot_isp_cac_attr.lcac_cfg at +286");
+
 typedef struct {
     int enable;
     unsigned short mesh_strength;
@@ -1259,6 +1353,8 @@ typedef struct {
     int (*fnSetAntiFalseColorAttr)(int vi_pipe, const v5_isp_anti_false_color_attr *attr);
     int (*fnGetShadingAttr)(int vi_pipe, v5_isp_shading_attr *attr);
     int (*fnSetShadingAttr)(int vi_pipe, const v5_isp_shading_attr *attr);
+    int (*fnGetCacAttr)(int vi_pipe, v5_isp_cac_attr *attr);
+    int (*fnSetCacAttr)(int vi_pipe, const v5_isp_cac_attr *attr);
 } v5_isp_tune_impl;
 
 /*
@@ -1306,6 +1402,7 @@ static inline void v5_isp_tune_load(v5_isp_tune_impl *lib, const v5_mpi_libs *li
     V5_TUNE_PAIR(fnGetAntiFalseColorAttr, fnSetAntiFalseColorAttr, v5_isp_anti_false_color_attr,
                  "anti_false_color_attr");
     V5_TUNE_PAIR(fnGetShadingAttr, fnSetShadingAttr, v5_isp_shading_attr, "mesh_shading_attr");
+    V5_TUNE_PAIR(fnGetCacAttr, fnSetCacAttr, v5_isp_cac_attr, "cac_attr");
 
 #undef V5_TUNE_PAIR
 }

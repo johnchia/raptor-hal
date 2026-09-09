@@ -38,8 +38,8 @@
  *   static_ae, static_aerouteex, static_aeweight, static_awb,
  *   static_awbex, static_ccm, static_color_sector, static_saturation,
  *   static_ldci, static_drc, static_dm, static_nr, static_dehaze,
- *   static_sharpen, static_dpc, static_ca, static_pregamma, static_blc,
- *   static_csc, static_shading
+ *   static_sharpen, static_dpc, static_ca, static_cac, static_pregamma,
+ *   static_blc, static_csc, static_shading
  *
  * The four colour sections are one calibration in four pieces and are
  * applied as a set. [static_awb] carries the white point the sensor
@@ -57,7 +57,7 @@
  *   dynamic_linear_drc, dynamic_dehaze, dynamic_gamma   hal_dyn.c
  *   dynamic_ae, dynamic_fps, dynamic_ldci, dynamic_dpc,  hal_ladder.c, on
  *   dynamic_blc, dynamic_color_sector, dynamic_ca,       the same AE tick;
- *   dynamic_nr                                          nr is WDR-only
+ *   dynamic_nr, dynamic_shading                         nr is WDR-only
  *   static_3dnr                                         hal_nrx.c, which
  *                  writes it through ss_mpi_vi_set_pipe_3dnr_param on the
  *                  VI pipe rather than to an ISP module -- on V5 3DNR is
@@ -662,6 +662,7 @@ enum {
     IQ_WB = 1u << 18,
     IQ_AWBEX = 1u << 19,
     IQ_CS = 1u << 20,
+    IQ_CAC = 1u << 21,
 };
 
 /*
@@ -691,6 +692,7 @@ typedef struct {
     v5_isp_wb_attr wb;
     v5_isp_awb_attr_ex awbex;
     v5_isp_color_sector_attr cs;
+    v5_isp_cac_attr cac;
 
     unsigned int have;    /* fetched via Get */
     unsigned int unavail; /* Get failed or symbol missing; do not retry */
@@ -741,6 +743,7 @@ static const struct {
     {IQ_WB, "wb_attr", offsetof(hisi_iq_load, wb)},
     {IQ_AWBEX, "awb_attr_ex", offsetof(hisi_iq_load, awbex)},
     {IQ_CS, "color_sector_attr", offsetof(hisi_iq_load, cs)},
+    {IQ_CAC, "cac_attr", offsetof(hisi_iq_load, cac)},
 };
 
 static const char *iq_mod_name(unsigned int bit)
@@ -817,6 +820,8 @@ static int (*iq_getter(hisi_state_t *st, unsigned int bit))(int, void *)
         return (int (*)(int, void *))t->fnGetAwbAttrEx;
     case IQ_CS:
         return (int (*)(int, void *))t->fnGetColorSectorAttr;
+    case IQ_CAC:
+        return (int (*)(int, void *))t->fnGetCacAttr;
     }
     return NULL;
 }
@@ -868,6 +873,8 @@ static int (*iq_setter(hisi_state_t *st, unsigned int bit))(int, const void *)
         return (int (*)(int, const void *))t->fnSetAwbAttrEx;
     case IQ_CS:
         return (int (*)(int, const void *))t->fnSetColorSectorAttr;
+    case IQ_CAC:
+        return (int (*)(int, const void *))t->fnSetCacAttr;
     }
     return NULL;
 }
@@ -1233,6 +1240,92 @@ static void iq_sect_color_sector(hisi_state_t *st, hisi_iq_load *ld, const char 
         return;
     }
     ld->dirty |= IQ_CS;
+}
+
+/*
+ * [static_cac]. Purple-fringe correction, in two halves that the dialect
+ * gives one section: ACAC's per-ISO ladders and LCAC's detection curves
+ * and per-exposure-ratio strengths. The key set and the fields left alone
+ * -- detect_mode and satu_high_threshold, neither a CV610 field -- follow
+ * the SDK's scene_auto reference exactly.
+ */
+static void iq_sect_cac(hisi_state_t *st, hisi_iq_load *ld, const char *key, const char *val)
+{
+    v5_isp_cac_attr *c = &ld->cac;
+    v5_isp_cac_acac_auto *a;
+    unsigned short *u16col = NULL;
+    unsigned char *u8col = NULL;
+    unsigned short *curve = NULL;
+    long cap = 4095;
+    int row, n;
+
+    if (!iq_fetch(st, ld, IQ_CAC))
+        return;
+
+    a = &c->acac_cfg.acac_auto;
+
+    if ((row = iq_row_index(key, "edge_threshold")) >= 0) {
+        if (row >= V5_ISP_CAC_THR_NUM) {
+            HAL_LOG_WARN("isp tuning: [static_cac] %s: row %d is past the end of the table", key,
+                         row);
+            return;
+        }
+        u16col = a->edge_threshold[row];
+    } else if (iq_ci_eq(key, "enable"))
+        c->enable = iq_num(val, 0) ? 1 : 0;
+    else if (iq_ci_eq(key, "op_type"))
+        c->op_type = iq_num(val, 0) ? V5_ISP_OP_MANUAL : V5_ISP_OP_AUTO;
+    else if (iq_ci_eq(key, "purple_upper_limit"))
+        c->purple_upper_limit = (signed short)iq_clamp(iq_num(val, 0), -511, 511);
+    else if (iq_ci_eq(key, "purple_lower_limit"))
+        c->purple_lower_limit = (signed short)iq_clamp(iq_num(val, 0), -511, 511);
+    else if (iq_ci_eq(key, "purple_detect_range"))
+        c->lcac_cfg.purple_detect_range = (unsigned short)iq_clamp(iq_num(val, 0), 0, 410);
+    else if (iq_ci_eq(key, "var_threshold"))
+        c->lcac_cfg.var_threshold = (unsigned short)iq_clamp(iq_num(val, 0), 0, 4095);
+    else if (iq_ci_eq(key, "edge_gain")) {
+        u16col = a->edge_gain;
+        cap = 63;
+    } else if (iq_ci_eq(key, "cac_rb_strength")) {
+        u16col = a->cac_rb_strength;
+        cap = 5;
+    } else if (iq_ci_eq(key, "purple_alpha")) {
+        u16col = a->purple_alpha;
+        cap = 63;
+    } else if (iq_ci_eq(key, "edge_alpha")) {
+        u16col = a->edge_alpha;
+        cap = 63;
+    } else if (iq_ci_eq(key, "satu_low_threshold")) {
+        u16col = a->satu_low_threshold;
+        cap = 255;
+    } else if (iq_ci_eq(key, "r_detect_threshold"))
+        curve = c->lcac_cfg.r_detect_threshold;
+    else if (iq_ci_eq(key, "g_detect_threshold"))
+        curve = c->lcac_cfg.g_detect_threshold;
+    else if (iq_ci_eq(key, "b_detect_threshold"))
+        curve = c->lcac_cfg.b_detect_threshold;
+    else if (iq_ci_eq(key, "de_purple_cr_strength"))
+        u8col = c->lcac_cfg.lcac_auto.de_purple_cr_strength;
+    else if (iq_ci_eq(key, "de_purple_cb_strength"))
+        u8col = c->lcac_cfg.lcac_auto.de_purple_cb_strength;
+    else {
+        HAL_LOG_DBG("isp tuning: [static_cac] %s: no mapping", key);
+        return;
+    }
+
+    if (u16col) {
+        n = iq_nums(val, ld->nums, V5_ISP_ISO_NUM);
+        iq_fill_u16_max(u16col, V5_ISP_ISO_NUM, ld->nums, n, cap);
+    } else if (u8col) {
+        /* LCAC's axis is the WDR exposure ratio, not ISO; same width. */
+        n = iq_nums(val, ld->nums, V5_ISP_CAC_EXP_RATIO_NUM);
+        iq_fill_u8_max(u8col, V5_ISP_CAC_EXP_RATIO_NUM, ld->nums, n, 8);
+    } else if (curve) {
+        if (!(n = iq_table(ld, "static_cac", key, val, V5_ISP_CAC_CURVE_NUM)))
+            return;
+        iq_fill_u16_max(curve, V5_ISP_CAC_CURVE_NUM, ld->nums, n, 4095);
+    }
+    ld->dirty |= IQ_CAC;
 }
 
 static void iq_sect_ccm(hisi_state_t *st, hisi_iq_load *ld, const char *key, const char *val)
@@ -2038,7 +2131,9 @@ enum {
     MS_STATIC_AWB = 1u << 24,
     MS_STATIC_AWBEX = 1u << 25,
     MS_STATIC_CS = 1u << 26,
-    MS_ALL = (1u << 27) - 1,
+    MS_STATIC_CAC = 1u << 27,
+    MS_DYN_SHADING = 1u << 28,
+    MS_ALL = (1u << 29) - 1,
 };
 
 static const struct {
@@ -2064,6 +2159,9 @@ static const struct {
     {"bStaticAWB", MS_STATIC_AWB},
     {"bStaticAWBEx", MS_STATIC_AWBEX},
     {"bStaticColorSector", MS_STATIC_CS},
+    /* bStaticLocalCac gates nothing: the vendor's loader reads it and
+     * writes both halves of ot_isp_cac_attr under bStaticCac alone. */
+    {"bStaticCac", MS_STATIC_CAC},
     {"bDynamicAE", MS_DYN_AE},
     {"bDynamicFps", MS_DYN_FPS},
     {"bDynamicLdci", MS_DYN_LDCI},
@@ -2073,6 +2171,7 @@ static const struct {
     {"bDynamicCA", MS_DYN_CA},
     {"bDynamicLinearCA", MS_DYN_CA},
     {"bDynamicNr", MS_DYN_NR},
+    {"bDynamicShading", MS_DYN_SHADING},
 };
 
 /* Which flags a section needs; 0 for one the mask does not cover. */
@@ -2116,6 +2215,8 @@ static unsigned int iq_state_bits(const char *s)
         return MS_STATIC_AWBEX;
     if (iq_ci_eq(s, "static_color_sector"))
         return MS_STATIC_CS;
+    if (iq_ci_eq(s, "static_cac"))
+        return MS_STATIC_CAC;
     if (iq_ci_eq(s, "dynamic_ae"))
         return MS_DYN_AE;
     if (iq_ci_eq(s, "dynamic_fps"))
@@ -2132,6 +2233,8 @@ static unsigned int iq_state_bits(const char *s)
         return MS_DYN_CA;
     if (iq_ci_eq(s, "dynamic_nr"))
         return MS_DYN_NR;
+    if (iq_ci_eq(s, "dynamic_shading"))
+        return MS_DYN_SHADING;
     return 0;
 }
 
@@ -2231,6 +2334,8 @@ static void iq_dispatch(hisi_state_t *st, hisi_iq_load *ld, hisi_iq_reader *r)
         iq_sect_awbex(st, ld, r->key, r->val);
     else if (iq_ci_eq(s, "static_color_sector"))
         iq_sect_color_sector(st, ld, r->key, r->val);
+    else if (iq_ci_eq(s, "static_cac"))
+        iq_sect_cac(st, ld, r->key, r->val);
     else if (iq_ci_eq(s, "static_3dnr")) {
         /* Same rule as the three below, and for the same reason: the two
          * [module_state] flags that name this section, bStatic3DNR and
@@ -2250,8 +2355,9 @@ static void iq_dispatch(hisi_state_t *st, hisi_iq_load *ld, hisi_iq_reader *r)
     } else if (iq_ci_eq(s, "dynamic_ae") || iq_ci_eq(s, "dynamic_fps") ||
                iq_ci_eq(s, "dynamic_ldci") || iq_ci_eq(s, "dynamic_dpc") ||
                iq_ci_eq(s, "dynamic_blc") || iq_ci_eq(s, "dynamic_color_sector") ||
-               iq_ci_eq(s, "dynamic_ca") || iq_ci_eq(s, "dynamic_nr")) {
-        /* The other eight ladders, gated above by their own [module_state]
+               iq_ci_eq(s, "dynamic_ca") || iq_ci_eq(s, "dynamic_nr") ||
+               iq_ci_eq(s, "dynamic_shading")) {
+        /* The other nine ladders, gated above by their own [module_state]
          * flags -- those carry intent, see the head of hal_ladder.c. */
         if (!hisi_lad_key(st, s, r->key, r->val))
             HAL_LOG_DBG("isp tuning: [%s] %s: no mapping", s, r->key);
@@ -2278,9 +2384,9 @@ void hisi_isp_tune_resolve(hisi_state_t *st)
 static void hisi_isp_apply_tuning(hisi_state_t *st)
 {
     static const unsigned int apply_order[] = {
-        IQ_ROUTE, IQ_EXP,     IQ_STAT,    IQ_BLC,   IQ_PREGAMMA, IQ_NR,     IQ_DM,
-        IQ_DPC,   IQ_SHADING, IQ_WB,      IQ_AWBEX, IQ_CCM,      IQ_TONE,   IQ_SAT,
-        IQ_CS,    IQ_CA,      IQ_SHARPEN, IQ_LDCI,  IQ_DRC,      IQ_DEHAZE, IQ_CSC,
+        IQ_ROUTE,   IQ_EXP,     IQ_STAT, IQ_BLC,   IQ_PREGAMMA, IQ_NR,   IQ_DM,  IQ_DPC,
+        IQ_SHADING, IQ_CAC,     IQ_WB,   IQ_AWBEX, IQ_CCM,      IQ_TONE, IQ_SAT, IQ_CS,
+        IQ_CA,      IQ_SHARPEN, IQ_LDCI, IQ_DRC,   IQ_DEHAZE,   IQ_CSC,
     };
     hisi_iq_reader r;
     hisi_iq_load *ld;
