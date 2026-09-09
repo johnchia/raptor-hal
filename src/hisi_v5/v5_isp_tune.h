@@ -19,7 +19,8 @@
  *                      absent from libss_mpi_isp.so -- the same trap
  *                      ss_mpi_isp_query_exposure_info sets in v5_isp.h.
  *   libss_mpi_awb.so   ss_mpi_isp_set_ccm_attr, _saturation_attr,
- *                      _color_tone_attr, _color_sector_attr, _wb_attr.
+ *                      _color_tone_attr, _color_sector_attr, _wb_attr,
+ *                      _awb_attr_ex.
  *
  * v5_isp_tune_load resolves all three out of the one v5_mpi_libs search
  * list, so the split costs nothing at the call site -- but a symbol looked
@@ -59,9 +60,14 @@
  * scene_auto reference writes it through ss_mpi_vi_set_pipe_3dnr_param on
  * the VI pipe, not through the VPSS group the way gen4's hal_nrx.c does.
  * ot_3dnr_param belongs to the VI header family and is transcribed in
- * v5_vi.h when hal_nrx.c lands. The AWB calibration attribute
- * (ot_isp_wb_attr, 1300 bytes) is also absent: it is sensor-calibration
- * data, not scene tuning, and nothing raptor ships would fill it in.
+ * v5_vi.h when hal_nrx.c lands. The lens-shading mesh and the per-pipe
+ * gain differences ([static_isp_diff]) stay out for the reason the AWB
+ * calibration used to: they are measured off one physical module, and a
+ * mesh from another board's lens is worse than no mesh. The AWB
+ * calibration is here now, and it is here for the mirror-image reason --
+ * ot_isp_wb_attr is the other half of the CCM the loader already applies,
+ * and half a calibration is worse than either whole one. See the WHITE
+ * BALANCE heading below.
  *
  * Copyright (C) 2026 Thingino Project
  * SPDX-License-Identifier: GPL-3.0-or-later
@@ -103,6 +109,11 @@
 #define V5_ISP_CCM_MATRIX_SIZE 9    /* OT_ISP_CCM_MATRIX_SIZE */
 #define V5_ISP_CA_LUT 128           /* OT_ISP_CA_YRATIO_LUT_LENGTH */
 #define V5_ISP_COLOR_SECTORS 6      /* OT_ISP_COLOR_SECTOR_NUM */
+#define V5_ISP_AWB_CURVE_PARA_NUM 6 /* OT_ISP_AWB_CURVE_PARA_NUM */
+#define V5_ISP_AWB_LS_NUM 4         /* OT_ISP_AWB_LS_NUM */
+#define V5_ISP_AWB_MULTI_CT_NUM 8   /* OT_ISP_AWB_MULTI_CT_NUM */
+#define V5_ISP_AWB_LUM_HIST_NUM 6   /* OT_ISP_AWB_LUM_HIST_NUM */
+#define V5_ISP_AWB_ZONE_NUM 1024    /* OT_ISP_AWB_ZONE_ORIG_ROW * _COLUMN, 32 x 32 */
 #define V5_ISP_CSC_DC_NUM 3         /* OT_ISP_CSC_DC_NUM */
 #define V5_ISP_CSC_COEF_NUM 9       /* OT_ISP_CSC_COEF_NUM */
 
@@ -274,16 +285,46 @@ _Static_assert(offsetof(v5_isp_ae_stats_cfg, weight) == 60, "ot_isp_ae_stats_cfg
 _Static_assert(offsetof(v5_isp_ae_stats_cfg, be_weight) == 315,
                "ot_isp_ae_stats_cfg.be_weight at +315");
 
+/*
+ * ot_isp_awb_crop and ot_isp_wb_stats_cfg -- where in the pipeline the AWB
+ * takes its statistics, and the window it takes them over. [static_awb]
+ * names two of these fields (awb_switch, black_level) and the vendor's own
+ * loader writes them here rather than into the WB attribute, which is why
+ * the WB half of the stats config is transcribed and the focus and motion
+ * halves after it stay opaque.
+ */
+typedef struct {
+    int enable;
+    unsigned short x, y, width, height;
+} v5_isp_awb_crop;
+
+_Static_assert(sizeof(v5_isp_awb_crop) == 12, "ot_isp_awb_crop is 12 bytes");
+
+typedef struct {
+    int awb_switch; /* ot_isp_awb_switch: 0 after DG, 1 after expander, 2 after DRC */
+    unsigned short zone_row, zone_col;
+    unsigned short white_level, black_level;
+    unsigned short cb_max, cb_min;
+    unsigned short cr_max, cr_min;
+    v5_isp_awb_crop crop;
+} v5_isp_wb_stats_cfg;
+
+_Static_assert(sizeof(v5_isp_wb_stats_cfg) == 32, "ot_isp_wb_stats_cfg is 32 bytes");
+_Static_assert(offsetof(v5_isp_wb_stats_cfg, black_level) == 10, "wb_stats_cfg.black_level at +10");
+_Static_assert(offsetof(v5_isp_wb_stats_cfg, crop) == 20, "wb_stats_cfg.crop at +20");
+
 typedef struct {
     unsigned int ctrl;   /* ot_isp_stats_ctrl, one u32 of bits */
     unsigned int update; /* likewise; bit 0 is AE */
     v5_isp_ae_stats_cfg ae_cfg;
-    unsigned char tail[316]; /* wb_cfg 32 + focus_cfg 276 + motion_cfg 8 */
+    v5_isp_wb_stats_cfg wb_cfg;
+    unsigned char tail[284]; /* focus_cfg 276 + motion_cfg 8 */
 } v5_isp_stats_cfg;
 
 _Static_assert(sizeof(v5_isp_stats_cfg) == 1664, "ot_isp_stats_cfg is 1664 bytes");
 _Static_assert(offsetof(v5_isp_stats_cfg, ae_cfg) == 8, "ot_isp_stats_cfg.ae_cfg at +8");
-_Static_assert(offsetof(v5_isp_stats_cfg, tail) == 1348, "ot_isp_stats_cfg tail at +1348");
+_Static_assert(offsetof(v5_isp_stats_cfg, wb_cfg) == 1348, "ot_isp_stats_cfg.wb_cfg at +1348");
+_Static_assert(offsetof(v5_isp_stats_cfg, tail) == 1380, "ot_isp_stats_cfg tail at +1380");
 
 /* ================================================================
  * LDCI -- ot_isp_ldci_attr
@@ -651,6 +692,149 @@ typedef struct {
 _Static_assert(sizeof(v5_isp_dp_dynamic_attr) == 196, "ot_isp_dp_dynamic_attr is 196 bytes");
 
 /* ================================================================
+ * WHITE BALANCE -- ot_isp_wb_attr and ot_isp_awb_attr_ex, libss_mpi_awb.so
+ *
+ * The AWB's own calibration: the white point the sensor sees under a
+ * reference illuminant, the Planckian curve fitted through it, and the
+ * limits the estimate is allowed to wander inside. It pairs with the CCM
+ * -- the AWB decides which matrix to blend and how far -- so a file that
+ * carries [static_ccm] and [static_awb] carries one calibration in two
+ * halves, and applying one half is worse than applying neither.
+ * ================================================================ */
+
+typedef struct {
+    int enable;
+    int op_type;
+    unsigned short high_rg_limit, high_bg_limit;
+    unsigned short low_rg_limit, low_bg_limit;
+} v5_isp_awb_ct_limit_attr;
+
+_Static_assert(sizeof(v5_isp_awb_ct_limit_attr) == 16, "ot_isp_awb_ct_limit_attr is 16 bytes");
+
+typedef struct {
+    int enable;
+    unsigned short cr_max[V5_ISP_ISO_NUM];
+    unsigned short cr_min[V5_ISP_ISO_NUM];
+    unsigned short cb_max[V5_ISP_ISO_NUM];
+    unsigned short cb_min[V5_ISP_ISO_NUM];
+} v5_isp_awb_cbcr_track_attr;
+
+_Static_assert(sizeof(v5_isp_awb_cbcr_track_attr) == 132,
+               "ot_isp_awb_cbcr_track_attr is 132 bytes");
+_Static_assert(offsetof(v5_isp_awb_cbcr_track_attr, cr_max) == 4, "cbcr_track.cr_max at +4");
+
+typedef struct {
+    int enable;
+    int op_type;
+    unsigned char hist_thresh[V5_ISP_AWB_LUM_HIST_NUM];
+    unsigned short hist_wt[V5_ISP_AWB_LUM_HIST_NUM];
+} v5_isp_awb_lum_hist_attr;
+
+_Static_assert(sizeof(v5_isp_awb_lum_hist_attr) == 28, "ot_isp_awb_lum_histgram_attr is 28 bytes");
+_Static_assert(offsetof(v5_isp_awb_lum_hist_attr, hist_wt) == 14, "luma_hist.hist_wt at +14");
+
+typedef struct {
+    int enable;
+    unsigned short ref_color_temp;
+    unsigned short static_wb[V5_ISP_BAYER_CHN];
+    int curve_para[V5_ISP_AWB_CURVE_PARA_NUM]; /* signed; curve_para[4] must stay 128 */
+    int alg_type;                              /* ot_isp_awb_alg_type */
+    unsigned char rg_strength, bg_strength;
+    unsigned short speed;
+    unsigned short zone_sel;
+    unsigned short high_color_temp, low_color_temp;
+    v5_isp_awb_ct_limit_attr ct_limit;
+    int shift_limit_en;
+    unsigned char shift_limit;
+    int gain_norm_en;
+    int natural_cast_en;
+    v5_isp_awb_cbcr_track_attr cb_cr_track;
+    v5_isp_awb_lum_hist_attr luma_hist;
+    int awb_zone_wt_en;
+    unsigned char zone_wt[V5_ISP_AWB_ZONE_NUM];
+} v5_isp_awb_attr;
+
+_Static_assert(sizeof(v5_isp_awb_attr) == 1276, "ot_isp_awb_attr is 1276 bytes");
+_Static_assert(offsetof(v5_isp_awb_attr, static_wb) == 6, "awb_attr.static_wb at +6");
+_Static_assert(offsetof(v5_isp_awb_attr, curve_para) == 16, "awb_attr.curve_para at +16");
+_Static_assert(offsetof(v5_isp_awb_attr, speed) == 46, "awb_attr.speed at +46");
+_Static_assert(offsetof(v5_isp_awb_attr, ct_limit) == 56, "awb_attr.ct_limit at +56");
+_Static_assert(offsetof(v5_isp_awb_attr, shift_limit) == 76, "awb_attr.shift_limit at +76");
+_Static_assert(offsetof(v5_isp_awb_attr, cb_cr_track) == 88, "awb_attr.cb_cr_track at +88");
+_Static_assert(offsetof(v5_isp_awb_attr, luma_hist) == 220, "awb_attr.luma_hist at +220");
+_Static_assert(offsetof(v5_isp_awb_attr, zone_wt) == 252, "awb_attr.zone_wt at +252");
+
+typedef struct {
+    unsigned short r_gain, gr_gain, gb_gain, b_gain;
+} v5_isp_mwb_attr;
+
+_Static_assert(sizeof(v5_isp_mwb_attr) == 8, "ot_isp_mwb_attr is 8 bytes");
+
+typedef struct {
+    int bypass;
+    unsigned char awb_run_interval;
+    int op_type;
+    v5_isp_mwb_attr manual_attr;
+    v5_isp_awb_attr auto_attr;
+    int alg_type; /* ot_isp_awb_alg: 0 grey world, 1 spectral (not on CV610) */
+} v5_isp_wb_attr;
+
+_Static_assert(sizeof(v5_isp_wb_attr) == 1300, "ot_isp_wb_attr is 1300 bytes");
+_Static_assert(offsetof(v5_isp_wb_attr, op_type) == 8, "wb_attr.op_type at +8");
+_Static_assert(offsetof(v5_isp_wb_attr, manual_attr) == 12, "wb_attr.manual_attr at +12");
+_Static_assert(offsetof(v5_isp_wb_attr, auto_attr) == 20, "wb_attr.auto_attr at +20");
+_Static_assert(offsetof(v5_isp_wb_attr, alg_type) == 1296, "wb_attr.alg_type at +1296");
+
+typedef struct {
+    unsigned short white_r_gain, white_b_gain;
+    unsigned short exp_quant;
+    unsigned char light_status;
+    unsigned char radius;
+} v5_isp_awb_light_source;
+
+_Static_assert(sizeof(v5_isp_awb_light_source) == 8,
+               "ot_isp_awb_extra_light_source_info is 8 bytes");
+
+typedef struct {
+    int enable;
+    int op_type;
+    int scene_status; /* ot_isp_awb_scene_mode_status: 0 indoor, 1 outdoor */
+    unsigned int out_thresh;
+    unsigned short low_start, low_stop;
+    unsigned short high_start, high_stop;
+    int green_enhance_en;
+    unsigned char out_shift_limit;
+} v5_isp_awb_in_out_attr;
+
+_Static_assert(sizeof(v5_isp_awb_in_out_attr) == 32, "ot_isp_awb_in_out_attr is 32 bytes");
+_Static_assert(offsetof(v5_isp_awb_in_out_attr, low_start) == 16, "in_or_out.low_start at +16");
+_Static_assert(offsetof(v5_isp_awb_in_out_attr, out_shift_limit) == 28,
+               "in_or_out.out_shift_limit at +28");
+
+typedef struct {
+    unsigned char tolerance;
+    unsigned char zone_radius;
+    unsigned short curve_l_limit, curve_r_limit;
+    int extra_light_en;
+    v5_isp_awb_light_source light_info[V5_ISP_AWB_LS_NUM];
+    v5_isp_awb_in_out_attr in_or_out;
+    int multi_light_source_en;
+    int multi_ls_type; /* ot_isp_awb_multi_ls_type: 0 saturation, 1 CCM */
+    unsigned short multi_ls_scaler;
+    unsigned short multi_ct_bin[V5_ISP_AWB_MULTI_CT_NUM];
+    unsigned short multi_ct_wt[V5_ISP_AWB_MULTI_CT_NUM];
+    int fine_tun_en;
+    unsigned char fine_tun_strength;
+} v5_isp_awb_attr_ex;
+
+_Static_assert(sizeof(v5_isp_awb_attr_ex) == 128, "ot_isp_awb_attr_ex is 128 bytes");
+_Static_assert(offsetof(v5_isp_awb_attr_ex, light_info) == 12, "awb_attr_ex.light_info at +12");
+_Static_assert(offsetof(v5_isp_awb_attr_ex, in_or_out) == 44, "awb_attr_ex.in_or_out at +44");
+_Static_assert(offsetof(v5_isp_awb_attr_ex, multi_ct_bin) == 86, "awb_attr_ex.multi_ct_bin at +86");
+_Static_assert(offsetof(v5_isp_awb_attr_ex, multi_ct_wt) == 102, "awb_attr_ex.multi_ct_wt at +102");
+_Static_assert(offsetof(v5_isp_awb_attr_ex, fine_tun_en) == 120, "awb_attr_ex.fine_tun_en at +120");
+
+/* ================================================================
  * SATURATION and CCM -- libss_mpi_awb.so
  * ================================================================ */
 
@@ -908,6 +1092,10 @@ typedef struct {
     int (*fnSetColorToneAttr)(int vi_pipe, const v5_isp_color_tone_attr *attr);
     int (*fnGetColorSectorAttr)(int vi_pipe, v5_isp_color_sector_attr *attr);
     int (*fnSetColorSectorAttr)(int vi_pipe, const v5_isp_color_sector_attr *attr);
+    int (*fnGetWbAttr)(int vi_pipe, v5_isp_wb_attr *attr);
+    int (*fnSetWbAttr)(int vi_pipe, const v5_isp_wb_attr *attr);
+    int (*fnGetAwbAttrEx)(int vi_pipe, v5_isp_awb_attr_ex *attr);
+    int (*fnSetAwbAttrEx)(int vi_pipe, const v5_isp_awb_attr_ex *attr);
 
     /* libss_mpi_isp.so. */
     int (*fnGetStatsCfg)(int vi_pipe, v5_isp_stats_cfg *attr);
@@ -969,6 +1157,8 @@ static inline void v5_isp_tune_load(v5_isp_tune_impl *lib, const v5_mpi_libs *li
     V5_TUNE_PAIR(fnGetColorToneAttr, fnSetColorToneAttr, v5_isp_color_tone_attr, "color_tone_attr");
     V5_TUNE_PAIR(fnGetColorSectorAttr, fnSetColorSectorAttr, v5_isp_color_sector_attr,
                  "color_sector_attr");
+    V5_TUNE_PAIR(fnGetWbAttr, fnSetWbAttr, v5_isp_wb_attr, "wb_attr");
+    V5_TUNE_PAIR(fnGetAwbAttrEx, fnSetAwbAttrEx, v5_isp_awb_attr_ex, "awb_attr_ex");
     V5_TUNE_PAIR(fnGetStatsCfg, fnSetStatsCfg, v5_isp_stats_cfg, "stats_cfg");
     V5_TUNE_PAIR(fnGetLdciAttr, fnSetLdciAttr, v5_isp_ldci_attr, "ldci_attr");
     V5_TUNE_PAIR(fnGetDrcAttr, fnSetDrcAttr, v5_isp_drc_attr, "drc_attr");

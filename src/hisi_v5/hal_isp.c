@@ -35,10 +35,21 @@
  * than majestic's CamelCase.
  *
  * Sections applied here, all of them values:
- *   static_ae, static_aerouteex, static_aeweight, static_ccm,
- *   static_saturation, static_ldci, static_drc, static_dm, static_nr,
- *   static_dehaze, static_sharpen, static_dpc, static_ca, static_pregamma,
- *   static_blc, static_csc, static_shading
+ *   static_ae, static_aerouteex, static_aeweight, static_awb,
+ *   static_awbex, static_ccm, static_color_sector, static_saturation,
+ *   static_ldci, static_drc, static_dm, static_nr, static_dehaze,
+ *   static_sharpen, static_dpc, static_ca, static_pregamma, static_blc,
+ *   static_csc, static_shading
+ *
+ * The four colour sections are one calibration in four pieces and are
+ * applied as a set. [static_awb] carries the white point the sensor
+ * reports under a reference illuminant and the curve fitted through it;
+ * [static_ccm] carries the matrices that white point selects between.
+ * Applying the matrices without the white point -- which is what this
+ * loader did until the AWB attribute was transcribed -- estimates the
+ * light with the sensor driver's calibration and then corrects it with
+ * the tuning file's, and the two disagree by design: they were measured
+ * off different modules.
  *
  * Sections deliberately not applied, and why:
  * Sections applied by the two engine files, which keep their tables and
@@ -57,17 +68,17 @@
  *                  NR and CA ladders). Named in the summary line as
  *                  skipped rather than silently dropped, so a file that
  *                  carries them is not mistaken for one that applied them.
- *   static_awb,    sensor calibration -- white-balance curves, per-pipe
- *   static_awbex,  gain differences, lens shading meshes. These belong to
- *   static_isp_diff the module vendor's calibration of *that* lens and
- *                  sensor, and raptor has no business applying one file's
- *                  calibration to another board.
+ *   static_isp_diff per-pipe gain differences, measured off one physical
+ *                  module. Unlike the AWB and CCM calibration above, this
+ *                  one has no counterpart already in force that it could
+ *                  be made coherent with, and a stitch calibration from
+ *                  another board is worse than none.
  *   static_venc,   encoder and scene-mode settings that raptor's own
  *   static_wdrexposure, config already owns, or that only apply in WDR.
  *   static_FsWdr
  *   static_cac,    modules whose attribute structs are not transcribed in
- *   static_crosstalk, v5_isp_tune.h. Naming them here is the promise that
- *   static_color_sector they were seen and skipped, not missed.
+ *   static_crosstalk v5_isp_tune.h. Naming them here is the promise that
+ *                  they were seen and skipped, not missed.
  *
  * THE ENABLE MASK
  *
@@ -617,6 +628,9 @@ enum {
     IQ_BLC = 1u << 14,
     IQ_CSC = 1u << 15,
     IQ_SHADING = 1u << 16,
+    IQ_WB = 1u << 18,
+    IQ_AWBEX = 1u << 19,
+    IQ_CS = 1u << 20,
 };
 
 /*
@@ -643,6 +657,9 @@ typedef struct {
     v5_isp_blc_attr blc;
     v5_isp_csc_attr csc;
     v5_isp_shading_attr shading;
+    v5_isp_wb_attr wb;
+    v5_isp_awb_attr_ex awbex;
+    v5_isp_color_sector_attr cs;
 
     unsigned int have;    /* fetched via Get */
     unsigned int unavail; /* Get failed or symbol missing; do not retry */
@@ -690,6 +707,9 @@ static const struct {
     {IQ_BLC, "black_level_attr", offsetof(hisi_iq_load, blc)},
     {IQ_CSC, "csc_attr", offsetof(hisi_iq_load, csc)},
     {IQ_SHADING, "mesh_shading_attr", offsetof(hisi_iq_load, shading)},
+    {IQ_WB, "wb_attr", offsetof(hisi_iq_load, wb)},
+    {IQ_AWBEX, "awb_attr_ex", offsetof(hisi_iq_load, awbex)},
+    {IQ_CS, "color_sector_attr", offsetof(hisi_iq_load, cs)},
 };
 
 static const char *iq_mod_name(unsigned int bit)
@@ -760,6 +780,12 @@ static int (*iq_getter(hisi_state_t *st, unsigned int bit))(int, void *)
         return (int (*)(int, void *))t->fnGetCscAttr;
     case IQ_SHADING:
         return (int (*)(int, void *))t->fnGetShadingAttr;
+    case IQ_WB:
+        return (int (*)(int, void *))t->fnGetWbAttr;
+    case IQ_AWBEX:
+        return (int (*)(int, void *))t->fnGetAwbAttrEx;
+    case IQ_CS:
+        return (int (*)(int, void *))t->fnGetColorSectorAttr;
     }
     return NULL;
 }
@@ -805,6 +831,12 @@ static int (*iq_setter(hisi_state_t *st, unsigned int bit))(int, const void *)
         return (int (*)(int, const void *))t->fnSetCscAttr;
     case IQ_SHADING:
         return (int (*)(int, const void *))t->fnSetShadingAttr;
+    case IQ_WB:
+        return (int (*)(int, const void *))t->fnSetWbAttr;
+    case IQ_AWBEX:
+        return (int (*)(int, const void *))t->fnSetAwbAttrEx;
+    case IQ_CS:
+        return (int (*)(int, const void *))t->fnSetColorSectorAttr;
     }
     return NULL;
 }
@@ -962,6 +994,214 @@ static void iq_sect_aeweight(hisi_state_t *st, hisi_iq_load *ld, const char *key
     n = iq_nums(val, ld->nums, V5_ISP_AE_COLS);
     iq_fill_u8(ld->stat.ae_cfg.weight[row], V5_ISP_AE_COLS, ld->nums, n, 1);
     ld->dirty |= IQ_STAT;
+}
+
+/*
+ * [static_awb] -- the AWB's calibration, and the half of the colour path
+ * [static_ccm] cannot stand without. static_wb is the raw white point the
+ * sensor reports under the reference illuminant; curve_para is the fit
+ * through the Planckian locus that turns a measured R/G, B/G pair into a
+ * colour temperature, which is what picks the CCM to blend. A file whose
+ * CCM is applied and whose AWB is not estimates the light with one
+ * module's calibration and corrects it with another's.
+ *
+ * Two of the section's keys are not WB attributes at all: awb_switch and
+ * black_level configure where in the pipeline the AWB takes its
+ * statistics, and the vendor's reference writes them into the stats
+ * config. Same section, different MPI -- the [static_ccm] cast gains do
+ * the same thing.
+ */
+static void iq_sect_awb(hisi_state_t *st, hisi_iq_load *ld, const char *key, const char *val)
+{
+    v5_isp_wb_attr *w = &ld->wb;
+    unsigned short *track = NULL;
+    int n;
+
+    if (iq_ci_eq(key, "awb_switch") || iq_ci_eq(key, "black_level")) {
+        if (!iq_fetch(st, ld, IQ_STAT))
+            return;
+        if (iq_ci_eq(key, "awb_switch"))
+            ld->stat.wb_cfg.awb_switch = (int)iq_clamp(iq_num(val, 0), 0, 2);
+        else
+            ld->stat.wb_cfg.black_level =
+                (unsigned short)iq_clamp(iq_num(val, 0), 0, ld->stat.wb_cfg.white_level);
+        ld->dirty |= IQ_STAT;
+        return;
+    }
+
+    if (!iq_fetch(st, ld, IQ_WB))
+        return;
+
+    if (iq_ci_eq(key, "auto_static_wb")) {
+        if (!(n = iq_table(ld, "static_awb", key, val, V5_ISP_BAYER_CHN)))
+            return;
+        iq_fill_u16(w->auto_attr.static_wb, V5_ISP_BAYER_CHN, ld->nums, n, sizeof(unsigned short));
+    } else if (iq_ci_eq(key, "auto_curve_para")) {
+        if (!(n = iq_table(ld, "static_awb", key, val, V5_ISP_AWB_CURVE_PARA_NUM)))
+            return;
+        /*
+         * The one field the driver validates: curve_para[4] is the fixed
+         * 128 denominator of the fit and a Set with anything else there is
+         * refused, taking the whole attribute with it.
+         */
+        if (ld->nums[4] != 128) {
+            HAL_LOG_WARN("isp tuning: [static_awb] %s: curve_para[4] is %ld, not 128 -- ignored",
+                         key, ld->nums[4]);
+            return;
+        }
+        iq_fill_s32(w->auto_attr.curve_para, V5_ISP_AWB_CURVE_PARA_NUM, ld->nums, n);
+    } else if (iq_ci_eq(key, "op_type"))
+        w->op_type = iq_num(val, 0) ? V5_ISP_OP_MANUAL : V5_ISP_OP_AUTO;
+    else if (iq_ci_eq(key, "manual_rgain"))
+        w->manual_attr.r_gain = (unsigned short)iq_clamp(iq_num(val, 256), 0, 0xfff);
+    else if (iq_ci_eq(key, "manual_grgain"))
+        w->manual_attr.gr_gain = (unsigned short)iq_clamp(iq_num(val, 256), 0, 0xfff);
+    else if (iq_ci_eq(key, "manual_gbgain"))
+        w->manual_attr.gb_gain = (unsigned short)iq_clamp(iq_num(val, 256), 0, 0xfff);
+    else if (iq_ci_eq(key, "manual_bgain"))
+        w->manual_attr.b_gain = (unsigned short)iq_clamp(iq_num(val, 256), 0, 0xfff);
+    else if (iq_ci_eq(key, "auto_speed"))
+        w->auto_attr.speed = (unsigned short)iq_clamp(iq_num(val, 256), 0, 0xfff);
+    else if (iq_ci_eq(key, "auto_low_color_temp"))
+        w->auto_attr.low_color_temp = (unsigned short)iq_clamp(iq_num(val, 2000), 0, 65535);
+    else if (iq_ci_eq(key, "luma_hist_enable"))
+        w->auto_attr.luma_hist.enable = iq_num(val, 0) ? 1 : 0;
+    else if (iq_ci_eq(key, "shift_limit"))
+        w->auto_attr.shift_limit = (unsigned char)iq_clamp(iq_num(val, 0x40), 0, 255);
+    else if (iq_ci_eq(key, "auto_cr_max"))
+        track = w->auto_attr.cb_cr_track.cr_max;
+    else if (iq_ci_eq(key, "auto_cr_min"))
+        track = w->auto_attr.cb_cr_track.cr_min;
+    else if (iq_ci_eq(key, "auto_cb_max"))
+        track = w->auto_attr.cb_cr_track.cb_max;
+    else if (iq_ci_eq(key, "auto_cb_min"))
+        track = w->auto_attr.cb_cr_track.cb_min;
+    else {
+        HAL_LOG_DBG("isp tuning: [static_awb] %s: no mapping", key);
+        return;
+    }
+
+    if (track) {
+        n = iq_nums(val, ld->nums, V5_ISP_ISO_NUM);
+        iq_fill_u16(track, V5_ISP_ISO_NUM, ld->nums, n, sizeof(unsigned short));
+    }
+    ld->dirty |= IQ_WB;
+}
+
+/*
+ * [static_awbex] -- the limits the estimate runs inside: how far from the
+ * curve a white point may sit, where indoor stops and outdoor starts, and
+ * the eight colour-temperature weights that bias a mixed-light scene. Its
+ * bypass key is the odd one out, living in the WB attribute rather than
+ * the extended one, exactly as the vendor's reference has it.
+ */
+static void iq_sect_awbex(hisi_state_t *st, hisi_iq_load *ld, const char *key, const char *val)
+{
+    v5_isp_awb_attr_ex *e = &ld->awbex;
+    int n;
+
+    if (iq_ci_eq(key, "bypass")) {
+        if (!iq_fetch(st, ld, IQ_WB))
+            return;
+        ld->wb.bypass = iq_num(val, 0) ? 1 : 0;
+        ld->dirty |= IQ_WB;
+        return;
+    }
+
+    if (!iq_fetch(st, ld, IQ_AWBEX))
+        return;
+
+    if (iq_ci_eq(key, "tolerance"))
+        e->tolerance = (unsigned char)iq_clamp(iq_num(val, 2), 0, 255);
+    else if (iq_ci_eq(key, "out_shift_limit"))
+        e->in_or_out.out_shift_limit = (unsigned char)iq_clamp(iq_num(val, 0x40), 0, 255);
+    else if (iq_ci_eq(key, "out_thresh"))
+        e->in_or_out.out_thresh = (unsigned int)iq_clamp(iq_num(val, 0), 0, 0x7FFFFFFF);
+    else if (iq_ci_eq(key, "low_stop"))
+        e->in_or_out.low_stop = (unsigned short)iq_clamp(iq_num(val, 4500), 0, 65535);
+    else if (iq_ci_eq(key, "high_start"))
+        e->in_or_out.high_start = (unsigned short)iq_clamp(iq_num(val, 6500), 0, 65535);
+    else if (iq_ci_eq(key, "high_stop"))
+        e->in_or_out.high_stop = (unsigned short)iq_clamp(iq_num(val, 8000), 0, 65535);
+    else if (iq_ci_eq(key, "multi_light_source_en"))
+        e->multi_light_source_en = iq_num(val, 0) ? 1 : 0;
+    else if (iq_ci_eq(key, "multi_ctwt")) {
+        if (!(n = iq_table(ld, "static_awbex", key, val, V5_ISP_AWB_MULTI_CT_NUM)))
+            return;
+        iq_fill_u16(e->multi_ct_wt, V5_ISP_AWB_MULTI_CT_NUM, ld->nums, n, sizeof(unsigned short));
+    } else {
+        HAL_LOG_DBG("isp tuning: [static_awbex] %s: no mapping", key);
+        return;
+    }
+    ld->dirty |= IQ_AWBEX;
+}
+
+/* color_tab<j>_hue_shift / _sat_shift -> matrix j, 0 for hue and 1 for
+ * sat. -1 for anything else. The dynamic section's per-ISO spelling ends
+ * in a second index and belongs to hal_ladder.c, not here. */
+static int iq_cs_row(const char *key, int *kind)
+{
+    static const char pfx[] = "color_tab";
+    const char *p = key;
+    char *end;
+    size_t i;
+    long j;
+
+    for (i = 0; i < sizeof(pfx) - 1; i++, p++) {
+        if (tolower((unsigned char)*p) != pfx[i])
+            return -1;
+    }
+    if (!isdigit((unsigned char)*p))
+        return -1;
+    j = strtol(p, &end, 10);
+    if (iq_ci_eq(end, "_hue_shift"))
+        *kind = 0;
+    else if (iq_ci_eq(end, "_sat_shift"))
+        *kind = 1;
+    else
+        return -1;
+    return (int)j;
+}
+
+/*
+ * [static_color_sector] -- the per-CCM-matrix hue and saturation trim the
+ * same tuner authored on top of the matrices, and the module's enable.
+ *
+ * The enable is the part that matters. hal_ladder.c's [dynamic_color_
+ * sector] engine rewrites all seven tables on every ISO step but never
+ * touches `enable`, and the ISP's own default for it is off -- so without
+ * this section the ladder has been writing shifts into a module that was
+ * never switched on. The seven tables here are the ladder's ISO-100
+ * column by another name and it will overwrite them on its first tick;
+ * they are still applied, because a file may carry this section and no
+ * dynamic one.
+ */
+static void iq_sect_color_sector(hisi_state_t *st, hisi_iq_load *ld, const char *key,
+                                 const char *val)
+{
+    int row, kind = 0, n;
+
+    if (!iq_fetch(st, ld, IQ_CS))
+        return;
+
+    if (iq_ci_eq(key, "enable"))
+        ld->cs.enable = iq_num(val, 0) ? 1 : 0;
+    else if ((row = iq_cs_row(key, &kind)) >= 0) {
+        if (row >= V5_ISP_CCM_MATRIX_NUM) {
+            HAL_LOG_WARN("isp tuning: [static_color_sector] %s: past matrix %d -- ignored", key,
+                         V5_ISP_CCM_MATRIX_NUM - 1);
+            return;
+        }
+        if (!(n = iq_table(ld, "static_color_sector", key, val, V5_ISP_COLOR_SECTORS)))
+            return;
+        iq_fill_u8(kind ? ld->cs.auto_attr.color_tab[row].sat_shift
+                        : ld->cs.auto_attr.color_tab[row].hue_shift,
+                   V5_ISP_COLOR_SECTORS, ld->nums, n, 1);
+    } else {
+        HAL_LOG_DBG("isp tuning: [static_color_sector] %s: no mapping", key);
+        return;
+    }
+    ld->dirty |= IQ_CS;
 }
 
 static void iq_sect_ccm(hisi_state_t *st, hisi_iq_load *ld, const char *key, const char *val)
@@ -1659,7 +1899,10 @@ enum {
     MS_DYN_CS = 1u << 21,
     MS_DYN_CA = 1u << 22, /* bDynamicCA or bDynamicLinearCA: either means the CA ladder */
     MS_DYN_NR = 1u << 23,
-    MS_ALL = (1u << 24) - 1,
+    MS_STATIC_AWB = 1u << 24,
+    MS_STATIC_AWBEX = 1u << 25,
+    MS_STATIC_CS = 1u << 26,
+    MS_ALL = (1u << 27) - 1,
 };
 
 static const struct {
@@ -1682,6 +1925,9 @@ static const struct {
     {"bStaticBlc", MS_STATIC_BLC},
     {"bStaticCSC", MS_STATIC_CSC},
     {"bStaticShading", MS_STATIC_SHADING},
+    {"bStaticAWB", MS_STATIC_AWB},
+    {"bStaticAWBEx", MS_STATIC_AWBEX},
+    {"bStaticColorSector", MS_STATIC_CS},
     {"bDynamicAE", MS_DYN_AE},
     {"bDynamicFps", MS_DYN_FPS},
     {"bDynamicLdci", MS_DYN_LDCI},
@@ -1728,6 +1974,12 @@ static unsigned int iq_state_bits(const char *s)
         return MS_STATIC_CSC;
     if (iq_ci_eq(s, "static_shading"))
         return MS_STATIC_SHADING;
+    if (iq_ci_eq(s, "static_awb"))
+        return MS_STATIC_AWB;
+    if (iq_ci_eq(s, "static_awbex"))
+        return MS_STATIC_AWBEX;
+    if (iq_ci_eq(s, "static_color_sector"))
+        return MS_STATIC_CS;
     if (iq_ci_eq(s, "dynamic_ae"))
         return MS_DYN_AE;
     if (iq_ci_eq(s, "dynamic_fps"))
@@ -1837,6 +2089,12 @@ static void iq_dispatch(hisi_state_t *st, hisi_iq_load *ld, hisi_iq_reader *r)
         iq_sect_csc(st, ld, r->key, r->val);
     else if (iq_ci_eq(s, "static_shading"))
         iq_sect_shading(st, ld, r->key, r->val);
+    else if (iq_ci_eq(s, "static_awb"))
+        iq_sect_awb(st, ld, r->key, r->val);
+    else if (iq_ci_eq(s, "static_awbex"))
+        iq_sect_awbex(st, ld, r->key, r->val);
+    else if (iq_ci_eq(s, "static_color_sector"))
+        iq_sect_color_sector(st, ld, r->key, r->val);
     else if (iq_ci_eq(s, "static_3dnr")) {
         /* Same rule as the three below, and for the same reason: the two
          * [module_state] flags that name this section, bStatic3DNR and
@@ -1884,8 +2142,9 @@ void hisi_isp_tune_resolve(hisi_state_t *st)
 static void hisi_isp_apply_tuning(hisi_state_t *st)
 {
     static const unsigned int apply_order[] = {
-        IQ_ROUTE, IQ_EXP,  IQ_STAT, IQ_BLC, IQ_PREGAMMA, IQ_NR,   IQ_DM,  IQ_DPC,    IQ_SHADING,
-        IQ_CCM,   IQ_TONE, IQ_SAT,  IQ_CA,  IQ_SHARPEN,  IQ_LDCI, IQ_DRC, IQ_DEHAZE, IQ_CSC,
+        IQ_ROUTE, IQ_EXP,     IQ_STAT,    IQ_BLC,   IQ_PREGAMMA, IQ_NR,     IQ_DM,
+        IQ_DPC,   IQ_SHADING, IQ_WB,      IQ_AWBEX, IQ_CCM,      IQ_TONE,   IQ_SAT,
+        IQ_CS,    IQ_CA,      IQ_SHARPEN, IQ_LDCI,  IQ_DRC,      IQ_DEHAZE, IQ_CSC,
     };
     hisi_iq_reader r;
     hisi_iq_load *ld;
