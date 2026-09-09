@@ -250,6 +250,21 @@ int hal_audio_init(void *ctx, const rss_audio_config_t *cfg)
          * ring lives in it, and ss_mpi_ai_enable answers NO_MEM until this
          * has run. Once per attach; ss_mpi_audio_exit at deinit.
          */
+        /*
+         * Exit before init, which is what the vendor's own
+         * sample_comm_audio_init does and what this did not. It matters
+         * for the same reason the video path tears SYS and VB down first:
+         * a rad that was killed rather than stopped -- the OOM killer's
+         * pick on a board whose Linux half is 27 MB -- leaves the AI
+         * device enabled and owned by a process that no longer exists,
+         * and the next rad's ss_mpi_ai_set_pub_attr answers NOT_PERM
+         * (0xa015800d) for as long as the box stays up. From the new
+         * process ss_mpi_ai_disable is refused too; only the module-level
+         * exit clears it. On a clean boot there is nothing to exit and
+         * this fails harmlessly, so the result is ignored.
+         */
+        st->aud.fnAudioExit();
+
         ret = st->aud.fnAudioInit();
         if (ret) {
             HAL_LOG_ERR("ss_mpi_audio_init failed: 0x%x (err %u)", (unsigned)ret, V5_ERR_ID(ret));

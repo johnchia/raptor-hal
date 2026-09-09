@@ -882,7 +882,7 @@ static void hisi_fs_frame_unmap(hisi_state_t *st, hisi_vpss_chn_t *fs)
     if (!fs->frame_map)
         return;
     if (st->sys.fnMunmap)
-        st->sys.fnMunmap(fs->frame_map);
+        st->sys.fnMunmap(fs->frame_map, fs->frame_map_size);
     fs->frame_map = NULL;
     fs->frame_map_phys = 0;
     fs->frame_map_size = 0;

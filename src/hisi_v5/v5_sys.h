@@ -201,7 +201,11 @@ typedef struct {
      * stranger than binding these.
      */
     void *(*fnMmap)(unsigned int phys_addr, unsigned int size);
-    int (*fnMunmap)(void *virt_addr);
+    /* Two arguments, not gen4's one: ss_mpi_sys_munmap(const void *,
+     * td_u32 size) -- ss_mpi_sys_mem.h:19. A one-argument call leaves the
+     * size register holding whatever was in it and the mapping is not
+     * given back, which costs 3 MB of address space per raw snapshot. */
+    int (*fnMunmap)(const void *virt_addr, unsigned int size);
     void *(*fnMmapCached)(unsigned int phys_addr, unsigned int size);
     int (*fnFlushCache)(unsigned int phys_addr, void *virt_addr, unsigned int size);
     int (*fnMmzAlloc)(unsigned int *phys_addr, void **virt_addr, const char *mmb, const char *zone,
@@ -258,7 +262,7 @@ static inline int v5_sys_load(v5_sys_impl *lib, const v5_mpi_libs *libs)
             libs, "ss_mpi_sys_get_vpss_venc_wrap_buf_line");
 
     lib->fnMmap = (void *(*)(unsigned int, unsigned int))v5_symbol_opt(libs, "ss_mpi_sys_mmap");
-    lib->fnMunmap = (int (*)(void *))v5_symbol_opt(libs, "ss_mpi_sys_munmap");
+    lib->fnMunmap = (int (*)(const void *, unsigned int))v5_symbol_opt(libs, "ss_mpi_sys_munmap");
     lib->fnMmapCached =
         (void *(*)(unsigned int, unsigned int))v5_symbol_opt(libs, "ss_mpi_sys_mmap_cached");
     lib->fnFlushCache =
