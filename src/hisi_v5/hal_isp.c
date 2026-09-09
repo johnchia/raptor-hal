@@ -602,6 +602,37 @@ static void iq_fill_s32(signed int *dst, int dn, const long *src, int sn)
         dst[i] = (signed int)iq_clamp(src[i], -0x7FFFFFFF, 0x7FFFFFFF);
 }
 
+static void iq_fill_s16(signed short *dst, int dn, const long *src, int sn)
+{
+    int i;
+
+    for (i = 0; i < dn && i < sn; i++)
+        dst[i] = (signed short)iq_clamp(src[i], -32768, 32767);
+}
+
+/*
+ * The two above clamp to the width; these clamp to a module's documented
+ * range. Bayer NR needs them: its driver validates every ladder it is
+ * handed and rejects the whole ot_isp_nr_attr on one out-of-range value,
+ * so a single wide row in a borrowed .ini would otherwise cost the file
+ * its other forty.
+ */
+static void iq_fill_u8_max(unsigned char *dst, int dn, const long *src, int sn, long max)
+{
+    int i;
+
+    for (i = 0; i < dn && i < sn; i++)
+        dst[i] = (unsigned char)iq_clamp(src[i], 0, max);
+}
+
+static void iq_fill_u16_max(unsigned short *dst, int dn, const long *src, int sn, long max)
+{
+    int i;
+
+    for (i = 0; i < dn && i < sn; i++)
+        dst[i] = (unsigned short)iq_clamp(src[i], 0, max);
+}
+
 /* ================================================================
  * THE LOAD
  * ================================================================ */
@@ -1418,20 +1449,42 @@ static void iq_sect_dm(hisi_state_t *st, hisi_iq_load *ld, const char *key, cons
 }
 
 /*
- * Bayer NR, the head of the attribute. The spatial and motion-detect
- * configs behind it are the opaque tail v5_isp_tune.h documents, so the
- * dialect's sfm0_*, md_* and noisesd_* keys are named as unmapped rather
- * than written into bytes nobody has transcribed.
+ * [static_nr]. The head is five scalars and a coring curve; everything
+ * else is a per-ISO ladder, sixteen columns wide, and the ladders are the
+ * module -- noisesd_lut alone is the sensor's measured noise-versus-signal
+ * curve, and without it the filter runs the library's generic profile.
+ * Every cap below is the range the driver's own check enforces.
  */
 static void iq_sect_nr(hisi_state_t *st, hisi_iq_load *ld, const char *key, const char *val)
 {
     v5_isp_nr_attr *nr = &ld->nr;
-    int n;
+    v5_isp_nr_snr_auto *a;
+    v5_isp_nr_md_auto *m;
+    unsigned char *u8col = NULL;
+    unsigned short *u16col = NULL;
+    signed short *s16col = NULL;
+    long cap = 255;
+    int row, n;
 
     if (!iq_fetch(st, ld, IQ_NR))
         return;
 
-    if (iq_ci_eq(key, "enable"))
+    a = &nr->snr_cfg.snr_auto;
+    m = &nr->md_cfg.md_auto;
+
+    /* The two-dimensional ladders, one row per key. */
+    if ((row = iq_row_index(key, "sfm0_coarse_strength")) >= 0) {
+        if (row >= V5_ISP_BAYER_CHN)
+            goto past_row;
+        u16col = a->sfm0_coarse_strength[row];
+        cap = 864;
+    } else if ((row = iq_row_index(key, "noisesd_lut")) >= 0) {
+        if (row >= V5_ISP_BAYERNR_LUT1)
+            goto past_row;
+        u8col = a->noisesd_lut[row];
+    }
+    /* The head. */
+    else if (iq_ci_eq(key, "enable"))
         nr->enable = iq_num(val, 0) ? 1 : 0;
     else if (iq_ci_eq(key, "op_type"))
         nr->op_type = iq_num(val, 0) ? V5_ISP_OP_MANUAL : V5_ISP_OP_AUTO;
@@ -1440,22 +1493,105 @@ static void iq_sect_nr(hisi_state_t *st, hisi_iq_load *ld, const char *key, cons
     else if (iq_ci_eq(key, "lsc_nr_enable"))
         nr->lsc_nr_en = iq_num(val, 0) ? 1 : 0;
     else if (iq_ci_eq(key, "lsc_ratio1"))
-        nr->lsc_ratio1 = (unsigned char)iq_clamp(iq_num(val, 0), 0, 255);
+        nr->lsc_ratio1 = (unsigned char)iq_clamp(iq_num(val, 0), 0, 15);
     else if (iq_ci_eq(key, "bnr_ref_mode"))
-        nr->ref_mode = (int)iq_clamp(iq_num(val, 0), 0, 3);
+        nr->ref_mode = (int)iq_clamp(iq_num(val, 0), 0, 2);
     else if (iq_ci_eq(key, "load_ref_en"))
         nr->load_ref_en = iq_num(val, 0) ? 1 : 0;
     else if (iq_ci_eq(key, "coring_ratio")) {
         n = iq_nums(val, ld->nums, V5_ISP_BAYERNR_LUT);
-        iq_fill_u16(nr->coring_ratio, V5_ISP_BAYERNR_LUT, ld->nums, n, sizeof(unsigned short));
+        iq_fill_u16_max(nr->coring_ratio, V5_ISP_BAYERNR_LUT, ld->nums, n, 1023);
+    }
+    /* The spatial-NR ladders. */
+    else if (iq_ci_eq(key, "sfm0_detail_prot")) {
+        u8col = a->sfm0_detail_prot;
+        cap = 31;
+    } else if (iq_ci_eq(key, "sfm1_strength")) {
+        u16col = a->sfm1_strength;
+        cap = 1023;
+    } else if (iq_ci_eq(key, "sfm1_adp_strength")) {
+        u8col = a->sfm1_adp_strength;
+        cap = 16;
+    } else if (iq_ci_eq(key, "sfm6_strength")) {
+        u8col = a->sfm6_strength;
+        cap = 64;
+    } else if (iq_ci_eq(key, "sfm7_strength")) {
+        u8col = a->sfm7_strength;
+        cap = 64;
+    } else if (iq_ci_eq(key, "sth"))
+        u8col = a->sth;
+    else if (iq_ci_eq(key, "tss")) {
+        u8col = a->tss;
+        cap = 128;
+    } else if (iq_ci_eq(key, "fine_strength")) {
+        u8col = a->fine_strength;
+        cap = 128;
     } else if (iq_ci_eq(key, "coring_wgt")) {
-        n = iq_nums(val, ld->nums, V5_ISP_BAYERNR_LUT1);
-        iq_fill_u16(nr->mix_gain, V5_ISP_BAYERNR_LUT1, ld->nums, n, sizeof(unsigned short));
+        u16col = a->coring_wgt;
+        cap = 3200;
+    } else if (iq_ci_eq(key, "coring_mot_ratio")) {
+        u8col = a->coring_mot_ratio;
+        cap = 63;
+    }
+    /* The motion-detect ladders. */
+    else if (iq_ci_eq(key, "md_mode")) {
+        u8col = m->md_mode;
+        cap = 2;
+    } else if (iq_ci_eq(key, "md_size_ratio")) {
+        u8col = m->md_size_ratio;
+        cap = 32;
+    } else if (iq_ci_eq(key, "md_anti_flicker_strength")) {
+        u8col = m->md_anti_flicker_strength;
+        cap = 64;
+    } else if (iq_ci_eq(key, "md_static_ratio")) {
+        u8col = m->md_static_ratio;
+        cap = 64;
+    } else if (iq_ci_eq(key, "md_motion_ratio")) {
+        u8col = m->md_motion_ratio;
+        cap = 64;
+    } else if (iq_ci_eq(key, "md_static_fine_strength"))
+        u8col = m->md_static_fine_strength;
+    else if (iq_ci_eq(key, "tfs"))
+        u8col = m->tfs;
+    else if (iq_ci_eq(key, "user_define_md")) {
+        u8col = m->user_define_md;
+        cap = 2;
+    } else if (iq_ci_eq(key, "user_define_slope"))
+        s16col = m->user_define_slope;
+    else if (iq_ci_eq(key, "user_define_dark_thresh")) {
+        u16col = m->user_define_dark_thresh;
+        cap = 65535;
+    } else if (iq_ci_eq(key, "user_define_color_thresh")) {
+        u8col = m->user_define_color_thresh;
+        cap = 64;
+    } else if (iq_ci_eq(key, "sfr_r")) {
+        u8col = m->sfr_r;
+        cap = 128;
+    } else if (iq_ci_eq(key, "sfr_g")) {
+        u8col = m->sfr_g;
+        cap = 128;
+    } else if (iq_ci_eq(key, "sfr_b")) {
+        u8col = m->sfr_b;
+        cap = 128;
     } else {
-        HAL_LOG_DBG("isp tuning: [static_nr] %s: not in the transcribed head", key);
+        HAL_LOG_DBG("isp tuning: [static_nr] %s: no mapping", key);
         return;
     }
+
+    if (u8col || u16col || s16col) {
+        n = iq_nums(val, ld->nums, V5_ISP_ISO_NUM);
+        if (u8col)
+            iq_fill_u8_max(u8col, V5_ISP_ISO_NUM, ld->nums, n, cap);
+        else if (u16col)
+            iq_fill_u16_max(u16col, V5_ISP_ISO_NUM, ld->nums, n, cap);
+        else
+            iq_fill_s16(s16col, V5_ISP_ISO_NUM, ld->nums, n);
+    }
     ld->dirty |= IQ_NR;
+    return;
+
+past_row:
+    HAL_LOG_WARN("isp tuning: [static_nr] %s: row %d is past the end of the table", key, row);
 }
 
 static void iq_sect_dehaze(hisi_state_t *st, hisi_iq_load *ld, const char *key, const char *val)

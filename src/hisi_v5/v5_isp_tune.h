@@ -47,14 +47,13 @@
  * the rest as opaque bytes sized so the Get/Set round-trip moves the whole
  * struct:
  *
- *   v5_isp_stats_cfg   the AE half is written (the weight table); the WB,
- *                      focus and motion tail passes through untouched.
- *   v5_isp_nr_attr     the bayer-NR head is written (coring, mix gain);
- *                      the spatial/motion-detect/WDR/dering configs are a
- *                      1336-byte tail, and the tail is where V5's own
- *                      3DNR-adjacent knobs live -- transcribing them is a
- *                      later phase's job, not a prerequisite for applying
- *                      the head.
+ *   v5_isp_stats_cfg   the AE and WB halves are written (the weight table,
+ *                      the AWB tap point and its black level); the focus
+ *                      and motion tail passes through untouched.
+ *   v5_isp_nr_attr     everything the .ini dialect names is written, head
+ *                      and per-ISO ladders alike; only the WDR and dering
+ *                      configs are opaque, 118 bytes with no .ini key
+ *                      between them and dering not a CV610 module.
  *
  * NOT HERE, ON PURPOSE. 3DNR is not an ISP module on V5: the vendor's
  * scene_auto reference writes it through ss_mpi_vi_set_pipe_3dnr_param on
@@ -462,9 +461,130 @@ _Static_assert(offsetof(v5_isp_drc_attr, bcnr_attr) == 580, "ot_isp_drc_attr.bcn
 /* ================================================================
  * BAYER NR -- ot_isp_nr_attr
  *
- * Partial: the head the loader writes, then the spatial/motion-detect/
- * WDR/dering configs as bytes. See the file comment.
+ * The whole per-ISO ladder set, because the ladders are the module:
+ * noisesd_lut is the sensor's measured noise-versus-signal curve, and
+ * without it the filter runs the library's generic profile and cleans the
+ * fine grain while leaving the coarse component behind. Only the WDR and
+ * dering configs stay opaque -- neither has a key in the .ini dialect and
+ * dering is not a CV610 module.
  * ================================================================ */
+
+typedef struct {
+    unsigned short sfm0_coarse_strength[V5_ISP_BAYER_CHN][V5_ISP_ISO_NUM];
+    unsigned char sfm0_detail_prot[V5_ISP_ISO_NUM];
+    unsigned short sfm1_strength[V5_ISP_ISO_NUM];
+    unsigned char sfm1_adp_strength[V5_ISP_ISO_NUM];
+    unsigned char sfm6_strength[V5_ISP_ISO_NUM];
+    unsigned char sfm7_strength[V5_ISP_ISO_NUM];
+    unsigned char sth[V5_ISP_ISO_NUM];
+    unsigned char tss[V5_ISP_ISO_NUM];
+    unsigned char fine_strength[V5_ISP_ISO_NUM];
+    unsigned short coring_wgt[V5_ISP_ISO_NUM];
+    unsigned char coring_mot_ratio[V5_ISP_ISO_NUM];
+    unsigned char noisesd_lut[V5_ISP_BAYERNR_LUT1][V5_ISP_ISO_NUM];
+} v5_isp_nr_snr_auto;
+
+_Static_assert(sizeof(v5_isp_nr_snr_auto) == 832, "ot_isp_nr_snr_auto_attr is 832 bytes");
+_Static_assert(offsetof(v5_isp_nr_snr_auto, sfm0_detail_prot) == 128,
+               "ot_isp_nr_snr_auto_attr.sfm0_detail_prot at +128");
+_Static_assert(offsetof(v5_isp_nr_snr_auto, tss) == 240, "ot_isp_nr_snr_auto_attr.tss at +240");
+_Static_assert(offsetof(v5_isp_nr_snr_auto, fine_strength) == 256,
+               "ot_isp_nr_snr_auto_attr.fine_strength at +256");
+_Static_assert(offsetof(v5_isp_nr_snr_auto, coring_wgt) == 272,
+               "ot_isp_nr_snr_auto_attr.coring_wgt at +272");
+_Static_assert(offsetof(v5_isp_nr_snr_auto, noisesd_lut) == 320,
+               "ot_isp_nr_snr_auto_attr.noisesd_lut at +320");
+
+typedef struct {
+    unsigned short sfm0_coarse_strength[V5_ISP_BAYER_CHN];
+    unsigned char sfm0_detail_prot;
+    unsigned short sfm1_strength;
+    unsigned char sfm1_adp_strength;
+    unsigned char sfm6_strength;
+    unsigned char sfm7_strength;
+    unsigned char sth;
+    unsigned char tss;
+    unsigned char fine_strength;
+    unsigned short coring_wgt;
+    unsigned char coring_mot_ratio;
+    unsigned char noisesd_lut[V5_ISP_BAYERNR_LUT1];
+} v5_isp_nr_snr_manual;
+
+_Static_assert(sizeof(v5_isp_nr_snr_manual) == 54, "ot_isp_nr_snr_manual_attr is 54 bytes");
+_Static_assert(offsetof(v5_isp_nr_snr_manual, sfm1_strength) == 10,
+               "ot_isp_nr_snr_manual_attr.sfm1_strength at +10");
+_Static_assert(offsetof(v5_isp_nr_snr_manual, coring_wgt) == 18,
+               "ot_isp_nr_snr_manual_attr.coring_wgt at +18");
+_Static_assert(offsetof(v5_isp_nr_snr_manual, noisesd_lut) == 21,
+               "ot_isp_nr_snr_manual_attr.noisesd_lut at +21");
+
+/*
+ * ot_isp_nr_snr_attr wraps ot_isp_nr_snr_attr_v0 in a version tag and a
+ * one-armed union; the tag is flattened here the way the vendor header's
+ * single OT_NR_SNR_V0 makes it.
+ */
+typedef struct {
+    int snr_version; /* ot_nr_snr_mode, OT_NR_SNR_V0 only */
+    v5_isp_nr_snr_auto snr_auto;
+    v5_isp_nr_snr_manual snr_manual;
+} v5_isp_nr_snr_cfg;
+
+_Static_assert(sizeof(v5_isp_nr_snr_cfg) == 892, "ot_isp_nr_snr_attr is 892 bytes");
+_Static_assert(offsetof(v5_isp_nr_snr_cfg, snr_auto) == 4, "ot_isp_nr_snr_attr.snr_auto at +4");
+_Static_assert(offsetof(v5_isp_nr_snr_cfg, snr_manual) == 836,
+               "ot_isp_nr_snr_attr.snr_manual at +836");
+
+typedef struct {
+    unsigned char md_mode[V5_ISP_ISO_NUM];
+    unsigned char md_size_ratio[V5_ISP_ISO_NUM];
+    unsigned char md_anti_flicker_strength[V5_ISP_ISO_NUM];
+    unsigned char md_static_ratio[V5_ISP_ISO_NUM];
+    unsigned char md_motion_ratio[V5_ISP_ISO_NUM];
+    unsigned char md_static_fine_strength[V5_ISP_ISO_NUM];
+    unsigned char tfs[V5_ISP_ISO_NUM];
+    unsigned char user_define_md[V5_ISP_ISO_NUM];
+    signed short user_define_slope[V5_ISP_ISO_NUM];
+    unsigned short user_define_dark_thresh[V5_ISP_ISO_NUM];
+    unsigned char user_define_color_thresh[V5_ISP_ISO_NUM];
+    unsigned char sfr_r[V5_ISP_ISO_NUM];
+    unsigned char sfr_g[V5_ISP_ISO_NUM];
+    unsigned char sfr_b[V5_ISP_ISO_NUM];
+} v5_isp_nr_md_auto;
+
+_Static_assert(sizeof(v5_isp_nr_md_auto) == 256, "ot_isp_nr_md_auto_attr is 256 bytes");
+_Static_assert(offsetof(v5_isp_nr_md_auto, user_define_md) == 112,
+               "ot_isp_nr_md_auto_attr.user_define_md at +112");
+_Static_assert(offsetof(v5_isp_nr_md_auto, user_define_slope) == 128,
+               "ot_isp_nr_md_auto_attr.user_define_slope at +128");
+_Static_assert(offsetof(v5_isp_nr_md_auto, sfr_r) == 208, "ot_isp_nr_md_auto_attr.sfr_r at +208");
+
+typedef struct {
+    unsigned char md_mode;
+    unsigned char md_size_ratio;
+    unsigned char md_anti_flicker_strength;
+    unsigned char md_static_ratio;
+    unsigned char md_motion_ratio;
+    unsigned char md_static_fine_strength;
+    unsigned char tfs;
+    unsigned char user_define_md;
+    signed short user_define_slope;
+    unsigned short user_define_dark_thresh;
+    unsigned char user_define_color_thresh;
+    unsigned char sfr_r;
+    unsigned char sfr_g;
+    unsigned char sfr_b;
+} v5_isp_nr_md_manual;
+
+_Static_assert(sizeof(v5_isp_nr_md_manual) == 16, "ot_isp_nr_md_manual_attr is 16 bytes");
+_Static_assert(offsetof(v5_isp_nr_md_manual, user_define_slope) == 8,
+               "ot_isp_nr_md_manual_attr.user_define_slope at +8");
+
+typedef struct {
+    v5_isp_nr_md_auto md_auto;
+    v5_isp_nr_md_manual md_manual;
+} v5_isp_nr_md_cfg;
+
+_Static_assert(sizeof(v5_isp_nr_md_cfg) == 272, "ot_isp_nr_md_attr is 272 bytes");
 
 typedef struct {
     int enable;
@@ -476,13 +596,24 @@ typedef struct {
     unsigned short mix_gain[V5_ISP_BAYERNR_LUT1];
     int ref_mode; /* ot_isp_bnr_ref_mode */
     int load_ref_en;
-    unsigned char tail[1336]; /* snr_cfg 892 + md_cfg 272 + wdr_cfg 32 + dering_cfg 86, padded */
+    v5_isp_nr_snr_cfg snr_cfg;
+    /*
+     * The vendor header unions md_cfg with ot_isp_nr_tnr_attr, the DV500
+     * arm; that arm is the larger of the two, so the union is 324 bytes.
+     */
+    union {
+        v5_isp_nr_md_cfg md_cfg;
+        unsigned char tnr_cfg[324];
+    };
+    unsigned char tail[118]; /* wdr_cfg 32 + dering_cfg 86, neither in the .ini */
 } v5_isp_nr_attr;
 
 _Static_assert(sizeof(v5_isp_nr_attr) == 1492, "ot_isp_nr_attr is 1492 bytes");
 _Static_assert(offsetof(v5_isp_nr_attr, coring_ratio) == 18, "ot_isp_nr_attr.coring_ratio at +18");
 _Static_assert(offsetof(v5_isp_nr_attr, mix_gain) == 84, "ot_isp_nr_attr.mix_gain at +84");
-_Static_assert(offsetof(v5_isp_nr_attr, tail) == 156, "ot_isp_nr_attr tail at +156");
+_Static_assert(offsetof(v5_isp_nr_attr, snr_cfg) == 156, "ot_isp_nr_attr.snr_cfg at +156");
+_Static_assert(offsetof(v5_isp_nr_attr, md_cfg) == 1048, "ot_isp_nr_attr.md_cfg at +1048");
+_Static_assert(offsetof(v5_isp_nr_attr, tail) == 1372, "ot_isp_nr_attr wdr_cfg at +1372");
 
 /* ================================================================
  * DEHAZE -- ot_isp_dehaze_attr
