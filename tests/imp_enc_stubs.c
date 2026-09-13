@@ -9,7 +9,8 @@
  * C has no mangling and the link is by name.
  *
  * Absent from this list, and faked for real in t_enc_imp.c: GetChnAttr,
- * SetDefaultParam, SetChnAttrRcMode, RequestIDR. GetChnAttrRcMode is
+ * SetDefaultParam, SetChnAttrRcMode, SetChnQpBounds, RequestIDR.
+ * GetChnAttrRcMode is
  * deliberately left here -- a rate-control switch that reads the channel's
  * current arm is the bug this suite exists to catch, so reaching it aborts.
  *
@@ -85,7 +86,6 @@ STUB(IMP_Encoder_SetChnGopLength)
 STUB(IMP_Encoder_SetChnMapRoi)
 STUB(IMP_Encoder_SetChnMaxPictureSize)
 STUB(IMP_Encoder_SetChnQp)
-STUB(IMP_Encoder_SetChnQpBounds)
 STUB(IMP_Encoder_SetChnQpBoundsPerFrame)
 STUB(IMP_Encoder_SetChnQpgAI)
 STUB(IMP_Encoder_SetChnQpIPDelta)

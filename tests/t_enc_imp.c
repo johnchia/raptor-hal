@@ -1,9 +1,11 @@
 /*
- * t_enc_imp.c -- what hal_enc_set_rc_mode sends the Ingenic encoder.
+ * t_enc_imp.c -- what the rate-control setters send the Ingenic encoder.
  *
- * One claim, and it is the whole suite: switching rate-control mode must build
+ * One claim carries most of the suite: switching rate-control mode must build
  * the target mode's attributes from nothing, never from the channel's current
- * ones.
+ * ones. The QP-bound legs at the end are the corollary -- because nothing
+ * survives a mode change, the bounds a caller configured have to be put back
+ * afterwards, and hal_enc_set_qp_bounds is where that lands.
  *
  * IMPEncoderAttrRcMode is a tag plus a union whose arms do not line up -- CBR
  * carries no uMaxBitRate, so every field after the target bitrate sits one
@@ -69,6 +71,12 @@ static int failures;
 static IMPEncoderAttrRcMode g_sent;
 static int g_sent_calls;
 static int g_idr_calls;
+
+/* What SetChnQpBounds was asked for, and whether it was asked at all: a bound
+ * the caller left to the channel has to arrive resolved, and one out of range
+ * has to not arrive. */
+static int g_bounds_min, g_bounds_max;
+static int g_bounds_calls;
 
 /* What SetDefaultParam was asked for, so the test can say the request was
  * shaped by the channel rather than by a constant. */
@@ -147,6 +155,15 @@ int IMP_Encoder_SetChnAttrRcMode(int encChn, const IMPEncoderAttrRcMode *pstRcMo
     return 0;
 }
 
+int IMP_Encoder_SetChnQpBounds(int encChn, int iMinQP, int iMaxQP)
+{
+    (void)encChn;
+    g_bounds_calls++;
+    g_bounds_min = iMinQP;
+    g_bounds_max = iMaxQP;
+    return 0;
+}
+
 int IMP_Encoder_RequestIDR(int encChn)
 {
     (void)encChn;
@@ -160,6 +177,8 @@ static void reset(void)
     g_sent_calls = 0;
     g_idr_calls = 0;
     g_defparam_calls = 0;
+    g_bounds_calls = 0;
+    g_bounds_min = g_bounds_max = 0;
 }
 
 /*
@@ -367,6 +386,61 @@ static void test_a_zero_bitrate_falls_back(void)
           g_sent.attrCbr.uTargetBitRate);
 }
 
+/*
+ * hal_enc_set_qp_bounds takes the bounds as a pair because the vendor does,
+ * but a config often names only one of them -- min_qp with the max left to the
+ * mode. -1 is how that arrives, and it has to be resolved here: the vendor
+ * call takes an int and would pass -1 straight through to the encoder.
+ *
+ * The channel the fakes describe is CBR 34..51, so an unset side comes back as
+ * one of those.
+ */
+static void test_an_unset_qp_bound_keeps_the_channels_own(void)
+{
+    reset();
+    CHECK(hal_enc_set_qp_bounds(NULL, 0, 20, -1) == 0, "accepted");
+    CHECK(g_bounds_calls == 1, "sent once, got %d", g_bounds_calls);
+    CHECK(g_bounds_min == 20, "the named bound is the caller's, got %d", g_bounds_min);
+    CHECK(g_bounds_max == 51, "the unset one is the channel's, got %d", g_bounds_max);
+
+    reset();
+    CHECK(hal_enc_set_qp_bounds(NULL, 0, -1, 40) == 0, "accepted");
+    CHECK(g_bounds_min == 34, "the unset floor is the channel's, got %d", g_bounds_min);
+    CHECK(g_bounds_max == 40, "the named ceiling is the caller's, got %d", g_bounds_max);
+
+    reset();
+    CHECK(hal_enc_set_qp_bounds(NULL, 0, -1, -1) == 0, "accepted");
+    CHECK(g_bounds_min == 34 && g_bounds_max == 51, "neither named leaves both, got %d..%d",
+          g_bounds_min, g_bounds_max);
+}
+
+/*
+ * Out of range is refused rather than clamped, and refused before the vendor
+ * hears about it. A QP nobody can encode at is a mistake in the caller;
+ * quietly moving it produces a stream that is merely not the one asked for,
+ * which is harder to notice than an error return.
+ */
+static void test_a_qp_outside_the_range_is_refused(void)
+{
+    static const struct {
+        int min_qp, max_qp;
+        const char *what;
+    } bad[] = {
+        {-2, 40, "a floor below -1"},           {52, 40, "a floor above 51"},
+        {20, 52, "a ceiling above 51"},         {20, -2, "a ceiling below -1"},
+        {40, 20, "bounds the wrong way round"},
+    };
+    size_t i;
+
+    for (i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+        reset();
+        CHECK(hal_enc_set_qp_bounds(NULL, 0, bad[i].min_qp, bad[i].max_qp) == RSS_ERR_INVAL,
+              "%s is refused", bad[i].what);
+        CHECK(g_bounds_calls == 0, "%s never reaches the encoder, got %d calls", bad[i].what,
+              g_bounds_calls);
+    }
+}
+
 int main(void)
 {
     test_a_vbr_switch_does_not_inherit_cbrs_bytes();
@@ -376,6 +450,8 @@ int main(void)
     test_fixqp_carries_a_qp_and_no_bitrate();
     test_smart_maps_onto_capped_vbr();
     test_a_zero_bitrate_falls_back();
+    test_an_unset_qp_bound_keeps_the_channels_own();
+    test_a_qp_outside_the_range_is_refused();
 
     if (failures) {
         printf("t_enc_imp: %d failure(s)\n", failures);

@@ -1744,11 +1744,49 @@ int hal_enc_set_qp(void *ctx, int chn, int qp)
  *
  * New SDK: modify RC mode attrs inline.
  * Old SDK: modify the per-codec RC mode attrs.
+ *
+ * The bounds are a pair here because the vendor takes them as a pair, but a
+ * caller often means only one of them -- a config naming min_qp and leaving
+ * max_qp to the mode. -1 is that: keep the bound the channel already has. It
+ * has to be resolved rather than passed on, because neither branch below
+ * treats it as absent: the new SDK hands -1 to the encoder and the old one
+ * casts it to 0xffffffff.
+ *
+ * Out of range is refused rather than clamped. A QP nobody can encode at is a
+ * mistake in the caller, and silently moving it produces a stream that is
+ * merely not the one asked for -- which is harder to notice than an error.
  */
 int hal_enc_set_qp_bounds(void *ctx, int chn, int min_qp, int max_qp)
 {
-    (void)ctx;
     int ret;
+
+    if (min_qp < -1 || min_qp > 51 || max_qp < -1 || max_qp > 51)
+        return RSS_ERR_INVAL;
+
+    if (min_qp < 0 || max_qp < 0) {
+        rss_video_config_t cur;
+
+        ret = hal_enc_get_channel_attr(ctx, chn, &cur);
+        if (ret != 0) {
+            HAL_LOG_ERR("chn %d: cannot read the bound to keep: %d", chn, ret);
+            return ret;
+        }
+        if (min_qp < 0)
+            min_qp = cur.min_qp;
+        if (max_qp < 0)
+            max_qp = cur.max_qp;
+
+        /* A mode with no QP bounds of its own -- FIXQP, JPEG -- reads back
+         * zeroes, and there is nothing to keep. Refusing says so; writing 0..0
+         * would pin the channel at the finest quantiser it has. */
+        if (min_qp < 0 || min_qp > 51 || max_qp <= 0 || max_qp > 51) {
+            HAL_LOG_ERR("chn %d: no QP bounds to keep (read back %d..%d)", chn, min_qp, max_qp);
+            return RSS_ERR_INVAL;
+        }
+    }
+
+    if (min_qp > max_qp)
+        return RSS_ERR_INVAL;
 
 #if defined(HAL_NEW_SDK)
     ret = IMP_Encoder_SetChnQpBounds(chn, min_qp, max_qp);

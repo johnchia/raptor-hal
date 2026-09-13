@@ -927,8 +927,10 @@ typedef struct rss_hal_ops {
     int (*enc_query)(void *ctx, int chn, bool *busy);
     int (*enc_get_fd)(void *ctx, int chn);
     int (*enc_set_qp)(void *ctx, int chn, int qp);
-    /* min_qp/max_qp: [0..51], or -1 to restore the SDK's own bound on
-     * that side. Out of range is RSS_ERR_INVAL, not clamped. */
+    /* min_qp/max_qp: [0..51], or -1 to keep the bound the channel already
+     * has on that side -- which is what a config naming only one of them
+     * means. Out of range, and min above max, are RSS_ERR_INVAL rather than
+     * clamped. */
     int (*enc_set_qp_bounds)(void *ctx, int chn, int min_qp, int max_qp);
     int (*enc_set_qp_ip_delta)(void *ctx, int chn, int delta);
     int (*enc_set_qp_pb_delta)(void *ctx, int chn, int delta);
