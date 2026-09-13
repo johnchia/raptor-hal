@@ -278,6 +278,48 @@ static void test_every_mode_fills_its_own_arm(void)
 }
 
 /*
+ * A live mode change and a channel creation are the only two ways a channel
+ * acquires an RC arm, and they have to leave the encoder in the same place.
+ * They did not once: creation's CBR floor was lowered from 34 to 15 and this
+ * path kept 34, so a 1 Mbps stream measured at 1.04 Mbps from boot fell to
+ * 68 kbps the moment anything set its rate control mode -- the config
+ * unchanged, the mode unchanged, only the floor. Pinned against the shared
+ * constants rather than against numbers, because a literal here is exactly how
+ * the two came apart.
+ */
+static void test_the_bounds_are_the_ones_creation_uses(void)
+{
+    reset();
+    CHECK(hal_enc_set_rc_mode(NULL, 0, RSS_RC_CBR, 1000000) == 0, "cbr accepted");
+    CHECK(g_sent.attrCbr.iMinQP == HAL_ENC_CBR_DEFAULT_MIN_QP, "cbr floor is creation's, got %d",
+          g_sent.attrCbr.iMinQP);
+    CHECK(g_sent.attrCbr.iMaxQP == HAL_ENC_CBR_DEFAULT_MAX_QP, "cbr ceiling is creation's, got %d",
+          g_sent.attrCbr.iMaxQP);
+
+    /* And the floor has to leave room to reach the target: at 34 the encoder
+     * delivers whatever that quality costs, whatever the target says. */
+    CHECK(g_sent.attrCbr.iMinQP < 34, "cbr floor leaves rate control room, got %d",
+          g_sent.attrCbr.iMinQP);
+
+    reset();
+    CHECK(hal_enc_set_rc_mode(NULL, 0, RSS_RC_VBR, 1000000) == 0, "vbr accepted");
+    CHECK(g_sent.attrVbr.iMinQP == HAL_ENC_VBR_DEFAULT_MIN_QP, "vbr floor is creation's, got %d",
+          g_sent.attrVbr.iMinQP);
+    CHECK(g_sent.attrVbr.iMaxQP == HAL_ENC_VBR_DEFAULT_MAX_QP, "vbr ceiling is creation's, got %d",
+          g_sent.attrVbr.iMaxQP);
+
+    reset();
+    CHECK(hal_enc_set_rc_mode(NULL, 0, RSS_RC_CAPPED_VBR, 1000000) == 0, "capped_vbr accepted");
+    CHECK(g_sent.attrCappedVbr.iMinQP == HAL_ENC_VBR_DEFAULT_MIN_QP,
+          "capped_vbr floor is creation's, got %d", g_sent.attrCappedVbr.iMinQP);
+
+    reset();
+    CHECK(hal_enc_set_rc_mode(NULL, 0, RSS_RC_CAPPED_QUALITY, 1000000) == 0, "capped_q accepted");
+    CHECK(g_sent.attrCappedQuality.iMinQP == HAL_ENC_VBR_DEFAULT_MIN_QP,
+          "capped_quality floor is creation's, got %d", g_sent.attrCappedQuality.iMinQP);
+}
+
+/*
  * FIXQP is the arm with nothing but a QP in it, and the one the caller's
  * bitrate means nothing to. Its initial QP has to be a QP -- the poison would
  * be accepted by an encoder that does not range-check, and produce a picture
@@ -330,6 +372,7 @@ int main(void)
     test_a_vbr_switch_does_not_inherit_cbrs_bytes();
     test_the_arm_is_seeded_for_this_channel();
     test_every_mode_fills_its_own_arm();
+    test_the_bounds_are_the_ones_creation_uses();
     test_fixqp_carries_a_qp_and_no_bitrate();
     test_smart_maps_onto_capped_vbr();
     test_a_zero_bitrate_falls_back();

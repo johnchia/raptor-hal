@@ -28,6 +28,24 @@ static int hal_jpeg_set_quality(int chn, int quality);
 /* Scratch buffer size for ring-buffer linearization (new SDK) */
 #define RSS_SCRATCH_DEFAULT_SIZE (512 * 1024)
 
+/*
+ * Default QP bounds for the T31/T40/T41 rate-control arms, used wherever the
+ * config names none. One pair of constants because a channel acquires an arm
+ * in two places -- hal_enc_create_channel_new and hal_enc_set_rc_mode -- and
+ * the two drifted apart once: creation was lowered from 34 to 15 while the
+ * live path kept 34, so a stream that ran at its target from boot collapsed
+ * the moment anything changed its rate control mode.
+ *
+ * CBR's floor has to leave the rate control room to reach the target: a floor
+ * of 34 caps the bitrate at whatever QP34 produces for the scene, whatever the
+ * target says. The ceiling stays 51 so a hard scene can still be compressed
+ * down to hold the target rather than overshooting it.
+ */
+#define HAL_ENC_CBR_DEFAULT_MIN_QP 15
+#define HAL_ENC_CBR_DEFAULT_MAX_QP 51
+#define HAL_ENC_VBR_DEFAULT_MIN_QP 20
+#define HAL_ENC_VBR_DEFAULT_MAX_QP 45
+
 /* ══════════════════════════════════════════════════════════════════════
  * Translation Helpers
  * ══════════════════════════════════════════════════════════════════════ */
@@ -600,10 +618,10 @@ static int hal_enc_create_channel_new(int chn, const rss_video_config_t *cfg)
      * compressed down to hold the target instead of overshooting. */
     {
         int32_t br_kbps = cfg->bitrate / 1000;
-        int16_t cbr_min = (cfg->min_qp >= 0) ? (int16_t)cfg->min_qp : 15;
-        int16_t cbr_max = (cfg->max_qp >= 0) ? (int16_t)cfg->max_qp : 51;
-        int16_t vbr_min = (cfg->min_qp >= 0) ? (int16_t)cfg->min_qp : 20;
-        int16_t vbr_max = (cfg->max_qp >= 0) ? (int16_t)cfg->max_qp : 45;
+        int16_t cbr_min = (cfg->min_qp >= 0) ? (int16_t)cfg->min_qp : HAL_ENC_CBR_DEFAULT_MIN_QP;
+        int16_t cbr_max = (cfg->max_qp >= 0) ? (int16_t)cfg->max_qp : HAL_ENC_CBR_DEFAULT_MAX_QP;
+        int16_t vbr_min = (cfg->min_qp >= 0) ? (int16_t)cfg->min_qp : HAL_ENC_VBR_DEFAULT_MIN_QP;
+        int16_t vbr_max = (cfg->max_qp >= 0) ? (int16_t)cfg->max_qp : HAL_ENC_VBR_DEFAULT_MAX_QP;
 
         switch (rc) {
         case IMP_ENC_RC_MODE_CBR:
@@ -1152,9 +1170,10 @@ int hal_enc_set_rc_mode(void *ctx, int chn, rss_rc_mode_t mode, uint32_t bitrate
         rcAttr = fresh.rcAttr.attrRcMode;
     }
 
-    /* The same overrides creation applies: the SDK's own defaults (MinQP 15,
-     * MaxQP 48) are worse than these. Unconditional -- the arm was just
-     * initialised, so there is no caller value here to preserve. */
+    /* The same overrides creation applies, from the same constants, because a
+     * live mode change and a channel creation have to leave the encoder in the
+     * same place. Unconditional -- the arm was just initialised, so there is
+     * no caller value here to preserve. */
     rcAttr.rcMode = vendor_mode;
     switch (vendor_mode) {
     case IMP_ENC_RC_MODE_FIXQP:
@@ -1163,29 +1182,29 @@ int hal_enc_set_rc_mode(void *ctx, int chn, rss_rc_mode_t mode, uint32_t bitrate
     case IMP_ENC_RC_MODE_CBR:
         rcAttr.attrCbr.uTargetBitRate = bitrate_kbps;
         rcAttr.attrCbr.uMaxPictureSize = bitrate_kbps;
-        rcAttr.attrCbr.iMinQP = 34;
-        rcAttr.attrCbr.iMaxQP = 51;
+        rcAttr.attrCbr.iMinQP = HAL_ENC_CBR_DEFAULT_MIN_QP;
+        rcAttr.attrCbr.iMaxQP = HAL_ENC_CBR_DEFAULT_MAX_QP;
         break;
     case IMP_ENC_RC_MODE_VBR:
         rcAttr.attrVbr.uTargetBitRate = bitrate_kbps;
         rcAttr.attrVbr.uMaxBitRate = bitrate_kbps * 4 / 3;
         rcAttr.attrVbr.uMaxPictureSize = bitrate_kbps;
-        rcAttr.attrVbr.iMinQP = 20;
-        rcAttr.attrVbr.iMaxQP = 45;
+        rcAttr.attrVbr.iMinQP = HAL_ENC_VBR_DEFAULT_MIN_QP;
+        rcAttr.attrVbr.iMaxQP = HAL_ENC_VBR_DEFAULT_MAX_QP;
         break;
     case IMP_ENC_RC_MODE_CAPPED_VBR:
         rcAttr.attrCappedVbr.uTargetBitRate = bitrate_kbps;
         rcAttr.attrCappedVbr.uMaxBitRate = bitrate_kbps * 4 / 3;
         rcAttr.attrCappedVbr.uMaxPictureSize = bitrate_kbps;
-        rcAttr.attrCappedVbr.iMinQP = 20;
-        rcAttr.attrCappedVbr.iMaxQP = 45;
+        rcAttr.attrCappedVbr.iMinQP = HAL_ENC_VBR_DEFAULT_MIN_QP;
+        rcAttr.attrCappedVbr.iMaxQP = HAL_ENC_VBR_DEFAULT_MAX_QP;
         break;
     case IMP_ENC_RC_MODE_CAPPED_QUALITY:
         rcAttr.attrCappedQuality.uTargetBitRate = bitrate_kbps;
         rcAttr.attrCappedQuality.uMaxBitRate = bitrate_kbps * 4 / 3;
         rcAttr.attrCappedQuality.uMaxPictureSize = bitrate_kbps;
-        rcAttr.attrCappedQuality.iMinQP = 20;
-        rcAttr.attrCappedQuality.iMaxQP = 45;
+        rcAttr.attrCappedQuality.iMinQP = HAL_ENC_VBR_DEFAULT_MIN_QP;
+        rcAttr.attrCappedQuality.iMaxQP = HAL_ENC_VBR_DEFAULT_MAX_QP;
         break;
     default:
         break;
