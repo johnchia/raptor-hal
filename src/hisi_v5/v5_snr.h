@@ -31,9 +31,11 @@
  *      slots at +12, +24 and +28 -- set_bus_ex_info, mirror_flip and
  *      set_blc_clamp -- are all null, and +44 is null on everything except
  *      os04d10. In particular *pfn_mirror_flip does not exist* on this
- *      family, which is why v5_vi.h and v5_vpss.h both note that the
- *      channel's mirror_en/flip_en is the one that works. Every call
- *      through this struct must be NULL-checked.
+ *      family; what does exist is pfn_write_reg / pfn_read_reg, and
+ *      hal_knob.c's orientation section turns the picture through those
+ *      from its own table of sensor registers, with the VPSS channels'
+ *      mirror_en/flip_en as the fallback (v5_vpss.h). Every call through
+ *      this struct must be NULL-checked.
  *
  *   4. libsns_sp2308.so exports `g_sns_os02m10_obj` and `os02m10_get_obj`.
  *      It is an os02m10 library under another name, so a loader that

@@ -124,7 +124,9 @@ _Static_assert(offsetof(v5_vpss_grp_attr, frame_rate) == 48, "ot_vpss_grp_attr.f
  * on a CV608 and both in the VPSS reference -- SEG_COMPACT compression
  * and either of them cannot be on together (0xa007800d to the attribute),
  * and the channel 0 wrap ring and *flip* cannot be on together
- * (0xa007800d to set_chn_buf_wrap, with mirror alone accepted).
+ * (0xa007800d to set_chn_buf_wrap, with mirror alone accepted). Those
+ * two are why a sensor whose registers the backend knows turns the
+ * picture itself instead, and these bits stay clear; see hal_knob.c.
  *
  * depth is the number of frames the channel holds for a userspace reader.
  * Zero means "bound consumer only" -- get_chn_frame then returns

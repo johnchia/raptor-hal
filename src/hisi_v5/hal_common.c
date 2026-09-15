@@ -930,10 +930,12 @@ static int hisi_isp_bringup(hisi_state_t *st)
     pub.bayer_format = m->bayer;
     pub.wdr_mode = V5_WDR_MODE_NONE;
     pub.sns_mode = m->sns_mode;
-    /* Orientation is the VPSS channels'; turning the picture at the sensor
-     * as well would turn it back. */
+    /* The phase and the OB hint follow the sensor's turn, if it is the
+     * sensor turning the picture; otherwise the VPSS channels are, and the
+     * ISP sees the readout as the mode file describes it. */
     pub.sns_flip_en = 0;
     pub.sns_mirror_en = 0;
+    hisi_snr_orien_pub(st, &pub);
 
     ret = st->isp.fnSetPubAttr(HISI_VI_PIPE, &pub);
     if (ret) {
@@ -958,6 +960,16 @@ static int hisi_isp_bringup(hisi_state_t *st)
         HAL_LOG_ERR("isp: cannot start the 3A thread: %s", strerror(ret));
         return RSS_ERR_IO;
     }
+
+    /*
+     * An orientation remembered before this point could not be written to
+     * the sensor, which ss_mpi_isp_init has only now programmed. The
+     * public attribute above already carries its phase, so this is the
+     * register write alone; an [image] applied later comes through
+     * hal_isp_set_hflip / set_vflip on its own.
+     */
+    if ((st->mirror || st->flip) && hisi_snr_orien_at_sensor(st))
+        hisi_snr_orien_apply(st);
     st->isp_thread_started = true;
 
     HAL_LOG_INFO("isp: pipe %d running, %ux%u @ %.2f fps, bayer %d", HISI_VI_PIPE,
@@ -1249,7 +1261,7 @@ static int hisi_vi_bringup(hisi_state_t *st)
      * Not [image]'s orientation. The VI channel takes mirror_en and
      * reports it in /proc/umap/vi, and in the all-online coupling it turns
      * nothing -- there is no VI write-out to reverse. Orientation is the
-     * VPSS channels'; see hisi_fs_apply_orien.
+     * sensor's or the VPSS channels'; see hal_knob.c.
      */
     chn.mirror_en = 0;
     chn.flip_en = 0;

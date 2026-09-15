@@ -78,6 +78,21 @@ static void hisi_fs_frame_rate(const hisi_state_t *st, uint32_t num, uint32_t de
 }
 
 /*
+ * The VPSS channels' share of [image]'s orientation: all of it, unless the
+ * sensor is turning the picture itself, in which case none -- turning it
+ * twice would turn it back. See hal_knob.c's orientation section.
+ */
+static int hisi_fs_vpss_mirror(const hisi_state_t *st)
+{
+    return hisi_snr_orien_at_sensor(st) ? 0 : st->mirror;
+}
+
+static int hisi_fs_vpss_flip(const hisi_state_t *st)
+{
+    return hisi_snr_orien_at_sensor(st) ? 0 : st->flip;
+}
+
+/*
  * hisi_fs_compress -- what this channel's output is compressed with.
  *
  * SEG_COMPACT on physical channel 0 and nothing anywhere else. Two
@@ -112,7 +127,7 @@ static v5_compress_mode hisi_fs_compress(const hisi_state_t *st, const hisi_vpss
 {
     if (phy != 0 || fs->depth)
         return V5_COMPRESS_MODE_NONE;
-    if (st->mirror || st->flip)
+    if (hisi_fs_vpss_mirror(st) || hisi_fs_vpss_flip(st))
         return V5_COMPRESS_MODE_NONE;
     return V5_COMPRESS_MODE_SEG_COMPACT;
 }
@@ -330,7 +345,7 @@ static bool hisi_fs_wrap_want(const hisi_state_t *st, const hisi_vpss_chn_t *fs,
      * flip that would, so in practice this term never fires; it is here
      * so the two statements of the rule cannot drift apart.
      */
-    return phy == 0 && !fs->depth && !st->flip && hisi_fs_chn0_rings(st);
+    return phy == 0 && !fs->depth && !hisi_fs_vpss_flip(st) && hisi_fs_chn0_rings(st);
 }
 
 /* The ring this channel would ask for now. False when it cannot be had. */
@@ -559,12 +574,13 @@ static void hisi_fs_fill_attr(const hisi_state_t *st, hisi_vpss_chn_t *fs, int p
     attr->aspect_ratio.mode = V5_ASPECT_RATIO_NONE;
 
     /*
-     * Mirror and flip are the *channel's* on V5, not the sensor's -- every
-     * sensor library on this image has a null pfn_mirror_flip -- and not
-     * the VI channel's, which in the all-online coupling writes nothing to
-     * DDR and so has no write-out to reverse: measured on a CV608, the VI
-     * channel takes mirror_en and reports it in /proc/umap/vi and the
-     * picture does not move.
+     * Mirror and flip are the channel's share of the orientation -- the
+     * whole of it when the sensor cannot turn the picture, none of it
+     * when it can (hisi_fs_vpss_mirror). Not the VI channel's, which in
+     * the all-online coupling writes nothing to DDR and so has no
+     * write-out to reverse: measured on a CV608, the VI channel takes
+     * mirror_en and reports it in /proc/umap/vi and the picture does not
+     * move.
      *
      * They are per-stream here, which is what raptor wants, and they
      * follow the backend's orientation state rather than the caller's
@@ -576,8 +592,8 @@ static void hisi_fs_fill_attr(const hisi_state_t *st, hisi_vpss_chn_t *fs, int p
      * hisi_fs_wrap_want gives up the ring while flip is on, because the
      * ring refuses to come back on over a flipped channel.
      */
-    attr->mirror_en = st->mirror;
-    attr->flip_en = st->flip;
+    attr->mirror_en = hisi_fs_vpss_mirror(st);
+    attr->flip_en = hisi_fs_vpss_flip(st);
 }
 
 /*
@@ -657,19 +673,10 @@ int hal_fs_create_channel(void *ctx, int chn, const rss_fs_config_t *cfg)
 /*
  * hisi_fs_apply_orien -- put st->mirror / st->flip onto the channels.
  *
- * WHERE ORIENTATION LIVES ON THIS PART. Three places carry a mirror and
- * only one of them turns the picture:
- *
- *   - the sensor object's pfn_mirror_flip, null on every sensor library
- *     this image ships (v5_snr.h, finding 3);
- *   - the VI channel's mirror_en/flip_en, which the driver accepts and
- *     reports in /proc/umap/vi and which does nothing in the all-online
- *     coupling, there being no VI write-out to reverse -- measured on a
- *     CV608 by comparing two captures, which differ only by sensor noise;
- *   - the VPSS channel's, measured on the same board to turn the picture.
- *
- * So it is the VPSS channels', set on all of them together because
- * [image] hflip means the camera rather than one stream.
+ * The fallback path, for a sensor without orientation registers the
+ * backend knows (hal_knob.c's orientation section has the whole account
+ * of where a turn can live on this part). Set on all the channels
+ * together because [image] hflip means the camera rather than one stream.
  *
  * WHAT IT COSTS. Channel 0 alone is expensive, and only because of how it
  * streams: it is SEG_COMPACT compressed and it feeds its encoder from the
@@ -693,7 +700,7 @@ int hal_fs_create_channel(void *ctx, int chn, const rss_fs_config_t *cfg)
  */
 void hisi_fs_orien_guard(hisi_state_t *st)
 {
-    if (!st->flip || !hisi_fs_chn0_rings(st))
+    if (!hisi_fs_vpss_flip(st) || !hisi_fs_chn0_rings(st))
         return;
     HAL_LOG_ERR("vflip dropped: channel 0's wrap ring is exclusive with flip, and the frames it "
                 "would need instead do not fit; see hal_isp_set_vflip");
@@ -748,7 +755,8 @@ int hisi_fs_apply_orien(hisi_state_t *st)
     }
 
     if (rc == RSS_OK)
-        HAL_LOG_INFO("orientation: mirror %d, flip %d on the VPSS channels", st->mirror, st->flip);
+        HAL_LOG_INFO("orientation: mirror %d, flip %d on the VPSS channels",
+                     hisi_fs_vpss_mirror(st), hisi_fs_vpss_flip(st));
     return rc;
 }
 
