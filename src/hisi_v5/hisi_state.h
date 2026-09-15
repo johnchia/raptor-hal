@@ -868,6 +868,16 @@ typedef struct {
     hisi_venc_chn_t enc[HISI_VENC_CHN_NUM];
 
     /*
+     * The JPEG module's memory-saving mode, asked for once before the
+     * first encoder is created (hisi_enc_mod_param_init) and remembered,
+     * because it decides how a JPEG stream buffer is sized: at the
+     * general-mode floor of a byte per pixel when it was refused, at
+     * rvd's own frame bound when it was not.
+     */
+    bool venc_mod_checked;
+    bool venc_jpeg_mini_buf;
+
+    /*
      * The framesource half of an FS -> OSD -> ENC pair, per encoder
      * channel, or -1.
      *

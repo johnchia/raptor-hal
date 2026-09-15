@@ -584,6 +584,47 @@ _Static_assert(sizeof(v5_venc_jpeg_param) == 204, "ot_venc_jpeg_param is 204 byt
 _Static_assert(offsetof(v5_venc_jpeg_param, mcu_per_ecs) == 196,
                "ot_venc_jpeg_param.mcu_per_ecs at +196");
 
+/*
+ * ot_venc_mod_param (ot_common_venc.h:775-836), the per-module knobs set
+ * with ss_mpi_venc_set_mod_param *before any channel exists* -- the
+ * reference says NOT_PERM afterwards. Only the JPEG arm is spelled out;
+ * the union is padded to the largest arm (the H.264/H.265/SVAC3 ones, six
+ * words) so the struct is the 28 bytes the driver copies: the setter's
+ * ioctl is 0x401c4527, whose size field is 0x1c.
+ *
+ * mini_buf_mode is the one that matters here. In "general mode" the driver
+ * refuses a JPEG stream buffer smaller than width x height (and an H.26x
+ * one smaller than three quarters of it): measured on a CV608, a
+ * 2304x1296 JPEG channel asked to make do with 1.5 MB is refused
+ * 0xa0088007 at create. In "memory-saving mode" the floor is 32 KB and the
+ * caller owns the consequence -- a frame that does not fit is re-encoded
+ * or dropped rather than reported (VENC reference, "编码码流buffer配置模式").
+ */
+typedef enum {
+    V5_VENC_MOD_VENC = 1,
+    V5_VENC_MOD_H264 = 2,
+    V5_VENC_MOD_H265 = 3,
+    V5_VENC_MOD_JPEG = 4,
+    V5_VENC_MOD_RC = 5,
+    V5_VENC_MOD_SVAC3 = 6,
+} v5_venc_mod_type;
+
+typedef struct {
+    v5_venc_mod_type mod_type;
+    union {
+        struct {
+            unsigned int one_stream_buf;
+            unsigned int mini_buf_mode;
+            unsigned int clear_stream_buf;
+        } jpeg;
+        unsigned int raw[6];
+    } u;
+} v5_venc_mod_param;
+
+_Static_assert(sizeof(v5_venc_mod_param) == 28, "ot_venc_mod_param is 28 bytes");
+_Static_assert(offsetof(v5_venc_mod_param, u.jpeg.mini_buf_mode) == 8,
+               "ot_venc_jpeg_mod_param.mini_buf_mode at +8");
+
 /* ================================================================
  * LOADER
  * ================================================================ */
@@ -620,6 +661,11 @@ typedef struct {
     /* JPEG quality. Optional: a build with no snapshot path never calls it. */
     int (*fnSetJpegParam)(int chn, const v5_venc_jpeg_param *param);
     int (*fnGetJpegParam)(int chn, v5_venc_jpeg_param *param);
+
+    /* Module parameters, before the first channel; optional, and without
+     * them the stream buffers keep the driver's general-mode floors. */
+    int (*fnSetModParam)(const v5_venc_mod_param *param);
+    int (*fnGetModParam)(v5_venc_mod_param *param);
 
     /*
      * The stream buffer's base addresses, for a zero-copy reader. Optional
@@ -686,6 +732,11 @@ static inline int v5_venc_load(v5_venc_impl *lib, const v5_mpi_libs *libs)
 
     lib->fnGetStreamBufInfo = (int (*)(int, v5_venc_stream_buf_info *))v5_symbol_opt(
         libs, "ss_mpi_venc_get_stream_buf_info");
+
+    lib->fnSetModParam =
+        (int (*)(const v5_venc_mod_param *))v5_symbol_opt(libs, "ss_mpi_venc_set_mod_param");
+    lib->fnGetModParam =
+        (int (*)(v5_venc_mod_param *))v5_symbol_opt(libs, "ss_mpi_venc_get_mod_param");
 
     lib->fnInsertUserData = (int (*)(int, unsigned char *, unsigned int))v5_symbol_opt(
         libs, "ss_mpi_venc_insert_user_data");

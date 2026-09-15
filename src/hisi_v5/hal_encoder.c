@@ -381,6 +381,66 @@ int hal_enc_destroy_group(void *ctx, int grp)
  * which is why there is no "start for N frames" path: rvd never asks for
  * one, and the single value that would express it is the one that fails.
  */
+/*
+ * hisi_enc_mod_param_init -- put the JPEG module in memory-saving mode.
+ *
+ * Once, before the first channel of this process exists -- of any codec,
+ * not just the first JPEG one: the driver answers NOT_PERM to a module
+ * parameter while any channel does, measured as 0xa008800d. Nothing
+ * fails on a refusal; the sizing below simply keeps the general-mode
+ * floor, which is the behaviour this replaced.
+ *
+ * Why. The general-mode floor for a JPEG stream buffer is a byte per
+ * pixel -- 2,985,984 B of MMZ for a 2304x1296 snapshot channel, and
+ * measured JPEGs at quality 75 run 0.07 to 0.3 of that. The memory-saving
+ * floor is 32 KB, which lets the buffer be sized to what a frame can
+ * actually be: rvd's own bound of half a byte per pixel plus 32 KB, the
+ * same figure it sizes the JPEG ring by, so a frame the encoder can emit
+ * is one the ring can carry.
+ */
+static void hisi_enc_mod_param_init(hisi_state_t *st)
+{
+    v5_venc_mod_param mp;
+    int ret;
+
+    if (st->venc_mod_checked)
+        return;
+    st->venc_mod_checked = true;
+    if (!st->venc.fnSetModParam || !st->venc.fnGetModParam)
+        return;
+
+    memset(&mp, 0, sizeof(mp));
+    mp.mod_type = V5_VENC_MOD_JPEG;
+    ret = st->venc.fnGetModParam(&mp);
+    if (ret) {
+        HAL_LOG_WARN("ss_mpi_venc_get_mod_param(JPEG) failed: 0x%x; JPEG stream buffers stay at "
+                     "the general-mode floor",
+                     ret);
+        return;
+    }
+    if (mp.u.jpeg.mini_buf_mode == 1) {
+        st->venc_jpeg_mini_buf = true;
+        return;
+    }
+    mp.u.jpeg.mini_buf_mode = 1;
+    ret = st->venc.fnSetModParam(&mp);
+    if (ret) {
+        HAL_LOG_WARN("ss_mpi_venc_set_mod_param(JPEG mini_buf_mode) failed: 0x%x; JPEG stream "
+                     "buffers stay at the general-mode floor",
+                     ret);
+        return;
+    }
+    st->venc_jpeg_mini_buf = true;
+    HAL_LOG_INFO("venc: JPEG module in memory-saving mode; snapshot buffers sized to the frame "
+                 "bound rather than a byte per pixel");
+}
+
+/* rvd_jpeg_frame_bound's figure, kept in step with rvd/rvd_ring_size.c. */
+static unsigned int hisi_enc_jpeg_bound(unsigned int width, unsigned int height)
+{
+    return width * height / 2u + 32768u;
+}
+
 static int hisi_enc_start_chn(hisi_state_t *st, int chn, hisi_venc_chn_t *enc)
 {
     v5_venc_start_param param;
@@ -424,6 +484,12 @@ int hal_enc_create_channel(void *ctx, int chn, const rss_video_config_t *cfg)
         return RSS_ERR_INVAL;
     }
 
+    /* Before this process's first channel of any codec: the module
+     * parameter is refused NOT_PERM once one exists, measured as
+     * 0xa008800d when it was asked for at the first JPEG channel, after
+     * the H.265 ones. */
+    hisi_enc_mod_param_init(st);
+
     memset(enc, 0, sizeof(*enc));
     enc->codec = cfg->codec;
     enc->payload = hisi_enc_payload(cfg->codec);
@@ -449,15 +515,25 @@ int hal_enc_create_channel(void *ctx, int chn, const rss_video_config_t *cfg)
      * the driver rejects an unaligned stream buffer.
      */
     enc->buf_size = cfg->buf_size ? cfg->buf_size : (unsigned int)enc->width * enc->height;
-    /* The JPEG encoder refuses a buffer smaller than the picture at
-     * 16-aligned dimensions -- measured on gen4, whose jpege is the same
-     * block, and reported by the create as an ILLEGAL_PARAM naming no
-     * field. */
     if (enc->payload == V5_PT_MJPEG) {
+        /*
+         * A JPEG channel's buffer is one of two figures. In the JPEG
+         * module's memory-saving mode (hisi_enc_mod_param_init) it is the
+         * frame bound rvd sizes its ring by -- half the picture's byte
+         * count plus 32 KB, 1.5 MB at 2304x1296 -- unless the caller asked
+         * for more. Otherwise the driver refuses anything under the
+         * picture at 16-aligned dimensions: measured on gen4, whose jpege
+         * is the same block, as an ILLEGAL_PARAM naming no field, and on
+         * this part as 0xa0088007 to a 1.5 MB buffer for 2304x1296.
+         */
         unsigned int min = ((enc->width + 15u) & ~15u) * ((enc->height + 15u) & ~15u);
 
-        if (enc->buf_size < min)
+        if (st->venc_jpeg_mini_buf) {
+            if (!cfg->buf_size)
+                enc->buf_size = hisi_enc_jpeg_bound(enc->width, enc->height);
+        } else if (enc->buf_size < min) {
             enc->buf_size = min;
+        }
     }
     enc->buf_size = (enc->buf_size + 63u) & ~63u;
 
