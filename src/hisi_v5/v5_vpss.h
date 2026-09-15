@@ -119,8 +119,12 @@ _Static_assert(offsetof(v5_vpss_grp_attr, frame_rate) == 48, "ot_vpss_grp_attr.f
  * ot_vpss_chn_attr (ot_common_vpss.h:70-87).
  *
  * mirror_en/flip_en here are the group-side pair of the ones in
- * v5_vi_chn_attr. Both work; VPSS's is per-stream, which is what raptor
- * wants, and VI's would flip all three at once.
+ * v5_vi_chn_attr, and the pair that works: VI's turns nothing while VI
+ * and VPSS are both online. Two exclusions come with them, both measured
+ * on a CV608 and both in the VPSS reference -- SEG_COMPACT compression
+ * and either of them cannot be on together (0xa007800d to the attribute),
+ * and the channel 0 wrap ring and *flip* cannot be on together
+ * (0xa007800d to set_chn_buf_wrap, with mirror alone accepted).
  *
  * depth is the number of frames the channel holds for a userspace reader.
  * Zero means "bound consumer only" -- get_chn_frame then returns

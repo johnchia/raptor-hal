@@ -1245,10 +1245,14 @@ static int hisi_vi_bringup(hisi_state_t *st)
     chn.dynamic_range = V5_DYNAMIC_RANGE_SDR8;
     chn.video_format = V5_VIDEO_FORMAT_LINEAR;
     chn.compress_mode = V5_COMPRESS_MODE_NONE;
-    /* Whatever [image] asked for before bring-up; hisi_vi_apply_orien
-     * writes the same pair afterwards. */
-    chn.mirror_en = st->mirror;
-    chn.flip_en = st->flip;
+    /*
+     * Not [image]'s orientation. The VI channel takes mirror_en and
+     * reports it in /proc/umap/vi, and in the all-online coupling it turns
+     * nothing -- there is no VI write-out to reverse. Orientation is the
+     * VPSS channels'; see hisi_fs_apply_orien.
+     */
+    chn.mirror_en = 0;
+    chn.flip_en = 0;
     chn.depth = 0;
     chn.frame_rate_ctrl.src_frame_rate = -1;
     chn.frame_rate_ctrl.dst_frame_rate = -1;
@@ -1969,6 +1973,16 @@ static unsigned int hisi_vb_vi_blk_cnt(unsigned long long blk_size, unsigned lon
  * want. About 0.4 MB at 2304x1296 against the 6.2 MB pool it stands in
  * for at 1080p. Returns 0, and no pool is cut, when the driver cannot be
  * asked.
+ *
+ * Cut for the *uncompressed* ring, which is the larger of the two and the
+ * one a turned picture needs: orientation and SEG_COMPACT cannot both be
+ * on (hisi_fs_compress), so an [image] hflip drops channel 0's
+ * compression, and a block cut only for the compressed ring is then
+ * 412,696 B against the 442,368 the ring wants -- the ring cannot be
+ * re-cut, channel 0 falls off it, and in the all-online coupling there is
+ * nothing underneath. 29,672 B at 2304x1296 buys a mirror that keeps the
+ * ring; the compressed ring still fits in the larger block, VB handing
+ * out the smallest block that fits.
  */
 static unsigned long long hisi_vb_wrap_blk(const hisi_state_t *st)
 {
@@ -1997,8 +2011,14 @@ static unsigned long long hisi_vb_wrap_blk(const hisi_state_t *st)
                      ret, line);
         return 0;
     }
-    return hisi_vb_wrap_size(m->dev_rect.width, m->dev_rect.height, line,
-                             V5_COMPRESS_MODE_SEG_COMPACT);
+    {
+        unsigned long long plain =
+            hisi_vb_wrap_size(m->dev_rect.width, m->dev_rect.height, line, V5_COMPRESS_MODE_NONE);
+        unsigned long long packed = hisi_vb_wrap_size(m->dev_rect.width, m->dev_rect.height, line,
+                                                      V5_COMPRESS_MODE_SEG_COMPACT);
+
+        return plain > packed ? plain : packed;
+    }
 }
 
 static void hisi_vb_fill_cfg(hisi_state_t *st, v5_vb_cfg *cfg)

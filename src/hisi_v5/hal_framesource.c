@@ -96,12 +96,23 @@ static void hisi_fs_frame_rate(const hisi_state_t *st, uint32_t num, uint32_t de
  *     Callers do not have to know: hal_fs_set_frame_depth rewrites the
  *     attribute and resizes the pool on the same transition.
  *
+ *   - Orientation. The VPSS reference is explicit that SEG_COMPACT output
+ *     and mirror/flip cannot both be on, and the driver enforces it:
+ *     measured on a CV608, ss_mpi_vpss_set_chn_attr answers 0xa007800d
+ *     (NOT_PERM) to an attribute carrying mirror_en while compress_mode is
+ *     SEG_COMPACT, and 0 to the same attribute with compress_mode NONE.
+ *     So a turned picture costs the compression for as long as it is
+ *     turned, and orientation is a whole-pipeline setting rather than a
+ *     per-channel one, which is why this reads the backend's state.
+ *
  * Worth about 31% of the block -- 3,110,400 bytes down to roughly 2.13 MB
  * at 1080p.
  */
-static v5_compress_mode hisi_fs_compress(const hisi_vpss_chn_t *fs, int phy)
+static v5_compress_mode hisi_fs_compress(const hisi_state_t *st, const hisi_vpss_chn_t *fs, int phy)
 {
     if (phy != 0 || fs->depth)
+        return V5_COMPRESS_MODE_NONE;
+    if (st->mirror || st->flip)
         return V5_COMPRESS_MODE_NONE;
     return V5_COMPRESS_MODE_SEG_COMPACT;
 }
@@ -278,7 +289,8 @@ static void hisi_fs_pool_release(hisi_state_t *st, int chn, hisi_vpss_chn_t *fs)
  * pipe's 3DNR reference frames were refused for.
  *
  * What it costs, from the VPSS reference's list for this call: no flip
- * on the channel (orientation is VI's here anyway), no channel
+ * on the channel -- mirror is fine, flip is not, and hisi_fs_wrap_want
+ * gives the ring up for as long as [image] asks for one -- no channel
  * post-processing, no low-delay and no buffer-share on the same channel,
  * and the bound encoders may not re-encode oversize frames -- none of
  * which this backend uses. A JPEG and an H.26x channel may both hang off
@@ -294,10 +306,31 @@ static void hisi_fs_pool_release(hisi_state_t *st, int chn, hisi_vpss_chn_t *fs)
  * frames, the way it did before the ring existed.
  * ================================================================ */
 
+/*
+ * hisi_fs_chn0_rings -- is the ring in play for channel 0 on this pipeline?
+ *
+ * Asked of the pipeline rather than of a channel, because it is what
+ * decides whether a flip can be had at all: the ring is exclusive with
+ * flip, and giving it up is not affordable here. See hal_isp_set_vflip.
+ */
+bool hisi_fs_chn0_rings(const hisi_state_t *st)
+{
+    return st->vb_wrap_blk && st->vpss.fnSetChnBufWrap && st->sys.fnGetVpssVencWrapBufLine;
+}
+
 static bool hisi_fs_wrap_want(const hisi_state_t *st, const hisi_vpss_chn_t *fs, int phy)
 {
-    return phy == 0 && !fs->depth && st->vb_wrap_blk && st->vpss.fnSetChnBufWrap &&
-           st->sys.fnGetVpssVencWrapBufLine;
+    /*
+     * Not while the picture is flipped. The VPSS reference's wrap table
+     * gives mirror as supported in every wrapped coupling and flip in
+     * none, and the driver agrees: measured on a CV608, an attribute
+     * carrying flip_en is accepted on the disabled channel and the
+     * following ss_mpi_vpss_set_chn_buf_wrap(on) is refused 0xa007800d.
+     * Mirror keeps the ring; flip costs it. hal_isp_set_vflip refuses the
+     * flip that would, so in practice this term never fires; it is here
+     * so the two statements of the rule cannot drift apart.
+     */
+    return phy == 0 && !fs->depth && !st->flip && hisi_fs_chn0_rings(st);
 }
 
 /* The ring this channel would ask for now. False when it cannot be had. */
@@ -511,7 +544,7 @@ static void hisi_fs_fill_attr(const hisi_state_t *st, hisi_vpss_chn_t *fs, int p
 
     /* Cached on the channel because the pool's block size has to agree
      * with it; hisi_fs_pool_want reads it back. */
-    fs->compress_mode = hisi_fs_compress(fs, phy);
+    fs->compress_mode = hisi_fs_compress(st, fs, phy);
 
     attr->width = fs->width;
     attr->height = fs->height;
@@ -527,21 +560,24 @@ static void hisi_fs_fill_attr(const hisi_state_t *st, hisi_vpss_chn_t *fs, int p
 
     /*
      * Mirror and flip are the *channel's* on V5, not the sensor's -- every
-     * sensor library on this image has a null pfn_mirror_flip. They are
-     * per-stream here, which is what raptor wants, and they follow the
-     * backend's orientation state rather than the caller's config.
+     * sensor library on this image has a null pfn_mirror_flip -- and not
+     * the VI channel's, which in the all-online coupling writes nothing to
+     * DDR and so has no write-out to reverse: measured on a CV608, the VI
+     * channel takes mirror_en and reports it in /proc/umap/vi and the
+     * picture does not move.
+     *
+     * They are per-stream here, which is what raptor wants, and they
+     * follow the backend's orientation state rather than the caller's
+     * config: [image] hflip turns the camera, not one stream.
+     *
+     * Two costs, both handled above rather than here. hisi_fs_compress
+     * drops channel 0's SEG_COMPACT while either is on, because the driver
+     * refuses an oriented attribute on a compressed channel; and
+     * hisi_fs_wrap_want gives up the ring while flip is on, because the
+     * ring refuses to come back on over a flipped channel.
      */
-    /*
-     * Not the VPSS channel's. This driver answers 0xa007800d
-     * (OT_ERR_VPSS_NOT_PERM) to a channel attribute carrying a mirror,
-     * enabled or disabled, so orientation is the VI channel's here --
-     * hisi_vi_apply_orien in hal_knob.c -- and turns all three streams
-     * together.
-     */
-    attr->mirror_en = 0;
-    attr->flip_en = 0;
-
-    (void)st;
+    attr->mirror_en = st->mirror;
+    attr->flip_en = st->flip;
 }
 
 /*
@@ -571,6 +607,7 @@ int hal_fs_create_channel(void *ctx, int chn, const rss_fs_config_t *cfg)
         HAL_LOG_ERR("fs%d: %ux%u is not a size", chn, cfg->width, cfg->height);
         return RSS_ERR_INVAL;
     }
+    hisi_fs_orien_guard(st);
     if (cfg->width > st->mode.dev_rect.width || cfg->height > st->mode.dev_rect.height) {
         /*
          * VPSS scales down, not up: the group was created for the sensor's
@@ -615,6 +652,104 @@ int hal_fs_create_channel(void *ctx, int chn, const rss_fs_config_t *cfg)
                  fs->height, fs->frame_rate.src_frame_rate, fs->frame_rate.dst_frame_rate,
                  fs->depth);
     return RSS_OK;
+}
+
+/*
+ * hisi_fs_apply_orien -- put st->mirror / st->flip onto the channels.
+ *
+ * WHERE ORIENTATION LIVES ON THIS PART. Three places carry a mirror and
+ * only one of them turns the picture:
+ *
+ *   - the sensor object's pfn_mirror_flip, null on every sensor library
+ *     this image ships (v5_snr.h, finding 3);
+ *   - the VI channel's mirror_en/flip_en, which the driver accepts and
+ *     reports in /proc/umap/vi and which does nothing in the all-online
+ *     coupling, there being no VI write-out to reverse -- measured on a
+ *     CV608 by comparing two captures, which differ only by sensor noise;
+ *   - the VPSS channel's, measured on the same board to turn the picture.
+ *
+ * So it is the VPSS channels', set on all of them together because
+ * [image] hflip means the camera rather than one stream.
+ *
+ * WHAT IT COSTS. Channel 0 alone is expensive, and only because of how it
+ * streams: it is SEG_COMPACT compressed and it feeds its encoder from the
+ * wrap ring. Compression is mutually exclusive with orientation, so that
+ * goes (hisi_fs_compress) and the ring is simply re-cut a little larger --
+ * which is all a mirror costs. The ring is mutually exclusive with flip
+ * alone, and giving it up is not affordable: see hal_isp_set_vflip, which
+ * refuses that flip outright, and hisi_fs_orien_guard, which drops one
+ * that arrived before the ring was settled.
+ */
+/*
+ * hisi_fs_orien_guard -- drop a flip channel 0 cannot have.
+ *
+ * hal_isp_set_vflip refuses it, so this is the case that got past that:
+ * an [image] vflip remembered before hal_init had settled whether channel
+ * 0 would ride the ring. Dropping it here rather than at bring-up is the
+ * difference between a mirrored picture and no pipeline at all -- channel
+ * 0 leaving the ring takes three sensor-sized frames out of the zone, and
+ * the encoders are created after the framesources, so what it starves
+ * fails later and fatally.
+ */
+void hisi_fs_orien_guard(hisi_state_t *st)
+{
+    if (!st->flip || !hisi_fs_chn0_rings(st))
+        return;
+    HAL_LOG_ERR("vflip dropped: channel 0's wrap ring is exclusive with flip, and the frames it "
+                "would need instead do not fit; see hal_isp_set_vflip");
+    st->flip = 0;
+}
+
+int hisi_fs_apply_orien(hisi_state_t *st)
+{
+    int chn;
+    int rc = RSS_OK;
+
+    if (!st)
+        return RSS_ERR_INVAL;
+    if (!st->vpss_grp_created || !st->vpss.fnSetChnAttr) {
+        HAL_LOG_DBG("orientation: mirror %d, flip %d noted for bring-up", st->mirror, st->flip);
+        return RSS_OK;
+    }
+
+    for (chn = 0; chn < HISI_VPSS_CHN_NUM; chn++) {
+        hisi_vpss_chn_t *fs = &st->fs[chn];
+        v5_vpss_chn_attr attr;
+        v5_compress_mode was;
+        int phy = hisi_vpss_phy(chn);
+        int ret;
+
+        if (!fs->configured)
+            continue;
+
+        was = fs->compress_mode;
+        hisi_fs_fill_attr(st, fs, phy, &attr);
+
+        /*
+         * A wrapped channel refuses a new attribute outright, and a
+         * channel whose compression or ring just changed has a block size
+         * that no longer matches its pool. Either way the cycle is the
+         * path that can do it; a plain channel takes the attribute live,
+         * and keeps streaming across the change.
+         */
+        if (fs->wrapped || fs->compress_mode != was ||
+            hisi_fs_wrap_want(st, fs, phy) != fs->wrapped) {
+            hisi_fs_pool_refresh(st, chn, fs, &attr);
+            continue;
+        }
+
+        ret = st->vpss.fnSetChnAttr(HISI_VPSS_GRP, phy, &attr);
+        if (ret) {
+            HAL_LOG_ERR("fs%d: ss_mpi_vpss_set_chn_attr(mirror %d, flip %d) failed: 0x%x", chn,
+                        st->mirror, st->flip, ret);
+            if (rc == RSS_OK)
+                rc = RSS_ERR_IO;
+        }
+    }
+
+    if (rc == RSS_OK)
+        HAL_LOG_INFO("orientation: mirror %d, flip %d on the VPSS channels", st->mirror, st->flip);
+    return rc;
 }
 
 /*

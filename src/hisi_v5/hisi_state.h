@@ -992,11 +992,12 @@ typedef struct {
     } knob;
 
     /*
-     * Orientation. The VI *channel's* mirror and flip, not the sensor's --
-     * every sensor library on this image has a null pfn_mirror_flip -- and
-     * not VPSS's, which refuses a mirror outright (0xa007800d). So it
-     * turns all three streams together, which is what [image] means by
-     * hflip and vflip anyway.
+     * Orientation. The VPSS *channels'* mirror and flip, not the sensor's
+     * -- every sensor library on this image has a null pfn_mirror_flip --
+     * and not the VI channel's, which the driver accepts and which turns
+     * nothing while VI and VPSS are both online. Written on every channel
+     * at once, so it turns all three streams together, which is what
+     * [image] means by hflip and vflip anyway. See hisi_fs_apply_orien.
      */
     int mirror;
     int flip;
@@ -1056,6 +1057,9 @@ static inline hisi_state_t *hisi_state(void *ctx)
  * ================================================================ */
 
 /* hal_framesource.c -- the VPSS channels rvd calls framesources. */
+bool hisi_fs_chn0_rings(const hisi_state_t *st);
+void hisi_fs_orien_guard(hisi_state_t *st);
+int hisi_fs_apply_orien(hisi_state_t *st);
 int hal_fs_create_channel(void *ctx, int chn, const rss_fs_config_t *cfg);
 int hal_fs_set_channel_attr(void *ctx, int chn, const rss_fs_config_t *cfg);
 int hal_fs_destroy_channel(void *ctx, int chn);
@@ -1150,7 +1154,6 @@ void hisi_knob_reapply(hisi_state_t *st);
 int hal_isp_set_hflip(void *ctx, int enable);
 int hal_isp_set_vflip(void *ctx, int enable);
 int hal_isp_get_hvflip(void *ctx, int *hflip, int *vflip);
-int hisi_vi_apply_orien(hisi_state_t *st);
 
 /* hal_encoder.c */
 int hal_enc_create_group(void *ctx, int grp);

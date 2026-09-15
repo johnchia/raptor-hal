@@ -64,9 +64,10 @@
  * promises, and isp_get_knob_caps says what they are.
  *
  * The orientation pair, hflip and vflip, is at the end of the file: not an
- * ISP attribute at all but the VI channel's mirror and flip bits, for the
- * reasons set out there -- the sensor libraries have no pfn_mirror_flip
- * and VPSS refuses a mirror outright.
+ * ISP attribute at all but the VPSS channels' mirror and flip bits, for
+ * the reasons set out there -- the sensor libraries have no
+ * pfn_mirror_flip, and the VI channel's pair turns nothing while VI and
+ * VPSS are both online.
  *
  * WHEN THE WRITE HAPPENS. rvd applies [image] right after hal_init, before
  * the first frame; the tuning loads on the first frame and rewrites all
@@ -607,54 +608,40 @@ int hal_isp_get_exposure(void *ctx, rss_exposure_t *exposure)
     return RSS_OK;
 }
 
-/* ---------------- orientation: the VI channel's mirror_en / flip_en ---------------- */
+/* ---------------- orientation: the VPSS channels' mirror_en / flip_en ---------------- */
 
 /*
- * WHY VI AND NOT VPSS. Three places on this SoC carry a mirror: the sensor
- * object's pfn_mirror_flip, which every sensor library on this image
- * leaves null; the VPSS channel attribute, which would have given a
- * per-stream answer and which this driver refuses outright -- 0xa007800d,
- * OT_ERR_VPSS_NOT_PERM, with the channel enabled or disabled alike; and
- * the VI channel attribute, which is one channel for the whole pipe. So
- * orientation turns all three streams together, which is what [image]
- * means by hflip and vflip anyway.
+ * WHY VPSS AND NOT VI. Three places on this SoC carry a mirror. The sensor
+ * object's pfn_mirror_flip is null on every sensor library this image
+ * ships. The VI channel's mirror_en/flip_en is accepted by the driver and
+ * shown in /proc/umap/vi, and turns nothing: in the all-online coupling
+ * the VI channel writes no frame to DDR, so there is no write-out to
+ * reverse -- measured on a CV608, where two captures either side of a
+ * mirror differ only by sensor noise, and neither is the mirror of the
+ * other. What is left is the VPSS channel's, which does turn the picture,
+ * and which hisi_fs_apply_orien writes on every channel at once.
  *
- * The value is remembered in the state and written here; bring-up reads
- * the same pair into the channel attribute it builds, which is how an
- * [image] hflip set before hal_init reaches the first frame.
+ * The value is remembered in the state and the framesource layer reads it
+ * when it builds a channel attribute, which is how an [image] hflip set
+ * before hal_init reaches the first frame.
+ *
+ * A flip can be refused -- it costs channel 0 its wrap ring, and the
+ * blocks it needs instead may not fit -- so the remembered value is put
+ * back when it is.
  */
-int hisi_vi_apply_orien(hisi_state_t *st)
+static int hisi_set_orien(hisi_state_t *st, int *field, int enable)
 {
-    v5_vi_chn_attr chn;
+    int prev = *field;
     int ret;
 
-    if (!st->vi.fnSetChnAttr || !st->vi.fnGetChnAttr)
-        return RSS_ERR_NOTSUP;
-    if (!st->vi_chn_enabled) {
-        HAL_LOG_DBG("orientation: mirror %d, flip %d noted for bring-up", st->mirror, st->flip);
+    *field = enable ? 1 : 0;
+    if (*field == prev)
         return RSS_OK;
-    }
-    /* Get-modify-set: the channel attribute carries the geometry and the
-     * pixel format bring-up settled, and rebuilding it here would be a
-     * second copy of that to keep in step. */
-    ret = st->vi.fnGetChnAttr(HISI_VI_PIPE, HISI_VI_CHN, &chn);
-    if (ret) {
-        HAL_LOG_WARN("ss_mpi_vi_get_chn_attr(pipe %d, chn %d) failed: 0x%x", HISI_VI_PIPE,
-                     HISI_VI_CHN, ret);
-        return RSS_ERR_IO;
-    }
-    if (chn.mirror_en == st->mirror && chn.flip_en == st->flip)
-        return RSS_OK;
-    chn.mirror_en = st->mirror;
-    chn.flip_en = st->flip;
-    ret = st->vi.fnSetChnAttr(HISI_VI_PIPE, HISI_VI_CHN, &chn);
-    if (ret) {
-        HAL_LOG_WARN("ss_mpi_vi_set_chn_attr(mirror %d, flip %d) failed: 0x%x", st->mirror,
-                     st->flip, ret);
-        return RSS_ERR_IO;
-    }
-    HAL_LOG_INFO("orientation: mirror %d, flip %d on the VI channel", st->mirror, st->flip);
-    return RSS_OK;
+
+    ret = hisi_fs_apply_orien(st);
+    if (ret != RSS_OK)
+        *field = prev;
+    return ret;
 }
 
 int hal_isp_set_hflip(void *ctx, int enable)
@@ -663,22 +650,54 @@ int hal_isp_set_hflip(void *ctx, int enable)
 
     if (!st)
         return RSS_ERR_INVAL;
-    st->mirror = enable ? 1 : 0;
-    return hisi_vi_apply_orien(st);
+    return hisi_set_orien(st, &st->mirror, enable);
 }
 
+/*
+ * vflip is refused while channel 0 rides the wrap ring, which on this part
+ * is always.
+ *
+ * The ring and flip are mutually exclusive -- the VPSS reference's wrap
+ * table says so, and set_chn_buf_wrap answers 0xa007800d over a flipped
+ * channel. So a flip takes channel 0 off the ring and onto whole frames of
+ * its own: three of them, 13.1 MB at 2304x1296 out of a 28 MB zone, in a
+ * coupling that reserved no frame pool at all precisely because the ring
+ * meant it did not have to.
+ *
+ * Whether that fits cannot be answered when the flip is asked for. The
+ * framesources are created before the encoders, so at bring-up the zone
+ * always looks empty enough and the pool is granted -- and then
+ * ss_mpi_venc_create_chn answers 0xa0088014 for the JPEG channel and rvd
+ * exits. Measured, from a config carrying hflip and vflip together:
+ *
+ *   fs0: vb pool 3, 4478976 B x3 for 2304x1296
+ *   ss_mpi_venc_create_chn(2) 2304x1296 codec 2 failed: 0xa0088014
+ *   pipeline init failed: -5
+ *
+ * A probe that asks "is there room now" gets the wrong answer for exactly
+ * that reason. So the rule is the static one: the ring stays, and the flip
+ * that would take it is refused -- here, where the caller learns why, and
+ * in hisi_fs_orien_guard for the one that predates the ring being settled.
+ * Mirror is unaffected; it keeps the ring and costs 29,672 B of it.
+ */
 int hal_isp_set_vflip(void *ctx, int enable)
 {
     hisi_state_t *st = hisi_state(ctx);
 
     if (!st)
         return RSS_ERR_INVAL;
-    st->flip = enable ? 1 : 0;
-    return hisi_vi_apply_orien(st);
+    if (enable && hisi_fs_chn0_rings(st)) {
+        HAL_LOG_ERR("vflip: channel 0 streams through the wrap ring, which flip is exclusive "
+                    "with, and the whole %ux%u frames it would need instead do not fit beside "
+                    "the encoders. hflip is unaffected.",
+                    st->mode.dev_rect.width, st->mode.dev_rect.height);
+        return RSS_ERR_NOTSUP;
+    }
+    return hisi_set_orien(st, &st->flip, enable);
 }
 
 /* The remembered value, not a read-back: the channel attribute answers
- * only while the pipe runs, and the answer would be the same. */
+ * only while the group runs, and the answer would be the same. */
 int hal_isp_get_hvflip(void *ctx, int *hflip, int *vflip)
 {
     hisi_state_t *st = hisi_state(ctx);

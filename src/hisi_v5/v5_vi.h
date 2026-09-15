@@ -18,7 +18,12 @@
  *     that moved to their own calls.
  *   - Mirror and flip moved *into* the channel (ot_vi_chn_attr.mirror_en /
  *     flip_en) from the sensor object's pfn_mirror_flip. Both still exist;
- *     the channel's is the one a running pipeline can change.
+ *     neither turns the picture here. The sensor libraries this image
+ *     ships leave pfn_mirror_flip null, and the channel's pair is
+ *     accepted, stored and shown in /proc/umap/vi while the picture does
+ *     not move -- in the all-online coupling the VI channel writes no
+ *     frame, so it has no write-out to reverse. Orientation on this
+ *     backend is the VPSS channels'; see v5_vpss.h.
  *
  * PROVENANCE. openhisilicon kernel/include/hi3516cv6xx/ot_common_vi.h at
  * 1.0.2.0 B051. Sizes and offsets from a probe compiled against it with the
