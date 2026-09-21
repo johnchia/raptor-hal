@@ -2638,6 +2638,12 @@ int hal_isp_set_sensor_fps(void *ctx, uint32_t fps_num, uint32_t fps_den)
         return RSS_OK;
     }
 
+    if (st->snr_mode_max_fps && fps > st->snr_mode_max_fps) {
+        HAL_LOG_WARN("isp: sensor rate %u fps is past the selected mode's %u; running at %u", fps,
+                     st->snr_mode_max_fps, st->snr_mode_max_fps);
+        fps = st->snr_mode_max_fps;
+    }
+
     ret = st->snr.set_fps(I6C_DEV_ID(I6C_SNR_PAD), fps);
     if (ret) {
         HAL_LOG_WARN("isp: MI_SNR_SetFps(%u) failed: %d", fps, ret);

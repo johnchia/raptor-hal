@@ -593,6 +593,14 @@ int i6c_bind_scl_to_venc(infinity6c_state_t *st, int port, int chn, unsigned int
         return RSS_OK;
 
     /*
+     * The pair is a drop ratio to MI, so a destination cannot be asked for more
+     * than the source delivers. A stream configured faster than the selected
+     * sensor mode runs (see i6c_snr_select) is paced at the sensor's rate.
+     */
+    if (dst_fps > st->fps)
+        dst_fps = st->fps;
+
+    /*
      * A second H.26x stream is not a second SCL port. Only one SCL port can ring
      * an H.26x channel -- a second SCL port bound to a second channel is refused
      * (a frame-based bind to an H.26x channel is NOT_SUPPORT) -- so the engine

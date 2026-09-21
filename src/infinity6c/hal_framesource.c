@@ -90,12 +90,23 @@ static i6c_common_pixfmt i6c_vif_pixfmt(const i6c_snr_plane *plane)
  * geometry and frame rate wins, which relies on the vendor listing modes
  * largest-first -- they do, and a wrong choice here costs resolution rather
  * than correctness.
+ *
+ * When no mode covers the geometry at the rate, the geometry wins and the rate
+ * gives: the mode that covers it at the highest rate is applied and the sensor
+ * runs at that. A 5 MP sensor's full frame is a 20 fps mode, and the size the
+ * daemon builds its main stream on is exactly that full frame (see
+ * hal_isp_get_sensor_attr, which sizes by area, not rate), while the 25 it
+ * asks for is usually its own default rather than anything the config named.
+ * Refusing would leave the board dark for a rate nobody chose; the daemon
+ * already knows how to run streams off a sensor slower than it asked for.
  */
 static int i6c_snr_select(infinity6c_state_t *st, unsigned short width, unsigned short height,
                           unsigned int fps)
 {
     unsigned int count = 0;
     unsigned int i;
+    int fallback = -1;
+    unsigned int fallback_fps = 0, fallback_w = 0, fallback_h = 0;
     int ret;
 
     /*
@@ -138,6 +149,7 @@ static int i6c_snr_select(infinity6c_state_t *st, unsigned short width, unsigned
     }
 
     st->snr_profile = -1;
+    st->snr_mode_max_fps = 0;
     for (i = 0; i < count; i++) {
         i6c_snr_res res;
 
@@ -150,15 +162,35 @@ static int i6c_snr_select(infinity6c_state_t *st, unsigned short width, unsigned
         HAL_LOG_DBG("infinity6c: sensor mode %u: %ux%u, up to %u fps, \"%.*s\"", i, res.crop.width,
                     res.crop.height, res.maxFps, (int)sizeof(res.desc), res.desc);
 
-        if (width > res.crop.width || height > res.crop.height || fps > res.maxFps)
+        if (width > res.crop.width || height > res.crop.height)
             continue;
 
-        st->snr_profile = (int)i;
-        break;
+        if (fps <= res.maxFps) {
+            st->snr_profile = (int)i;
+            st->snr_mode_max_fps = res.maxFps;
+            break;
+        }
+
+        if (res.maxFps > fallback_fps) {
+            fallback = (int)i;
+            fallback_fps = res.maxFps;
+            fallback_w = res.crop.width;
+            fallback_h = res.crop.height;
+        }
+    }
+
+    if (st->snr_profile < 0 && fallback >= 0) {
+        HAL_LOG_WARN("infinity6c: no sensor mode covers %ux%u at %u fps; mode %d (%ux%u) runs it "
+                     "at %u, the fastest that does, so the sensor rate is %u fps",
+                     width, height, fps, fallback, fallback_w, fallback_h, fallback_fps,
+                     fallback_fps);
+        st->snr_profile = fallback;
+        st->snr_mode_max_fps = fallback_fps;
+        fps = fallback_fps;
     }
 
     if (st->snr_profile < 0) {
-        HAL_LOG_ERR("infinity6c: no sensor mode covers %ux%u at %u fps", width, height, fps);
+        HAL_LOG_ERR("infinity6c: no sensor mode covers %ux%u", width, height);
         return RSS_ERR_INVAL;
     }
 
@@ -850,6 +882,7 @@ void i6c_pipeline_destroy(infinity6c_state_t *st)
 
     st->pipeline_up = false;
     st->snr_profile = -1;
+    st->snr_mode_max_fps = 0;
     /*
      * The next pipeline reloads the tuning, which puts every module back to what
      * the binary says -- so the knobs go back to being queued until it has. The

@@ -458,6 +458,13 @@ typedef struct {
     i6c_snr_pad pad;
     i6c_snr_plane plane;
     int snr_profile; /* index into the sensor's resolution list; -1 = unset */
+    /*
+     * The selected mode's ceiling, 0 until one is selected. A rate asked for
+     * above it is clamped to it, at selection and live alike: the driver's fps
+     * setter refuses anything past the mode's maximum rather than running as
+     * fast as it can.
+     */
+    unsigned int snr_mode_max_fps;
     unsigned int fps;
 
     /*
