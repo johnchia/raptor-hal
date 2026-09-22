@@ -1025,6 +1025,9 @@ static int star_enc_bind_port_rate(star_state_t *st, int port, int chn, unsigned
     star_venc_chn_t *enc;
     unsigned int port_fps;
     unsigned int src_fps;
+    i6_sys_link link;
+    unsigned int link_param;
+    bool ring;
     int ret;
 
     if (!st || port < 0 || port >= STAR_VPE_PORT_NUM || chn < 0 || chn >= I6_VENC_CHN_NUM)
@@ -1037,6 +1040,47 @@ static int star_enc_bind_port_rate(star_state_t *st, int port, int chn, unsigned
     }
     if (enc->bound)
         return enc->src_port == port ? RSS_OK : RSS_ERR_BUSY;
+
+    /*
+     * A video channel reads the port through the hardware ring: VPE
+     * writes lines into a buffer half a frame deep and the encoder
+     * follows behind, so the port keeps no queue of whole frames in DRAM.
+     * That queue is the largest thing on the MMA heap for a main stream
+     * -- three frames' worth asked for, a sensor-sized frame each -- and
+     * on a 32 MB heap the third never fits, which MI reports once per
+     * frame as "Get Buffer Faild" on the port and survives only by
+     * dropping the frame. The vendor's RTSP reference binds its main
+     * stream this way (E_MI_SYS_BIND_TYPE_HW_RING with the frame height
+     * as the bind parameter, or half of it for the half-frame ring); the
+     * half ring is a hardware handshake like the whole one, and it costs
+     * a 2304x1296 stream 2.2 MB of heap where a whole frame costs 4.5.
+     *
+     * A snapshot channel stays frame based. It shares or clones a port
+     * and is paced by the bind, and the ring belongs to the one consumer
+     * the encoder set up for it -- a second bind on a ring-bound port is
+     * refused BUSY, which the register path reports as no snapshots.
+     *
+     * The encoder must be told before the bind, and MI is asked either
+     * way so a channel re-created after a hot restart never keeps a mode
+     * it was given for a bind that has gone. A part refuses the mode for
+     * a channel it has no ring for (the second channel of a VENC device
+     * answers NOT_SUPPORT), and that channel binds frame based.
+     */
+    ring = enc->codec != RSS_CODEC_JPEG && enc->codec != RSS_CODEC_MJPEG &&
+           st->venc.fnSetSourceConfig != NULL;
+    if (st->venc.fnSetSourceConfig) {
+        i6_venc_src_conf mode = ring ? I6_VENC_SRC_CONF_RING_HALF : I6_VENC_SRC_CONF_NORMAL;
+
+        ret = st->venc.fnSetSourceConfig(chn, &mode);
+        if (ret) {
+            HAL_LOG_WARN("MI_VENC_SetInputSourceConfig(chn %d, %s) failed: %#x -- binding "
+                         "frame based",
+                         chn, ring ? "ring" : "framebase", (unsigned int)ret);
+            ring = false;
+        }
+    }
+    link = ring ? I6_SYS_LINK_RING : I6_SYS_LINK_FRAMEBASE;
+    link_param = ring ? st->port[port].height / 2 : 0;
 
     /*
      * divinus enables the VPE port as part of binding (i6_channel_bind),
@@ -1054,10 +1098,10 @@ static int star_enc_bind_port_rate(star_state_t *st, int port, int chn, unsigned
     }
 
     /*
-     * FRAMEBASE, not REALTIME: the VIF->VPE link is realtime because
-     * the ISP consumes pixels as they arrive, but VENC reads whole
-     * frames out of DRAM. A realtime link here would hand the encoder
-     * MI_SYS_REALTIME_MAGIC_PADDR instead of a frame.
+     * Never REALTIME: the VIF->VPE link is realtime because the ISP
+     * consumes pixels as they arrive, but VENC reads its input out of
+     * DRAM, ring or frame. A realtime link here would hand the encoder
+     * MI_SYS_REALTIME_MAGIC_PADDR instead of a buffer.
      */
     port_fps = st->port[port].fps_num && st->port[port].fps_den
                    ? st->port[port].fps_num / st->port[port].fps_den
@@ -1087,7 +1131,20 @@ static int star_enc_bind_port_rate(star_state_t *st, int port, int chn, unsigned
         dst_fps = src_fps;
 
     star_enc_bind_cells(st, port, chn, &source, &dest);
-    ret = st->sys.fnBindExt(&source, &dest, src_fps, dst_fps, I6_SYS_LINK_FRAMEBASE, 0);
+    ret = st->sys.fnBindExt(&source, &dest, src_fps, dst_fps, link, link_param);
+    if (ret && ring) {
+        /* A part or a port that has no ring for this channel: say so and
+         * take the frame queue, which is what every bind was before. */
+        i6_venc_src_conf mode = I6_VENC_SRC_CONF_NORMAL;
+
+        HAL_LOG_WARN("MI_SYS_BindChnPort2 VPE port %d -> VENC %d as a ring failed: %#x -- "
+                     "binding frame based",
+                     port, chn, (unsigned int)ret);
+        st->venc.fnSetSourceConfig(chn, &mode);
+        ring = false;
+        link = I6_SYS_LINK_FRAMEBASE;
+        ret = st->sys.fnBindExt(&source, &dest, src_fps, dst_fps, link, 0);
+    }
     if (ret) {
         HAL_LOG_ERR("MI_SYS_BindChnPort2 VPE port %d -> VENC %d failed: %d", port, chn, ret);
         return RSS_ERR_IO;
@@ -1097,10 +1154,11 @@ static int star_enc_bind_port_rate(star_state_t *st, int port, int chn, unsigned
     enc->src_port = port;
 
     if (dst_fps == src_fps)
-        HAL_LOG_DBG("bind: VPE port %d -> VENC chn %d, framebase, %u fps", port, chn, src_fps);
+        HAL_LOG_DBG("bind: VPE port %d -> VENC chn %d, %s, %u fps", port, chn,
+                    ring ? "ring" : "framebase", src_fps);
     else
-        HAL_LOG_DBG("bind: VPE port %d -> VENC chn %d, framebase, %u -> %u fps", port, chn,
-                    src_fps, dst_fps);
+        HAL_LOG_DBG("bind: VPE port %d -> VENC chn %d, %s, %u -> %u fps", port, chn,
+                    ring ? "ring" : "framebase", src_fps, dst_fps);
 
     return RSS_OK;
 }
