@@ -665,10 +665,12 @@ static int star_enc_spare_port(const star_state_t *st, unsigned int width, unsig
  * them, so the code falls back to sharing the paired stream's port rather
  * than giving up. See the fallback below for what that trades away.
  *
- * Failures warn and return RSS_OK rather than propagating. rvd treats a
- * register failure as fatal to the stream, and a board that cannot feed
- * its JPEG channel should lose its snapshots, not its video. Every such
- * exit says so in the log: a JPEG path that quietly does nothing is
+ * A channel this cannot feed is reported, not swallowed: rvd answers a
+ * snapshot channel's register failure by dropping that stream and keeping
+ * the video one, so a board that cannot feed its JPEG channel loses its
+ * snapshots, not its video, and does not keep an encoder channel and its
+ * output buffer for frames that will never come. Every such exit says so
+ * in the log: a JPEG path that quietly does nothing is
  * indistinguishable from one that works until someone asks it for a
  * picture, and telling those apart from a log is the whole point.
  */
@@ -704,7 +706,7 @@ int hal_enc_register_channel(void *ctx, int grp, int chn)
         HAL_LOG_WARN("venc chn %d: paired video chn %d is not bound to a VPE port yet, "
                      "so there is no geometry to clone -- no snapshots on this stream",
                      chn, grp);
-        return RSS_OK;
+        return RSS_ERR_NOTSUP;
     }
 
     snap_fps = enc->fps_num / (enc->fps_den ? enc->fps_den : 1);
@@ -769,7 +771,7 @@ int hal_enc_register_channel(void *ctx, int grp, int chn)
         HAL_LOG_WARN("venc chn %d: sharing chn %d's VPE port %d failed too: %d "
                      "-- no snapshots on this stream",
                      chn, grp, src_port, ret);
-        return RSS_OK;
+        return RSS_ERR_NOTSUP;
     }
 
     HAL_LOG_DBG("venc chn %d: snapshot channel sharing chn %d's VPE port %d "
