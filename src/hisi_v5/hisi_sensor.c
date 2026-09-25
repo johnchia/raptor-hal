@@ -897,6 +897,12 @@ int hisi_sensor_mode_load(hisi_sensor_mode_t *m, const char *sensor_name, const 
     hisi_parse_lane_map(lane, m->lane_id, V5_MIPI_LANE_NUM);
     m->lane_divide_mode =
         (v5_lane_divide_mode)hisi_ini_int(&ini, "mipi", "lane_divide_mode", V5_LANE_DIVIDE_MODE_0);
+    m->mipi_dev = (unsigned int)hisi_ini_int(&ini, "mipi", "dev", 0);
+    if (m->mipi_dev > 1) {
+        HAL_LOG_WARN("sensor: %s: [mipi] dev %u is not a receiver; using 0", m->ini_path,
+                     m->mipi_dev);
+        m->mipi_dev = 0;
+    }
     m->mipi_data_rate =
         (v5_mipi_data_rate)hisi_ini_int(&ini, "mipi", "data_rate", V5_MIPI_DATA_RATE_X1);
 

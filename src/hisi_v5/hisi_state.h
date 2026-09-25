@@ -46,12 +46,13 @@
 /* ================================================================
  * FIXED TOPOLOGY
  *
- * One sensor on VI device 0, pipe 0, channel 0, feeding VPSS group 0. The
- * numbering only becomes interesting with several sensors and this target
- * has one; hal_caps.c publishes max_sensors accordingly.
+ * One sensor on pipe 0, channel 0, feeding VPSS group 0. The numbering only
+ * becomes interesting with several sensors and this target has one;
+ * hal_caps.c publishes max_sensors accordingly. The VI device is the one
+ * exception: it is the MIPI receiver the sensor is wired to, which is board
+ * wiring and so comes from the mode file (hisi_vi_dev).
  * ================================================================ */
 
-#define HISI_VI_DEV 0
 #define HISI_VI_CHN 0
 #define HISI_VPSS_GRP 0
 
@@ -174,6 +175,16 @@ typedef struct {
      */
     short lane_id[V5_MIPI_LANE_NUM];
     v5_lane_divide_mode lane_divide_mode;
+    /*
+     * The receiver the sensor is wired to: the port every MIPI ioctl names,
+     * and the VI device too, because each VI device takes its input from
+     * the receiver of the same number and from no other. Also board wiring:
+     * in 2+2 mode the phy is two receivers, device 0 on lanes 0 and 2 and
+     * device 1 on lanes 1 and 3 with the second clock pair, and the driver
+     * refuses device 1 in 4-lane mode. The sensor's clock and reset stay on
+     * source 0 either way; that follows the sensor, not the receiver.
+     */
+    unsigned int mipi_dev;
     v5_mipi_data_rate mipi_data_rate;
 
     /* [isp_image] -- ot_isp_pub_attr's half. frame_rate is a float in the
@@ -1028,6 +1039,12 @@ typedef struct {
     unsigned long long vb_wrap_blk;
     bool vi_3dnr_enabled;
 } hisi_state_t;
+
+/* The VI device, which is the sensor's MIPI receiver; see mipi_dev. */
+static inline int hisi_vi_dev(const hisi_state_t *st)
+{
+    return (int)st->mode.mipi_dev;
+}
 
 static inline hisi_state_t *hisi_state(void *ctx)
 {

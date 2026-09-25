@@ -595,12 +595,16 @@ static int hisi_mipi_ioctl(int fd, unsigned long req, void *arg, const char *wha
  * because it decides whether the phy is one four-lane receiver or two
  * two-lane ones, and the device attribute that follows is interpreted
  * under it.
+ *
+ * devno is the receiver, and hisi_vi_bringup opens the VI device of the
+ * same number: a sensor on the second receiver ([mipi] dev = 1) reaches VI
+ * device 1 and nothing else. The sensor clock and reset stay on source 0.
  */
 static int hisi_mipi_configure(hisi_state_t *st)
 {
     const hisi_sensor_mode_t *m = &st->mode;
     v5_combo_dev_attr attr;
-    unsigned int devno = HISI_VI_DEV;
+    unsigned int devno = m->mipi_dev;
     unsigned int sns_src = 0;
     v5_lane_divide_mode hs_mode = m->lane_divide_mode;
     int fd;
@@ -670,7 +674,7 @@ out:
  * individual failure. */
 static void hisi_mipi_shutdown(hisi_state_t *st)
 {
-    unsigned int devno = HISI_VI_DEV;
+    unsigned int devno = st->mode.mipi_dev;
     unsigned int sns_src = 0;
     int fd;
 
@@ -1185,22 +1189,23 @@ static int hisi_vi_bringup(hisi_state_t *st)
     dev.in_size.height = m->dev_rect.height;
     dev.data_rate = m->data_rate;
 
-    ret = st->vi.fnSetDevAttr(HISI_VI_DEV, &dev);
+    ret = st->vi.fnSetDevAttr(hisi_vi_dev(st), &dev);
     if (ret) {
-        HAL_LOG_ERR("ss_mpi_vi_set_dev_attr(dev %d) failed: 0x%x", HISI_VI_DEV, ret);
+        HAL_LOG_ERR("ss_mpi_vi_set_dev_attr(dev %d) failed: 0x%x", hisi_vi_dev(st), ret);
         return RSS_ERR_IO;
     }
 
-    ret = st->vi.fnEnableDev(HISI_VI_DEV);
+    ret = st->vi.fnEnableDev(hisi_vi_dev(st));
     if (ret) {
-        HAL_LOG_ERR("ss_mpi_vi_enable_dev(dev %d) failed: 0x%x", HISI_VI_DEV, ret);
+        HAL_LOG_ERR("ss_mpi_vi_enable_dev(dev %d) failed: 0x%x", hisi_vi_dev(st), ret);
         return RSS_ERR_IO;
     }
     st->vi_dev_enabled = true;
 
-    ret = st->vi.fnBind(HISI_VI_DEV, HISI_VI_PIPE);
+    ret = st->vi.fnBind(hisi_vi_dev(st), HISI_VI_PIPE);
     if (ret) {
-        HAL_LOG_ERR("ss_mpi_vi_bind(dev %d, pipe %d) failed: 0x%x", HISI_VI_DEV, HISI_VI_PIPE, ret);
+        HAL_LOG_ERR("ss_mpi_vi_bind(dev %d, pipe %d) failed: 0x%x", hisi_vi_dev(st), HISI_VI_PIPE,
+                    ret);
         return RSS_ERR_IO;
     }
     st->vi_bound = true;
@@ -1284,8 +1289,8 @@ static int hisi_vi_bringup(hisi_state_t *st)
     }
     st->vi_chn_enabled = true;
 
-    HAL_LOG_INFO("vi: dev %d -> pipe %d -> chn %d, %ux%u", HISI_VI_DEV, HISI_VI_PIPE, HISI_VI_CHN,
-                 m->dev_rect.width, m->dev_rect.height);
+    HAL_LOG_INFO("vi: dev %d -> pipe %d -> chn %d, %ux%u", hisi_vi_dev(st), HISI_VI_PIPE,
+                 HISI_VI_CHN, m->dev_rect.width, m->dev_rect.height);
 
     hisi_vi_enable_3dnr(st);
     return RSS_OK;
@@ -1306,11 +1311,11 @@ static void hisi_vi_teardown(hisi_state_t *st)
     st->vi_pipe_created = false;
 
     if (st->vi_bound)
-        st->vi.fnUnbind(HISI_VI_DEV, HISI_VI_PIPE);
+        st->vi.fnUnbind(hisi_vi_dev(st), HISI_VI_PIPE);
     st->vi_bound = false;
 
     if (st->vi_dev_enabled)
-        st->vi.fnDisableDev(HISI_VI_DEV);
+        st->vi.fnDisableDev(hisi_vi_dev(st));
     st->vi_dev_enabled = false;
 }
 
