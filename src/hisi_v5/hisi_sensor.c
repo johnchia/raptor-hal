@@ -30,12 +30,12 @@
  * THREE THINGS THE V5 LAYOUT ADDS.
  *
  *   - **The die caps the geometry.** One MPP serves CV610, CV610_10B and
- *     CV608, and clk_cfg.c clocks the CV608's ISP at 148.5 MHz against the
- *     CV610's 198. Every vendor config therefore ships in three variants,
- *     and the _608 one is 2304x1296 where the others are 4M or 5M. Rather
- *     than three files per sensor, a mode file here carries per-die
- *     override sections: a key in [vi_dev.hi3516cv608] beats the same key
- *     in [vi_dev]. hisi_state_t::chip_name selects the suffix.
+ *     CV608, and the CV608's ISP line buffers are 2304 pixels wide. Every
+ *     vendor config therefore ships in three variants, and the _608 one is
+ *     2304x1296 where the others are 4M or 5M. Rather than three files per
+ *     sensor, a mode file here carries per-die override sections: a key in
+ *     [vi_dev.hi3516cv608] beats the same key in [vi_dev].
+ *     hisi_state_t::chip_name selects the suffix.
  *
  *   - **The I2C bus is explicit.** gen4 assumed it; V5's sensor library
  *     takes it through pfn_set_bus_info before registration.
@@ -952,9 +952,21 @@ int hisi_sensor_mode_load(hisi_sensor_mode_t *m, const char *sensor_name, const 
     /*
      * The sensor's output size, and the one field the die overrides in
      * practice: a CV608 runs every sensor here at 2304x1296 where a CV610
-     * runs 4M or 5M, because its ISP is clocked at 148.5 MHz rather than
-     * 198 (clk_cfg.c). That is why hisi_ini_str consults [vi_dev.<die>]
+     * runs 4M or 5M. That is why hisi_ini_str consults [vi_dev.<die>]
      * first.
+     *
+     * The ceiling is line width, not pixel rate. The CV608's ISP line
+     * buffers hold 2304 pixels, and no driver checks it: on every die
+     * ot_vi accepts pipes at least 3200 wide and the ISP library 4096, so
+     * nothing ahead of the encoder refuses a wider mode. The encoder's
+     * CV608 limit is a width of 144 macroblocks. The vendor's _608 configs
+     * reach 2304 by cropping the sensor's full output at the MIPI receiver,
+     * not by selecting a smaller sensor mode.
+     *
+     * The ISP clock does not explain it. clk_cfg.c clocks the ISP at 264
+     * MHz on a CV610, 198 on a 10B and 148.5 on a CV608. The CV610's 4K@25
+     * and the 10B's 5M@30 use 0.79 and 0.71 of their clocks in active
+     * pixels, and 2560x1440@30 would use 0.74 of the CV608's.
      *
      * DevRect_x/DevRect_y are read and reported and then not applied, for
      * the reason gen4's file gives at length: used as a crop they ask for
