@@ -29,13 +29,14 @@
  *
  * THREE THINGS THE V5 LAYOUT ADDS.
  *
- *   - **The die caps the geometry.** One MPP serves CV610, CV610_10B and
- *     CV608, and the CV608's encoder refuses anything wider than 2304 or
- *     larger than 2304x1296. Every vendor config therefore ships in three
- *     variants, and the _608 one is 2304x1296 where the others are 4M or
- *     5M. Rather than three files per sensor, a mode file here carries
- *     per-die override sections: a key in [vi_dev.hi3516cv608] beats the
- *     same key in [vi_dev]. hisi_state_t::chip_name selects the suffix.
+ *   - **The die caps the mode.** One MPP serves CV610, CV610_10B and
+ *     CV608, and the CV608 cannot encode what the other two can: its
+ *     encoder either refuses the size or cannot keep the rate (see the
+ *     DevRect comment in hisi_sensor_mode_load). Every vendor config
+ *     therefore ships in three variants. Rather than three files per
+ *     sensor, a mode file here carries per-die override sections: a key in
+ *     [vi_dev.hi3516cv608] or [isp_image.hi3516cv608] beats the same key
+ *     in the plain section. hisi_state_t::chip_name selects the suffix.
  *
  *   - **The I2C bus is explicit.** gen4 assumed it; V5's sensor library
  *     takes it through pfn_set_bus_info before registration.
@@ -902,7 +903,12 @@ int hisi_sensor_mode_load(hisi_sensor_mode_t *m, const char *sensor_name, const 
     /* [i2c] */
     m->i2c_dev = hisi_ini_int(&ini, "i2c", "i2c_dev", 0);
 
-    /* [isp_image] */
+    /*
+     * [isp_image]. Isp_FrameRate is the sensor's rate and so the ceiling
+     * for every stream (hisi_enc_fill_rc clamps to it). It is also how a
+     * mode file caps a die whose encoder cannot keep up with the sensor's
+     * full rate; see the DevRect comment below.
+     */
     m->frame_rate = hisi_ini_float(&ini, "isp_image", "Isp_FrameRate", 30.0f);
     m->bayer = (v5_bayer_format)hisi_ini_enum_val(&ini, "isp_image", "Isp_Bayer", hisi_enum_bayer,
                                                   V5_BAYER_RGGB);
@@ -950,27 +956,38 @@ int hisi_sensor_mode_load(hisi_sensor_mode_t *m, const char *sensor_name, const 
         (unsigned int)hisi_ini_int(&ini, "vi_dev", "Timingblank_VsyncVbbb", 0);
 
     /*
-     * The sensor's output size, and the one field the die overrides in
-     * practice: a CV608 runs every sensor here at 2304x1296 where a CV610
-     * runs 4M or 5M. That is why hisi_ini_str consults [vi_dev.<die>]
-     * first.
+     * The sensor's output size, which a CV608 may override: that is why
+     * hisi_ini_str consults [vi_dev.<die>] first.
      *
-     * The ceiling is the encoder's, not the front end's. On a CV608,
-     * ss_mpi_venc_create_chn answers 0xa0088007 (illegal parameter) to any
-     * channel wider than 144 macroblocks or larger than 2304x1296, a limit
-     * ot_venc applies by chip variant. VI, the ISP and VPSS carry the
-     * sensor's full 2560x1440 without complaint on this die, at least at
-     * the 20 fps a dim scene holds: frames arrive without loss or bus
-     * errors, and the picture is continuous past column 2304. So a CV608
-     * could run the sensor at 4M and scale down in VPSS; the vendor's _608
-     * configs instead crop the sensor's output to 2304x1296 at the MIPI
-     * receiver, which keeps the full-size stream under the encoder's limit
-     * at the cost of field of view.
-     *
-     * The ISP clock is not the limit either. clk_cfg.c clocks the ISP at
-     * 264 MHz on a CV610, 198 on a 10B and 148.5 on a CV608, and the
-     * CV608 at 2560x1440 uses no larger a share of its clock in active
+     * Every CV608 limit is the encoder's; the front end carries the
+     * sensor's full 2560x1440 on this die. VI, the ISP and VPSS pass it
+     * without lost frames or bus errors, and the picture is continuous
+     * past column 2304. The ISP clock is not the limit: clk_cfg.c clocks
+     * the ISP at 264 MHz on a CV610, 198 on a 10B and 148.5 on a CV608, and
+     * the CV608 at 2560x1440 uses no larger a share of its clock in active
      * pixels than the other two dies do at their rated maximums.
+     *
+     * The encoder limits the CV608 in two ways:
+     *
+     *   - Size. The vendor's stock encoder applies a per-die table and
+     *     gives the CV608 at most 144 macroblocks wide and 2304x1296 in
+     *     all. ss_mpi_venc_create_chn answers 0xa0088007 (illegal
+     *     parameter) to anything larger. The vendor's _608 configs
+     *     therefore crop the sensor to 2304x1296 at the MIPI receiver, the
+     *     top-left corner, at the cost of field of view. openhisilicon's
+     *     encoder gives the CV608 the 10B's 2880x1620 instead, as shipping
+     *     CV608 firmware does.
+     *
+     *   - Rate. The CV608 encoder tops out near 103 Mpixel/s whatever the
+     *     table says. 2560x1440 asked for 30 fps encodes 28, skipping about
+     *     two ring frames a second in either codec; at 25 it skips none.
+     *
+     * So a mode file for a CV608 does one of two things. It keeps the
+     * vendor's crop in [vi_dev.hi3516cv608] (30 fps, reduced field of
+     * view, any encoder). Or it drops the crop and caps the sensor in
+     * [isp_image.hi3516cv608] Isp_FrameRate (full field of view, 25 fps,
+     * openhisilicon's encoder only: on the stock one the full-size channel
+     * fails to create).
      *
      * DevRect_x/DevRect_y are read and reported and then not applied, for
      * the reason gen4's file gives at length: used as a crop they ask for
