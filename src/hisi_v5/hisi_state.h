@@ -1010,6 +1010,7 @@ typedef struct {
         int drc_base;
         int drc_base_op;
         bool exp_warned;
+        bool night; /* ric's running mode; see hal_isp_set_running_mode */
     } knob;
 
     /*
@@ -1180,6 +1181,8 @@ int hal_isp_get_brightness(void *ctx, int *val);
 int hal_isp_set_contrast(void *ctx, int val);
 int hal_isp_get_contrast(void *ctx, int *val);
 int hal_isp_set_saturation(void *ctx, int val);
+int hal_isp_set_running_mode(void *ctx, rss_isp_mode_t mode);
+int hal_isp_get_running_mode(void *ctx, rss_isp_mode_t *mode);
 int hal_isp_get_saturation(void *ctx, int *val);
 int hal_isp_set_ae_comp(void *ctx, int val);
 int hal_isp_get_ae_comp(void *ctx, int *val);

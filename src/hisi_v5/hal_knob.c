@@ -539,6 +539,106 @@ int hal_isp_get_knob_caps(void *ctx, const char *name, rss_isp_knob_t *caps)
     return RSS_ERR_NOTSUP;
 }
 
+/* ---------------- day and night ---------------- */
+
+/*
+ * Night is the SDK's IR recipe (sample_ir_auto.c, isp_ir_switch_to_ir):
+ * saturation manual at 0, white balance manual at unity, the CCM manual at
+ * identity. Under IR the colour channels carry no chroma worth keeping, and
+ * each of the three would otherwise invent some: the AWB chases the IR's
+ * tint, the CCM amplifies it, and saturation turns what is left into the
+ * magenta cast of an unfiltered sensor. Day hands all three back to their
+ * auto tables, which are the tuning file's. Driving the IR-cut is ric's.
+ *
+ * The tuning load rewrites these same attributes, so the mode is
+ * remembered and laid back down after a load (hisi_knob_reapply).
+ */
+static int knob_night_write(hisi_state_t *st, bool night)
+{
+    const v5_isp_tune_impl *t;
+    v5_isp_saturation_attr sat;
+    v5_isp_wb_attr wb;
+    v5_isp_ccm_attr ccm;
+    int op = night ? V5_OP_MODE_MANUAL : V5_OP_MODE_AUTO;
+    int ret;
+
+    hisi_isp_tune_resolve(st);
+    t = &st->tune;
+    if (!t->fnGetSaturationAttr || !t->fnSetSaturationAttr || !t->fnGetWbAttr || !t->fnSetWbAttr ||
+        !t->fnGetCcmAttr || !t->fnSetCcmAttr)
+        return RSS_ERR_NOTSUP;
+
+    memset(&sat, 0, sizeof(sat));
+    if ((ret = t->fnGetSaturationAttr(HISI_VI_PIPE, &sat)) != 0)
+        goto fail;
+    sat.op_type = op;
+    if (night)
+        sat.manual_saturation = 0;
+    if ((ret = t->fnSetSaturationAttr(HISI_VI_PIPE, &sat)) != 0)
+        goto fail;
+
+    memset(&wb, 0, sizeof(wb));
+    if ((ret = t->fnGetWbAttr(HISI_VI_PIPE, &wb)) != 0)
+        goto fail;
+    wb.op_type = op;
+    if (night) {
+        wb.manual_attr.r_gain = 0x100;
+        wb.manual_attr.gr_gain = 0x100;
+        wb.manual_attr.gb_gain = 0x100;
+        wb.manual_attr.b_gain = 0x100;
+    }
+    if ((ret = t->fnSetWbAttr(HISI_VI_PIPE, &wb)) != 0)
+        goto fail;
+
+    memset(&ccm, 0, sizeof(ccm));
+    if ((ret = t->fnGetCcmAttr(HISI_VI_PIPE, &ccm)) != 0)
+        goto fail;
+    ccm.op_type = op;
+    if (night) {
+        unsigned int i;
+
+        for (i = 0; i < V5_ISP_CCM_MATRIX_SIZE; i++)
+            ccm.manual_attr.ccm[i] = (i % 4 == 0) ? 0x100 : 0;
+    }
+    if ((ret = t->fnSetCcmAttr(HISI_VI_PIPE, &ccm)) != 0)
+        goto fail;
+
+    return RSS_OK;
+
+fail:
+    HAL_LOG_ERR("isp: %s mode: saturation/wb/ccm write failed: 0x%x", night ? "night" : "day", ret);
+    return RSS_ERR_IO;
+}
+
+int hal_isp_set_running_mode(void *ctx, rss_isp_mode_t mode)
+{
+    hisi_state_t *st = hisi_state(ctx);
+    bool night = (mode == RSS_ISP_NIGHT);
+    int ret;
+
+    if (!st)
+        return RSS_ERR_INVAL;
+    st->knob.night = night;
+    /* Before the ISP runs there is nothing to write to; the load picks
+     * the mode up when it lands. */
+    if (!knob_live(st))
+        return RSS_OK;
+    ret = knob_night_write(st, night);
+    if (ret == RSS_OK)
+        HAL_LOG_INFO("isp: %s mode", night ? "night (monochrome)" : "day (colour)");
+    return ret;
+}
+
+int hal_isp_get_running_mode(void *ctx, rss_isp_mode_t *mode)
+{
+    hisi_state_t *st = hisi_state(ctx);
+
+    if (!st || !mode)
+        return RSS_ERR_INVAL;
+    *mode = st->knob.night ? RSS_ISP_NIGHT : RSS_ISP_DAY;
+    return RSS_OK;
+}
+
 /* ---------------- the loader's brackets ---------------- */
 
 void hisi_knob_before_load(hisi_state_t *st)
@@ -558,6 +658,8 @@ void hisi_knob_reapply(hisi_state_t *st)
         knob_ae_write(st, st->knob.ae_comp.val, ", again over the tuning");
     if (st->knob.drc.asked)
         knob_drc_write(st, st->knob.drc.val);
+    if (st->knob.night)
+        knob_night_write(st, true);
 }
 
 /* ---------------- the readback ---------------- */
