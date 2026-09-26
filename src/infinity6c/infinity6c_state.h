@@ -457,7 +457,8 @@ typedef struct {
      */
     i6c_snr_pad pad;
     i6c_snr_plane plane;
-    int snr_profile; /* index into the sensor's resolution list; -1 = unset */
+    int snr_profile;  /* index into the sensor's resolution list; -1 = unset */
+    int snr_mode_req; /* the mode the config names; -1 = choose by size and rate */
     /*
      * The selected mode's ceiling, 0 until one is selected. A rate asked for
      * above it is clamped to it, at selection and live alike: the driver's fps

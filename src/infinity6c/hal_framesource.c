@@ -99,6 +99,15 @@ static i6c_common_pixfmt i6c_vif_pixfmt(const i6c_snr_plane *plane)
  * asks for is usually its own default rather than anything the config named.
  * Refusing would leave the board dark for a rate nobody chose; the daemon
  * already knows how to run streams off a sensor slower than it asked for.
+ *
+ * A mode named by index ([sensor] mode) skips the search, because the search
+ * cannot express what naming one is for: of two modes that both cover the
+ * stream at its rate it always takes the earlier, whatever their aspect or
+ * field of view. The named mode still has to cover the stream's size -- a
+ * smaller one would have the scaler enlarge it -- and one that does not, or an
+ * index the driver does not have, is reported and the search runs instead, so
+ * a stale index costs the choice rather than the picture. Its rate gives way
+ * the same as a searched mode's.
  */
 static int i6c_snr_select(infinity6c_state_t *st, unsigned short width, unsigned short height,
                           unsigned int fps)
@@ -150,7 +159,35 @@ static int i6c_snr_select(infinity6c_state_t *st, unsigned short width, unsigned
 
     st->snr_profile = -1;
     st->snr_mode_max_fps = 0;
-    for (i = 0; i < count; i++) {
+    if (st->snr_mode_req >= 0 && (unsigned int)st->snr_mode_req >= count) {
+        HAL_LOG_WARN("infinity6c: [sensor] mode %d, but the sensor driver has modes 0-%u; "
+                     "choosing by size and rate instead",
+                     st->snr_mode_req, count - 1);
+    } else if (st->snr_mode_req >= 0) {
+        i6c_snr_res res;
+
+        i = (unsigned int)st->snr_mode_req;
+        memset(&res, 0, sizeof(res));
+        if ((ret = st->snr.get_res(I6C_DEV_ID(I6C_SNR_PAD), (unsigned char)i, &res)) != 0) {
+            HAL_LOG_ERR("MI_SNR_GetRes(%u) failed: %d", i, ret);
+            return RSS_ERR_IO;
+        }
+        if (width > res.crop.width || height > res.crop.height) {
+            HAL_LOG_WARN("infinity6c: [sensor] mode %u is %ux%u, smaller than the %ux%u stream; "
+                         "choosing by size and rate instead",
+                         i, res.crop.width, res.crop.height, width, height);
+        } else {
+            st->snr_profile = (int)i;
+            st->snr_mode_max_fps = res.maxFps;
+            if (fps > res.maxFps) {
+                HAL_LOG_WARN("infinity6c: [sensor] mode %u runs at most %u fps, so the sensor "
+                             "rate is %u, not %u",
+                             i, res.maxFps, res.maxFps, fps);
+                fps = res.maxFps;
+            }
+        }
+    }
+    for (i = 0; st->snr_profile < 0 && i < count; i++) {
         i6c_snr_res res;
 
         memset(&res, 0, sizeof(res));

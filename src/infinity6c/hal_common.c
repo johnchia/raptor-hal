@@ -210,8 +210,6 @@ static int hal_init(void *ctx, const rss_multi_sensor_config_t *cfg)
     infinity6c_state_t *st;
     int ret;
 
-    (void)cfg;
-
     if (!hal)
         return RSS_ERR_INVAL;
     if (hal->platform)
@@ -226,6 +224,7 @@ static int hal_init(void *ctx, const rss_multi_sensor_config_t *cfg)
      * port and a valid encoder channel, so "unset" needs a value of its own.
      */
     st->snr_profile = -1;
+    st->snr_mode_req = cfg && cfg->sensor_count > 0 ? cfg->sensors[0].mode : -1;
     st->scl_video_port = -1;
     /* Not the calloc'd zero either: the flip predicates are gated on 3DNR. */
     st->isp_nr3d_req = 1;

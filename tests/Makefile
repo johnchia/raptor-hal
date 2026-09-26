@@ -42,9 +42,9 @@ LDFLAGS = -fsanitize=$(SAN) -lpthread
 # rests on it and its behaviour is which file gets written in what order,
 # which a host can check once the sysfs root is redirected.
 SUITES = osd isp audio gpio enc
-BINS = $(addprefix t_,$(SUITES)) t_isp_i6c t_enc_i6c t_isp_imp t_enc_imp t_hisi_iq t_hisi_osd
+BINS = $(addprefix t_,$(SUITES)) t_isp_i6c t_enc_i6c t_fs_i6c t_isp_imp t_enc_imp t_hisi_iq t_hisi_osd
 
-test: $(addprefix test-,$(SUITES)) test-isp_i6c test-enc_i6c test-isp_imp test-enc_imp \
+test: $(addprefix test-,$(SUITES)) test-isp_i6c test-enc_i6c test-fs_i6c test-isp_imp test-enc_imp \
       test-hisi_iq test-hisi_osd
 
 $(addprefix test-,$(SUITES)): test-%: t_%
@@ -54,6 +54,9 @@ test-isp_i6c: t_isp_i6c
 	@./$<
 
 test-enc_i6c: t_enc_i6c
+	@./$<
+
+test-fs_i6c: t_fs_i6c
 	@./$<
 
 # The suites #include the sources they test, so those are prerequisites --
@@ -82,7 +85,7 @@ I6C_CFLAGS = -Wall -Wextra -std=c11 -D_GNU_SOURCE -g -fsanitize=$(SAN) \
 I6C_DEPS = $(wildcard ../src/infinity6c/*.c ../src/infinity6c/*.h ../src/*.c ../src/*.h \
 		      ../include/*.h ../../raptor-common/include/*.h)
 
-t_isp_i6c t_enc_i6c: t_%: t_%.c $(I6C_DEPS)
+t_isp_i6c t_enc_i6c t_fs_i6c: t_%: t_%.c $(I6C_DEPS)
 	$(CC) $(I6C_CFLAGS) -o $@ $< $(LDFLAGS)
 
 # HiSilicon gen4: a fourth PLATFORM_ define and no vendor headers at all --

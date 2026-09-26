@@ -472,6 +472,18 @@ typedef struct {
     rss_sensor_mclk_t mclk;
     int default_boot;
 
+    /*
+     * Which of the sensor driver's modes to run, by its index in the driver's
+     * list; -1 lets the backend choose from the stream's size and rate.
+     *
+     * SigmaStar infinity6c only. There the driver publishes its modes and the
+     * backend picks the first that covers the stream, which cannot tell two
+     * modes of the same size and rate apart -- a 4:3 window and a 16:9 one that
+     * both cover 1920x1080 at 60, say. Naming the index is how a config gets
+     * the other one.
+     */
+    int mode;
+
     /* GPIO pins; -1 = unused */
     int rst_gpio;
     int pwdn_gpio;
